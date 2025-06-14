@@ -38,7 +38,7 @@ def upload_file():
             return redirect(request.url)
 
         try:
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.stl') as tmp:
                 file.save(tmp.name)
                 mesh = trimesh.load(tmp.name)
 
