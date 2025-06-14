@@ -1,0 +1,11 @@
+kind: Service
+metadata:
+  name: mesh-uploader
+  namespace: mode-search-engine
+spec:
+  selector:
+    app: mesh-uploader
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 5000

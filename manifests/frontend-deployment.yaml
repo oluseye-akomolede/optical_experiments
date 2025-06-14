@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mesh-uploader
+  namespace: mode-search-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mesh-uploader
+  template:
+    metadata:
+      labels:
+        app: mesh-uploader
+    spec:
+      containers:
+        - name: flask-app
+          image: your-docker-repo/mesh-uploader:latest
+          ports:
+            - containerPort: 5000
+          env:
+            - name: FLASK_APP
+              value: uploader.py
+            - name: ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mesh-uploader-secrets
+                  key: ACCESS_KEY
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mesh-uploader-secrets
+                  key: SECRET_KEY
+            - name: FLASK_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mesh-uploader-secrets
+                  key: FLASK_SECRET_KEY

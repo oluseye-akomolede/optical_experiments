@@ -1,0 +1,20 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mesh-uploader
+  namespace: mode-search-engine
+spec:
+  ingressClassName: tailscale
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mesh-uploader
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - mesh-uploader
