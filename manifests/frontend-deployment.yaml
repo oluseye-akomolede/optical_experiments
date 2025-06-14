@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: flask-app
-          image: your-docker-repo/mesh-uploader:latest
+          image: harbor.arcadia-ecs.local/mode-search-engine/mesh-uploader:latest
           ports:
             - containerPort: 5000
           env:
