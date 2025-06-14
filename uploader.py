@@ -7,7 +7,7 @@ from werkzeug.utils import secure_filename
 
 # --- Configuration ---
 BUCKET_NAME = "mse-meshes"
-MINIO_ENDPOINT = "https://minio"
+MINIO_ENDPOINT = "https://minio.taildfdd3b.ts.net"
 ACCESS_KEY = os.getenv("ACCESS_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")
 
