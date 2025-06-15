@@ -1,6 +1,6 @@
 import os
 import torch
-
+import xml.etree.ElementTree as ET
 #os.system(' pip uninstall --quiet numpy pyvista tetgen scipy -y')
 #os.system(' pip install  --upgrade --quiet pyvista tetgen scipy')
 #os.system(' pip install --upgrade --quiet numpy')
@@ -83,10 +83,41 @@ def coo_list_to_matrix(coo_list, n):
     from scipy.sparse import coo_matrix
     rows, cols, data = zip(*[(i, j, v) for ((i, j), v) in coo_list])
     return coo_matrix((data, (rows, cols)), shape=(n, n))
-    
+
+def create_pvd_file(output_dir: str, base_name: str, timesteps: int, dt: float) -> str:
+    """
+    Create a ParaView .pvd file that references all time-step .vtu files.
+
+    Parameters:
+    - output_dir: Directory where files are saved
+    - base_name: Prefix for .vtu files (e.g., "impulse_mode0")
+    - timesteps: Number of time steps
+    - dt: Time step size
+
+    Returns:
+    - Full path to the created .pvd file
+    """
+    root = ET.Element("VTKFile", type="Collection", version="0.1", byte_order="LittleEndian")
+    collection = ET.SubElement(root, "Collection")
+
+    for t in range(timesteps):
+        time = t * dt
+        filename = f"{base_name}_t{t:03d}.vtu"
+        ET.SubElement(collection, "DataSet", {
+            "timestep": f"{time:.6f}",
+            "group": "",
+            "part": "0",
+            "file": filename
+        })
+
+    pvd_path = os.path.join(output_dir, f"{base_name}.pvd")
+    tree = ET.ElementTree(root)
+    tree.write(pvd_path, encoding='UTF-8', xml_declaration=True)
+    return pvd_path
+
 def main():
     TARGET_BUCKET_FEM = "mse-fem-modes"
-    TARGET_BUCKET_FDTD = "mse-fdtd-modes"
+    TARGET_BUCKET_FDTD = "mse-time-series"
     parser = ArgumentParser(add_help=True)
     parser.add_argument("--stl", type=str, dest="stl",required=True)
     args = parser.parse_args()
@@ -264,9 +295,46 @@ def main():
             INSERT INTO mse_fem_eigenmodes (filename, fem_filename, mode_index, eigenvalue)
                        VALUES ({args.stl}, '{eigenmode_type}_eigenmode_{i:02d}.vtu', {i}, {eigvals_sorted[i].item()})
         """)
-    conn.commit()
-    cursor.close()
-    conn.close()
+    
 
     print(f"✅ Exported {N} eigenmodes to '{output_dir}/' for ParaView.")
 
+    # Choose time steps
+    timesteps = 1000
+    dt = 1e-10  # seconds
+    frequencies = np.sqrt(eigvals_sorted.numpy()) / (2 * np.pi)  # Hz
+    omega = 2 * np.pi * frequencies
+
+    # Pick an initial mode shape (e.g., unit excitation in mode 0)
+    coeffs = np.zeros(N)
+    coeffs[0] = 1.0
+
+    response_dir = "impulse_response"
+    os.makedirs(response_dir, exist_ok=True)
+
+    for t in range(timesteps):
+        time = t * dt
+        field = np.zeros_like(eigvecs_np[:, 0])
+        for i in range(N):
+            field += coeffs[i] * np.cos(omega[i] * time) * eigvecs_np[:, i]
+        mesh.point_data.clear()
+        mesh.point_data[f"field_t{t:03d}"] = field
+        mesh.save(os.path.join(response_dir, f"{eigenmode_type}_response_t{t:03d}.vtu"))
+
+    pvd_path = create_pvd_file(response_dir, eigenmode_type, timesteps, dt)
+
+    for t in range(timesteps):
+        file_path = os.path.join(response_dir, f"{eigenmode_type}_response_t{t:03d}.vtu")
+        s3.upload_file(file_path, TARGET_BUCKET_FDTD, f"{eigenmode_type}_response_t{t:03d}.vtu")
+
+    # 🔁 Upload .pvd
+    s3.upload_file(pvd_path, TARGET_BUCKET_FDTD, os.path.basename(pvd_path))
+
+
+    cursor.execute(f"""
+        INSERT INTO mse_time_series (filename, mode_index, pvd_path, dt, num_steps, created_at)
+        VALUES ('{args.stl}', 0, '{pvd_path}', {dt}, {timesteps}, NOW())
+    """)
+    conn.commit()
+    cursor.close()
+    conn.close()
