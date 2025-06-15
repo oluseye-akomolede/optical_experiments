@@ -26,15 +26,17 @@ RUN pip install --no-cache-dir \
 
 # Install Java for Spark (OpenJDK 11)
 USER root
+# Install Java 17 and dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    openjdk-11-jre-headless \
+    openjdk-17-jre-headless \
     curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
-ENV PATH=$JAVA_HOME/bin:$PATH
+# Set Java path
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PATH="$JAVA_HOME/bin:$PATH"
 RUN java -version
 
 # Copy the Spark job into the image
