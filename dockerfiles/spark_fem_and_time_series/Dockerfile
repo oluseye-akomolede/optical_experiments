@@ -27,9 +27,11 @@ RUN pip install --no-cache-dir \
 # Install Java for Spark (OpenJDK 11)
 USER root
 RUN apt-get update && \
-    apt-get install -y software-properties-common && \
-    apt-get install -y openjdk-11-jdk && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends \
+    openjdk-11-jre-headless \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
 ENV PATH=$JAVA_HOME/bin:$PATH
