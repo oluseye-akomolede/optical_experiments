@@ -128,7 +128,7 @@ def main():
     if stl_file is None:
         print("Failed to download STL file.")
         return
-    os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-11-openjdk-amd64"
+    os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-17-openjdk-amd64"
     from scipy.spatial import Delaunay
 
     # Step 2: Load STL file using PyVista
