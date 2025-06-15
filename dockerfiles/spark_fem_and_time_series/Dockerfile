@@ -8,6 +8,8 @@ ENV PIP_DEFAULT_TIMEOUT=100 \
 
 # Install required Python libraries (combine into one layer)
 RUN pip install --no-cache-dir \
+    boto3 \
+    botocore \
     pyspark==3.5.1 \
     pyvista \
     tetgen \
