@@ -291,7 +291,7 @@ def run_fem_solver(stl_file: str):
     for i in range(N):
         cursor.execute(f"""
             INSERT INTO mse_fem_eigenmodes (filename, fem_filename, mode_index, eigenvalue)
-                       VALUES ({args.stl}, '{eigenmode_type}_eigenmode_{i:02d}.vtu', {i}, {eigvals_sorted[i].item()})
+                       VALUES ('{args.stl}', '{eigenmode_type}_eigenmode_{i:02d}.vtu', {i}, {eigvals_sorted[i].item()})
         """)
     
 
