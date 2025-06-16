@@ -18,6 +18,32 @@ import boto3
 from botocore.client import Config
 import psycopg2
 
+
+def average_edge_length(mesh):
+    edge_lengths = []
+    edges = mesh.extract_all_edges()
+    lines = edges.lines.reshape(-1, 3)
+    for _, p0_idx, p1_idx in lines:
+        p0 = edges.points[p0_idx]
+        p1 = edges.points[p1_idx]
+        edge_lengths.append(np.linalg.norm(p0 - p1))
+    return np.mean(edge_lengths) if edge_lengths else float('inf')
+
+def adaptive_subdivide(mesh, min_points=3000, max_edge_length=0.2, max_subdivisions=4, verbose=True):
+    subdivisions = 0
+    while (
+        (mesh.n_points < min_points or average_edge_length(mesh) > max_edge_length)
+        and subdivisions < max_subdivisions
+    ):
+        if verbose:
+            print(f"Subdivision {subdivisions}: {mesh.n_points} points, avg edge = {average_edge_length(mesh):.4f}")
+        mesh = mesh.subdivide(1, subfilter='loop')
+        subdivisions += 1
+
+    if verbose:
+        print(f"Final: {mesh.n_points} points, avg edge = {average_edge_length(mesh):.4f} after {subdivisions} subdivisions")
+    return mesh
+
 #Download STL file from minio server
 def download_stl(filename):
     # MinIO config
@@ -118,6 +144,8 @@ def create_pvd_file(output_dir: str, base_name: str, timesteps: int, dt: float) 
 def run_fem_solver(stl_file: str):
     TARGET_BUCKET_FEM = "mse-fem-modes"
     TARGET_BUCKET_FDTD = "mse-time-series"
+    MIN_MESH_POINTS = 3000
+    max_subdivisions = 4
     
     stl_file = stl_file
 
@@ -137,10 +165,14 @@ def run_fem_solver(stl_file: str):
     surface_mesh = surface_mesh.triangulate()
     surface_mesh = surface_mesh.connectivity(largest=True)
     print("repaired mesh")
-    #surface_mesh = surface_mesh.triangulate()
-    surface_mesh = surface_mesh.subdivide(nsub=4, subfilter='linear')
+    #surface_mesh = surface_mesh.subdivide(nsub=4, subfilter='linear')
+    surface_mesh = adaptive_subdivide(surface_mesh, min_points=MIN_MESH_POINTS, max_edge_length=0.2, max_subdivisions=max_subdivisions)
 
-    #os.system('pip install --quiet numpy')
+    # Step 2.1: Ensure the mesh is closed
+    if not surface_mesh.is_all_triangles:
+        print("Mesh is not triangulated, triangulating now...")
+        surface_mesh = surface_mesh.triangulate()
+
     # Step 3: Generate tetrahedral mesh using TetGen
     tet = tetgen.TetGen(surface_mesh)
     tet.tetrahedralize(order=1, mindihedral=20, minratio=2.0)
