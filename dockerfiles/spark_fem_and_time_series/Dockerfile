@@ -35,6 +35,7 @@ RUN apt-get update && \
     openjdk-17-jre-headless \
     curl \
     ca-certificates \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Java path
