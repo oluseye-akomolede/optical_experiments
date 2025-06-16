@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir \
     pyspark==3.5.1 \
     pyvista \
     tetgen \
+    psycopg2-binary \
     scipy \
     numpy \
     numba \
