@@ -115,13 +115,11 @@ def create_pvd_file(output_dir: str, base_name: str, timesteps: int, dt: float) 
     tree.write(pvd_path, encoding='UTF-8', xml_declaration=True)
     return pvd_path
 
-def main():
+def run_fem_solver(stl_file: str):
     TARGET_BUCKET_FEM = "mse-fem-modes"
     TARGET_BUCKET_FDTD = "mse-time-series"
-    parser = ArgumentParser(add_help=True)
-    parser.add_argument("--stl", type=str, dest="stl",required=True)
-    args = parser.parse_args()
-    stl_file = args.stl
+    
+    stl_file = stl_file
 
     # Step 1: Download STL file from MinIO
     stl_file =download_stl(stl_file)
@@ -338,3 +336,9 @@ def main():
     conn.commit()
     cursor.close()
     conn.close()
+
+if __name__ == "__main__":
+    parser = ArgumentParser(add_help=True)
+    parser.add_argument("--stl", type=str, dest="stl",required=True)
+    args = parser.parse_args()
+    run_fem_solver(args.stl)
