@@ -1,0 +1,15 @@
+# Runtime dependencies for the MSE Maxwell cavity solver.
+#
+# Everything here must install with plain `pip install -r` on aarch64 (the
+# Jetson bench runs this without apt), so there are no system packages.
+#
+# pyvista is required even though the solver is headless: tetgen's `.grid`
+# property returns a pyvista.UnstructuredGrid, and that is how the mesh is read
+# back. It pulls in VTK, which is the heaviest dependency by far.
+numpy>=2.0
+scipy>=1.14
+trimesh>=4.0
+tetgen>=0.6
+pyvista>=0.44
+boto3>=1.34
+psycopg2-binary>=2.9

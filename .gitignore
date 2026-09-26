@@ -1,0 +1,16 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtualenvs
+.venv*/
+venv/
+
+# Local scratch
+*.log
+
+# OpenRig seat projections (generated per seat; never commit)
+CLAUDE.md
+.openrig/

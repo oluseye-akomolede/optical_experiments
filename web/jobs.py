@@ -1,0 +1,221 @@
+"""The solver Job: its manifest, and launching/deleting it.
+
+This is a plain ``batch/v1`` Job in the ``mode-search-engine`` namespace -- *not*
+a SparkApplication, and nothing is ever created in ``default`` (see the task-2
+amendment; the Spark operator only watches ``default``, which is outside the
+owner's power cap).
+
+``build_job_manifest`` is a **pure function**: same arguments in, same dict out,
+no environment, no clock, no cluster. That is what the tests pin.
+
+Concurrency is one. The namespace quota counts finished Jobs too, so a finished
+Job is deleted as soon as its result is in the database rather than waiting for
+``ttlSecondsAfterFinished``.
+"""
+
+from __future__ import annotations
+
+import re
+
+#: label values must be DNS-1123-ish; a job id is a uuid but be defensive
+_UNSAFE = re.compile(r"[^a-z0-9.-]")
+
+#: the solver CLI takes n-modes; the owner-facing default lives in config
+DEFAULT_N_MODES = 20
+
+
+def job_name(job_id) -> str:
+    """Deterministic, DNS-1123-safe Kubernetes object name for a job id."""
+    clean = _UNSAFE.sub("-", str(job_id).lower()).strip("-.")
+    return f"mse-solver-{clean[:48]}"
+
+
+def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
+                       solver_image: str, pull_secret: str, namespace: str,
+                       cpu: str = "4", memory: str = "14Gi",
+                       active_deadline_seconds: int = 1800,
+                       ttl_seconds_after_finished: int = 30):
+    """Return the ``batch/v1`` Job manifest that solves one upload.
+
+    Pure: no environment lookups, no cluster calls, no time.
+
+    The shape is dictated by the amendment:
+    ``envFrom`` the ``mse-minio``/``mse-db`` Secrets, ``imagePullSecrets``
+    (the Harbor project is private, so the pull secret is required),
+    ``restartPolicy: Never``, ``backoffLimit: 0`` (a failed solve must not be
+    retried -- it would spend another ten minutes reaching the same error),
+    and ``requests == limits`` so the Job is Guaranteed and the quota, not the
+    scheduler, decides admission.
+    """
+    name = job_name(job_id)
+    labels = {"app": "mse-solver", "job-id": str(job_id)}
+    args = [
+        "--job-id", str(job_id),
+        "--units", str(units),
+        "--n-index", repr(float(n_index)),
+        "--n-modes", str(int(n_modes)),
+    ]
+    return {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {"name": name, "namespace": namespace, "labels": labels},
+        "spec": {
+            # The quota tallies finished Jobs, so the TTL is only a backstop for
+            # the tick having died; the app deletes the Job itself once the
+            # result is recorded.
+            "ttlSecondsAfterFinished": int(ttl_seconds_after_finished),
+            "activeDeadlineSeconds": int(active_deadline_seconds),
+            "backoffLimit": 0,
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": {
+                    "restartPolicy": "Never",
+                    # The solver only talks to MinIO and Postgres through env
+                    # credentials; it never calls the Kubernetes API, so do not
+                    # hand it a token that could be used to reach the cluster.
+                    "automountServiceAccountToken": False,
+                    "imagePullSecrets": [{"name": pull_secret}],
+                    "containers": [
+                        {
+                            "name": "solver",
+                            "image": solver_image,
+                            "args": args,
+                            "envFrom": [
+                                {"secretRef": {"name": "mse-minio"}},
+                                {"secretRef": {"name": "mse-db"}},
+                            ],
+                            "resources": {
+                                "requests": {"cpu": cpu, "memory": memory},
+                                "limits": {"cpu": cpu, "memory": memory},
+                            },
+                        }
+                    ],
+                },
+            },
+        },
+    }
+
+
+class K8sJobLauncher:
+    """Create/delete the solver Job through the in-cluster Kubernetes API.
+
+    Everything the request needs is passed in, so the object can be built in
+    tests (and with ``dry_run``) without a cluster.
+    """
+
+    def __init__(self, namespace: str, image: str, pull_secret: str,
+                 cpu: str = "4", memory: str = "14Gi",
+                 active_deadline_seconds: int = 1800,
+                 ttl_seconds_after_finished: int = 30, dry_run: bool = False):
+        self.namespace = namespace
+        self.image = image
+        self.pull_secret = pull_secret
+        self.cpu = cpu
+        self.memory = memory
+        self.active_deadline_seconds = active_deadline_seconds
+        self.ttl_seconds_after_finished = ttl_seconds_after_finished
+        self.dry_run = dry_run
+        self._client = None
+
+    def _batch(self):
+        # imported lazily so the app imports (and the tests run) with no kube
+        # configuration present at all
+        if self._client is None:
+            from kubernetes import client, config
+
+            try:
+                config.load_incluster_config()
+            except Exception:  # noqa: BLE001 - fall back for local/dev use
+                config.load_kube_config()
+            self._client = client.BatchV1Api()
+            self._core = client.CoreV1Api()
+        return self._client
+
+    def manifest(self, job_id, units: str, n_index: float, n_modes: int) -> dict:
+        return build_job_manifest(
+            job_id, units, n_index, n_modes, self.image, self.pull_secret,
+            self.namespace, cpu=self.cpu, memory=self.memory,
+            active_deadline_seconds=self.active_deadline_seconds,
+            ttl_seconds_after_finished=self.ttl_seconds_after_finished,
+        )
+
+    # -- cluster state -----------------------------------------------------
+    def active_job_names(self) -> list[str]:
+        """Names of Jobs with our labels that still occupy the quota slot.
+
+        A Job counts against ``count/jobs.batch`` from creation until deletion,
+        including while it is finished, so "occupying" means "exists".
+        """
+        if self.dry_run:
+            return []
+        from kubernetes import client
+
+        api = self._batch()
+        try:
+            jobs = api.list_namespaced_job(
+                self.namespace, label_selector="app=mse-solver"
+            )
+        except client.ApiException as exc:
+            if exc.status == 403:
+                # quota/RBAC confusion: treat as "cannot start anything now"
+                return []
+            raise
+        return [j.metadata.name for j in jobs.items]
+
+    def is_quota_exceeded(self, exc: Exception) -> bool:
+        """A 403 'exceeded quota' means wait, not fail."""
+        status = getattr(exc, "status", None)
+        body = str(getattr(exc, "body", "") or str(exc))
+        return status == 403 and "exceeded quota" in body.lower()
+
+    # -- mutation ----------------------------------------------------------
+    def create(self, job_id, units: str, n_index: float, n_modes: int) -> str:
+        """Create the Job and return its name."""
+        manifest = self.manifest(job_id, units, n_index, n_modes)
+        if self.dry_run:
+            return manifest["metadata"]["name"]
+        from kubernetes import client
+
+        api = self._batch()
+        try:
+            api.create_namespaced_job(self.namespace, manifest)
+        except client.ApiException as exc:
+            raise _as_launch_error(exc) from exc
+        return manifest["metadata"]["name"]
+
+    def delete(self, name: str) -> None:
+        """Delete a Job (and its pods) once its result is recorded."""
+        if self.dry_run or not name:
+            return
+        from kubernetes import client
+
+        api = self._batch()
+        try:
+            api.delete_namespaced_job(
+                name, self.namespace,
+                body=client.V1DeleteOptions(propagation_policy="Background"),
+            )
+        except client.ApiException as exc:
+            if exc.status != 404:  # already gone is success
+                raise
+
+
+class JobLaunchError(Exception):
+    """The cluster refused the Job for a reason worth telling the owner."""
+
+
+def _as_launch_error(exc: Exception) -> Exception:
+    """Translate a Kubernetes API error into something the app can handle."""
+    status = getattr(exc, "status", None)
+    body = str(getattr(exc, "body", "") or "")
+    if status == 403 and "exceeded quota" in body.lower():
+        return QuotaExceeded(body)
+    if status == 403:
+        return JobLaunchError(
+            "The service account is not allowed to start solver jobs."
+        )
+    return JobLaunchError(f"the solver job could not be started: {body or exc}")
+
+
+class QuotaExceeded(Exception):
+    """The namespace is full. This is a 'wait', not a 'fail'."""

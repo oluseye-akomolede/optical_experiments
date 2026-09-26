@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}{{ job.original_filename or job.job_id }} — Mode Search Engine{% endblock %}
+{% block content %}
+<section class="card" id="job" data-job-id="{{ job.job_id }}">
+  <h1 id="job-title">{{ job.original_filename or job.job_id }}</h1>
+  <p class="muted small">
+    Units {{ job.units }} &middot; refractive index {{ job.n_index }} &middot;
+    {{ job.n_modes }} modes requested
+  </p>
+
+  <div id="progress">
+    <p><strong id="status-text">{{ job.status }}</strong>
+      <span class="muted" id="stage-text">{{ job.stage or '' }}</span></p>
+    {% if queue_position and queue_position > 1 %}
+      <p class="muted" id="queue-line">Waiting in the queue: position {{ queue_position }}.</p>
+    {% else %}
+      <p class="muted" id="queue-line" hidden></p>
+    {% endif %}
+    <div class="bar-track"><div class="bar-fill" id="bar"></div></div>
+    <p class="muted small" id="elapsed"></p>
+  </div>
+
+  <div id="failure" hidden>
+    <p class="error" id="failure-text"></p>
+  </div>
+
+  <div id="viewer" hidden>
+    <div class="viewer-wrap">
+      <canvas id="scene"></canvas>
+      <div class="legend"><span id="legend-lo">0</span>
+        <div class="legend-bar"></div>
+        <span id="legend-hi">1</span></div>
+    </div>
+    <div class="controls">
+      <button id="toggle-animate" type="button">Animate</button>
+      <button id="toggle-arrows" type="button">Show E direction</button>
+      <span class="muted small" id="mode-caption"></span>
+    </div>
+    <div class="sliders">
+      <label>x<input type="range" id="slice-x" min="0" max="0" value="0"></label>
+      <label>y<input type="range" id="slice-y" min="0" max="0" value="0"></label>
+      <label>z<input type="range" id="slice-z" min="0" max="0" value="0"></label>
+    </div>
+  </div>
+</section>
+
+<section class="card" id="modes-card" hidden>
+  <h2>Modes</h2>
+  <table class="modes">
+    <thead><tr><th>#</th><th>Frequency</th><th>Vacuum wavelength</th></tr></thead>
+    <tbody id="modes-body"></tbody>
+  </table>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script type="module" src="{{ url_for('static', filename='viewer.js') }}"></script>
+{% endblock %}

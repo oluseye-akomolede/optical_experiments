@@ -1,0 +1,91 @@
+# The web app. One replica: uploads are queued in the database and the
+# background tick starts them, so there is nothing for a second replica to do
+# except race the first one for the single Job slot.
+#
+# The schema is applied here, from an initContainer -- NOT from a Job, because
+# the namespace quota allows exactly one batch/v1 Job and the solver needs it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mse-web
+  namespace: mode-search-engine
+  labels:
+    app: mse-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mse-web
+  strategy:
+    # the single replica serves uploads; rolling means a moment with two pods,
+    # which would race on the Job slot
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mse-web
+    spec:
+      serviceAccountName: mse-web
+      imagePullSecrets:
+        - name: mse-harbor-pull
+      initContainers:
+        - name: schema
+          image: harbor.arcadia-ecs.local/mode-search-engine/mse-web:latest
+          command: ["python", "-c"]
+          args:
+            - |
+              from db import JobStore
+              JobStore().apply_schema()
+              print("mse schema applied")
+          envFrom:
+            - secretRef:
+                name: mse-db
+      containers:
+        - name: web
+          image: harbor.arcadia-ecs.local/mode-search-engine/mse-web:latest
+          # gunicorn, not the Flask dev server. EXACTLY ONE worker: the tick
+          # thread that launches solver Jobs runs in-process, and two workers
+          # would race for the namespace's single Job slot. --threads gives the
+          # concurrency instead, which is safe (I/O bound + a guarded ticker).
+          command: ["gunicorn", "-w", "1", "--threads", "8", "-b", "0.0.0.0:5000",
+                    "app:build_app()"]
+          ports:
+            - name: http
+              containerPort: 5000
+          env:
+            - name: MSE_SOLVER_IMAGE
+              value: harbor.arcadia-ecs.local/mode-search-engine/mse-maxwell-solver:latest
+            - name: MSE_PULL_SECRET
+              value: mse-harbor-pull
+            - name: MSE_BUCKET
+              value: mse-web
+            - name: MSE_NAMESPACE
+              value: mode-search-engine
+            - name: FLASK_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mse-web-secrets
+                  key: FLASK_SECRET_KEY
+                  # flask only needs this to sign its own flash cookie; a
+                  # missing key is not worth failing a rollout over
+                  optional: true
+          envFrom:
+            - secretRef:
+                name: mse-minio
+            - secretRef:
+                name: mse-db
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi

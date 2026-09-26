@@ -1,0 +1,32 @@
+# What mse-web may do: create and manage solver Jobs, and read their pods and
+# logs. Nothing else -- in particular no access to Secrets, and no other
+# namespace. The solver Job itself runs with the default service account
+# because it needs no API access at all.
+#
+# There is deliberately no Role in `default`: nothing of ours belongs there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mse-web
+  namespace: mode-search-engine
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mse-web
+  namespace: mode-search-engine
+subjects:
+  - kind: ServiceAccount
+    name: mse-web
+    namespace: mode-search-engine
+roleRef:
+  kind: Role
+  name: mse-web
+  apiGroup: rbac.authorization.k8s.io

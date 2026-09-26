@@ -1,0 +1,34 @@
+# MSE web app: upload an .obj, watch the solver, view the modes.
+#
+# The app never talks to the solver directly: it writes an upload row and a Job,
+# and proxies the result files back out of MinIO. It runs as uid 10001 and needs
+# no filesystem beyond its own code.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DEFAULT_TIMEOUT=100 \
+    PIP_RETRIES=20 \
+    PIP_NO_CACHE_DIR=1
+
+# No apt packages: the app is pure Python, which keeps the image small and the
+# aarch64 build free of a native toolchain.
+
+WORKDIR /opt/app
+
+COPY dockerfiles/web/requirements.txt /opt/app/requirements.txt
+RUN pip install --no-cache-dir -r /opt/app/requirements.txt
+
+COPY web/ /opt/app/
+COPY db/ /opt/app/db/
+
+RUN useradd --create-home --uid 10001 mse
+USER 10001
+
+EXPOSE 5000
+
+# gunicorn, not the Flask dev server. EXACTLY ONE worker: the background ticker
+# that launches solver Jobs runs in-process, and two workers would race for the
+# single namespace Job slot. Threads give the concurrency instead, which is safe
+# because the ticker is guarded and every other request is I/O bound.
+CMD ["gunicorn", "-w", "1", "--threads", "8", "-b", "0.0.0.0:5000", "app:build_app()"]

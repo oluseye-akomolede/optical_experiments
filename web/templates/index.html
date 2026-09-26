@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h1>Upload an object</h1>
+  <p class="muted">
+    Send a closed (<em>watertight</em>) <strong>.obj</strong> model. We treat it as a
+    hollow metal cavity and compute its {{ 20 }} lowest optical modes.
+  </p>
+  <form method="post" enctype="multipart/form-data" class="upload">
+    <label>Model file (.obj, up to {{ max_mb }} MB)
+      <input type="file" name="meshfile" accept=".obj" required>
+    </label>
+    <div class="row">
+      <label>Units
+        <select name="units">
+          {% for unit in units %}
+            <option value="{{ unit }}" {% if unit == default_units %}selected{% endif %}>{{ unit }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Refractive index
+        <input type="number" name="n_index" value="1.0" min="1" step="0.001" required>
+      </label>
+    </div>
+    <p class="muted small">
+      The refractive index is the medium filling your object: 1.0 for air or vacuum,
+      about 1.5 for glass.
+    </p>
+    <button type="submit">Compute modes</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Recent jobs</h2>
+  {% if jobs %}
+    <table class="jobs">
+      <thead><tr><th>Object</th><th>Uploaded</th><th>Status</th></tr></thead>
+      <tbody>
+      {% for job in jobs %}
+        <tr>
+          <td><a href="{{ url_for('job_page', job_id=job.job_id) }}">{{ job.original_filename or job.job_id }}</a></td>
+          <td class="muted">{{ job.created_at }}</td>
+          <td><span class="pill pill-{{ job.status }}">{{ job.status }}</span>
+              {% if job.stage and job.stage != job.status %}<span class="muted small">{{ job.stage }}</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No objects yet.</p>
+  {% endif %}
+</section>
+{% endblock %}
