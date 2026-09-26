@@ -39,10 +39,46 @@ def dsn_from_env() -> dict:
     }
 
 
+#: filename of the DDL script, and where it lives relative to this module.
+SCHEMA_FILENAME = "001_schema.sql"
+
+
+def schema_candidates() -> list[str]:
+    """Every path the DDL script may live at, most specific first.
+
+    The script sits next to this module's directory in **both** layouts, but at
+    a different depth, and climbing a fixed number of levels is what broke the
+    deployed image:
+
+    * image: ``web/`` is copied to ``/opt/app/`` and ``db/`` to ``/opt/app/db/``,
+      so the script is ``<module dir>/db/001_schema.sql``.
+    * repo: this file is ``web/db.py`` and the script is ``repo/db/``, so it is
+      ``<module dir>/../db/001_schema.sql``.
+
+    ``MSE_SCHEMA_PATH`` wins if set, so an operator can point at a mounted copy
+    without rebuilding. The caller reports every candidate it tried, because a
+    bare FileNotFoundError naming one wrong path is what made this hard to see.
+    """
+    override = os.environ.get("MSE_SCHEMA_PATH")
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "db", SCHEMA_FILENAME),              # image layout
+        os.path.join(os.path.dirname(here), "db", SCHEMA_FILENAME),  # repo layout
+    ]
+    if override:
+        candidates.insert(0, override)
+    return candidates
+
+
 def _schema_path() -> str:
-    return os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "db", "001_schema.sql",
+    """The first candidate that exists. Raises if none do."""
+    candidates = schema_candidates()
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(
+        "could not find " + SCHEMA_FILENAME + "; looked in: "
+        + ", ".join(candidates)
     )
 
 

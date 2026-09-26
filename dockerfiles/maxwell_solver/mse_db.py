@@ -15,6 +15,9 @@ from contextlib import contextmanager
 #: stage names the UI polls for, in order
 STAGES = ("meshing", "assembling", "solving", "writing", "done")
 
+#: filename of the DDL script, kept the same as web/db.py's constant
+SCHEMA_FILENAME = "001_schema.sql"
+
 
 def dsn_from_env() -> dict:
     """Connection parameters from the environment (never from a file)."""
@@ -81,19 +84,43 @@ class JobStore:
         The file is a single multi-statement script (including a ``DO $$`` block
         that renames the legacy ``spark_app_name`` column); psycopg2 sends it as
         one execute, which the server runs as a single transaction.
+
+        Nothing in the solver calls this: the web app's initContainer owns the
+        schema and applies it before any Job is queued. It is kept for
+        operators running the solver outside the cluster (``--local-*`` paths do
+        not touch the database at all), and resolves its path the same
+        candidate-list way as the web app so the two cannot drift.
         """
         if self._conn is None:
             return
         if path is None:
-            path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                "db",
-                "001_schema.sql",
-            )
+            path = self._resolve_schema_path()
         with open(path, encoding="utf-8") as fh:
             sql = fh.read()
         with self._cursor() as cur:
             cur.execute(sql)
+
+    @staticmethod
+    def _resolve_schema_path() -> str:
+        """First existing candidate, else a clear error naming all of them."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates = [os.path.join(here, "db", SCHEMA_FILENAME)]
+        candidates.extend(
+            os.path.join(os.path.dirname(here), *([os.pardir] * n),
+                         "db", SCHEMA_FILENAME)
+            for n in range(1, 4)
+        )
+        override = os.environ.get("MSE_SCHEMA_PATH")
+        if override:
+            candidates.insert(0, override)
+        for candidate in candidates:
+            resolved = os.path.normpath(candidate)
+            if os.path.exists(resolved):
+                return resolved
+        raise FileNotFoundError(
+            "could not find " + SCHEMA_FILENAME + "; looked in: "
+            + ", ".join(os.path.normpath(c) for c in candidates)
+        )
 
     def set_stage(self, job_id, status: str, stage: str | None = None,
                   message: str | None = None, k8s_job_name: str | None = None,

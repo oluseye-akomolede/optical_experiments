@@ -304,7 +304,11 @@ def main(argv=None) -> int:
         if not (args.local_in or args.local_out):
             db = mse_db.JobStore()
             db.connect()
-            db.apply_schema()
+            # The schema is owned by the web app's initContainer, which applies
+            # it once before any Job can be queued. A Job must NOT run DDL: it
+            # would repeat identical work on every upload, and every Job failing
+            # at startup because the script was not where this file expected it
+            # is exactly the deploy failure that removed this call.
         summary = solve(
             job_id, args.units, args.n_index, args.n_modes,
             store_in, store_out, args.max_tets, args.grid,
