@@ -71,10 +71,15 @@ def schema_candidates() -> list[str]:
 
 
 def _schema_path() -> str:
-    """The first candidate that exists. Raises if none do."""
+    """The first candidate that is a real file. Raises if none are.
+
+    ``isfile``, not ``exists``: a directory passes ``exists`` and then fails at
+    ``open`` with an unexplained IsADirectoryError, which defeats the point of
+    reporting every candidate tried.
+    """
     candidates = schema_candidates()
     for path in candidates:
-        if os.path.exists(path):
+        if os.path.isfile(path):
             return path
     raise FileNotFoundError(
         "could not find " + SCHEMA_FILENAME + "; looked in: "

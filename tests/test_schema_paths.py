@@ -110,6 +110,70 @@ def test_web_error_names_every_path_it_tried(monkeypatch, tmp_path):
         assert candidate in message
 
 
+def test_web_skips_a_directory_at_the_override(monkeypatch, tmp_path):
+    """A directory must never be RETURNED as the schema.
+
+    ``os.path.exists`` says yes to a directory, and the failure then surfaces as
+    an unexplained ``IsADirectoryError`` from ``open`` -- which defeats the
+    point of an error that names every candidate. ``isfile`` is the fix. Found
+    in review, not by the original tests.
+
+    The assertion is on what is *returned*, not on raising: with a bogus
+    override the resolver must fall through to a real candidate if one exists.
+    """
+    wrong = tmp_path / "not_a_file"
+    wrong.mkdir()
+    monkeypatch.setenv("MSE_SCHEMA_PATH", str(wrong))
+    resolved = WEB_DB._schema_path()
+    assert Path(resolved) != wrong
+    assert Path(resolved).is_file()
+
+
+def test_solver_skips_a_directory_at_the_override(monkeypatch, tmp_path):
+    wrong = tmp_path / "not_a_file"
+    wrong.mkdir()
+    monkeypatch.setenv("MSE_SCHEMA_PATH", str(wrong))
+    resolved = SOLVER_DB.JobStore._resolve_schema_path()
+    assert Path(resolved) != wrong
+    assert Path(resolved).is_file()
+
+
+def test_a_directory_at_the_override_alone_raises_clearly(monkeypatch, tmp_path):
+    """With no valid candidate left, the error must still name the candidates.
+
+    This is the case that used to degrade to a bare ``IsADirectoryError``.
+    """
+    module = tmp_path / "empty"
+    module.mkdir()
+    fake = module / "db.py"
+    fake.write_text("", encoding="utf-8")
+    monkeypatch.setattr(WEB_DB, "__file__", str(fake))
+    wrong = tmp_path / "not_a_file"
+    wrong.mkdir()
+    monkeypatch.setenv("MSE_SCHEMA_PATH", str(wrong))
+    with pytest.raises(FileNotFoundError) as excinfo:
+        WEB_DB._schema_path()
+    assert str(wrong) in str(excinfo.value)
+
+
+def test_a_directory_beside_the_module_is_not_the_schema(monkeypatch, tmp_path):
+    """The same defect without an override: a `db` directory is not a script.
+
+    ``<module>/db/001_schema.sql`` is the image candidate, so if that path
+    resolves to a directory the resolver must skip it rather than return it.
+    """
+    module = tmp_path / "app"
+    module.mkdir()
+    # a DIRECTORY named 001_schema.sql -- exists() would accept it
+    (module / "db" / "001_schema.sql").mkdir(parents=True)
+    fake = module / "db.py"
+    fake.write_text("", encoding="utf-8")
+    monkeypatch.setattr(WEB_DB, "__file__", str(fake))
+    monkeypatch.delenv("MSE_SCHEMA_PATH", raising=False)
+    with pytest.raises(FileNotFoundError):
+        WEB_DB._schema_path()
+
+
 def test_web_candidates_cover_both_layouts_without_existing(monkeypatch, tmp_path):
     """The candidate list itself is layout-independent, which is the point."""
     module = tmp_path / "somewhere"

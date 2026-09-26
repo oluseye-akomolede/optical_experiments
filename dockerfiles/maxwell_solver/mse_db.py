@@ -89,7 +89,13 @@ class JobStore:
         schema and applies it before any Job is queued. It is kept for
         operators running the solver outside the cluster (``--local-*`` paths do
         not touch the database at all), and resolves its path the same
-        candidate-list way as the web app so the two cannot drift.
+        candidate-list way as the web app.
+
+        The two resolvers are deliberately not mirror copies the whole way down
+        -- the connection models differ (``_connect`` vs ``_cursor`` plus a
+        ``None`` guard) -- so what is actually shared and tested is the filename
+        constant and the candidate SEMANTICS: env override first, then beside
+        the module, then one level up. The bodies may change independently.
         """
         if self._conn is None:
             return
@@ -115,7 +121,9 @@ class JobStore:
             candidates.insert(0, override)
         for candidate in candidates:
             resolved = os.path.normpath(candidate)
-            if os.path.exists(resolved):
+            # isfile, not exists: a directory would pass exists and then fail at
+            # open() with an unexplained IsADirectoryError
+            if os.path.isfile(resolved):
                 return resolved
         raise FileNotFoundError(
             "could not find " + SCHEMA_FILENAME + "; looked in: "
