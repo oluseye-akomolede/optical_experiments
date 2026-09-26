@@ -1,8 +1,10 @@
 -- MSE job bookkeeping.
 --
--- Applied idempotently by the web app (and by the solver at start-up) so the
--- schema exists whichever component gets there first. Parameterised SQL only:
--- values are never interpolated into statements.
+-- Applied idempotently by the web app's initContainer, which runs before the
+-- web container and therefore before any solver Job can be queued. The solver
+-- does NOT apply it: it only reads and writes rows, and a Job that ran DDL
+-- would repeat identical work on every upload. Parameterised SQL only: values
+-- are never interpolated into statements.
 --
 -- The tables live in their own `mse` schema so this project cannot collide with
 -- the other databases that share this Postgres instance.
