@@ -9,7 +9,24 @@
 -- The tables live in their own `mse` schema so this project cannot collide with
 -- the other databases that share this Postgres instance.
 
-CREATE SCHEMA IF NOT EXISTS mse;
+-- Create the schema only when it is actually missing.
+--
+-- NOT `CREATE SCHEMA IF NOT EXISTS mse`: Postgres checks CREATE privilege on
+-- the DATABASE before it evaluates the IF NOT EXISTS short-circuit, so that
+-- statement fails even when the schema is already present. Our scoped role
+-- mse_app owns the `mse` schema but deliberately has no database-level CREATE,
+-- and it should not be granted one just to make this idempotent.
+--
+-- Guarding on pg_namespace instead means an existing schema never reaches a
+-- statement that needs the database privilege, so re-running this file is free.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = 'mse'
+    ) THEN
+        CREATE SCHEMA mse;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS mse.jobs (
     job_id            uuid PRIMARY KEY,

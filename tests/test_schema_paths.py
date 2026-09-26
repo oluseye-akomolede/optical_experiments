@@ -228,6 +228,115 @@ def test_solver_and_web_agree_on_the_filename():
 
 
 # ---------------------------------------------------------------------------
+# The DDL must not need database-level privileges
+# ---------------------------------------------------------------------------
+SCHEMA_SQL = ROOT / "db" / "001_schema.sql"
+
+#: statements that require a privilege on the DATABASE, which our scoped role
+#: mse_app deliberately does not have (it owns only the `mse` schema)
+DATABASE_LEVEL = (
+    "CREATE SCHEMA",
+    "CREATE EXTENSION",
+    "CREATE DATABASE",
+    "ALTER DATABASE",
+    "DROP DATABASE",
+    "CREATE ROLE",
+    "CREATE USER",
+    "CREATE TABLESPACE",
+    "CREATE LANGUAGE",
+)
+
+
+def _statements_outside_do_blocks(sql: str) -> list[str]:
+    """SQL statements that are not inside a ``DO $$ ... $$`` block.
+
+    The DO block is how this file creates the schema without needing the
+    database-level privilege, so what it wraps is legitimate; anything outside
+    one is not. Dollar-quoted bodies and ``--`` comments are stripped so a
+    keyword in a comment or a body cannot produce a false hit.
+    """
+    lines, in_do, out = [], False, []
+    for line in sql.splitlines():
+        stripped = line.split("--", 1)[0]
+        if "$$" in stripped:
+            # a DO $$ opens it; the closing $$ ends it. Two $$ on one line
+            # (DO $$ ... $$;) both opens and closes.
+            if stripped.count("$$") % 2 == 1:
+                in_do = not in_do
+            continue
+        if not in_do:
+            lines.append(stripped)
+    body = "\n".join(lines)
+    for statement in body.split(";"):
+        cleaned = statement.strip()
+        if cleaned:
+            out.append(cleaned)
+    return out
+
+
+def test_the_ddl_has_no_bare_create_schema():
+    """`CREATE SCHEMA IF NOT EXISTS` still needs CREATE on the DATABASE.
+
+    Postgres checks the privilege before the IF NOT EXISTS short-circuit, so
+    that one line crash-looped the initContainer with 'permission denied for
+    database mode_search_engine' even though the schema already existed. It must
+    only ever appear inside a DO block guarded on pg_namespace.
+    """
+    for statement in _statements_outside_do_blocks(
+        SCHEMA_SQL.read_text(encoding="utf-8")
+    ):
+        upper = statement.upper()
+        assert not upper.startswith("CREATE SCHEMA"), (
+            f"bare CREATE SCHEMA outside a DO block: {statement!r}"
+        )
+
+
+def test_the_ddl_has_no_other_database_level_statement():
+    """CREATE EXTENSION, GRANT ... ON DATABASE and friends need the same grant."""
+    for statement in _statements_outside_do_blocks(
+        SCHEMA_SQL.read_text(encoding="utf-8")
+    ):
+        upper = " ".join(statement.upper().split())
+        for keyword in DATABASE_LEVEL:
+            assert not upper.startswith(keyword), (
+                f"database-level statement outside a DO block: {statement!r}"
+            )
+        assert " ON DATABASE " not in upper, (
+            f"privilege granted on the DATABASE: {statement!r}"
+        )
+
+
+def test_the_schema_creation_is_guarded_on_pg_namespace():
+    """The guard must test the catalog, not rely on IF NOT EXISTS.
+
+    Asserted on the DO block's own text rather than the whole file, because the
+    file's comment names the rejected form ('CREATE SCHEMA IF NOT EXISTS') while
+    explaining why it is wrong -- a whole-file substring check would be fooled
+    by that comment, and was.
+    """
+    sql = SCHEMA_SQL.read_text(encoding="utf-8")
+    guard = sql[sql.index("DO $$"): sql.index("END $$;") + len("END $$;")]
+    assert "pg_catalog.pg_namespace" in guard
+    assert "CREATE SCHEMA mse;" in guard
+    assert "IF NOT EXISTS" not in guard.split("CREATE SCHEMA")[1], (
+        "the CREATE SCHEMA inside the guard must be unqualified"
+    )
+
+
+def test_the_stripper_sees_a_bare_create_schema():
+    """The helper itself must be discriminating, or the tests above are vacuous."""
+    fake = "CREATE SCHEMA IF NOT EXISTS mse;\n"
+    statements = _statements_outside_do_blocks(fake)
+    assert statements == ["CREATE SCHEMA IF NOT EXISTS mse"]
+
+    wrapped = (
+        "DO $$\nBEGIN\n  IF NOT EXISTS (SELECT 1) THEN\n"
+        "    CREATE SCHEMA mse;\n  END IF;\nEND $$;\n"
+    )
+    assert _statements_outside_do_blocks(wrapped) == []
+
+
+# ---------------------------------------------------------------------------
 # The solver must not run DDL at all
 # ---------------------------------------------------------------------------
 SOLVER_ENTRYPOINT = SOLVER / "mse_maxwell_solver.py"
