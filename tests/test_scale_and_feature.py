@@ -896,6 +896,12 @@ def test_the_mesh_cap_is_a_limit_not_a_target(monkeypatch):
     _install(monkeypatch, CapFlat)
     monkeypatch.setattr(MESH, "decimate_to_edge_length",
                         lambda surface, edge_length, verbose=True: (surface, None))
+    # The guard this test drives is the CAP, not the resolution rule, so the
+    # target edge is scripted to the mesh the fake returns -- the 10-unit box
+    # side. Without this the object-sized fake mesh is genuinely too coarse
+    # for the real physics edge (0.0015 m on a 0.01 m box, 6.6x) and the
+    # resolution guard refuses first, so the cap assertions are never reached.
+    monkeypatch.setattr(MESH, "target_edge_length", lambda *a, **k: 10.0)
 
     def mesh(copies: int | None, max_tets: int):
         CapFlat.calls = []

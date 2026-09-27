@@ -551,6 +551,17 @@ def tetrahedralize(
     it. The rename of that local to ``unit_scale_m`` is the fix's own guard:
     the shadowing cannot come back if the names cannot collide.
 
+    TetGen is handed the surface in a CANONICAL internal frame -- centred on its
+    bounding box and divided by the longest side -- and the points are mapped
+    back before returning. This is not tidiness: TetGen's Steiner insertion
+    depends on the absolute coordinate magnitude, so meshing the same physical
+    object spelled in mm, m and um gave three different element counts (measured
+    35237..47323, i.e. 34%, across three spellings of one icosphere). In the
+    canonical frame the count is a function of the shape alone (measured spread
+    ratio 1.0000 against 1.17 raw), so ``est_tets`` and the solver agree
+    whichever unit the upload used. Only the tetrahedralization moves; every
+    length reported out of here is metres of the SCALED object, unchanged.
+
     ``points_m`` is ``(n_points, 3)`` float64 in metres, ``tets`` is
     ``(n_tets, 4)`` indices into it. Raises :class:`MeshingError` when the
     result would blow the element cap.
@@ -599,6 +610,46 @@ def tetrahedralize(
     vertices = np.asarray(surface.vertices, dtype=float)
     faces = np.asarray(surface.faces, dtype=np.int32)
 
+    # --- TetGen's magnitude sensitivity, and the canonical frame that removes
+    # it ---------------------------------------------------------------------
+    # TetGen's Steiner-point insertion is sensitive to the ABSOLUTE magnitude of
+    # the coordinates, not just the shape. The same physical object spelled in
+    # different units therefore meshes to a different element count: a 2 mm
+    # icosphere gives a different count at extent 2, 0.002 and 2000, and the
+    # spread grows with the range -- measured 35237..47323 tets (34%) across
+    # three spellings of one object, and count is what the element cap and the
+    # cost depend on. (The row that motivated this quoted ~7% for a cube; the
+    # spread is larger for a curved surface, which is the realistic case.)
+    #
+    # The fix is to mesh in a frame whose scale is fixed by the OBJECT, not by
+    # the unit it was written in: centre on the bounding box and divide by the
+    # longest side, so every object is meshed at O(1) regardless of its units.
+    # Measured with one canonical surface scaled to each magnitude: raw spread
+    # ratio 1.17, canonical 1.0000.
+    #
+    # ``canonical_scale`` is the inverse of that division, so it maps a length
+    # in the canonical frame back to the scaled surface's own units. maxvolume
+    # is a VOLUME, so it goes as the cube.
+    #
+    # Only the tetrahedralization moves into this frame. The decimation above,
+    # the surface-edge measurements and every reported length stay in the
+    # scaled surface's units, because those are what ``est_tets`` in the app
+    # reproduces and what the owner's numbers are in.
+    bbox_lo = vertices.min(axis=0)
+    bbox_hi = vertices.max(axis=0)
+    longest = float(np.max(bbox_hi - bbox_lo))
+    if not np.isfinite(longest) or longest <= 0:
+        # A degenerate (flat or single-point) surface. TetGen will reject it on
+        # its own terms, and inventing a frame for it would only replace a clear
+        # failure with a confusing one, so mesh it as it is.
+        canonical_offset = np.zeros(3)
+        canonical_scale = 1.0
+    else:
+        canonical_offset = (bbox_lo + bbox_hi) / 2.0
+        canonical_scale = 1.0 / longest
+    vertices = (vertices - canonical_offset) * canonical_scale
+    maxvolume *= canonical_scale ** 3
+
     # Both sides in metres of the SCALED object: ``achieved`` below is measured
     # on ``points * unit_scale_m``, so the allowance must be too. The old
     # ``edge_length * scale`` multiplied a user-units edge by a metres-per-unit
@@ -618,7 +669,11 @@ def tetrahedralize(
         )
         grid = tet.grid
         tets = np.asarray(grid.cells_dict[VTK_TETRA], dtype=np.int64)
-        points = np.asarray(grid.points, dtype=float)
+        # Map the points straight back to the scaled surface's units. This is
+        # the exact inverse of the mapping above, and it happens per attempt
+        # because each retry re-tetrahedralizes and returns fresh points.
+        points = (np.asarray(grid.points, dtype=float) / canonical_scale
+                  + canonical_offset)
         n_tets = int(tets.shape[0])
 
         if n_tets == 0:

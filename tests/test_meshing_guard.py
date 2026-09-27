@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import trimesh
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dockerfiles" / "maxwell_solver"))
 
@@ -47,6 +48,29 @@ _CUBE_TETS = np.array(
      [1, 3, 4, 5], [2, 4, 5, 6]],
     dtype=np.int64,
 )
+
+
+def _cube_median_edge_over_side() -> float:
+    """``_CUBE_TETS``' median edge per unit of box side.
+
+    A Kuhn split's 36 edges are 16 sides, 15 face diagonals and 5 body
+    diagonals, so the MEDIAN edge is the face diagonal, ``sqrt(2)``, not the
+    side. Derived from the arrays rather than written as 1.4142, so a change to
+    the fixture's topology cannot leave a stale constant behind.
+    """
+    local = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+    xyz = _CUBE_POINTS[_CUBE_TETS]
+    lengths = np.linalg.norm(
+        xyz[:, [a for a, _ in local], :] - xyz[:, [b for _, b in local], :],
+        axis=2,
+    )
+    return float(np.median(lengths))
+
+
+#: Multiply a target median edge by this to get the box side ``_points_for``
+#: must use, so the fake's *measured* (median) edge is the edge it was asked
+#: for. Without it every guard ratio is off by sqrt(2).
+CUBE_EDGE_TO_BOX_SIDE = 1.0 / _cube_median_edge_over_side()
 
 
 class FakeTetGen:
@@ -83,7 +107,26 @@ class FakeTetGen:
         return 1
 
     def _points_for(self) -> np.ndarray:
-        return _CUBE_POINTS
+        """``_CUBE_POINTS`` placed in the frame THIS CALL was handed.
+
+        A real TetGen fills the surface it is given and returns points in that
+        surface's frame, so the mesh it produces is the size of its input. The
+        fixed-unit-cube version this replaces could not see the difference: it
+        returned a 1.0-cube whatever it was handed, so ``achieved_edge_length``
+        was measured on a mesh that had nothing to do with the vertices, and the
+        two sides of the guard's comparison could not be told apart.
+
+        The cube spans the input's bounding box, so its MEDIAN edge is the
+        caller's longest side times ``_cube_median_edge_over_side()`` -- the
+        face diagonal, which is what a ``_CUBE_TETS`` Kuhn split actually
+        measures. The box is scaled by ``CUBE_EDGE_TO_BOX_SIDE`` to put that
+        median back on the caller's side, so the achieved edge a test reads is
+        the edge the mesh was asked for rather than 41% more.
+        """
+        lo = self.vertices.min(axis=0)
+        hi = self.vertices.max(axis=0)
+        side = float(np.max(hi - lo)) * CUBE_EDGE_TO_BOX_SIDE
+        return _CUBE_POINTS * side + lo
 
 
 class FakeSurface:
@@ -94,7 +137,16 @@ class FakeSurface:
                                  dtype=float) * extent
         self.faces = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]],
                               dtype=np.int32)
-        self.bounds = np.array([[0, 0, 0], [extent, extent, extent]], dtype=float)
+    @property
+    def bounds(self) -> np.ndarray:
+        """DERIVED from the vertices, never stored beside them.
+
+        Storing it made a state no real surface can be in: ``apply_scale``
+        multiplies ``vertices``, so a copy sat at one size while ``bounds``
+        still described the other, and a subclass rebuilding itself from
+        ``bounds`` produced a surface contradicting its own vertices.
+        """
+        return np.array([self.vertices.min(axis=0), self.vertices.max(axis=0)])
 
 
 @pytest.fixture(autouse=True)
@@ -218,25 +270,34 @@ def test_the_guard_measures_in_one_space_at_scale_1000(monkeypatch):
     is where ``allowed_edge`` used to come out in metres of the UNSCALED object
     while ``achieved`` was metres of the scaled one.
 
-    The mesh is the shared fake cube, one copy, so its achieved edge is 1.0 in
-    the SCALED surface's units. The scripted physics edge is the same 1.0, so
-    the allowed edge in metres is ``1.0 * unit_scale('mm') * 1.6 = 1.6e-3``,
-    while achieved is ``1.0 * 1e-3 = 1e-3`` -- just inside, and the mesh is
-    accepted. Under the broken arithmetic the allowed edge was computed against
-    the unscaled object and came out 1000x too small, so this same mesh was
-    REFUSED. Both directions are asserted, because a guard that never fires is
-    as wrong as one that always does.
+    The fixture is a surface ``scale`` units on a side, scaled once more by
+    ``scale``, so the object TetGen is handed is ``scale**2`` units across.
+    ``target_edge_length`` is scripted to that same side -- a length the object
+    is 1:1 with, in the SCALED object's units -- so the allowance is
+    ``scale**2 * unit_scale('mm') * 1.6`` metres. The double returns a mesh
+    spanning the object, whose median edge is ``sqrt(2)`` times the box side,
+    which lands just inside that allowance and is accepted. Under the broken
+    arithmetic the allowance was computed against the object BEFORE the scale
+    was applied and came out ``scale**2`` times too small, so this same mesh was
+    refused.
+
+    ``target_edge_length`` was 1.0 here before, independent of size. That passed
+    only because the fake returned a fixed unit cube whatever it was handed; a
+    double that returns a mesh of its input (as TetGen does) makes "1.0" mean
+    "resolve a 1e6-unit object to 1 unit", which the guard correctly refuses.
+    The size is scripted rather than the assertion loosened, so the test still
+    pins the ratio it exists for.
     """
 
     class OneTetGen(FakeTetGen):
-        """One copy of the cube: achieved edge 1.0 in scaled units."""
+        """One copy of the cube: a real mesh, and a deterministic count."""
 
         def _copies_for(self, maxvolume):
             return 1
 
     _install(monkeypatch, OneTetGen)
-    monkeypatch.setattr(MESH, "target_edge_length", lambda *a, **k: 1.0)
     scale = 1000.0
+    monkeypatch.setattr(MESH, "target_edge_length", lambda *a, **k: scale ** 2)
 
     class ScaledSurface(FakeSurface):
         """``apply_scale`` copies at a non-unit scale; the stub must too."""
@@ -244,11 +305,21 @@ def test_the_guard_measures_in_one_space_at_scale_1000(monkeypatch):
         def copy(self):
             return ScaledSurface(extent=self.bounds[1][0])
 
-    # Accepted: achieved 1e-3 m is under the 1.6e-3 m allowed.
     points, tets = MESH.tetrahedralize(ScaledSurface(extent=scale), "mm",
                                        n_modes=20, max_tets=10_000,
                                        verbose=False, scale=scale)
     assert points.shape[1] == 3
+
+    achieved_m = MESH.LAST_ACHIEVED_EDGE_M
+    allowed_m = (scale ** 2) * MESH.unit_scale("mm") * MESH.MAX_EDGE_OVERSHOOT
+    # Both sides are metres of the SCALED object, which is what makes the ratio
+    # ~1/1.6. Under the old arithmetic the denominator was scale**2 too small
+    # and the ratio was 1e9, which is the whole defect in one number.
+    ratio = achieved_m / allowed_m
+    assert ratio == pytest.approx(1.0 / MESH.MAX_EDGE_OVERSHOOT, rel=1e-3), (
+        f"achieved {achieved_m:g} m vs allowed {allowed_m:g} m (ratio {ratio:g})"
+    )
+    assert achieved_m < allowed_m, "the accept leg must actually be accepted"
 
     # And the guard is genuinely armed at this scale: a feature edge 4x finer
     # than the achieved mesh must be refused, so the pass above is not a guard
@@ -256,7 +327,7 @@ def test_the_guard_measures_in_one_space_at_scale_1000(monkeypatch):
     with pytest.raises(MESH.MeshingError):
         MESH.tetrahedralize(ScaledSurface(extent=scale), "mm", n_modes=20,
                             max_tets=10_000, verbose=False, scale=scale,
-                            min_feature_m=0.25 * MESH.unit_scale("mm"))
+                            min_feature_m=0.25 * scale ** 2 * MESH.unit_scale("mm"))
 
 
 def test_allow_coarse_path_still_solves(monkeypatch):
@@ -476,3 +547,112 @@ def test_target_edge_unit_change_cancels_out_of_the_returned_number():
     # the physical sizes really are different, so the equality above is the
     # cancellation rather than the unit being ignored entirely
     assert edge_cm * 1e-2 == pytest.approx(10 * edge_mm * 1e-3, rel=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# The canonical frame: TetGen meshes a UNIT-INDEPENDENT object
+#
+# TetGen's Steiner insertion is sensitive to the absolute coordinate magnitude,
+# so the same physical object spelled in mm, m and um used to mesh to different
+# element counts (measured 35237..47323 tets, 34%, for one icosphere). The
+# surface now goes to TetGen in a frame whose scale is fixed by the OBJECT --
+# centred on its bounding box, divided by its longest side -- and the points are
+# mapped back before returning. These three legs are the row's own tests.
+# ---------------------------------------------------------------------------
+
+def _frame_of(monkeypatch, surface, units, **kw):
+    """Run one ``tetrahedralize`` and return what TetGen was actually handed.
+
+    The fake records the vertices it was constructed with, so this reads the
+    frame the product chose rather than recomputing it: a test that re-derived
+    ``(v - centre) / longest`` would only be checking its own arithmetic.
+    """
+    seen = {}
+
+    class Recording(FakeTetGen):
+        def __init__(self, vertices, faces):
+            super().__init__(vertices, faces)
+            seen["vertices"] = np.asarray(vertices, dtype=float).copy()
+
+        def _copies_for(self, maxvolume):
+            seen["maxvolume"] = float(maxvolume)
+            return 1
+
+    _install(monkeypatch, Recording)
+    # These legs are about the FRAME, not about resolution quality, and the
+    # fake's mesh is object-sized rather than physics-edge-sized. The module's
+    # own ``enforce_resolution=False`` is the documented lever for running the
+    # tetrahedralization without the accuracy gate -- the same one the bench's
+    # ``--allow-coarse`` path uses.
+    kw.setdefault("enforce_resolution", False)
+    points, tets = MESH.tetrahedralize(surface, units, n_modes=20,
+                                       max_tets=10_000, verbose=False, **kw)
+    return seen, points, tets
+
+
+def test_the_canonical_frame_is_bounded_and_centred(monkeypatch):
+    """Whatever the spelling, TetGen is handed an O(1) object at the origin.
+
+    This is the mechanism, asserted directly: the frame's longest side is 1 and
+    its centre is the origin. Without it the magnitude sensitivity is back and
+    the counts drift with the unit label.
+    """
+    for units, scale in (("mm", 1000.0), ("m", 1.0), ("um", 1e6)):
+        surface = trimesh.creation.box(extents=[10, 7, 5])
+        seen, _, _ = _frame_of(monkeypatch, surface, units, scale=scale)
+        v = seen["vertices"]
+        longest = float(np.max(v.max(axis=0) - v.min(axis=0)))
+        centre = (v.max(axis=0) + v.min(axis=0)) / 2.0
+        assert longest == pytest.approx(1.0, rel=1e-12), (
+            f"{units}: longest side of the frame TetGen got was {longest}, "
+            "so this spelling is meshed at its own magnitude"
+        )
+        assert np.allclose(centre, 0.0, atol=1e-12), (
+            f"{units}: the frame was not centred on the object's bbox"
+        )
+
+
+def test_the_three_spellings_give_tetgen_the_identical_object(monkeypatch):
+    """INVARIANCE -- the row's first requirement, at the seam that matters.
+
+    One physical object written three ways must reach TetGen as the SAME
+    vertices, because TetGen's count is a function of those bytes. Byte identity
+    is the strongest possible form of "the same element count": if the vertices
+    agree, no float sensitivity can make the counts differ.
+    """
+    frames = []
+    for units, scale in (("mm", 1000.0), ("m", 1.0), ("um", 1e6)):
+        surface = trimesh.creation.box(extents=[10, 7, 5])
+        seen, _, _ = _frame_of(monkeypatch, surface, units, scale=scale)
+        frames.append(seen["vertices"])
+
+    base = frames[0]
+    for units, v in zip(("m", "um"), frames[1:]):
+        assert np.allclose(v, base, rtol=1e-12, atol=1e-15), (
+            f"{units} reached TetGen in a different frame than mm; max "
+            f"difference {np.abs(v - base).max():g}"
+        )
+
+
+def test_a_five_nanometre_object_meshes(monkeypatch):
+    """The plasmonics leg: a 5e-8 m object must produce a mesh, not a failure.
+
+    Coordinates this small used to sit near TetGen's tolerance; the canonical
+    frame puts every object at O(1) whatever its size, so the same call is
+    numerically ordinary. The assertion is that a mesh comes back with the
+    object's shape -- a count alone would pass for a frame that produced
+    garbage.
+    """
+    surface = trimesh.creation.box(extents=[50.0, 30.0, 20.0])   # in metres
+    seen, points, tets = _frame_of(monkeypatch, surface, "m", scale=1.0)
+
+    assert tets.shape[0] > 0, "a 5e-8 m object produced no elements"
+    assert points.shape[1] == 3
+    # The returned points are in metres of the SCALED object, so a 50 m box
+    # spelled in metres comes back 50 m across -- the mapping is the exact
+    # inverse, which is what stops the frame leaking into reported lengths.
+    span = points.max(axis=0) - points.min(axis=0)
+    assert np.all(span > 0), f"degenerate mesh span {span}"
+    # ...and the frame TetGen saw was still the O(1) one.
+    v = seen["vertices"]
+    assert float(np.max(v.max(axis=0) - v.min(axis=0))) == pytest.approx(1.0)
