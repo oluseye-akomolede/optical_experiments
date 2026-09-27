@@ -15,10 +15,20 @@
 -- the DATABASE before it evaluates the IF NOT EXISTS short-circuit, so that
 -- statement fails even when the schema is already present. Our scoped role
 -- mse_app owns the `mse` schema but deliberately has no database-level CREATE,
--- and it should not be granted one just to make this idempotent.
+-- and it should not be granted one merely to make RE-application idempotent.
 --
--- Guarding on pg_namespace instead means an existing schema never reaches a
--- statement that needs the database privilege, so re-running this file is free.
+-- Guarding on pg_namespace instead means that when the schema already exists it
+-- never reaches a statement that needs the database privilege, so re-running
+-- this file against a deployed database is free.
+--
+-- When the schema is ABSENT this still needs database-level CREATE, which the
+-- scoped app role does not have: the inner CREATE SCHEMA then fails with the
+-- same bare "permission denied for database ..." as before, so a deploy log
+-- alone cannot distinguish "schema missing" from "schema present". Provisioning
+-- a missing schema is therefore an operator's one-off with a role that holds the
+-- grant (CREATE SCHEMA mse AUTHORIZATION <app_role>), not something this file
+-- can do on a fresh database. The CREATE is kept, not replaced by a RAISE, so
+-- that a role which does hold the grant still provisions in one step.
 DO $$
 BEGIN
     IF NOT EXISTS (
