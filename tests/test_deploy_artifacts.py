@@ -233,19 +233,70 @@ def test_the_worker_token_is_optional_at_pod_level_but_never_open():
     """`optional: true` keeps the app serving; the API stays closed anyway.
 
     The safety of tolerating a missing key depends entirely on the code's other
-    half -- an unset token must mean 503, not an open route. That is asserted
-    here against worker_api.py's own source so the two cannot be changed
-    independently.
+    half -- an unset token must mean 503, not an open route.
     """
     text = DEPLOYMENT.read_text(encoding="utf-8")
     block = text.split("- name: MSE_WORKER_TOKEN", 1)[1][:400]
     assert "optional: true" in block, (
         "a missing key would fail the rollout, which is not what was decided")
-    api = (ROOT / "web" / "worker_api.py").read_text(encoding="utf-8")
-    assert "WorkerAPIDisabled" in api, (
-        "worker_api.py no longer has the disabled-API path, so an unset token "
-        "may no longer mean 503 -- the manifest's optional:true is only safe "
-        "while that holds")
+
+
+def test_every_worker_route_refuses_with_the_token_unset(monkeypatch):
+    """The other half, EXERCISED rather than grepped for.
+
+    An earlier version of this pair asserted only that the string
+    ``WorkerAPIDisabled`` appeared in ``worker_api.py``. That class was defined
+    and never raised, so the assertion was about a name rather than a
+    behaviour: the reviewer deleted the ``abort(503)`` block, kept the class
+    name, and the test still passed -- a future edit could have shipped
+    ``optional: true`` with a WIDE OPEN worker API and stayed green. (The dead
+    class has since been deleted; the guard is the ``abort(503)`` below, and it
+    is now asserted by calling it.)
+
+    Every route on the blueprint is driven, and the list is read off the
+    blueprint rather than retyped: a NEW worker route added later is covered
+    automatically, which a hand-written list cannot promise. ``MSE_WORKER_TOKEN``
+    is deleted from the environment, so this is the true "the Secret is absent"
+    case -- the worker Deployment tolerates that, and the code must too.
+    """
+    import sys
+
+    sys.path.insert(0, str(ROOT / "web"))
+    sys.path.insert(0, str(ROOT / "tests"))
+    import worker_api as WORKER
+
+    monkeypatch.delenv(WORKER.TOKEN_ENV, raising=False)
+
+    from test_web_routes import make_app
+
+    # The routes come from the app's own url_map, so this cannot drift from the
+    # code the way a retyped list would.
+    app, _store, _db, _launcher = make_app(Path("/tmp"))  # noqa: F841
+    worker_rules = sorted(
+        (str(r), sorted(r.methods - {"HEAD", "OPTIONS"}))
+        for r in app.url_map.iter_rules()
+        if str(r).startswith("/worker/")
+    )
+    assert worker_rules, (
+        "no /worker/ routes were registered, so this test would pass vacuously "
+        "-- the blueprint is not wired the way this test assumes")
+    assert len(worker_rules) >= 5, (
+        f"only {len(worker_rules)} worker routes found ({worker_rules}); the "
+        "route table has shrunk, which this test should not silently accept")
+
+    client = app.test_client()
+    for path, methods in worker_rules:
+        concrete = path.replace("<job_id>", "j1").replace("<name>", "n1")
+        # The VERB comes from the rule too. Hard-coding POST made this test
+        # report 405 for the one route that is a PUT, and a hand-written method
+        # would have to be revisited for every new route -- the same drift the
+        # route list avoids by being read off the app.
+        for method in methods:
+            response = client.open(concrete, method=method)
+            assert response.status_code == 503, (
+                f"{method} {concrete} returned {response.status_code} with "
+                f"{WORKER.TOKEN_ENV} unset; it must be 503, not open"
+            )
 
 
 def test_the_deployment_is_valid_yaml_and_keeps_one_replica():

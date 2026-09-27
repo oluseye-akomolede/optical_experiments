@@ -48,16 +48,6 @@ bp = Blueprint("worker", __name__)
 TOKEN_ENV = "MSE_WORKER_TOKEN"
 
 
-class WorkerAPIDisabled(Exception):
-    """No token is configured, so there are no workers and no API.
-
-    A distinct type from "the caller sent a bad token": one is a
-    misconfiguration to fix, the other is a request to refuse. They get
-    different status codes (503 vs 401) because conflating them would tell a
-    worker with a wrong token to wait for an operator who has nothing to fix.
-    """
-
-
 def configured_token() -> str:
     """The token workers must present, or ``""`` when the API is disabled.
 
