@@ -14,6 +14,16 @@ which is what "discriminating" means. It never leaves the tree modified: the
 original bytes are restored in a ``finally``, and the restoration is verified by
 hash rather than assumed.
 
+**One run at a time.** This tool rewrites the working tree and puts it back, so
+two concurrent runs will each restore over the other's reversion -- and the
+damage is silent, because a case whose file was restored mid-run reports as
+"not discriminating" while a case that finishes during the other's apply can
+leave a reverted file behind. A lock file makes the second run refuse rather
+than corrupt. This is not hypothetical: on 2026-09-27 the reviewer ran this in
+my worktree while I was committing in it, and a leftover ``bench_box.py``
+reversion -- the bench skipping its production solve, the exact defect the bench
+case exists to catch -- sat in the tree until I noticed it by hand.
+
 This exists because a reviewer asked for revert-and-rerun fixtures to be left in
 place. A script is better than a scratch commit: the fixture is checked in, it
 cannot be lost, and the failure count is reproducible from the tests alone.
@@ -22,16 +32,52 @@ cannot be lost, and the failure count is reproducible from the tests alone.
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+LOCK = ROOT / ".check-discriminating.lock"
 WEB_DB = ROOT / "web" / "db.py"
 SOLVER_DB = ROOT / "dockerfiles" / "maxwell_solver" / "mse_db.py"
 SCHEMA_SQL = ROOT / "db" / "001_schema.sql"
+
+
+def take_lock() -> None:
+    """Refuse to run if another instance is mid-reversion.
+
+    ``O_CREAT | O_EXCL`` is atomic, so two processes cannot both believe they
+    hold it. A stale lock from a killed run is the cost of that safety; the
+    message says which file to remove, and the pid in it says whether it is
+    still alive.
+    """
+    try:
+        fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            holder = LOCK.read_text().strip()
+        except OSError:
+            holder = "unknown"
+        raise SystemExit(
+            f"another check_discriminating run is in progress (pid {holder}).\n"
+            "It rewrites the tree and restores it, so running two at once would "
+            "corrupt both.\n"
+            f"If that process is gone, remove {LOCK} and retry."
+        )
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+    atexit.register(release_lock)
+
+
+def release_lock() -> None:
+    try:
+        LOCK.unlink()
+    except OSError:
+        pass
 
 
 @dataclass
@@ -571,6 +617,9 @@ def main(argv=None) -> int:
             "which cannot import it -- use the venv:\n"
             "  .venv-mse/bin/python tests/check_discriminating.py"
         )
+
+    # One run at a time -- taken before any case can revert a file.
+    take_lock()
 
     if args.list:
         for case in CASES:

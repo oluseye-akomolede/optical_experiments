@@ -15,3 +15,6 @@ venv/
 CLAUDE.md
 .openrig/
 scratch/
+
+# Held by a running tests/check_discriminating.py (see its "One run at a time")
+.check-discriminating.lock
