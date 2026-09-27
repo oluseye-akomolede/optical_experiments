@@ -212,12 +212,25 @@ def write_results(job_id, store_out, surface, points_m, tets, edges, tet_edges,
     origin = None
     spacing = None
 
+    # Locate the grid points ONCE for the whole job, then reuse it for every
+    # mode. Which tet contains a point, and where inside it, does not depend on
+    # the eigenvector, so repeating it per mode was pure waste -- and it was
+    # waste of the most expensive kind: the brute-force version allocated a
+    # (chunk, n_tets, 3) array per mode and OOM-killed the Job at its 14 Gi
+    # limit after a 7 s solve.
+    samples, gshape, gorigin, gspacing = FLD.sample_grid(points_m, grid)
+    located = FLD.locate_samples(points_m, tets, samples)
+    if verbose:
+        print(f"[mse] located {located[0].size:,} of {samples.shape[0]:,} grid "
+              f"points inside the mesh", flush=True)
+
     modes = []
     for index in range(len(freq_hz)):
         field, shape, origin, spacing = FLD.sample_field(
             points_m, tets, edges, tet_edges, signs,
             np.asarray(eigenvectors[:, index], dtype=float),
             n_longest=grid, free_edges=free_edges, n_edges=n_edges,
+            located=located, grid=(samples, gshape, gorigin, gspacing),
         )
         store_out.write(
             STORE.job_key(job_id, f"mode_{index + 1:02d}.bin"),

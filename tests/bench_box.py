@@ -66,6 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dockerfiles" / "ma
 import mse_eigen as EIG  # noqa: E402
 import mse_fem as F  # noqa: E402
 import mse_meshing as MESH  # noqa: E402
+import mse_storage as STORE  # noqa: E402
 
 
 def analytic_box_k(a: float, b: float, d: float, n_modes: int, n_max: int = 8):
@@ -172,7 +173,56 @@ def build_parser() -> argparse.ArgumentParser:
                              "icosphere subdivisions. Box: finer facets, which "
                              "also demonstrates the planar over-count "
                              "limitation. 1 = facets at the target (default)")
+    parser.add_argument("--write", action="store_true",
+                        help="ALSO run the production writing stage "
+                             "(sampling, .bin, .vtu, .glb, modes.json) into a "
+                             "temporary directory, and print its time and peak "
+                             "RSS separately. Off by default because it roughly "
+                             "doubles the peak memory; on because skipping it "
+                             "is how the (chunk, n_tets, 3) sampler reached the "
+                             "cluster unseen")
+    parser.add_argument("--write-dir", default=None,
+                        help="where --write puts the job directory (default: a "
+                             "fresh temp dir, printed then left in place)")
     return parser
+
+
+def run_writing_stage(obj_bytes, job_id, units, n_index, n_modes, max_tets,
+                      grid, write_dir, verbose=True) -> dict:
+    """Drive the PRODUCTION ``solve()`` so the writing stage really runs.
+
+    Deliberately not a re-implementation of the writing code: a bench that
+    copies the pipeline stops measuring the pipeline the moment the two drift
+    apart, and this is the stage that OOM-killed the Job. It writes through
+    ``LocalStore`` -- the same store class the container uses for
+    ``--local-out`` -- so the bytes written are the production bytes.
+
+    Returns the summary dict ``solve()`` produces, whose ``timings`` already
+    separates ``writing`` from the other stages, plus what was written.
+    """
+    import tempfile
+
+    import mse_maxwell_solver as SOLVER
+
+    root = Path(write_dir) if write_dir else Path(tempfile.mkdtemp(
+        prefix="mse-bench-write-"))
+    stores = STORE.LocalStore(root)
+    stores.write(STORE.job_key(job_id, "input.obj"), obj_bytes)
+
+    t0 = time.time()
+    summary = SOLVER.solve(
+        job_id, units, n_index, n_modes, stores, stores,
+        max_tets=max_tets, grid=grid, verbose=verbose,
+    )
+    summary["wall_s"] = time.time() - t0
+    summary["root"] = str(root)
+
+    written = {}
+    for path in sorted((root / "jobs" / job_id).glob("**/*")):
+        if path.is_file():
+            written[path.name] = path.stat().st_size
+    summary["written"] = written
+    return summary
 
 
 def main(argv=None) -> int:
@@ -315,7 +365,51 @@ def main(argv=None) -> int:
     print(f"worst |error| = {worst:.3f}%  (threshold {args.tolerance}%)")
     print(f"non-physical modes: {spurious}")
 
-    ok = worst <= args.tolerance and spurious == 0
+    writing_ok = True
+    if args.write:
+        # The stage that reached the cluster unmeasured. It runs as a SECOND
+        # solve, on purpose: the point is to watch the writing stage's own
+        # time and peak, and sharing this process's already-high-water RSS with
+        # the analytic solve above would hide both. Dividing RSS at the end by
+        # the pre-writing value is what makes the number attributable.
+        print()
+        print("=" * 72)
+        print("writing stage (production solve() through LocalStore)")
+        rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        try:
+            summary = run_writing_stage(
+                obj_bytes, "bench", args.units, args.n_index, args.n_modes,
+                args.max_tets, 64, args.write_dir,
+            )
+        except Exception as exc:  # noqa: BLE001 - report, do not hide
+            print(f"WRITING STAGE FAILED: {type(exc).__name__}: {exc}")
+            writing_ok = False
+        else:
+            rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+            timings = summary.get("timings", {})
+            for stage in ("meshing", "assembling", "solving", "writing"):
+                if stage in timings:
+                    print(f"  {stage:>10}: {timings[stage]:6.1f} s")
+            print(f"  {'total':>10}: {timings.get('total', 0.0):6.1f} s "
+                  f"(wall {summary['wall_s']:.1f} s)")
+            print(f"  peak RSS after writing: {rss_after:.0f} MB "
+                  f"(was {rss_before:.0f} MB before the writing stage)")
+            print(f"  job dir: {summary['root']}")
+            total_bytes = sum(summary["written"].values())
+            print(f"  wrote {len(summary['written'])} files, "
+                  f"{total_bytes / 1e6:.1f} MB "
+                  f"({summary['n_tets']:,} tets, {summary['n_modes']} modes)")
+            for name, size in sorted(summary["written"].items()):
+                print(f"      {name:>20}  {size / 1e6:9.3f} MB")
+            # A solve that wrote no mode files did not exercise the stage.
+            binary = [n for n in summary["written"] if n.endswith(".bin")]
+            if len(binary) != summary["n_modes"]:
+                print(f"  EXPECTED {summary['n_modes']} .bin files, "
+                      f"got {len(binary)}")
+                writing_ok = False
+        print("=" * 72)
+
+    ok = worst <= args.tolerance and spurious == 0 and writing_ok
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

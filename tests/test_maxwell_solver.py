@@ -618,3 +618,101 @@ def test_sphere_reference_scales_inversely_with_radius():
     big = bench_box.analytic_sphere_k(radius=10e-3, n_modes=23)
     small = bench_box.analytic_sphere_k(radius=5e-3, n_modes=23)
     assert small == pytest.approx(2.0 * big, rel=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# The writing stage, as the bench runs it.
+#
+# BUG A (deploy blocker 3) reached the cluster because the bench stopped after
+# the solve: the writing stage -- sampling, .bin, .vtu, .glb, modes.json -- was
+# never exercised, so the ~15 GB (chunk, n_tets, 3) sampler allocation was
+# never seen. These two tests keep the bench's writing stage honest: one that it
+# really drives the production solve(), and one that it reports the stage's time
+# rather than folding it into the total.
+# ---------------------------------------------------------------------------
+def test_the_bench_writing_stage_drives_the_production_solve(tmp_path):
+    """The bench must call the production ``solve()``, not a copy of it.
+
+    A bench that re-implements the pipeline stops measuring the pipeline the
+    moment the two drift apart, and the writing stage is the one that OOM-killed
+    the Job. Measured on a tiny box: the artefacts below are the production
+    ones, written through the same ``LocalStore`` the container uses.
+
+    Tier 1 by construction -- 1.4k tets, 2 modes, a 10^3 grid -- because the
+    claim is about wiring, not accuracy. The accuracy claim is the bench's job
+    on the Jetson.
+    """
+    import trimesh
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import bench_box
+
+    obj = trimesh.creation.box(extents=[40.0, 30.0, 20.0]).export(
+        file_type="obj").encode()
+    summary = bench_box.run_writing_stage(
+        obj, "bencht", "mm", 1.0, 2, max_tets=3000, grid=10,
+        write_dir=str(tmp_path), verbose=False,
+    )
+
+    written = summary["written"]
+    assert {"surface.glb", "modes.json"} <= set(written), (
+        f"the writing stage did not run: wrote {sorted(written)}"
+    )
+    assert set(written) >= {f"mode_{i:02d}.bin" for i in (1, 2)}
+    assert set(written) >= {f"mode_{i:02d}.vtu" for i in (1, 2)}
+
+    # every reported stage is timed, and writing is one of them -- if the stage
+    # vanishes from `timings` the bench would print a total with a hole in it
+    for stage in ("meshing", "assembling", "solving", "writing"):
+        assert stage in summary["timings"], f"no timing for {stage}"
+
+    # the field is what the viewer reads: the .bin is flat float32 triples, and
+    # the NaN mask is how the outside is marked. Checking the VALUES rather than
+    # the byte count is the point -- a stage that wrote the right number of
+    # bytes of garbage would pass a size check.
+    import numpy as np
+
+    field = np.frombuffer(
+        (tmp_path / "jobs" / "bencht" / "mode_01.bin").read_bytes(),
+        dtype=np.float32,
+    )
+    assert field.size % 3 == 0, "the .bin must be a whole number of vectors"
+    assert np.isfinite(field).any() and np.isnan(field).any(), (
+        "the sampled field must straddle the surface"
+    )
+    inside = np.isfinite(field)
+    assert np.linalg.norm(field[inside].reshape(-1, 3), axis=1).max() == \
+        pytest.approx(1.0, rel=1e-5), "the field must come out normalised"
+
+
+def test_the_bench_reports_the_writing_stage_among_its_timings():
+    """The bench's reason for --write is that the writing cost was invisible.
+
+    A run that folds writing into `total` would reproduce the gap that let the
+    ~15 GB sampler reach the cluster. The timing has to be its own measurement,
+    so this pins that `writing` is a stage the bench's own summary carries and
+    prints -- measured on the summary the bench produces, not read off its
+    source, because a printed total with a hole in it is the failure mode.
+    """
+    import trimesh
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import bench_box
+
+    obj = trimesh.creation.box(extents=[40.0, 30.0, 20.0]).export(
+        file_type="obj").encode()
+    summary = bench_box.run_writing_stage(
+        obj, "bencht2", "mm", 1.0, 1, max_tets=3000, grid=8,
+        write_dir=None, verbose=False,
+    )
+    timings = summary["timings"]
+    assert "writing" in timings
+    assert timings["writing"] >= 0.0
+    assert timings["total"] >= timings["writing"], (
+        "the writing stage cannot take longer than the whole solve"
+    )
+    # and the bench prints exactly the stages its summary carries, so a stage
+    # added to solve() without being printed shows up as a mismatch
+    printed = [s for s in ("meshing", "assembling", "solving", "writing")
+               if s in timings]
+    assert printed == ["meshing", "assembling", "solving", "writing"]

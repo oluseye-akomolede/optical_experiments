@@ -155,7 +155,7 @@ def run_tick(store, jobs_db, launcher, log=print) -> dict:
     Safe to call concurrently and safe to call when nothing is queued. Returns a
     small summary so the tests (and the log) can see what it decided.
     """
-    result = {"deleted": [], "requeued": 0, "launched": None, "waited": False}
+    result = {"deleted": [], "failed": 0, "launched": None, "waited": False}
 
     # A Job whose result is already in the database is holding the namespace's
     # single quota slot for nothing -- the quota counts finished Jobs too. Delete
@@ -178,15 +178,14 @@ def run_tick(store, jobs_db, launcher, log=print) -> dict:
         namespace_active = namespace_active or (
             ["<running>"] * jobs_db.count_running())
 
-    # A Job the app no longer knows about, or a row stuck in `running` with no
-    # Job behind it, both mean the same thing: the slot is free.
-    if not namespace_active:
-        stale = [j["job_id"] for j in jobs_db.list_jobs(50)
-                 if j["status"] == DB.RUNNING]
-        if stale:
-            result["requeued"] = jobs_db.requeue_stale(stale)
-            log(f"[mse-web] requeued {result['requeued']} job(s) whose Job "
-                "is gone (deleted by hand, or lost with its node)")
+    # Reconcile rows the app thinks are running against what the cluster
+    # actually has. A row can only be `running` because the app set it when it
+    # launched the Job, so a row with no Job behind it did not finish -- it was
+    # deleted, evicted, or lost with its node. Failing it is the honest outcome:
+    # re-queueing (what this used to do) re-runs a solve that already died, so
+    # an object that OOMs would OOM forever and the owner would watch a spinner
+    # that never ends. Kubernetes' own reasons are mapped to plain English.
+    result["failed"] = _fail_dead_jobs(launcher, jobs_db, log)
 
     # `namespace_active` is already the concurrency gate: the namespace admits
     # exactly one Job, including finished ones, so any Job on the list means the
@@ -216,6 +215,58 @@ def run_tick(store, jobs_db, launcher, log=print) -> dict:
     result["launched"] = name
     log(f"[mse-web] started {name} for job {job['job_id']}")
     return result
+
+
+def _fail_dead_jobs(launcher, jobs_db, log=print) -> int:
+    """Mark rows whose Job has died as failed. Returns how many.
+
+    Three states matter, and they are decided by crossing the database against
+    the cluster:
+
+    * **Job present, no failure** -- still running. Never touched: the solve is
+      live and deleting or failing it would throw the work away.
+    * **Job present and FAILED** -- the solve died (deadline, OOM, error). Its
+      reason names the cause for the owner.
+    * **Job absent** -- it was deleted, evicted, or lost with its node, so the
+      row would otherwise stay ``running`` forever. Nothing will ever finish it.
+
+    A launcher that cannot report (no cluster, dry run, a failed list call)
+    makes this return 0 rather than guess: failing a live solve on a transient
+    API error would be much worse than a spinner that lasts one more tick.
+    """
+    if launcher is None or not hasattr(launcher, "job_states"):
+        # A launcher that cannot report Job conditions cannot tell a dead solve
+        # from a live one; leave the rows for a launcher that can.
+        return 0
+    try:
+        present = set(_active_jobs(launcher))
+        states = launcher.job_states()
+    except Exception as exc:  # noqa: BLE001 - never let a tick crash the loop
+        log(f"[mse-web] could not read job states: {exc}")
+        return 0
+
+    # In dry-run there is no cluster, so `present` is empty and every running
+    # row would look dead. The in-memory launcher's own state is the only view
+    # available, and it reports nothing as failed -- so do nothing.
+    if getattr(launcher, "dry_run", False):
+        return 0
+
+    failed = 0
+    for job in jobs_db.list_jobs(50):
+        if job["status"] != DB.RUNNING:
+            continue
+        name = job.get("k8s_job_name")
+        if name and name in states:
+            message = JOBS.failure_message(states[name])
+        elif name and name in present:
+            continue                       # alive and well; not ours to touch
+        else:
+            message = JOBS.failure_message(None)
+        jobs_db.mark_failed(job["job_id"], message)
+        failed += 1
+        log(f"[mse-web] job {job['job_id']} failed: its Job "
+            f"{name or '<unnamed>'} is {('reported FAILED' if name in states else 'gone')}")
+    return failed
 
 
 def _finished_job_names(launcher, jobs_db) -> list[str]:
