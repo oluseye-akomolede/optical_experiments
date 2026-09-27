@@ -171,9 +171,47 @@ try {
   else ok(`WebGL2 up: ${gl.renderer}`);
 
   const canvas = page.locator('#scene');
+
+  // The canvas box, taken once and reused by every shoot and by the drag below.
+  //
+  // The screenshots below are clips of a page screenshot, not
+  // `canvas.screenshot()`. Element screenshots run a geometry-stability poll
+  // first (playwright-core's `_checkElementIsStable`): it reads
+  // getBoundingClientRect() each frame and only proceeds once two consecutive
+  // reads are exactly equal -- no epsilon. Against the live service that poll
+  // timed out at 30 s two runs running while passing locally, so it is a race,
+  // not a fixed latency: under SwiftShader the frame rate is ~1/s, and the
+  // canvas is sized in a rAF callback at startup, so two reads can straddle it.
+  // page.screenshot() never runs that poll, which is why a clip sidesteps the
+  // stall rather than racing it.
+  //
+  // Failing closed: if #scene is not on the page this check must not go on to
+  // photograph nothing and report green. Mutation-tested by pointing the
+  // selector at a missing element: the run fails, exiting 1 via the catch below.
+  //
+  // Be precise about which line does that, because it is not this one.
+  // boundingBox() on a missing element does not return null -- it times out
+  // after 30 s and throws (measured). So the guard below is a second line of
+  // defence for the case where the element exists but has no box, not the
+  // mechanism that catches a vanished canvas. It is kept because that case
+  // would otherwise pass `clip: undefined` through, which screenshots the whole
+  // page and reports a green run having measured nothing.
+  const box = await canvas.boundingBox();
+  if (!box) {
+    fail('#scene has no bounding box -- the canvas is on the page but has no ' +
+         'box, so there is nothing to photograph');
+    throw new Error('no canvas box; stopping rather than screenshotting nothing');
+  }
+
   const shoot = async (name) => {
     const path = join(outDir, name);
-    await canvas.screenshot({ path });
+    // The PNG is for a human; every assertion reads the readPixels summary
+    // returned below, never this file. It comes off the compositor, so it can in
+    // principle catch a frame whose drawing buffer was already presented and
+    // cleared (the renderer has no preserveDrawingBuffer -- web/static/viewer.js).
+    // The readback below is immune because it reads inside a frame; this one is
+    // best-effort. A blank PNG here is that, not a check false-alarm.
+    await page.screenshot({ path, clip: box });
     const { data, width, height } = await page.evaluate(() => new Promise((resolve) => {
       const el = document.getElementById('scene');
       const gl2 = el.getContext('webgl2');
@@ -355,7 +393,10 @@ try {
   // Drag the canvas and require the picture to move. This is the "rotatable"
   // half of what the owner asked for, and a camera that is not the one drawing
   // the scene is the failure it catches.
-  const box = await canvas.boundingBox();
+  //
+  // `box` is the one taken up top, not a fresh boundingBox() -- it is the same
+  // canvas in the same layout, and taking it twice would mean the screenshot
+  // clip and the drag could disagree about where the canvas is.
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   await page.mouse.down();
   await page.mouse.move(box.x + box.width / 2 + 220, box.y + box.height / 2 + 60,
