@@ -121,6 +121,7 @@ def solve_modes(
     free_edges: np.ndarray,
     constrained: np.ndarray,
     verbose: bool = True,
+    spd_ordering: bool = True,
 ):
     """Solve for the lowest ``n_modes`` physical eigenvalues of ``A x = k^2 B x``.
 
@@ -141,10 +142,48 @@ def solve_modes(
     s = default_shift(points)
     sigma = -s
 
+    # Both matrices below are symmetric positive definite, and both are factored
+    # as such. That is what these three arguments say, and it is worth stating
+    # what the default cost instead, because the default is *correct* -- it just
+    # does work the problem does not need:
+    #
+    #   permc_spec='MMD_AT_PLUS_A'  SuperLU's default is COLAMD, an ordering for
+    #       a general unsymmetric matrix. K and S are symmetric, so the fill it
+    #       produces is larger than it needs to be, and the fill is what the
+    #       factorisation, the solves and the memory all scale with.
+    #   diag_pivot_thresh=0.0       The default 1.0 does threshold partial
+    #       pivoting, which permutes rows to avoid small pivots. For an SPD
+    #       matrix that risk does not exist -- every pivot is positive -- so the
+    #       pivoting only destroys the ordering chosen above. Setting 0.0 keeps
+    #       the symmetric ordering intact, which is also what makes the
+    #       factorisation of a symmetric matrix symmetric.
+    #   options={'SymmetricMode': True}  tells SuperLU the same thing again, so
+    #       it stores L*D*L^T rather than a general L*U.
+    #
+    # Measured by the lead on the Jetson box (10x7x5 mm, 76,809 tets, 85,771
+    # unknowns): solve 255 s -> 98.5 s, L+U 178M -> 80M, peak 2.1 GB -> 1.25 GB,
+    # with the same worst-case error (0.058% vs analytic) and the same 122
+    # OPinv applications -- so the speedup is the factorisation, not a
+    # looser convergence.
+    #
+    # `permc_spec` is spelled out rather than passed positionally: splu takes it
+    # by keyword, and a positional argument would silently bind to the wrong
+    # parameter if SciPy ever reorders the signature.
+    #
+    # `spd_ordering=False` restores SuperLU's defaults. It exists for the tests:
+    # the two orderings must find the same eigenvalues, and the only way to
+    # assert that is to be able to run both. It is not a runtime switch and
+    # nothing in the solver passes it.
+    spd_lu = {
+        "permc_spec": "MMD_AT_PLUS_A",
+        "diag_pivot_thresh": 0.0,
+        "options": {"SymmetricMode": True},
+    } if spd_ordering else {}
+
     # negative shift => K = A + s B is SPD
     K = (A + s * B).tocsc()
     try:
-        K_lu = spla.splu(K)
+        K_lu = spla.splu(K, **spd_lu)
     except Exception as exc:  # noqa: BLE001
         raise EigenError(f"could not factor A + sB: {exc}") from exc
 
@@ -152,8 +191,13 @@ def solve_modes(
     G, _ = build_gradient(points, tets, edges, tet_edges, free_edges, constrained)
     GtB = (G.T @ B).tocsr()
     S = (GtB @ G).tocsc()                       # sparse SPD nodal (interior) matrix
+    # S is SPD too, and for the same reason: B is SPD and G has full column rank
+    # (its columns are the gradients of the nodal basis functions, which are
+    # linearly independent, one per interior node). So it takes the same
+    # arguments. Checked rather than assumed -- the test suite factors both on a
+    # small box and asserts the same eigenvalues as the default ordering.
     try:
-        S_lu = spla.splu(S)
+        S_lu = spla.splu(S, **spd_lu)
     except Exception as exc:  # noqa: BLE001
         raise EigenError(f"could not factor G^T B G: {exc}") from exc
 

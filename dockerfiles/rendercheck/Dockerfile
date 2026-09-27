@@ -25,6 +25,10 @@ COPY dockerfiles/rendercheck/package.json /opt/rendercheck/package.json
 RUN npm install --omit=dev --no-audit --no-fund
 
 COPY dockerfiles/rendercheck/check.mjs /opt/rendercheck/check.mjs
+# The pixel predicates, imported by check.mjs and tested on their own in
+# tests/js/test_rendercheck_predicates.mjs. Kept beside the check so the file
+# the tests import is the file the check runs.
+COPY dockerfiles/rendercheck/pixels.mjs /opt/rendercheck/pixels.mjs
 
 # No root: the Job runs as a non-root user with a read-only root filesystem, so
 # the browser needs a writable /tmp to put its own profile in.

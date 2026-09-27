@@ -24,6 +24,8 @@
 import { chromium } from 'playwright-core';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { divergingNote, divergingProblem, drawProblem, framingProblem }
+  from './pixels.mjs';
 
 const url = process.env.MSE_URL;
 const outDir = process.env.OUT_DIR || '/out';
@@ -61,6 +63,17 @@ function summarise(buffer, width, height) {
   let coloured = 0;
   let sum = 0;
   let hash = 0;
+  // Sign-of-colour counters. The diverging ramp puts blue on the negative lobe
+  // and red on the positive one, so a frame that has field in it and a frame
+  // that has the *right* field in it can be told apart by counting how much of
+  // each hue is present. A single sequential ramp, or the old broken
+  // `colormap(|v|) * sign(v)`, produces a frame with one hue and a great deal
+  // of black -- which is exactly the defect these counters exist to catch.
+  let warm = 0;    // r clearly above b: the + lobe
+  let cool = 0;    // b clearly above r: the - lobe
+  // Bounding box of the coloured pixels, which is how "the object fills the
+  // frame" becomes an assertion rather than an opinion.
+  let minX = width; let minY = height; let maxX = -1; let maxY = -1;
   const total = width * height;
   for (let i = 0; i < total; i += 1) {
     const o = i * 4;
@@ -68,14 +81,35 @@ function summarise(buffer, width, height) {
     const g = buffer[o + 1];
     const b = buffer[o + 2];
     const distance = Math.abs(r - bg[0]) + Math.abs(g - bg[1]) + Math.abs(b - bg[2]);
-    if (distance > 24) coloured += 1;
+    const lit = distance > 24;
+    if (lit) {
+      coloured += 1;
+      const x = i % width;
+      const y = (i - x) / width;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+      // The thresholds are slack on purpose: they ask which side of the ramp a
+      // pixel is on, not what exact hue it is, so an antialiased edge pixel
+      // part-way between the lobes is simply not counted either way.
+      if (r > b + 32) warm += 1;
+      else if (b > r + 32) cool += 1;
+    }
     sum += r + g + b;
     // A cheap order-sensitive digest: two frames that differ anywhere in their
     // leading bytes differ here. Collisions are not a concern because the frames
     // being compared differ by whole regions, not by a bit.
     hash = (hash * 31 + r + 7 * g + 13 * b) >>> 0;
   }
-  return { coloured, fraction: coloured / total, sum, hash, total };
+  const box = maxX < 0 ? null : { minX, minY, maxX, maxY,
+                                  w: maxX - minX + 1, h: maxY - minY + 1 };
+  // width/height are returned rather than left for the caller to guess: an
+  // earlier version of the framing check read `sample.width` and rendered as
+  // "undefinedxundefined", so the assertion compared NaN and passed without
+  // measuring anything.
+  return { coloured, fraction: coloured / total, sum, hash, total,
+           warm, cool, box, width, height };
 }
 
 const browser = await chromium.launch({
@@ -163,18 +197,14 @@ try {
   // Give the render loop a few frames; the lazy field fetch has to land first.
   await page.waitForTimeout(4000);
 
+  // The predicates live in pixels.mjs so they can be tested without a browser.
+  // They used to be inline here, which meant the only way to exercise them was
+  // to run this whole check against a live page -- so they went untested, and a
+  // predicate that is wrong in the direction of *passing* would have reported
+  // green forever.
   function drew(sample, what) {
-    // The bar is deliberately low and is about *kind*, not amount: the question
-    // is whether the shader drew the field at all, and a blank canvas is the
-    // failure being caught. A fixed percentage would be wrong -- a component
-    // that is genuinely thin over the volume covers less of the frame than |E|
-    // does, and failing it would be failing correct data. So the floor is only
-    // "more than a handful of pixels", and the comparisons below carry the rest.
-    if (sample.coloured < 500) {
-      fail(`${what} drew ${sample.coloured} field pixels of ${sample.total} ` +
-           '-- the plot is not drawing this component');
-      return false;
-    }
+    const problem = drawProblem(sample, what);
+    if (problem) { fail(problem); return false; }
     ok(`${what} draws: ${(sample.fraction * 100).toFixed(2)}% of the canvas ` +
        `(${sample.coloured} px)`);
     return true;
@@ -198,6 +228,25 @@ try {
   }
   drew(ez, 'Ez');
 
+  {
+    const problem = framingProblem(magnitude);
+    if (problem) {
+      fail(problem);
+    } else {
+      const frame = Math.max(magnitude.width, magnitude.height);
+      const across = Math.max(magnitude.box.w, magnitude.box.h);
+      ok(`the plot is framed: ${magnitude.box.w}x${magnitude.box.h} px, ` +
+         `which is ${(across / frame * 100).toFixed(0)}% of the ` +
+         `${magnitude.width}x${magnitude.height} frame`);
+    }
+  }
+
+  const diverging = (sample, what) => {
+    const problem = divergingProblem(sample, what);
+    if (problem) fail(problem); else ok(divergingNote(sample, what));
+  };
+  diverging(ez, 'Ez');
+
   await page.selectOption('#component-system', 'cylindrical');
   await page.selectOption('#component-name', 'Erho');
   await page.waitForTimeout(3000);
@@ -209,6 +258,7 @@ try {
     ok('the coordinate-system selector changes the picture');
   }
   drew(erho, 'Erho');
+  diverging(erho, 'Erho');
 
   // Drag the canvas and require the picture to move. This is the "rotatable"
   // half of what the owner asked for, and a camera that is not the one drawing
@@ -231,9 +281,15 @@ try {
   // preceding component drew nothing, the two frames are the same background
   // and the comparison above cannot tell "did not rotate" from "nothing there
   // to rotate" -- so the two are checked together rather than either alone.
-  if (magnitudeDrew && rotated.coloured < 500) {
+  if (magnitudeDrew && drawProblem(rotated, 'the rotated frame')) {
     fail('the rotated frame is empty -- rotating lost the plot');
   }
+  // And the rotated frame must still be drawn in its own hues. The defect this
+  // catches is the black half-disc, seen on a rotated Erho: the negative lobe
+  // clamped to black, so the frame changed when dragged (the test above passed)
+  // while half the object had silently stopped being drawn. "The picture moved"
+  // and "the picture is still there" are different claims.
+  if (magnitudeDrew) diverging(rotated, 'the rotated frame');
 
   if (consoleErrors.length) {
     // Console errors are reported but are only fatal when they are the viewer's

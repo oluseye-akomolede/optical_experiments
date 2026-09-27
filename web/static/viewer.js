@@ -110,16 +110,40 @@ function init(root) {
 // Volume rendering
 // --------------------------------------------------------------------------
 
-// A node-scale perceptual ramp: deep blue -> cyan -> green -> yellow -> red.
-// Declared once, here, and shared three ways -- the shader's colour function,
-// the legend gradient in CSS, and the legend bar drawn from this table -- so
-// the key beside the plot is guaranteed to be the ramp the plot is using.
-const COLORMAP = [
+// Two ramps, because a signed component and a magnitude are two different
+// quantities and one ramp cannot say both. Each is declared once here and
+// mirrored in the shader's colour function and the legend bar, so the key
+// beside the plot is guaranteed to be the ramp the plot is using.
+//
+// The design calls for it: "signed components use a diverging map (red +,
+// blue -, transparent near 0); |E| uses a sequential map". The first cut used
+// the sequential ramp for everything and said "signed" by multiplying the
+// colour by sign(v) -- which does not produce a cool end, it produces a
+// *negative* colour, and negative RGB clamps to black at the framebuffer. So
+// every negative lobe rendered as a black half-disc: not a wrong hue, an
+// absent one. That is the defect the render check was supposed to catch and
+// did not, because the check only asked whether *some* pixels were coloured.
+//
+// The diverging ramp goes blue -> near-transparent white -> red. The middle
+// stop is deliberately pale rather than saturated: it is where the colour
+// carries no sign, so it must not read as either lobe, and the alpha fade near
+// zero (see uThreshold) is what keeps "no field here" from being drawn as a
+// third colour.
+const COLORMAP_SEQUENTIAL = [
   [0.00, 0.05, 0.17, 0.42],
   [0.35, 0.12, 0.54, 0.84],
   [0.60, 0.26, 0.82, 0.49],
   [0.82, 1.00, 0.78, 0.34],
   [1.00, 1.00, 0.35, 0.24],
+];
+
+// -1 at the cool end, 0 at the pale middle, +1 at the warm end.
+const COLORMAP_DIVERGING = [
+  [-1.00, 0.15, 0.35, 0.85],
+  [-0.45, 0.25, 0.60, 0.95],
+  [0.00, 0.92, 0.92, 0.90],
+  [0.45, 0.98, 0.60, 0.22],
+  [1.00, 0.80, 0.16, 0.14],
 ];
 
 // The box's vertex coordinates run 0..1 on every face and hit all eight
@@ -180,24 +204,48 @@ uniform vec3 uVolumeSize;   // texels per axis, for the sampling step
 uniform float uAlphaScale;
 uniform float uThreshold;
 uniform bool uSigned;       // false for |E|, which has no negative half
-uniform float uExtent;      // local -> metres, i.e. the box's largest side
 in vec3 vLocal;
 out vec4 fragColor;
 
+// Sequential ramp, for |E|. Mirrors COLORMAP_SEQUENTIAL in viewer.js, whose
+// table the legend gradient is drawn from, so the key beside the plot is the
+// ramp the plot is actually using.
 const vec3 CM0 = vec3(0.05, 0.17, 0.42);
 const vec3 CM1 = vec3(0.12, 0.54, 0.84);
 const vec3 CM2 = vec3(0.26, 0.82, 0.49);
 const vec3 CM3 = vec3(1.00, 0.78, 0.34);
 const vec3 CM4 = vec3(1.00, 0.35, 0.24);
 
-// Mirrors COLORMAP in viewer.js, whose table the legend gradient is drawn from,
-// so the key beside the plot is the ramp the plot is using.
-vec3 colormap(float t) {
+vec3 colormapSequential(float t) {
   t = clamp(t, 0.0, 1.0);
   if (t < 0.35) return mix(CM0, CM1, t / 0.35);
   if (t < 0.60) return mix(CM1, CM2, (t - 0.35) / 0.25);
   if (t < 0.82) return mix(CM2, CM3, (t - 0.60) / 0.22);
   return mix(CM3, CM4, (t - 0.82) / 0.18);
+}
+
+// Diverging ramp, for a signed component. Blue at -1, pale at 0, red at +1.
+// Mirrors COLORMAP_DIVERGING in viewer.js.
+const vec3 DV0 = vec3(0.15, 0.35, 0.85);
+const vec3 DV1 = vec3(0.25, 0.60, 0.95);
+const vec3 DV2 = vec3(0.92, 0.92, 0.90);
+const vec3 DV3 = vec3(0.98, 0.60, 0.22);
+const vec3 DV4 = vec3(0.80, 0.16, 0.14);
+
+// The argument is the SIGNED value in -1..1, NOT its magnitude: the sign picks
+// the half of the ramp. This is the function whose absence produced the black
+// half-disc -- the previous code took colormap(|v|) and multiplied the colour
+// by sign(v), and multiplying a colour by a negative number clamps to black.
+//
+// (No backticks anywhere in this shader source: it is a JS template literal, so
+// one would end the string early and the file would fail to parse -- as it did
+// when this comment was first written.)
+vec3 colormapDiverging(float s) {
+  float t = clamp(s, -1.0, 1.0) * 0.5 + 0.5;   // -1..1 -> 0..1
+  if (t < 0.25) return mix(DV0, DV1, t / 0.25);
+  if (t < 0.50) return mix(DV1, DV2, (t - 0.25) / 0.25);
+  if (t < 0.75) return mix(DV2, DV3, (t - 0.50) / 0.25);
+  return mix(DV3, DV4, (t - 0.75) / 0.25);
 }
 
 bool isNan(float x) { return !(x == x); }
@@ -315,19 +363,44 @@ void main() {
     // still advances the ray, so the hole in the object stays a hole.
     float t = uSigned ? abs(v) : v;
     if (t > uThreshold) {
-      // Signed components keep their sign in the colour: the negative lobe gets
-      // the cool end of the ramp and the positive lobe the warm end. Without
-      // this, Ez and |Ez| would be the same picture, and a standing wave's two
-      // out-of-phase lobes -- the thing the component view exists to show --
-      // would be indistinguishable from each other.
-      vec3 c = uSigned ? colormap(t) * sign(v) : colormap(t);
+      // A signed component takes the diverging ramp and is handed its *signed*
+      // value, so the negative lobe gets the cool end and the positive lobe the
+      // warm end. Without this, Ez and |Ez| would be the same picture, and a
+      // standing wave's two out-of-phase lobes -- the thing the component view
+      // exists to show -- would be indistinguishable from each other.
+      //
+      // The value is normalised by the component's own peak before it reaches
+      // here -- see the texture build, which divides by it -- so "1.0" in the
+      // diverging ramp is the strongest sample anywhere in the picture, the two
+      // lobes are directly comparable, and uThreshold means the same contrast
+      // floor in every mode. (It did not, until the build learned to divide: an
+      // absolute threshold on an unnormalised component made a faint mode draw
+      // its faint structure as though there were none.) This is why the ramp
+      // takes a signed argument
+      // rather than a magnitude plus a sign separately: the two lobes must
+      // share one scale, or a slightly-positive and a strongly-negative region
+      // would draw the same colour.
+      vec3 c = uSigned ? colormapDiverging(v) : colormapSequential(t);
       // Alpha is accumulated as an integral along the ray, which is what makes
       // the picture a smoke plot of the mode's cross-section rather than a
-      // function of whichever face the camera happens to be looking at. It also
-      // keeps the same field looking the same in a 20 µm object and a 20 mm one:
-      // dt * uExtent is a physical length, so the exponent is optical depth
-      // and the grid's own scale cancels out.
-      float a = clamp(t * uAlphaScale * dt * uExtent, 0.0, 1.0);
+      // function of whichever face the camera happens to be looking at.
+      //
+      // The step is measured as a FRACTION OF THE BOX, not in metres. An
+      // earlier version multiplied by uExtent -- the box's physical size -- on
+      // the theory that optical depth should be physical. It is not, and the
+      // effect was that the same field drew at wildly different opacities
+      // depending on how big the object happened to be: on the live job
+      // (10.4 mm box, 169 steps) the per-step alpha came to 2.5e-4, so the whole
+      // mode accumulated 4% opacity and the plot was invisible -- every
+      // component, including |E|. The synthetic fixture this was first tried on
+      // had a box large relative to its grid, so it looked fine there and the
+      // bug stayed hidden until real data arrived.
+      //
+      // dt is already in the box's own 0..1 units, so t * uAlphaScale * dt
+      // says "how much of this ray's length lies in field of this strength".
+      // A 5 mm object and a 5 m one then draw identically, which is what the
+      // owner wants to see: the mode's shape, not its size.
+      float a = clamp(t * uAlphaScale * dt, 0.0, 1.0);
       acc.rgb += (1.0 - acc.a) * a * c;
       acc.a += (1.0 - acc.a) * a;
     }
@@ -392,7 +465,6 @@ function loadFieldData(jobId, statusData) {
       // Multiplied by the box's largest side once the grid is known, so the
       // emissive integral is exp(-k * t * depth) with depth in physical units.
       uSigned: { value: true },
-      uExtent: { value: 1 },
       uBoxCentre: { value: new THREE.Vector3() },
       uBoxSize: { value: new THREE.Vector3(1, 1, 1) },
     },
@@ -433,11 +505,10 @@ function loadFieldData(jobId, statusData) {
     const grid = manifest.grid;
     volumeMaterial.uniforms.uVolumeSize.value.set(
       Math.max(grid.nx, 1), Math.max(grid.ny, 1), Math.max(grid.nz, 1));
-    // The ray runs in local units but the mesh is scaled in metres, so the
-    // shader needs that scale to turn its step into a physical length. Without it
-    // the absorption would be a per-texel constant and a 20 µm object would
-    // look like a 20 mm one only by coincidence.
-    volumeMaterial.uniforms.uExtent.value = Math.max(...bounds.size, 1e-12);
+    // uBoxCentre/uBoxSize are the only place the box's physical size is still
+    // needed, and only to put the camera into the shader's local space -- the
+    // raymarch's own step is a fraction of the box (see the alpha line), so the
+    // plot looks the same whatever the object's real size.
     volumeMaterial.uniforms.uBoxCentre.value.set(bounds.centre[0],
                                                  bounds.centre[1],
                                                  bounds.centre[2]);
@@ -447,12 +518,25 @@ function loadFieldData(jobId, statusData) {
   }
 
   function frameCamera() {
-    const radius = Math.max(...bounds.size) * 1.6 || 1;
-    camera.position.set(bounds.centre[0] + radius,
-                        bounds.centre[1] + radius * 0.8,
-                        bounds.centre[2] + radius);
-    camera.near = Math.max(radius / 1000, 1e-6);
-    camera.far = radius * 100;
+    // Distance from the box centre to the eye, as a multiple of the box's
+    // largest side. The first cut used a "radius" as if it were a distance-to-
+    // corner and then added an offset in x, y AND z -- so the eye sat at
+    // sqrt(1 + 0.64 + 1) * 1.6 = 2.87 box-widths out while the object spans one,
+    // and the mode rendered as a small dot in the middle of the frame. The
+    // object fills ~84% of the grid box (measured on the live job), so any
+    // distance past roughly 2 box-widths leaves most of the canvas empty.
+    //
+    // 1.35 puts the near face of the box just inside the frustum and the object
+    // comfortably filling the frame, with a little air around it so the outline
+    // and a rotating object do not touch the edge. The diagonal view keeps all
+    // three axes legible from the first frame.
+    const distance = (Math.max(...bounds.size) || 1) * 1.35;
+    const unit = 1 / Math.sqrt(3);   // the (1,1,1) direction, normalised
+    camera.position.set(bounds.centre[0] + distance * unit,
+                        bounds.centre[1] + distance * unit,
+                        bounds.centre[2] + distance * unit);
+    camera.near = Math.max(distance / 100, 1e-6);
+    camera.far = distance * 100;
     camera.updateProjectionMatrix();
     controls.target.set(bounds.centre[0], bounds.centre[1], bounds.centre[2]);
     controls.update();
@@ -521,28 +605,31 @@ function loadFieldData(jobId, statusData) {
   }
 
   // -- legend -------------------------------------------------------------
-  // Drawn from COLORMAP, the same table the shader hard-codes, so the bar
-  // beside the plot is the ramp in the plot rather than a hand-matched guess.
-  // For a signed component the bar runs low -> high -> low, matching the
-  // shader's `colormap(|v|) * sign(v)`: the middle of the bar is the zero
-  // crossing, the two ends are the extremes, and the colour at each end is the
-  // colour of that sign.
+  // Drawn from the same table the shader hard-codes, so the bar beside the plot
+  // is the ramp in the plot rather than a hand-matched guess -- and from the
+  // *matching* table, because the two ramps say different things. A signed
+  // component runs blue at -max through the pale zero crossing to red at +max;
+  // |E| runs the sequential ramp from 0 to its maximum.
+  //
+  // The previous version drew one ramp and dimmed its left half by a factor of
+  // 0.45 to stand in for "negative". That is the legend being wrong in the same
+  // way the plot was: it made the negative lobe read as *the same hue, darker*
+  // when it should be a different hue, so even a reader who looked at the key
+  // would have taken a black half-disc for a weak one.
   function paintLegend() {
     const bar = document.getElementById('legend-bar');
     if (!bar) return;
     const signed = name !== 'E';
+    const table = signed ? COLORMAP_DIVERGING : COLORMAP_SEQUENTIAL;
     const stops = [];
     const n = 64;
     for (let i = 0; i <= n; i += 1) {
       const u = i / n;
-      // u = 0 at -max, 0.5 at zero, 1 at +max; the magnitude is |2u - 1|.
-      const magnitude = Math.abs(2 * u - 1);
-      const negative = u < 0.5;
-      const [r, g, b] = rampAt(signed ? magnitude : u);
-      const scale = signed && negative ? 0.45 : 1;
-      stops.push(`rgb(${Math.round(r * 255 * scale)},` +
-                 `${Math.round(g * 255 * scale)},` +
-                 `${Math.round(b * 255 * scale)}) ${(u * 100).toFixed(1)}%`);
+      // Diverging: u = 0 at -max, 0.5 at zero, 1 at +max, so the ramp's own
+      // coordinate is 2u - 1. Sequential: u is already the ramp's coordinate.
+      const [r, g, b] = rampAt(signed ? 2 * u - 1 : u, table);
+      stops.push(`rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ` +
+                 `${Math.round(b * 255)}) ${(u * 100).toFixed(1)}%`);
     }
     bar.style.background = `linear-gradient(90deg, ${stops.join(', ')})`;
     const label = COMPONENT_LABELS[name] || name;
@@ -564,19 +651,23 @@ function loadFieldData(jobId, statusData) {
     if (hi) hi.textContent = signed ? `+${label}` : `${label} max`;
   }
 
-  function rampAt(t) {
-    t = Math.max(0, Math.min(1, t));
-    for (let i = 1; i < COLORMAP.length; i += 1) {
-      if (t <= COLORMAP[i][0]) {
-        const a = COLORMAP[i - 1];
-        const b = COLORMAP[i];
+  // `t` is the ramp's own coordinate: 0..1 for the sequential table, -1..1 for
+  // the diverging one. Both tables store it in their first column.
+  function rampAt(t, table) {
+    const lo = table[0][0];
+    const hi = table[table.length - 1][0];
+    t = Math.max(lo, Math.min(hi, t));
+    for (let i = 1; i < table.length; i += 1) {
+      if (t <= table[i][0]) {
+        const a = table[i - 1];
+        const b = table[i];
         const k = (t - a[0]) / (b[0] - a[0]);
         return [a[1] + (b[1] - a[1]) * k,
                 a[2] + (b[2] - a[2]) * k,
                 a[3] + (b[3] - a[3]) * k];
       }
     }
-    const last = COLORMAP[COLORMAP.length - 1];
+    const last = table[table.length - 1];
     return [last[1], last[2], last[3]];
   }
 
@@ -629,10 +720,44 @@ function loadFieldData(jobId, statusData) {
     const centre = boxCentre(grid);
     const scalar = componentVolume(vec, positions, centre, system, name);
 
+    // Normalise the chosen component by its own peak, so the shader's "1.0 is
+    // the strongest sample in this picture" is true.
+    //
+    // It was not, and the picture was wrong in a way that is easy to miss
+    // because it depends on the *mode*: the solver normalises a mode by
+    // max|E| over the vector, so |E| always peaks at 1 but an individual
+    // component need not. Measured on the live job, mode 1's Erho peaks at
+    // 0.4236 and mode 2's at 0.9936, and the shader's threshold is an absolute
+    // 0.02 -- so mode 1 discarded 63% of Erho as "no field here" and mode 2
+    // discarded 16%, drawing the *same component* at visibly different densities
+    // because of nothing but the mode's amplitude. The faint outer lobes that a
+    // smoke plot exists to show were the first thing to go.
+    //
+    // Dividing by the peak is not cosmetic. It makes the threshold a contrast
+    // floor rather than an amplitude floor ("draw anything within 50x of this
+    // mode's strongest point"), it makes the diverging ramp's mid-band mean the
+    // same thing in every mode, and it is what the shader has been claiming in
+    // its own comments all along.
+    //
+    // NaN is skipped, not treated as zero: it marks outside-the-object and must
+    // stay NaN so the upload keeps it transparent. A field with no finite
+    // non-zero sample (all NaN, or all zero) has no peak to divide by and is
+    // left as it is -- every sample is already below any threshold, so the
+    // picture is correctly empty.
+    let peak = 0;
+    for (let i = 0; i < scalar.length; i += 1) {
+      const abs = Math.abs(scalar[i]);
+      if (abs > peak) peak = abs;
+    }
+    if (peak > 0 && Number.isFinite(peak)) {
+      for (let i = 0; i < scalar.length; i += 1) scalar[i] /= peak;
+    }
+
     // The texture is R32F rather than RGBA16F: the transform is exact in
     // float32 and only the result is narrowed, so a float16 upload would round
-    // twice. Values are the solver's own (max |E| is 1), and NaN is preserved
-    // as the sign-and-magnitude half pattern by the narrowing itself.
+    // twice. The values are the component's own, scaled by the peak above so
+    // they arrive in -1..1, and NaN is preserved as the sign-and-magnitude half
+    // pattern by the narrowing itself.
     const data = new Uint16Array(scalar.length);
     for (let i = 0; i < scalar.length; i += 1) {
       data[i] = float32ToHalf(scalar[i]);

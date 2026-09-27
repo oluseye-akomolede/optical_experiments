@@ -297,6 +297,113 @@ def test_solver_matches_dense_generalized_eigendecomposition():
 
 
 # --------------------------------------------------------------------------
+# the SPD ordering (the lead's Jetson bench, pinned at tier 1)
+# --------------------------------------------------------------------------
+
+def _box_matrices(nx=6, ny=5, nz=4):
+    """The assembled, PEC-reduced A and B for a small structured box."""
+    points, tets = structured_box_mesh(10.0, 7.0, 5.0, nx=nx, ny=ny, nz=nz)
+    edges, tet_edges, _ = F.build_edges(tets)
+    n_edges = edges.shape[0]
+    A, B = F.assemble_global(points, tets, tet_edges, n_edges)
+    constrained = F.boundary_edges(tets, edges)
+    A_free, B_free, free = F.pec_eliminate(A, B, constrained, n_edges)
+    return points, tets, edges, tet_edges, free, constrained, A_free, B_free
+
+
+def test_the_symmetric_ordering_finds_the_same_modes_as_the_default():
+    """The ordering is a permutation, so the answer must not move.
+
+    MMD_AT_PLUS_A with pivoting off is a different factorisation of the same
+    matrix, and the whole justification for it is that it is *cheaper*, not
+    different. If it changed the eigenvalues the speedup would be a different
+    solver, not a faster one -- so this is the test that makes the change safe
+    to take. rtol 1e-8 is tighter than the tolerance the two orderings could
+    plausibly disagree by if they were doing the same arithmetic; a real
+    difference in the ordering shows up far above it.
+    """
+    points, tets, edges, tet_edges, free, constrained, A_free, B_free = _box_matrices()
+
+    symmetric, _, _ = EIG.solve_modes(
+        A_free, B_free, 6, points,
+        edges=edges, tets=tets, tet_edges=tet_edges,
+        free_edges=free, constrained=constrained, verbose=False,
+        spd_ordering=True,
+    )
+    default, _, _ = EIG.solve_modes(
+        A_free, B_free, 6, points,
+        edges=edges, tets=tets, tet_edges=tet_edges,
+        free_edges=free, constrained=constrained, verbose=False,
+        spd_ordering=False,
+    )
+    symmetric = np.sort(np.asarray(symmetric))
+    default = np.sort(np.asarray(default))
+    assert np.allclose(symmetric, default, rtol=1e-8), (
+        f"symmetric {np.round(symmetric, 10)}\ndefault   {np.round(default, 10)}"
+    )
+
+
+def test_the_ordering_arguments_are_the_symmetric_ones():
+    """Mutation guard: the three arguments must actually reach SuperLU.
+
+    The eigenvalue test above passes whether or not the arguments are applied,
+    because the same matrix factorises to the same answer either way -- so it
+    cannot be the thing that protects this change. This one pins the arguments
+    themselves, by recording what `splu` was called with. Revert any of the
+    three to its default and this goes red.
+    """
+    points, tets, edges, tet_edges, free, constrained, A_free, B_free = _box_matrices()
+
+    calls = []
+    real_splu = EIG.spla.splu
+
+    def recording_splu(m, **kwargs):
+        calls.append(kwargs)
+        return real_splu(m, **kwargs)
+
+    EIG.spla.splu = recording_splu
+    try:
+        EIG.solve_modes(
+            A_free, B_free, 4, points,
+            edges=edges, tets=tets, tet_edges=tet_edges,
+            free_edges=free, constrained=constrained, verbose=False,
+            spd_ordering=True,
+        )
+    finally:
+        EIG.spla.splu = real_splu
+
+    assert len(calls) == 2, f"expected K and S to be factored, got {len(calls)}"
+    for kwargs in calls:
+        assert kwargs.get("permc_spec") == "MMD_AT_PLUS_A", kwargs
+        assert kwargs.get("diag_pivot_thresh") == 0.0, kwargs
+        assert kwargs.get("options") == {"SymmetricMode": True}, kwargs
+
+
+def test_both_factored_matrices_are_symmetric_positive_definite():
+    """The claim the arguments depend on, checked rather than asserted.
+
+    If either matrix were only PSD, `diag_pivot_thresh=0.0` would be unsafe --
+    pivoting is the thing that rescues a singular pivot -- so the premise is
+    tested directly rather than trusted. `S = G^T B G` is SPD because B is SPD
+    and G has full column rank; `K = A + sB` is SPD because the shift is chosen
+    below the first eigenvalue and B is SPD.
+    """
+    points, tets, edges, tet_edges, free, constrained, A_free, B_free = _box_matrices()
+
+    s = EIG.default_shift(points)
+    K = (A_free + s * B_free).tocsc()
+    G, _ = EIG.build_gradient(points, tets, edges, tet_edges, free, constrained)
+    S = ((G.T @ B_free) @ G).tocsc()
+
+    for name, matrix in (("K = A + sB", K), ("S = G^T B G", S)):
+        dense = matrix.toarray()
+        assert np.abs(dense - dense.T).max() < 1e-9, f"{name} is not symmetric"
+        # Cholesky exists iff the matrix is positive definite, and it fails
+        # loudly rather than returning a plausible wrong answer.
+        np.linalg.cholesky(dense)
+
+
+# --------------------------------------------------------------------------
 # meshing contract
 # --------------------------------------------------------------------------
 
