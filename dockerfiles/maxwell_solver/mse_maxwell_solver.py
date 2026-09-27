@@ -436,6 +436,15 @@ def write_results(job_id, store_out, surface, points_m, tets, edges, tet_edges,
         # frequencies without re-reading the Job.
         "scale": float(scale),
         "min_feature": None if min_feature_m is None else float(min_feature_m),
+        # The median element edge the mesher ACTUALLY achieved, in metres of the
+        # scaled object -- the measurement, beside the target the line above
+        # states. Read from the mesher's module state rather than threaded
+        # through as a parameter: tetrahedralize returns (points, tets), and
+        # this describes the run that just happened, the same way
+        # LAST_BACKEND_DESCRIPTION does. The job page shows it next to the
+        # requested resolution so the owner can see the allowance being used
+        # rather than having to trust that it was.
+        "achieved_median_edge_m": MESH.LAST_ACHIEVED_EDGE_M,
         "grid": {
             "nx": int(nx), "ny": int(ny), "nz": int(nz),
             "origin": [float(v) for v in origin],
@@ -482,6 +491,80 @@ def _write_termination_log(text: str, path: str = "/dev/termination-log") -> boo
         return False
 
 
+#: The words that mean "the GPU ran and said no to THIS job". Spelled the ways
+#: cuDSS (CUDSS_STATUS_ALLOC_FAILED), nvmath's prose and the driver say it.
+#: Shared by both ``_names_*`` helpers below so the two cannot disagree about
+#: which side of the line an allocation failure falls on.
+ALLOC_FAILURE_WORDS = (
+    "alloc_failed", "alloc failed", "allocation failed", "allocation_failed",
+    "out of memory", "outofmemory", "insufficient memory",
+)
+#: The words that mean "the GPU would not come up" -- the opposite verdict.
+GPU_INIT_WORDS = (
+    "initializ", "initialis",
+    "no device", "no cuda", "no gpu",
+    "device not found", "driver",
+    "context creation", "context init",
+    "nvrtc", "cuda_driver",
+)
+
+
+def _names_an_allocation_failure(exc: BaseException) -> bool:
+    """Does this ``EigenError`` come from a cuDSS allocation failure?
+
+    The type cannot say: ``mse_eigen`` wraps every cuDSS status as
+    ``EigenError(...) from exc``, so ALLOC_FAILED and a genuinely unsolvable
+    problem arrive looking identical. The status NAME is carried in the message
+    and in the wrapped exception's, which is the only evidence there is.
+
+    Walks the chain because the word may sit either side of the re-raise: nvmath
+    puts the status in its own exception's message, and ``mse_eigen``'s wrapper
+    may or may not repeat it.
+    """
+    seen: set[int] = set()
+    node: BaseException | None = exc
+    depth = 0
+    while node is not None and depth < 10 and id(node) not in seen:
+        seen.add(id(node))
+        depth += 1
+        text = f"{type(node).__name__}: {node}".lower()
+        if any(word in text for word in ALLOC_FAILURE_WORDS):
+            return True
+        node = node.__cause__ or node.__context__
+    return False
+
+
+def _names_a_gpu_init_failure(exc: BaseException) -> bool:
+    """Could this ``EigenError`` mean the GPU never came up?
+
+    The mirror of ``_names_an_allocation_failure``, and it exists for the same
+    reason: ``mse_eigen`` wraps every cuDSS failure the same way, so "the GPU is
+    absent or its driver is broken" and "this object has no solution" are the
+    same TYPE. The distinction matters to the OWNER, not just to the worker's
+    retry logic: an object-blaming sentence ("try a simpler object") is FALSE for
+    a GPU fault, and it is shown on the job page while the job is being retried.
+
+    Checked AFTER the allocation words and in the same chain walk, so a message
+    carrying both reads as the allocation failure (the GPU ran and answered).
+    """
+    seen: set[int] = set()
+    node: BaseException | None = exc
+    depth = 0
+    while node is not None and depth < 10 and id(node) not in seen:
+        seen.add(id(node))
+        depth += 1
+        name = type(node).__name__
+        text = f"{name}: {node}".lower()
+        if any(word in text for word in ALLOC_FAILURE_WORDS):
+            return False
+        if name in ("CUDARuntimeError", "CUDADriverError"):
+            return True
+        if any(word in text for word in GPU_INIT_WORDS):
+            return True
+        node = node.__cause__ or node.__context__
+    return False
+
+
 def owner_message(exc: BaseException) -> str:
     """Plain-English text for the job page.
 
@@ -504,6 +587,32 @@ def owner_message(exc: BaseException) -> str:
     if isinstance(exc, ValueError):
         return str(exc)
     if isinstance(exc, EIG.EigenError):
+        if _names_an_allocation_failure(exc):
+            # ALLOC_FAILED is not a verdict about the object's difficulty, and
+            # the generic EigenError text below would be a LIE about it: the
+            # object is not too complex to solve, the GPU had no room for it
+            # right now. That same status also comes from other GPU memory
+            # users and from a previous job's context in the warm worker, so a
+            # coarser setting is not always the answer -- it is offered first
+            # because the owner can act on it, and "try again later" is what is
+            # actually true.
+            return (
+                "This object could not fit in the GPU's memory. If it is very "
+                "detailed, try a coarser detail setting; otherwise please try "
+                "again later."
+            )
+        if _names_a_gpu_init_failure(exc):
+            # The GPU was absent or its driver was broken. Blaming the object
+            # here -- which is what the sentence below does -- would be false,
+            # and this text is shown on the job page while the job is requeued,
+            # so the owner would be told to simplify an object that is fine.
+            # The wording must not promise a retry that may not happen either:
+            # the app gives up after MAX_RELEASES, and this may be the last one.
+            return (
+                "The graphics processor was not available for this run. This "
+                "is a problem on our side, not with your object -- the job will "
+                "be retried, and please try again later if it does not finish."
+            )
         return (
             "This object could not be solved for the requested number of modes. "
             "Try a simpler object, fewer modes, or a larger size."

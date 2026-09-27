@@ -144,6 +144,25 @@ def target_edge_length_mm(surface, n_modes: int, units: str) -> float:
     return float(MESH.target_edge_length(surface, n_modes, units=units))
 
 
+def _solver_module():
+    """The solver's meshing module, imported late so tier-1 tests stay cheap."""
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    import mse_meshing as MESH  # noqa: PLC0415 - deliberately late
+
+    return MESH
+
+
+#: How far above the requested edge a mesh may land before the solver refuses it.
+#: Re-exported so the job page can state the allowance in the same number the
+#: mesher enforces, rather than a copy that could drift from it.
+MAX_EDGE_OVERSHOOT = _solver_module().MAX_EDGE_OVERSHOOT
+
+
 def unit_scale_m(units: str) -> float:
     """Metres per unit, from the solver's own table.
 

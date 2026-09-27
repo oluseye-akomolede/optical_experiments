@@ -76,6 +76,48 @@ class BackendError(Exception):
     """The requested backend cannot be used, and falling back is not an option."""
 
 
+#: Every cuDSS factorisation currently holding device memory. Strong refs on
+#: purpose -- see ``_gpu_factor`` -- so the set is what makes the memory
+#: reachable from outside the solve, whatever path the solve took out.
+_GPU_FACTORS: set = set()
+
+
+def release_gpu_memory() -> int:
+    """Free this process's GPU memory. Returns the factors closed.
+
+    The warm worker calls this between jobs, on success AND failure. ORDER IS
+    LOAD-BEARING: the factors are closed FIRST, because cuDSS holds device
+    allocations of its own that are not in cupy's pools -- emptying the pools
+    while a live factor still holds blocks reclaims those blocks and nothing
+    else. The pools are then emptied to return the scratch cupy allocated around
+    them (the ``csr_matrix`` conversion, the right-hand sides, the refinement
+    temporaries), which cupy caches by design and would otherwise hold for the
+    life of the process.
+
+    A no-op on the CPU backend and wherever the CUDA stack is absent: the import
+    is attempted and its failure is the answer, not an error. Nothing here may
+    raise -- it runs in a ``finally`` on paths that may already be unwinding.
+    """
+    closed = 0
+    for factor_obj in list(_GPU_FACTORS):
+        factor_obj.close()
+        closed += 1
+    _GPU_FACTORS.clear()
+
+    try:
+        import cupy as cp  # noqa: PLC0415 - absent on the CPU backend
+    except Exception:  # noqa: BLE001 - no CUDA stack means nothing to release
+        return closed
+
+    for pool_getter in (cp.get_default_memory_pool,
+                        cp.get_default_pinned_memory_pool):
+        try:
+            pool_getter().free_all_blocks()
+        except Exception:  # noqa: BLE001 - a pool that will not empty is not fatal
+            pass
+    return closed
+
+
 def selected_backend() -> str:
     """The backend named by ``MSE_SOLVER_BACKEND``, defaulting to the CPU.
 
@@ -193,7 +235,16 @@ def _gpu_factor(A: sparse.spmatrix, *, label: str):
             f"imported ({exc}). This image has no GPU support; run the GPU backend "
             f"on the Jetson, or set {BACKEND_ENV}={CPU}."
         ) from exc
-    return _CudssFactor(A, cp=cp, csp=csp, nvmath=nvmath, label=label)
+    factor_obj = _CudssFactor(A, cp=cp, csp=csp, nvmath=nvmath, label=label)
+    # Registered so the warm worker can free device memory deterministically
+    # between jobs. ``solve_modes``' locals are refcounted and do drop, but a
+    # bare reference in a registry is the only handle that survives an exception
+    # thrown BETWEEN the two factorisations -- K exists, S never got built, and
+    # the traceback's ``finally`` is the only thing that knows K is there.
+    # A weak set would be tidier and would also drop the entry exactly when it
+    # is no longer needed, which is why the entry is removed in close().
+    _GPU_FACTORS.add(factor_obj)
+    return factor_obj
 
 
 def _missing_gpu_package() -> str:
@@ -249,6 +300,36 @@ class _CudssFactor:
         self.solver.plan()
         self.solver.factorize()
         cp.cuda.Device().synchronize()
+
+    def close(self) -> None:
+        """Release the cuDSS solver and its device buffers. Idempotent.
+
+        The factorisation holds device memory for as long as this object lives,
+        and in the WARM worker the object lives until the job's frame is dropped
+        -- which is per-job, fine -- EXCEPT that ``self.solver`` is a bare
+        nvmath ``DirectSolver`` attribute that never frees its own buffers. With
+        ``MSE_GPU_PRECISION=single`` on the Jetson (unified memory, so device
+        memory IS system RAM) a warm process that solves two large jobs back to
+        back climbs until the cgroup or the OS kills it.
+
+        ``free()`` is the documented teardown on nvmath 0.9.0; there is no
+        ``close()`` on the nvmath object itself. Idempotent because both the
+        factor registry and the worker's cleanup may call it, and calling it
+        twice must not raise -- a raise here would mask the real job failure
+        that is on its way out.
+        """
+        _GPU_FACTORS.discard(self)
+        solver, self.solver = getattr(self, "solver", None), None
+        if solver is None:
+            return
+        try:
+            solver.free()
+        except Exception:  # noqa: BLE001 - teardown must never fail a job
+            # A device that is already gone (a reset, an OOM kill in progress)
+            # raises here. There is nothing to recover and nothing to report:
+            # the memory is not coming back either way, and this runs inside a
+            # ``finally`` on a path that may already be unwinding an error.
+            pass
 
     def _solve_once(self, b: np.ndarray) -> np.ndarray:
         cp = self.cp

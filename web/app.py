@@ -36,8 +36,8 @@ import fields as FLD
 import jobs as JOBS
 import storage as STORE
 import worker_api as WORKER
-from meshing import (UploadError, effective_edge_mm, estimate_tets,
-                      load_surface, unit_scale_m, validate_upload)
+from meshing import (MAX_EDGE_OVERSHOOT, UploadError, effective_edge_mm,
+                     estimate_tets, load_surface, unit_scale_m, validate_upload)
 
 #: where the solver puts one mode's field, and the ONE place that decides it.
 #: Both the index (which reads a size to decide `available`) and the fetch route
@@ -142,9 +142,19 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
     @app.route("/jobs/<job_id>")
     def job_page(job_id):
         job = _require_job(jobs_db, job_id)
+        # The achieved edge lives in the manifest, so it exists only for a
+        # finished job. A missing manifest is an ABSENCE, not a failure: the
+        # page then shows the request alone, which is the truth for a job that
+        # has not meshed yet.
+        achieved_m = None
+        if job.get("status") == DB.DONE:
+            manifest = _done_manifest(store, jobs_db, job_id)
+            if manifest:
+                achieved_m = manifest.get("achieved_median_edge_m")
         return render_template("job.html", job=job,
                               effective_size=_effective_size(job),
-                              resolution=_resolution_caption(job),
+                              resolution=_resolution_caption(job, achieved_m),
+                              max_edge_overshoot=MAX_EDGE_OVERSHOOT,
                               queue_position=jobs_db.queue_position(job_id))
 
     # -- JSON the page polls ----------------------------------------------
@@ -784,21 +794,23 @@ def _effective_size(job: dict) -> str | None:
         return None
 
 
-def _resolution_caption(job: dict) -> dict | None:
-    """The REQUESTED mesh resolution, in the unit the owner typed it in.
+def _resolution_caption(job: dict, achieved_m: float | None = None) -> dict | None:
+    """The mesh resolution the owner asked for, and what they actually got.
 
-    One number, LABELLED with its unit, because the feature's unit is its own
-    and is not the object's -- a bare "0.2" beside a "0.27" is a pair the reader
-    has to guess at, and a number the page cannot explain reads as a defect.
+    Both numbers, each LABELLED with its unit, because the feature's unit is its
+    own and is not the object's -- a bare "0.2" beside a "0.27" is a pair the
+    reader has to guess at, and a number the page cannot explain reads as a
+    defect.
 
     "requested" is the length the mesh was ASKED to resolve: the smaller of the
-    physics edge and the owner's declared feature. The ACHIEVED median edge is
-    deliberately not shown, because the solver measures it internally and does
-    not report it, so the page has no number to show -- an earlier draft of this
-    caption and the template both claimed it was displayed, which is the sort of
-    promise that reads as satisfied until someone looks. Showing it would need a
-    new field on the manifest and a column to carry it; that is its own piece of
-    work, not part of stating the requested resolution correctly.
+    physics edge and the owner's declared feature. "achieved" is the median
+    element edge the solver measured, reported through ``modes.json`` by
+    ``write_results``; it is the same physical length, re-expressed in the unit
+    the owner typed, so the two can be read against each other directly.
+
+    ``achieved`` is present only once the job has finished -- before that there
+    is no manifest and no measurement, and the page says so by showing the
+    request alone rather than a placeholder that looks like data.
 
     Returns ``None`` when there is no feature to report (auto), so the page can
     say nothing rather than invent a number.
@@ -808,10 +820,30 @@ def _resolution_caption(job: dict) -> dict | None:
     if value is None or not unit:
         return None
     try:
-        return {
+        caption = {
             "requested": f"{float(value):g} {unit}",
             "requested_m": job.get("min_feature_m"),
         }
+        if achieved_m:
+            # metres -> the owner's unit, via the SAME table the upload form
+            # converted with. Referencing a bare ``MESH`` here was a NameError
+            # (that name is only ever a local inside ``_effective_size``), which
+            # would have crashed the job page for every finished job that set a
+            # feature -- i.e. exactly the pages this caption was added for.
+            scale = unit_scale_m(unit)
+            caption["achieved"] = f"{float(achieved_m) / scale:.4g} {unit}"
+            caption["achieved_m"] = float(achieved_m)
+            # Above the request by up to MAX_EDGE_OVERSHOOT is the allowance,
+            # not an error. Say which side of the line this run is on, so a
+            # reader is not left to judge a bare ratio.
+            req_m = job.get("min_feature_m")
+            caption["over_request"] = bool(
+                req_m and float(achieved_m) > float(req_m)
+            )
+            caption["within_allowance"] = bool(
+                req_m and float(achieved_m) <= MAX_EDGE_OVERSHOOT * float(req_m)
+            )
+        return caption
     except (TypeError, ValueError):
         return None
 

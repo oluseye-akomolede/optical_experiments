@@ -63,6 +63,34 @@ def releases_are_terminal(count: int, bound: int = MAX_RELEASES) -> bool:
     return int(count) >= int(bound)
 
 
+def _retry_message(reason: str, bound: int, attempt: int | None = None) -> str:
+    """The row's message while a job is RETRYING, so the owner can see why.
+
+    A transient release puts the job back in the queue, and without this the row
+    looks identical to a fresh upload -- the owner sees a job that has been
+    waiting a long time with no explanation of what it is waiting for. The
+    attempt number is the point: "retrying (attempt 2 of 3)" says the job has a
+    finite number of further chances, which a bare reason does not.
+    """
+    reason = (reason or "the GPU worker could not finish this attempt").strip()
+    if attempt is None:
+        return f"retrying: {reason}"
+    return f"retrying (attempt {int(attempt)} of {int(bound)}): {reason}"
+
+
+def _terminal_message(reason: str, attempts: int) -> str:
+    """The FAILED message: what went wrong AND that no further attempt is coming.
+
+    Both halves matter and neither is inferable from the other. The reason names
+    the immediate cause; the bound sentence is what tells the owner the job is
+    genuinely over rather than one more retry away.
+    """
+    reason = (reason or "").strip()
+    bound = (f"the GPU worker could not complete this job after "
+             f"{int(attempts)} attempts; try again later")
+    return f"{reason} ({bound})" if reason else bound
+
+
 def dsn_from_env() -> dict:
     """Connection parameters from the environment (never from a file)."""
     return {
@@ -303,15 +331,30 @@ class JobStore:
         with self._connect() as conn, conn.cursor() as cur:
             # (a) Requeue everything under the bound. No list parameter here, so
             # this branch cannot fail on type adaptation.
+            # ``message`` is set in the same statement here, unlike
+            # ``release_jetson``, because the attempt number comes back from
+            # this UPDATE's own RETURNING -- so the text is per-row and correct
+            # without a second statement per job. The reason is fixed rather
+            # than a caller's: an expired lease says only that the worker
+            # stopped, which is exactly what the owner needs to know.
+            # The message is written for ALL reclaimed rows at once, so it
+            # cannot name a per-row attempt number in this statement -- the
+            # number is only known after the increment. It states the reason and
+            # the bound without the count, which is the honest form: "retrying
+            # (of up to 3)". Naming a specific attempt here would mean a second
+            # statement per row, and the reason is what the owner needs.
             cur.execute(
                 "UPDATE mse.jobs SET lease_owner = NULL, "
                 "lease_expires_at = NULL, status = %s, stage = %s, "
-                "gpu_queued_at = now(), "
+                "gpu_queued_at = now(), message = %s, "
                 "release_count = release_count + 1 "
                 "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
                 "AND release_count < %s "
                 "RETURNING job_id",
-                (QUEUED, "queued", MAX_RELEASES),
+                (QUEUED, "queued",
+                 _retry_message("the GPU worker stopped responding",
+                                MAX_RELEASES),
+                 MAX_RELEASES),
             )
             requeued = [str(r[0]) for r in cur.fetchall()]
 
@@ -581,14 +624,24 @@ class JobStore:
         with self._connect() as conn, conn.cursor() as cur:
             # Try the bounded release first. The WHERE carries the bound, so a
             # racer that loses sees rowcount 0 and falls through to the failure.
+            # ``message`` is written in a SECOND statement below, after this one
+            # tells us which attempt this was: the text names the attempt count
+            # and that number only exists once the increment has happened.
             cur.execute(
                 "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL, "
                 "status = %s, stage = %s, gpu_queued_at = now(), "
                 "release_count = release_count + 1 "
-                "WHERE job_id = %s AND lease_owner = %s AND release_count < %s",
+                "WHERE job_id = %s AND lease_owner = %s AND release_count < %s "
+                "RETURNING release_count",
                 (QUEUED, "queued", str(job_id), owner, MAX_RELEASES),
             )
-            if cur.rowcount > 0:
+            row = cur.fetchone()
+            if row is not None:
+                cur.execute(
+                    "UPDATE mse.jobs SET message = %s WHERE job_id = %s",
+                    (_retry_message(message, MAX_RELEASES, attempt=row[0]),
+                     str(job_id)),
+                )
                 return "released"
             # Zero rows: either the lease is not ours (409) or the bound is
             # reached. Distinguish them, because they are not the same event.
@@ -614,13 +667,20 @@ class JobStore:
             # than a path -- but a guard that cannot refuse is not a guard.
             if not releases_are_terminal(row[0]):
                 return None
+            # The bound sentence is APPENDED to the caller's message, not
+            # substituted for it. The old form was ``message or <bound
+            # sentence>``, which read as though the sentence were a fallback --
+            # but the worker always supplies a message, so the sentence was
+            # never reached and the owner was never told that the job had
+            # already been retried to its limit. They would see "the GPU worker
+            # stopped responding" with no way to know a further attempt was not
+            # coming.
             cur.execute(
                 "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
                 "finished_at = now(), lease_owner = NULL, lease_expires_at = NULL "
                 "WHERE job_id = %s AND lease_owner = %s",
                 (FAILED, FAILED,
-                 message or f"the GPU worker could not complete this job after "
-                            f"{row[0]} attempts; try again later",
+                 _terminal_message(message, row[0]),
                  str(job_id), owner),
             )
             return "failed"

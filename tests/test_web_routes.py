@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "web"))
 
 import app as APP  # noqa: E402
 import db as DB  # noqa: E402
+import fields as FLD  # noqa: E402
 import jobs as JOBS  # noqa: E402
 import storage as STORE  # noqa: E402
 
@@ -132,7 +133,7 @@ class FakeDb:
         return []
 
     # set a job up as finished, with a mode table and field files on disk
-    def finish(self, job_id, store, n_modes=2):
+    def finish(self, job_id, store, n_modes=2, achieved_median_edge_m=None):
         grid = {"nx": 4, "ny": 3, "nz": 2, "origin": [0.0, 0.0, 0.0],
                 "spacing": [1.0, 1.0, 1.0]}
         self.jobs[str(job_id)].update(status=DB.DONE, stage=DB.DONE,
@@ -146,10 +147,15 @@ class FakeDb:
             store.write(STORE.job_key(job_id, f"mode_{index:02d}.bin"),
                         field.tobytes())
         self.modes[str(job_id)] = rows
+        manifest = {"units": "mm", "n_index": 1.0, "n_tets": 6,
+                    "n_edges": 12, "grid": grid, "modes": rows}
+        # Only written when the solver measured one, mirroring the real
+        # ``write_results``: a manifest that always carried the key would hide
+        # the "no measurement yet" branch behind a null.
+        if achieved_median_edge_m is not None:
+            manifest["achieved_median_edge_m"] = achieved_median_edge_m
         store.write(STORE.job_key(job_id, "modes.json"),
-                    json.dumps({"units": "mm", "n_index": 1.0, "n_tets": 6,
-                                "n_edges": 12, "grid": grid,
-                                "modes": rows}).encode())
+                    json.dumps(manifest).encode())
         store.write(STORE.job_key(job_id, "surface.glb"), b"glTF")
         return rows
 
@@ -505,6 +511,85 @@ def test_the_job_page_shows_the_feature_in_the_unit_the_owner_typed(tmp_path):
         assert found is not None, "the resolution element is absent from the page"
         assert " ".join(found.group(1).split()) == \
             f"requested mesh resolution {want_text}"
+
+
+def test_the_job_page_reports_the_achieved_edge_once_the_run_is_finished(tmp_path):
+    """The achieved median edge reaches the owner, in their own unit.
+
+    This drives the REAL path the lead named: the solver's ``modes.json``, read
+    back through ``web/fields.load_modes_json`` by the job route, rendered into
+    the page. The caption is computed by ``_resolution_caption``, which
+    re-expresses a metre measurement in the unit the owner TYPED -- and which
+    used to reference a bare ``MESH`` that does not exist in ``app.py``. That
+    was a NameError on the ``achieved_m`` branch, so every finished job with a
+    feature set would have 500'd. An HTTP 200 would not have caught it: the
+    branch only runs when a job is DONE *and* its manifest carries a
+    measurement, so the test must lay down both.
+
+    The second half is the honest-statement requirement: when the mesh landed
+    above the request, say so, and say whether it is inside the 1.6x allowance
+    the solver enforces. A bare ratio the reader has to judge reads as a defect.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+    box = trimesh.creation.box(extents=[200.0, 120.0, 80.0])
+    upload(client, data=box.export(file_type="obj").encode(),
+           units="nm", detail="5", feature_unit="nm")
+    (job,) = db.jobs.values()
+
+    # 1. BEFORE the run: no measurement exists, and the page says so rather
+    #    than inventing a number.
+    body = client.get(f"/jobs/{job['job_id']}").get_data(as_text=True)
+    assert "appears here once the run finishes" in " ".join(body.split())
+    assert "median element edge" not in body
+
+    # 2. The solver finishes and the worker writes the measurement into the
+    #    manifest, exactly as write_results does.
+    achieved_m = 6.1e-9          # 6.1 nm, i.e. above the 5 nm requested
+    db.finish(job["job_id"], store, achieved_median_edge_m=achieved_m)
+
+    response = client.get(f"/jobs/{job['job_id']}")
+    assert response.status_code == 200, (
+        "the finished job page raised -- check _resolution_caption's unit "
+        "lookup, which must use the module-level unit_scale_m"
+    )
+    detail = re.search(r'<p class="muted small" id="resolution-detail">(.*?)</p>',
+                       response.get_data(as_text=True), re.S)
+    assert detail is not None, "the resolution detail is absent from the page"
+    text = " ".join(detail.group(1).split())
+
+    # The achieved edge is in the OWNER'S unit (nm), not the object's and not
+    # metres: 6.1e-9 m must read as "6.1 nm".
+    assert "6.1 nm" in text, text
+    assert "1.22" in text, f"the over-request ratio is missing or wrong: {text}"
+    assert "1.6" in text, f"the allowance must be stated: {text}"
+
+    # 3. And the measurement came through the REAL reader, so it is the value
+    #    the solver wrote, not a number this test's store manufactured.
+    manifest = FLD.load_modes_json(
+        store.read(STORE.job_key(job["job_id"], "modes.json")))
+    assert manifest["achieved_median_edge_m"] == achieved_m
+
+
+def test_the_achieved_caption_honours_the_feature_unit_not_the_objects(tmp_path):
+    """The same physical measurement, three spellings, three true sentences.
+
+    The feature carries its OWN unit, so re-expressing the achieved median in
+    that unit is the only correct reading -- and the conversion goes through the
+    same table the form converted the input with. 0.27 mm, 270 um and 2.7e5 nm
+    are one length; a caption that printed metres would be true and unreadable,
+    and one that printed the object's units would describe a different object.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+    box = trimesh.creation.box(extents=[0.01, 0.007, 0.005])
+    upload(client, data=box.export(file_type="obj").encode(), units="m",
+           detail="0.2", feature_unit="mm")
+    (job,) = db.jobs.values()
+
+    db.finish(job["job_id"], store, achieved_median_edge_m=2.7e-4)
+    body = client.get(f"/jobs/{job['job_id']}").get_data(as_text=True)
+    assert "0.27 mm" in body, f"achieved edge not in the typed unit: {body[:400]}"
 
 
 def test_auto_leaves_the_feature_unset_rather_than_zero(tmp_path):

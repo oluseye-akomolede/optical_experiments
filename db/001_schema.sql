@@ -195,6 +195,26 @@ BEGIN
         ALTER TABLE mse.jobs ADD COLUMN min_feature_unit text;
     END IF;
 
+    -- DROP the superseded single column. Without this the "fresh and upgraded
+    -- end up identical" promise above is false for any database that ran the
+    -- intermediate version: `min_feature_mm` would survive as a dead column
+    -- that the code no longer reads or writes, and the two schema shapes would
+    -- differ. Adding and never dropping is how a schema accumulates columns
+    -- nobody can account for.
+    --
+    -- There is no data to migrate: `min_feature_mm` was a bare number in the
+    -- OBJECT's units, and the column it would map to (`min_feature_value`) has
+    -- no meaning without a `min_feature_unit` that the old row does not carry.
+    -- A backfill would have to guess, and a guessed unit is a wrong length --
+    -- the exact class of defect this change exists to remove. The old value is
+    -- not recoverable as a physical length, so it is not preserved.
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'min_feature_mm'
+    ) THEN
+        ALTER TABLE mse.jobs DROP COLUMN min_feature_mm;
+    END IF;
+
     -- NOT NULL DEFAULT 1: an old row is an unscaled upload by definition, so
     -- backfilling 1 is the true value, not a placeholder that has to be
     -- interpreted. The default is what keeps `scale` from ever being NULL in a

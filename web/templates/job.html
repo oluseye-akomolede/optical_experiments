@@ -17,9 +17,18 @@
   {% if resolution %}
     <p class="muted small" id="resolution-detail">
       You asked the mesh to resolve a smallest feature of
-      <strong>{{ resolution.requested }}</strong>. The elements it builds are
-      sized around that length, within a small allowance either way. This is the
-      size you asked for; it is not a measurement of the mesh that was built.
+      <strong>{{ resolution.requested }}</strong>.
+      {%- if resolution.achieved %} The mesh it built has a median element edge of
+      <strong>{{ resolution.achieved }}</strong>{%
+      if resolution.over_request %}, larger than you asked for by
+      {{ '%g'|format(resolution.achieved_m / resolution.requested_m) }}&times;{%
+      endif %}. Elements are allowed to come out up to
+      {{ '%g'|format(max_edge_overshoot) }}&times; the requested size before the
+      solver refuses the mesh, so a median in that band is the allowance being
+      used, not a fault — the frequencies are computed on the mesh that was
+      built, so this is a record of what they rest on.
+      {%- else %} This is the size you asked for; the achieved median element
+      edge appears here once the run finishes.{% endif %}
     </p>
   {% endif %}
   {# The EFFECTIVE size, stated in plain numbers. With a scale factor and um/nm

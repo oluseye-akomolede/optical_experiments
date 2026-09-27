@@ -498,6 +498,16 @@ def estimate_tet_count(surface, edge_length: float) -> tuple[int, float]:
     return int(volume / max(maxvolume, 1e-30)), volume
 
 
+# The median edge the LAST tetrahedralize() actually achieved, in metres on
+# the scaled object -- the measurement, as opposed to the target it was
+# asked for. The solver writes it into modes.json so the job page can show
+# the owner what they got next to what they asked for. Module state, the
+# same shape as mse_eigen.LAST_WORST_RESIDUAL: it describes the run that
+# just happened, and tetrahedralize returns (points, tets) so there is
+# nowhere else for it to travel.
+LAST_ACHIEVED_EDGE_M: float | None = None
+
+
 def tetrahedralize(
     surface,
     units: str,
@@ -708,6 +718,8 @@ def tetrahedralize(
             flush=True,
         )
 
+    global LAST_ACHIEVED_EDGE_M
+    LAST_ACHIEVED_EDGE_M = float(achieved)
     return points_m, tets
 
 

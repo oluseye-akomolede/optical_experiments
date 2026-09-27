@@ -848,3 +848,246 @@ def test_the_bench_lock_is_exclusive_within_a_process(tmp_path):
     first.release()
     assert second.acquire() is True
     second.release()
+
+
+# ---------------------------------------------------------------------------
+# 5. the GPU error CHAIN decides transient vs terminal
+# ---------------------------------------------------------------------------
+#
+# ``mse_eigen`` wraps a cuDSS failure as ``EigenError(msg) from exc``, so the
+# worker never sees the cuDSS exception itself. The top-level TYPE is therefore
+# the same for both events that matter here -- a GPU that would not come up
+# (transient) and a GPU that ran and rejected THIS job (terminal) -- and only the
+# ``__cause__`` chain tells them apart. These use the REAL ``EigenError`` rather
+# than a stub, because a stub that merely resembles it would not catch a change
+# to how the solver wraps its failures, which is the whole seam under test.
+
+def test_a_gpu_that_would_not_initialise_is_transient_through_the_wrapper():
+    """A dead/absent GPU must not fail the job forever.
+
+    The cupy types are the strongest evidence: they are raised by the runtime or
+    driver itself, never as a verdict about an eigenproblem.
+    """
+    from mse_eigen import EigenError
+
+    class CUDARuntimeError(RuntimeError):
+        pass
+
+    for cause in (
+        CUDARuntimeError("cudaErrorNoDevice: no CUDA-capable device is detected"),
+        RuntimeError("CUDA driver version is insufficient for CUDA runtime"),
+        RuntimeError("failed to initialise the cuDSS context"),
+        RuntimeError("CUDA context creation failed"),
+    ):
+        exc = EigenError("the eigensolver failed")
+        exc.__cause__ = cause
+        assert W.classify(exc) == "transient", (
+            f"{type(cause).__name__}: {cause} was called terminal; a GPU that "
+            f"is down would then fail every job permanently")
+
+
+def test_a_cudss_status_error_stays_terminal_even_inside_the_wrapper():
+    """A GPU that RAN and rejected this job is a verdict about the job.
+
+    ``ALLOC_FAILED`` is the case the lead named: re-running produces the same
+    answer, so requeueing it is the loop this function exists to prevent. The
+    status words are checked FIRST, so a message that also mentions
+    initialisation ('initialization failed after ALLOC_FAILED') reads terminal.
+    """
+    from mse_eigen import EigenError
+
+    for text in (
+        "cuDSS status 4: CUDSS_STATUS_ALLOC_FAILED",
+        "cudss execution failed: wrong parameter",
+        "the factorisation is singular",
+        "initialization succeeded but allocation failed",
+    ):
+        exc = EigenError("the eigensolver failed")
+        exc.__cause__ = RuntimeError(text)
+        assert W.classify(exc) == "terminal", (
+            f"{text!r} was called transient; a job that will always fail the "
+            f"same way would be requeued until the bound and then reported as "
+            f"an infrastructure problem, which it is not")
+
+
+def test_the_chain_is_walked_and_not_just_the_first_cause():
+    """Two wrappers deep is still the same event.
+
+    The worker's own code may wrap again before ``classify`` sees it, so the
+    walk must follow ``__context__`` as well as ``__cause__``. Without this a
+    doubly-wrapped GPU init failure is terminal, which is the silent half of
+    the bug.
+    """
+    from mse_eigen import EigenError
+
+    inner = RuntimeError("cudaErrorInsufficientDriver: driver too old")
+    middle = RuntimeError("could not build the solver")
+    middle.__context__ = inner
+    exc = EigenError("the eigensolver failed")
+    exc.__cause__ = middle
+    assert W.classify(exc) == "transient"
+
+
+def test_the_bound_sentence_and_the_workers_reason_both_reach_the_owner(
+        tmp_path, server):
+    """On the LAST attempt the owner gets both halves, not the reason alone.
+
+    ``release_jetson`` appends the bound sentence on the over-bound branch. The
+    bug it fixes was ``message or <bound sentence>``: the worker always sends a
+    non-empty message, so the bound sentence was shadowed and the owner was told
+    only why the last attempt failed -- never that this was the end of the
+    retries, which is the part they need to act on. Both parts are asserted
+    here, because either one alone was already being printed.
+    """
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    def gpu_down(job, store_in, store_out, stage=None):
+        # What the worker really sees when the GPU is absent: mse_eigen wraps
+        # the CUDA failure, and ``_owner_message`` maps it to the owner's text.
+        from mse_eigen import EigenError
+        exc = EigenError("the eigensolver failed")
+        exc.__cause__ = RuntimeError(
+            "cudaErrorNoDevice: no CUDA-capable device is detected")
+        raise exc
+
+    # The owner-facing reason, taken from the production mapping rather than
+    # retyped here: a test that restates the sentence checks its own copy.
+    reason = W._owner_message(
+        _wrapped_eigen("cudaErrorNoDevice: no CUDA-capable device is detected"))
+
+    worker = make_worker(server, tmp_path, solve=gpu_down)
+    for _ in range(DB.MAX_RELEASES):
+        worker.claim_loop(max_jobs=1)
+    # The retries are still claimable, and their message says so with the count.
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.QUEUED
+    assert "retrying (attempt" in row["message"], row["message"]
+    assert reason in row["message"], (
+        f"the reason was dropped from the retry message: {row['message']!r}")
+
+    # The attempt past the bound is the last, and its message carries both the
+    # reason and the fact that the retries are over.
+    worker.claim_loop(max_jobs=1)
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.FAILED
+    message = row["message"] or ""
+    assert reason in message, f"the owner lost the reason: {message!r}"
+    assert f"{DB.MAX_RELEASES} attempts" in message, (
+        f"the owner was never told the retries are over: {message!r}")
+
+    # And the reason must not blame the object: the GPU was down, the object was
+    # never even looked at. This is the sentence the owner reads on the page.
+    assert "simpler object" not in message, (
+        f"a GPU outage was reported to the owner as a fault in their object: "
+        f"{message!r}")
+    assert "graphics processor was not available" in message, message
+
+
+def _wrapped_eigen(text: str):
+    """An ``EigenError`` wrapping a cuDSS/CUDA failure, as mse_eigen raises it."""
+    from mse_eigen import EigenError
+    exc = EigenError("the eigensolver failed")
+    exc.__cause__ = RuntimeError(text)
+    return exc
+
+
+def test_the_achieve_path_stays_terminal_for_an_alloc_failure(tmp_path, server):
+    """ALWAYS a verdict, never a retry: the message the owner gets must be TRUE.
+
+    ``ALLOC_FAILED`` also arrives when another process on the GPU is holding the
+    memory, so the owner is told the two things they can actually act on rather
+    than "too detailed", which is a claim we cannot make. This drives it through
+    the production failure path so the MESSAGE, not just the classification, is
+    asserted.
+    """
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    def cudss_alloc_failure(job, store_in, store_out, stage=None):
+        from mse_eigen import EigenError
+        exc = EigenError("the eigensolver failed")
+        exc.__cause__ = RuntimeError("cuDSS status 4: CUDSS_STATUS_ALLOC_FAILED")
+        raise exc
+
+    worker = make_worker(server, tmp_path, solve=cudss_alloc_failure)
+    worker.claim_loop(max_jobs=1)
+
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.FAILED, (
+        "an ALLOC_FAILED was retried; it is a verdict about this job and "
+        "re-running produces the same one")
+    message = row["message"] or ""
+    assert "could not fit in the GPU's memory" in message, message
+    assert "try again later" in message, message
+    assert "too detailed" not in message, (
+        "the owner was told the object is too detailed, which ALLOC_FAILED does "
+        "not tell us -- another process may be holding the memory")
+
+
+def test_the_chain_walk_terminates_on_a_cycle():
+    """A self-referential chain must not hang the worker.
+
+    ``__context__`` is set automatically during ``raise ... from`` handling and
+    can point back at an ancestor. A walk without a visited-set spins forever
+    holding the job's lease, which is worse than any wrong classification.
+    """
+    exc = RuntimeError("boom")
+    exc.__context__ = exc
+    assert W.classify(exc) == "terminal"
+
+    a = RuntimeError("a")
+    b = RuntimeError("b")
+    a.__cause__ = b
+    b.__cause__ = a
+    assert W.classify(a) == "terminal"
+
+
+def test_gpu_memory_is_released_after_a_successful_job(tmp_path, server,
+                                                       monkeypatch):
+    """A warm worker must hand the device memory back when the job ends.
+
+    The worker is deliberately long-lived, so per-job allocations that are not
+    released accumulate. On the Jetson that is system RAM, and the first symptom
+    is the OS killing the worker -- which arrives as SIGKILL, so nothing gets
+    logged and the job looks hung until its lease expires.
+    """
+    calls = []
+    monkeypatch.setattr(W, "_release_gpu_memory", lambda: calls.append("free"))
+
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+    worker = make_worker(server, tmp_path, solve=FakeSolve())
+    worker.claim_loop(max_jobs=1)
+
+    assert server.jobs_db.jobs[job["job_id"]]["status"] == DB.DONE
+    assert calls == ["free"], (
+        "the GPU memory was not released after a successful job, or was "
+        "released more than once")
+
+
+def test_gpu_memory_is_released_after_a_failed_job(tmp_path, server,
+                                                   monkeypatch):
+    """The failure path leaks WORST, and it is the path people forget.
+
+    An exception between the two factorisations leaves the first one alive with
+    no local holding it on the way out of the frame -- the registry is what
+    makes it reachable. A cleanup wired only into the success branch would look
+    correct in every passing test and leak on exactly the runs that are already
+    going wrong.
+    """
+    calls = []
+    monkeypatch.setattr(W, "_release_gpu_memory", lambda: calls.append("free"))
+
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    def explodes(job, store_in, store_out, stage=None):
+        raise RuntimeError("the factorisation died halfway")
+
+    worker = make_worker(server, tmp_path, solve=explodes)
+    worker.claim_loop(max_jobs=1)
+
+    assert calls == ["free"], (
+        "the GPU memory was not released after a failed job -- this is the "
+        "path a per-job leak accumulates on")

@@ -641,22 +641,25 @@ class LeaseDb(RoutingDb):
         # most worth modelling: a double that requeued unconditionally would let
         # a test "prove" the loop terminates when the real SQL would cycle, and
         # would never exercise the failure branch at all.
+        # Both messages come from ``web/db.py``'s own helpers rather than being
+        # restated here. The form this double used to have -- ``message or
+        # <fixed string>`` on the over-bound branch, and no message at all on the
+        # retry branch -- was the DEFECT that item 2b fixed in the real store,
+        # faithfully copied. A double that models the bug instead of the fix
+        # makes every test written against it report the fixed code as correct
+        # for the wrong reason, and hides the regression when it comes back.
         if int(job.get("release_count", 0)) >= DB.MAX_RELEASES:
-            # The message the owner reads is the one from the run that finally
-            # failed -- here, the reason the caller passed. The earlier form used
-            # a fixed string, which matched neither ``web/db.py`` (which prefers
-            # the caller's message and falls back only when there is none) nor
-            # the lead's item D, and it would have hidden a worker that stopped
-            # sending one.
             job.update(status=DB.FAILED, stage=DB.FAILED,
-                       message=message or "the GPU worker could not complete "
-                                          "this job after several attempts; "
-                                          "try again later",
+                       message=DB._terminal_message(
+                           message, int(job.get("release_count", 0))),
                        lease_owner=None, lease_expires_at=None)
             return "failed"
+        attempt = int(job.get("release_count", 0)) + 1
         job.update(lease_owner=None, lease_expires_at=None,
                    status=DB.QUEUED, stage="queued",
-                   release_count=int(job.get("release_count", 0)) + 1)
+                   message=DB._retry_message(message, DB.MAX_RELEASES,
+                                             attempt=attempt),
+                   release_count=attempt)
         return "released"
 
     def fail_jetson(self, job_id, owner, message):
@@ -1075,8 +1078,20 @@ def test_release_hands_the_job_back_with_no_verdict(tmp_path, worker):
     assert row["status"] == DB.QUEUED, "a release must leave it claimable"
     assert row["lease_owner"] is None
     assert row["release_count"] == 1, "the release must be counted"
-    assert "the connection dropped" not in (row.get("message") or ""), (
-        "a release is not a verdict; it must not write a failure message")
+    # A release IS allowed to write a message now, and should: the owner sees
+    # "retrying (attempt 1 of 3): the connection dropped" while they wait, which
+    # is the honest thing to show. What it must not write is a TERMINAL verdict
+    # -- no "failed", no bound sentence, because the retries are not over. The
+    # earlier assertion here ("no message at all") was correct for a row that
+    # had no message column being written, and would now forbid the retry text
+    # the owner needs.
+    assert row["message"] == DB._retry_message("the connection dropped",
+                                               DB.MAX_RELEASES, attempt=1), (
+        "a release must record the retry and its attempt number, and nothing "
+        "that reads as a verdict")
+    assert "could not complete this job after" not in row["message"], (
+        "a release wrote the bound sentence; the owner would be told the job "
+        "was over while it is still queued")
 
 
 def test_a_release_on_a_lease_this_worker_does_not_hold_is_409(tmp_path,
@@ -1123,9 +1138,14 @@ def test_three_releases_fail_the_job_and_the_bound_is_the_same_in_both_copies(
     assert db.jobs["job-1"]["status"] == DB.FAILED
     assert db.jobs["job-1"]["lease_owner"] is None
     # The message is the one from the run that FINALLY failed (item D): the
-    # owner should read the cause that ended it, not an earlier one.
-    assert db.jobs["job-1"]["message"] == "and again", (
-        "the owner was not shown the failure that ended the job")
+    # owner should read the cause that ended it, not an earlier one. It also
+    # carries the bound sentence -- the owner has to be told the retries are
+    # over, or they will wait for an attempt that is not coming. The expected
+    # text comes from the production helper, not a copy retyped here.
+    assert db.jobs["job-1"]["message"] == DB._terminal_message(
+        "and again", DB.MAX_RELEASES), (
+        "the owner was not shown the failure that ended the job, or was not "
+        "told the retries were over")
 
 
 def test_two_interleaved_releases_cannot_both_requeue_past_the_bound(

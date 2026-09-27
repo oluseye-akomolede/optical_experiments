@@ -569,3 +569,127 @@ def _spd_matrix(n: int, seed: int = 7) -> "EIG.sparse.spmatrix":
 # stack raises instead of falling back, that both factorisations go through the
 # factory, that the refinement loop converges and is checked, and that the
 # backend and its worst residual reach the manifest.
+
+
+# ---------------------------------------------------------------------------
+# GPU memory: the warm worker must not accumulate device allocations
+# ---------------------------------------------------------------------------
+#
+# On the Jetson the GPU has UNIFIED memory, so a per-job factorisation that is
+# never released is system RAM -- and the MemoryMax cgroup does not reliably see
+# cuDSS/nvmap allocations, so the first symptom is the OS killing the worker.
+# These are tier 1: no GPU, no cupy. What they can prove is the SHAPE of the
+# teardown -- that every created factor is closed, that closing is idempotent,
+# and that the factors are closed BEFORE the pools are emptied.
+
+def _fake_cupy(events: list):
+    """A cupy module whose pools record when they were emptied.
+
+    The real interface is ``get_default_memory_pool()`` and
+    ``get_default_pinned_memory_pool()``, each returning an object with
+    ``free_all_blocks()``. Modelling it rather than passing a bare Mock matters:
+    a Mock would answer ANY call, so a release function that emptied the wrong
+    pool -- or emptied a pool that does not exist -- would still pass.
+    """
+    import types
+
+    class _Pool:
+        def __init__(self, name):
+            self.name = name
+
+        def free_all_blocks(self):
+            events.append(f"pool:{self.name}")
+
+    cp = types.ModuleType("cupy")
+    cp.get_default_memory_pool = lambda: _Pool("default")
+    cp.get_default_pinned_memory_pool = lambda: _Pool("pinned")
+    return cp
+
+
+def test_every_created_gpu_factor_is_closed_and_the_pools_are_emptied_after(
+        monkeypatch):
+    """The order is the whole point: pockets before floors.
+
+    Emptying a cupy pool while a live cuDSS factor still holds blocks reclaims
+    only the scratch cupy allocated around it -- the bulk is in the factor, and
+    it stays. So the assertion is not "both happened" but "close happened
+    first", which a test that only counted calls could not tell apart.
+    """
+    events = []
+
+    class _Solver:
+        def free(self):
+            events.append("solver.free")
+
+    factors = []
+    for _ in range(2):
+        obj = B._CudssFactor.__new__(B._CudssFactor)
+        obj.solver = _Solver()
+        obj.cp = None
+        factors.append(obj)
+
+    B._GPU_FACTORS.update(factors)
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(events))
+
+    closed = B.release_gpu_memory()
+
+    assert closed == 2, f"expected both factors closed, got {closed}"
+    assert events.count("solver.free") == 2, events
+    # Both frees precede both pool empties.
+    first_pool = min(i for i, e in enumerate(events) if e.startswith("pool:"))
+    last_free = max(i for i, e in enumerate(events) if e == "solver.free")
+    assert last_free < first_pool, (
+        f"a pool was emptied while a factor was still alive: {events}")
+    assert not B._GPU_FACTORS, "closed factors must leave the registry"
+
+
+def test_closing_a_factor_twice_is_safe(monkeypatch):
+    """Idempotent, because two owners may call it on the same unwind.
+
+    The worker's cleanup and the registry's own clear both reach the same
+    object, and this runs inside a ``finally``: a raise here would replace the
+    job's real error with a teardown error and lose the reason the job failed.
+    """
+    calls = []
+
+    class _Solver:
+        def free(self):
+            calls.append(1)
+
+    obj = B._CudssFactor.__new__(B._CudssFactor)
+    obj.solver = _Solver()
+    obj.close()
+    obj.close()
+
+    assert calls == [1], f"free() ran {len(calls)} times, want exactly 1"
+
+
+def test_a_factor_whose_device_is_gone_still_closes_quietly():
+    """``free()`` on a lost device raises; that must not escape.
+
+    A GPU reset, or an OOM kill already in flight, makes the teardown itself
+    fail. There is nothing to recover -- the memory is gone either way -- and
+    this runs on a path that may already be unwinding an exception, so the only
+    correct behaviour is silence.
+    """
+    class _Solver:
+        def free(self):
+            raise RuntimeError("CUDA error: device not available")
+
+    obj = B._CudssFactor.__new__(B._CudssFactor)
+    obj.solver = _Solver()
+    obj.close()                      # must not raise
+
+    assert obj.solver is None, "the reference must still be dropped"
+
+
+def test_release_gpu_memory_is_a_no_op_without_the_cuda_stack(monkeypatch):
+    """On the CPU backend there is nothing to release and no import to fail on.
+
+    The worker calls this on EVERY job, and most jobs run on the cluster. An
+    ImportError escaping here would fail clean CPU jobs for a reason that has
+    nothing to do with them.
+    """
+    monkeypatch.setitem(sys.modules, "cupy", None)
+    B._GPU_FACTORS.clear()
+    assert B.release_gpu_memory() == 0

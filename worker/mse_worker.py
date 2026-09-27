@@ -91,6 +91,104 @@ class LeaseLost(Exception):
     """
 
 
+# The words that mean "this GPU would not come up", as opposed to "this GPU
+# tried and could not do THIS". Matched case-insensitively on the message, which
+# is the only evidence available: cuDSS raises its status through nvmath, whose
+# exception carries the status name as text.
+def _solver_word_list(name: str, fallback: tuple) -> tuple:
+    """The solver's own word list for this distinction, or a local copy.
+
+    Both places need to read the same words: the worker decides whether to
+    requeue, and ``mse_maxwell_solver.owner_message`` decides what to TELL the
+    owner. Two hand-maintained copies would drift, and the drift would be
+    invisible -- a word added to one and not the other produces a job that is
+    requeued while its page blames the object, which is the false sentence this
+    pair of lists exists to prevent. The import is late because the worker must
+    start on a machine where the solver's heavy dependencies are absent.
+    """
+    try:
+        if str(_SOLVER_DIR) not in sys.path:
+            sys.path.insert(0, str(_SOLVER_DIR))
+        import mse_maxwell_solver as SOLVER  # noqa: PLC0415 - deliberately late
+    except Exception:  # noqa: BLE001 - no solver means classify() has no table
+        return fallback
+    return tuple(getattr(SOLVER, name, fallback))
+
+
+# The words that mean "this GPU would not come up", as opposed to "this GPU
+# tried and could not do THIS". Matched case-insensitively on the message, which
+# is the only evidence available: cuDSS raises its status through nvmath, whose
+# exception carries the status name as text.
+_GPU_INIT_WORDS = _solver_word_list("GPU_INIT_WORDS", (
+    "initializ", "initialis",     # "initialization failed", "could not initialise"
+    "no device", "no cuda", "no gpu",
+    "device not found", "driver",
+    "context creation", "context init",
+    "nvrtc", "cuda_driver",
+))
+# The words that mean the OPPOSITE -- a real answer from a working GPU about
+# THIS job. Checked FIRST, so a message containing both ('initialization failed
+# after ALLOC_FAILED') is read as terminal, which is the safe direction: a job
+# wrongly failed once can be re-uploaded, a job wrongly requeued loops forever.
+# The allocation family is spelled several ways depending on whether the message
+# comes from cuDSS (CUDSS_STATUS_ALLOC_FAILED), nvmath's prose ("allocation
+# failed") or the driver ("out of memory"). All of them are the GPU reporting on
+# THIS job, and all of them must beat an init word in the same message --
+# "initialization succeeded but allocation failed" is a GPU that came up and then
+# ran out of room, so requeueing it is the loop this list exists to prevent.
+# (Found by a test: the two spellings of "alloc failed" that were here did not
+# cover the third, and the init word won.) The allocation words are the solver's
+# own list; the rest are the worker's, because a cuDSS STATUS error reaches the
+# worker as text and the solver's owner_message never sees it
+# (releases are not passed through owner_message at all).
+_GPU_STATUS_WORDS = _solver_word_list("ALLOC_FAILURE_WORDS", (
+    "alloc_failed", "alloc failed", "allocation failed", "allocation_failed",
+    "out of memory", "outofmemory", "insufficient memory",
+)) + (
+    "singular", "not positive definite", "invalid value",
+    "execution failed", "wrong parameter",
+)
+
+
+def _wraps_a_gpu_init_failure(exc: BaseException) -> bool:
+    """Does the ``__cause__``/``__context__`` chain hold a GPU INIT failure?
+
+    ``mse_eigen`` wraps a cuDSS failure as ``EigenError(msg) from exc``, so the
+    worker never sees the cuDSS exception itself -- it must look through the
+    chain. Walking it is also what keeps this narrow: the top-level type is
+    ``EigenError`` for BOTH "the GPU would not initialise" (transient) and "the
+    factorisation hit ALLOC_FAILED" (terminal), and only the chain tells them
+    apart.
+
+    The line is drawn on the MESSAGE, because that is all the chain carries. A
+    status error wins over an init word when both appear: a GPU that came up,
+    ran, and then said ALLOC_FAILED is giving a verdict about the job, and
+    re-running it would produce the same verdict. Getting that backwards is the
+    loop this function exists to prevent.
+    """
+    seen: set[int] = set()
+    node: BaseException | None = exc
+    depth = 0
+    while node is not None and depth < 10 and id(node) not in seen:
+        seen.add(id(node))
+        depth += 1
+        name = type(node).__name__
+        text = f"{name}: {node}".lower()
+
+        # A status error anywhere in the chain means the GPU ran and answered.
+        if any(word in text for word in _GPU_STATUS_WORDS):
+            return False
+        # A CUDA TYPE is the strongest evidence: cupy raises these only when the
+        # runtime or driver itself is the problem.
+        if name in ("CUDARuntimeError", "CUDADriverError"):
+            return True
+        if any(word in text for word in _GPU_INIT_WORDS):
+            return True
+
+        node = node.__cause__ or node.__context__
+    return False
+
+
 def classify(exc: BaseException) -> str:
     """Is this failure TERMINAL (this job can never succeed) or TRANSIENT?
 
@@ -153,6 +251,18 @@ def classify(exc: BaseException) -> str:
     if name.startswith("CUDA") or name in ("CudaError", "GpuInitError"):
         # cuDSS/CUDA initialisation. Documented on this box as a state the
         # process recovers from on restart, not a property of the job.
+        return "transient"
+    if _wraps_a_gpu_init_failure(exc):
+        # The SAME event as the branch above, one wrapper deeper. ``mse_eigen``
+        # raises ``EigenError(...) from exc`` when cuDSS fails, so a GPU that
+        # would not initialise reaches here as an ``EigenError`` and the name
+        # check above cannot see it. Without this the job is failed forever for
+        # a fault that clears on the next worker.
+        #
+        # Deliberately narrow: ONLY initialisation-type GPU faults. A cuDSS
+        # STATUS error (ALLOC_FAILED, a singular factor) is a verdict about the
+        # data in this job and must stay terminal -- see the docstring of
+        # ``_wraps_a_gpu_init_failure`` for where that line is drawn.
         return "transient"
     if isinstance(exc, APIError):
         # The APP could not be reached -- the job never ran. A 4xx that means
@@ -727,6 +837,17 @@ class Worker:
             # ``release`` is idempotent: the loop calls it again after a claim
             # comes back empty, and that second call is a no-op.
             self.lock.release()
+            # Free the GPU memory this job held, on success AND failure. This
+            # process is deliberately WARM -- the CUDA context and the solver's
+            # imports are built once and kept -- but the FACTORISATIONS are
+            # per-job and must not accumulate. On the Jetson the GPU has unified
+            # memory, so a leak here is system RAM, and the ``MemoryMax`` cgroup
+            # does not reliably account for cuDSS/nvmap allocations: two large
+            # jobs back to back would climb until the OS OOM-killed the worker.
+            # A host OOM kill arrives as SIGKILL with no exception, so it is not
+            # a ``classify()`` case -- the lease simply expires and the app
+            # requeues the row. This is what stops that happening.
+            _release_gpu_memory()
 
     def _done(self, job_id: str, work_dir: Path, summary) -> None:
         if self._lease_lost:
@@ -929,6 +1050,28 @@ class StageReporter:
     def set_stage(self, _job_id, _status, stage=None, **_ignored):
         if stage:
             self.stage = str(stage)
+
+
+def _release_gpu_memory() -> None:
+    """Hand the backend's GPU memory back between jobs. Never raises.
+
+    Lives here rather than inline so the tier-1 tests can assert the ORDER
+    (factors closed before the pools are emptied) and that it is called on both
+    the success and the failure path, without a GPU present. A failure to free
+    is logged and swallowed: this runs in a ``finally``, and turning it into a
+    job failure would report an infrastructure cleanup problem as a problem with
+    the owner's object.
+    """
+    try:
+        if str(_SOLVER_DIR) not in sys.path:
+            sys.path.insert(0, str(_SOLVER_DIR))
+        import mse_backend  # noqa: PLC0415 - deliberately late, as elsewhere
+
+        closed = mse_backend.release_gpu_memory()
+        if closed:
+            print(f"[mse-worker] freed {closed} GPU factorisation(s)", flush=True)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not fail a job
+        print(f"[mse-worker] could not release GPU memory: {exc!r}", flush=True)
 
 
 def _owner_message(exc: BaseException) -> str:

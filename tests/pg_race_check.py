@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """Prove the two SQL properties a tier-1 double CANNOT prove.
 
-Run against a THROWAWAY Postgres, never production:
+Run against a THROWAWAY Postgres, never production. The connection comes from
+the ENVIRONMENT, never from argv: a DSN on the command line is visible to every
+seat's ``ps`` on this shared VM, and the habit leaks real passwords even when
+the password in question is a throwaway container's. There is deliberately no
+``--dsn`` flag, so the insecure form is not even expressible:
 
-    DSN="postgresql://postgres:pw@127.0.0.1:55432/msecheck"
-    .venv-mse/bin/python tests/pg_race_check.py --dsn "$DSN"
+    export DATABASE_URL="postgresql://postgres:pw@127.0.0.1:55432/msecheck"
+    .venv-mse/bin/python tests/pg_race_check.py
+
+The individual ``PGHOST`` / ``PGPORT`` / ``PGUSER`` / ``PGPASSWORD`` /
+``PGDATABASE`` variables work too -- ``DATABASE_URL`` wins if both are set, which
+is libpq's own precedence. ``PGPASSWORD`` is no better on the process table than
+argv is, but it is at least not in this file's documented command line; for a
+throwaway container either is safe, and for a real one the connection should be
+reached through ``~/.pgpass`` instead.
 
 Run it against a FRESH database, and do not trust a second run on a dirty one.
 This check does not clean up after itself, and three of its legs depend on being
@@ -207,6 +218,58 @@ def check_feature_triplet_roundtrip(conn, r: Result, JobStore):
             f"unit={got.get('min_feature_unit')!r} (want 2e-04 / 0.2 / 'nm')")
 
 
+def check_upgrade_matches_a_fresh_schema(conn, r: Result, JobStore, db_module):
+    """A2c: an upgraded database has the SAME columns as a fresh one.
+
+    ``db/001_schema.sql`` states this promise in a comment, and states it for a
+    reason: a column that exists in one shape and not the other is read by nobody
+    on one deployment and by everybody on the other, so the same code works on
+    one machine and fails on the next. It is claimed in prose and was FALSE --
+    ``min_feature_mm`` survived the upgrade as a dead column, because the file
+    added columns and never dropped a superseded one. Measured before the fix:
+    fresh and upgraded column sets differed by exactly that column.
+
+    A double cannot check this: the property is about two REAL schema shapes.
+    Run in a transaction that is rolled back, so the legs after this one see the
+    schema they expect.
+    """
+    with conn.cursor() as cur:
+        cur.execute("BEGIN")
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'mse' AND table_name = 'jobs'
+            ORDER BY column_name
+        """)
+        fresh = [row[0] for row in cur.fetchall()]
+        # Reconstruct a pre-rename shape: drop the three new columns and restore
+        # the one they replaced, then run the project's own upgrade path.
+        cur.execute("ALTER TABLE mse.jobs DROP COLUMN IF EXISTS min_feature_value")
+        cur.execute("ALTER TABLE mse.jobs DROP COLUMN IF EXISTS min_feature_unit")
+        cur.execute("ALTER TABLE mse.jobs DROP COLUMN IF EXISTS min_feature_m")
+        cur.execute("ALTER TABLE mse.jobs ADD COLUMN IF NOT EXISTS "
+                    "min_feature_mm double precision")
+        # The PROJECT's own DDL file, read through the SAME resolver
+        # ``apply_schema`` uses -- so this leg upgrades with the real SQL, not a
+        # retyped fragment that could agree with itself while disagreeing with
+        # the file. psycopg2 runs a multi-statement string as one implicit
+        # transaction, which is how the file's DO blocks are written.
+        with open(db_module._schema_path(), encoding="utf-8") as handle:
+            cur.execute(handle.read())
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'mse' AND table_name = 'jobs'
+            ORDER BY column_name
+        """)
+        upgraded = [row[0] for row in cur.fetchall()]
+        cur.execute("ROLLBACK")
+
+    r.check("A2c an upgraded schema has exactly the columns a fresh one has "
+            "(an ADD-only migration leaves dead columns behind)",
+            fresh == upgraded,
+            f"fresh-only={sorted(set(fresh) - set(upgraded))} "
+            f"upgrade-only={sorted(set(upgraded) - set(fresh))}")
+
+
 def _race(conn, dsn, r: Result, col: str, bound: int, rounds: int = 60,
           predicate: bool = True):
     """Two sessions, each reading `col`, meeting at a barrier, then writing.
@@ -225,8 +288,8 @@ def _race(conn, dsn, r: Result, col: str, bound: int, rounds: int = 60,
     for _ in range(rounds):
         jid = str(uuid.uuid4())
         insert_job(conn, jid, **{"lease_owner": "w-race"})
-        a = psycopg2.connect(dsn)
-        b = psycopg2.connect(dsn)
+        a = psycopg2.connect(**dsn)
+        b = psycopg2.connect(**dsn)
         a.autocommit = b.autocommit = True
         bar = threading.Barrier(2)
 
@@ -263,7 +326,7 @@ def _race(conn, dsn, r: Result, col: str, bound: int, rounds: int = 60,
     return worst
 
 
-def check_release_bound(conn, r: Result, bound: int, dsn: str, JobStore,
+def check_release_bound(conn, r: Result, bound: int, dsn: dict, JobStore,
                         db_module):
     """B2: the bound must be enforced INSIDE the UPDATE, not by the caller.
 
@@ -592,32 +655,52 @@ def check_expiry_bound_is_terminal(conn, r: Result, JobStore, bound: int):
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dsn", required=True,
-                    help="throwaway Postgres DSN -- NEVER production")
+    ap = argparse.ArgumentParser(
+        description="Race/lease checks against a throwaway Postgres. The "
+                    "connection is read from DATABASE_URL or the standard "
+                    "PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE variables; "
+                    "there is deliberately no --dsn flag.")
     ap.add_argument("--bound", type=int, default=3,
                     help="release bound the code uses (default 3)")
     args = ap.parse_args()
+
+    import os  # noqa: PLC0415
 
     import psycopg2  # noqa: PLC0415
     from psycopg2.extensions import parse_dsn  # noqa: PLC0415
     from mse_db_shim import load_db_module  # noqa: PLC0415
 
-    # JobStore takes a parsed dsn dict (web/db.py:99 -> _connect reads
-    # dsn["host"] etc), so parse the URL rather than passing the string. Parse it
-    # with psycopg2's own parser so the URL is interpreted exactly as
-    # psycopg2.connect would read it -- one reading, not two.
-    params = parse_dsn(args.dsn)
+    # The connection is assembled from the ENVIRONMENT so no password ever
+    # appears on argv, where any seat's `ps` can read it. Building the dict
+    # ourselves (rather than handing psycopg2.connect() no arguments and letting
+    # libpq pick the variables up) is what makes the checking possible: we need
+    # the same values as a parsed dict for JobStore, and we want to refuse
+    # loudly when nothing is configured rather than let libpq silently fall back
+    # to a local socket and a same-named role.
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if url:
+        # psycopg2's own parser, so the URL is read exactly as connect() would.
+        params = parse_dsn(url)
+    else:
+        params = {k: os.environ.get(f"PG{k.upper()}", "")
+                  for k in ("host", "port", "dbname", "user", "password")}
     dsn = {
-        "host": params.get("host", "localhost"),
-        "port": params.get("port", "5432"),
-        "dbname": params.get("dbname", ""),
-        "user": params.get("user", ""),
-        "password": params.get("password", ""),
+        "host": params.get("host") or "localhost",
+        "port": params.get("port") or "5432",
+        "dbname": params.get("dbname") or "postgres",
+        "user": params.get("user") or "postgres",
+        "password": params.get("password") or "",
     }
+    if not url and not any(os.environ.get(f"PG{k.upper()}")
+                           for k in ("host", "dbname", "user")):
+        raise SystemExit(
+            "No connection configured. Set DATABASE_URL, or at least PGHOST/"
+            "PGDATABASE/PGUSER. This check must be pointed at a THROWAWAY "
+            "Postgres -- it writes to the schema and does not clean up.")
+
     DSN_OF[0] = dsn
     r = Result()
-    conn = psycopg2.connect(args.dsn)
+    conn = psycopg2.connect(**dsn)
     try:
         db_module = load_db_module()
         JobStore = db_module.JobStore
@@ -632,7 +715,8 @@ def main() -> int:
         print("schema applied via web/db.py:JobStore.apply_schema()")
         check_claim_columns(conn, r, JobStore)
         check_feature_triplet_roundtrip(conn, r, JobStore)
-        check_release_bound(conn, r, args.bound, args.dsn, JobStore, db_module)
+        check_upgrade_matches_a_fresh_schema(conn, r, JobStore, db_module)
+        check_release_bound(conn, r, args.bound, dsn, JobStore, db_module)
         # The expiry path is its own route (a worker that DIES never calls
         # /release), so it gets its own legs rather than reusing the release
         # ones with a different caller.
