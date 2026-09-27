@@ -4,7 +4,14 @@
   <h1>Upload an object</h1>
   <p class="muted">
     Send a closed (<em>watertight</em>) <strong>.obj</strong> model. We treat it as a
-    hollow metal cavity and compute its {{ 20 }} lowest optical modes.
+    hollow metal cavity and compute its lowest optical modes.
+  </p>
+  <p class="muted small">
+    One thing to know before you trust a number: the walls are modelled as a
+    <em>perfect conductor</em>. That is an excellent approximation for a real metal at
+    microwave frequencies and a rough one at optical frequencies, where the field
+    penetrates the metal and the true resonance shifts. Treat these frequencies as the
+    ideal-cavity answer, not a measured one.
   </p>
   <form method="post" enctype="multipart/form-data" class="upload">
     <label>Model file (.obj, up to {{ max_mb }} MB)
@@ -34,17 +41,30 @@
       about 1.5 for glass. More modes means a finer mesh and a longer solve; the
       mesh grows in proportion to this number.
     </p>
-    <label>Smallest feature (mm) &mdash; optional
-      <input type="text" name="detail" value="auto" placeholder="auto"
-             pattern="auto|([0-9]*\.?[0-9]+)">
-    </label>
+    <div class="row">
+      <label>Smallest feature ({{ default_units }}) &mdash; optional
+        <input type="text" name="detail" value="auto" placeholder="auto"
+               pattern="auto|([0-9]*\.?[0-9]+)">
+      </label>
+      <label>Scale factor &mdash; optional
+        <input type="text" name="scale" value="" placeholder="1"
+               pattern="[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?">
+      </label>
+    </div>
     <p class="muted small">
-      Leave this on <strong>auto</strong> for the default resolution, which is set by
-      the physics of the modes you asked for. If your object has fine detail the modes
-      depend on &mdash; a thin wall, a narrow gap &mdash; enter its size in millimetres
-      here and the mesh will be refined to resolve it. Setting it larger than the
-      automatic value has no effect: the mesh is never made coarser than the detail
-      you name.
+      Leave the feature size on <strong>auto</strong> for the default resolution, which
+      is set by the physics of the modes you asked for. If your object has fine detail
+      the modes depend on &mdash; a thin wall, a narrow gap &mdash; enter its size in the
+      units above and the mesh will be refined to resolve it. Setting it larger than the
+      automatic value has no effect: the mesh is never made coarser than the detail you
+      name.
+    </p>
+    <p class="muted small">
+      The <strong>scale factor</strong> multiplies the model before anything else looks
+      at it, so <code>1000</code> turns a model drawn in millimetres into one 1000 times
+      larger. Leave it blank for the model exactly as it is. If your .obj has no stated
+      units, this is how you say how big it really is &mdash; and the size you state is
+      the size whose modes you get.
     </p>
     <button type="submit">Compute modes</button>
   </form>

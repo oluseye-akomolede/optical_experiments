@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import gzip
 import os
+import sys
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from flask import (Flask, abort, flash, jsonify, make_response, redirect,
                    render_template, request, send_file, url_for)
@@ -33,7 +35,8 @@ import fields as FLD
 import jobs as JOBS
 import storage as STORE
 import worker_api as WORKER
-from meshing import (UploadError, estimate_tets, load_surface, validate_upload)
+from meshing import (UploadError, effective_edge_mm, estimate_tets,
+                      load_surface, validate_upload)
 
 #: where the solver puts one mode's field, and the ONE place that decides it.
 #: Both the index (which reads a size to decide `available`) and the fetch route
@@ -109,6 +112,7 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
     def job_page(job_id):
         job = _require_job(jobs_db, job_id)
         return render_template("job.html", job=job,
+                              effective_size=_effective_size(job),
                               queue_position=jobs_db.queue_position(job_id))
 
     # -- JSON the page polls ----------------------------------------------
@@ -297,7 +301,9 @@ def run_tick(store, jobs_db, launcher, log=print) -> dict:
 
     try:
         name = launcher.create(job["job_id"], job["units"], job["n_index"],
-                               job["n_modes"])
+                               job["n_modes"],
+                               min_feature_mm=job.get("min_feature_mm"),
+                               scale=job.get("scale", 1.0) or 1.0)
     except JOBS.QuotaExceeded:
         # The quota counts finished Jobs, so a 403 here is "wait", not "fail".
         result["waited"] = True
@@ -576,6 +582,22 @@ def _handle_upload(app, store, jobs_db):
             flash("The smallest feature must be greater than zero millimetres.")
             return redirect(url_for("index"))
 
+    # The free scale factor: the object is multiplied by this before anything
+    # measures it. Blank or 1 means "as uploaded", which is also what every job
+    # created before this control existed gets.
+    scale_text = (request.form.get("scale") or "").strip()
+    scale = 1.0
+    if scale_text:
+        try:
+            scale = float(scale_text)
+        except ValueError:
+            flash("The scale must be a number, or left blank.")
+            return redirect(url_for("index"))
+        if not (CFG.MIN_SCALE <= scale <= CFG.MAX_SCALE) or scale != scale:
+            flash(f"The scale must be between {CFG.MIN_SCALE:g} and "
+                  f"{CFG.MAX_SCALE:g}.")
+            return redirect(url_for("index"))
+
     data = uploaded.read()
     try:
         validate_upload(uploaded.filename, data, CFG.MAX_UPLOAD_BYTES)
@@ -589,7 +611,8 @@ def _handle_upload(app, store, jobs_db):
     # failed estimate must never send a job to the slower machine, and it is the
     # failure mode this rig keeps finding where a non-answer is read as one.
     surface = load_surface(data)
-    est_tets = estimate_tets(surface, n_modes, units, c=CFG.est_tets_c())
+    est_tets = estimate_tets(surface, n_modes, units, c=CFG.est_tets_c(),
+                             min_feature_mm=min_feature_mm, scale=scale)
 
     if est_tets > CFG.upload_refuse_tets():
         flash(
@@ -610,7 +633,8 @@ def _handle_upload(app, store, jobs_db):
         return redirect(url_for("index"))
 
     jobs_db.create_job(job_id, uploaded.filename, units, n_index,
-                       n_modes, target=target, est_tets=est_tets)
+                       n_modes, target=target, est_tets=est_tets,
+                       min_feature_mm=min_feature_mm, scale=scale)
 
     # Try to start it right away; if the slot is busy it simply stays queued and
     # the tick will pick it up.
@@ -631,6 +655,46 @@ def _require_job(jobs_db, job_id):
     if job is None:
         abort(404)
     return job
+
+
+def _effective_size(job: dict) -> str | None:
+    """How big this object is inside the solver, in human units.
+
+    Shown because neither `units` nor `scale` says it alone: a model 2 units
+    across at scale 1000 is 2 km, and the frequencies that come back are the
+    frequencies of the 2 km object. Reporting the effective size is what lets a
+    surprising result be traced to a scale factor rather than argued about.
+
+    Reads ONLY the job row -- no surface, no storage -- because it is called on
+    every job-page render, including long after the result exists and the
+    upload's own geometry is no longer the thing being displayed.
+
+    Returns ``None`` when there is nothing to scale: an unscaled job's size is
+    whatever the .obj said, and inventing a number for it would be worse than
+    saying nothing.
+    """
+    try:
+        scale = job.get("scale")
+        n_modes = int(job.get("n_modes") or CFG.DEFAULT_N_MODES)
+        units = job.get("units") or CFG.DEFAULT_UNITS
+        factor = float(scale) if scale not in (None, "") else 1.0
+        if factor == 1.0:
+            return None
+        root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        import mse_meshing as MESH  # noqa: PLC0415 - deliberately late, as elsewhere
+
+        # The equivalent size in mm, which is the unit the owner reads the
+        # upload form in: scaling by 1000 in mm is the same object as 1000x the
+        # numbers, and mm is what makes the result comparable to the form.
+        per_mm = MESH.unit_scale("mm") / MESH.unit_scale(units)
+        equivalent_mm = factor * per_mm
+        if equivalent_mm >= 1000.0:
+            return f"{equivalent_mm / 1000.0:,.4g} m of model per unit of file"
+        return f"{equivalent_mm:,.4g} mm of model per unit of file"
+    except Exception:  # noqa: BLE001 - a caption must never break the page
+        return None
 
 
 def _safe_result_name(name: str) -> bool:

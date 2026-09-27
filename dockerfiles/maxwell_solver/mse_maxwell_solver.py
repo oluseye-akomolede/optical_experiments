@@ -117,6 +117,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"samples along the longest axis (default: {DEFAULT_GRID})")
     parser.add_argument("--epw", type=float, default=None,
                         help="edges per wavelength for mesh resolution (bench use)")
+    parser.add_argument("--min-feature", type=float, default=None,
+                        metavar="SIZE",
+                        help="smallest feature to resolve, in --units (default: "
+                             "the physics edge alone)")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="multiply every vertex by this before any "
+                             "measurement (default: 1.0)")
     parser.add_argument("--quiet", action="store_true", help="less progress logging")
     return parser
 
@@ -131,7 +138,9 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
           store_in: STORE.ObjectStore, store_out: STORE.ObjectStore,
           max_tets: int, grid: int, verbose: bool = True,
           db: "mse_db.JobStore | None" = None,
-          backend: str | None = None):
+          backend: str | None = None,
+          min_feature_mm: float | None = None,
+          scale: float = 1.0):
     """Run the pipeline and write every result. Returns a summary dict.
 
     ``backend`` selects the solver backend (``cpu``/``gpu``); ``None`` reads
@@ -139,6 +148,11 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
     to :func:`mse_eigen.solve_modes`, so the mesh-count guard below and the
     factorisation cannot disagree about which machine is running -- reading the
     env twice would let a test set it after the guard had already decided.
+
+    ``min_feature_mm`` and ``scale`` reach the mesh only, and they are the same
+    two numbers the app used for its ``est_tets``; if they were applied in one
+    place and not the other, routing would be wrong for exactly the detailed
+    jobs the GPU exists for.
 
     Raises on failure after recording the stage that failed; the caller turns
     that into a ``failed`` status and a non-zero exit.
@@ -167,6 +181,7 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
     points_m, tets = MESH.tetrahedralize(
         surface, units, n_modes=n_modes, n_index=n_index,
         max_tets=max_tets, verbose=verbose,
+        min_feature_mm=min_feature_mm, scale=scale,
     )
     timings["meshing"] = time.time() - t0
 
@@ -258,6 +273,7 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
         job_id, store_out, surface, points_m, tets, edges, tet_edges, signs,
         eigenvectors, k, k0, freq_hz, wavelength_m, units, n_index, grid,
         free_edges=free_edges, n_edges=n_edges, verbose=verbose,
+        min_feature_mm=min_feature_mm, scale=scale,
     )
     timings["writing"] = time.time() - t0
     timings["total"] = time.time() - t_start
@@ -291,7 +307,7 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
 def write_results(job_id, store_out, surface, points_m, tets, edges, tet_edges,
                   signs, eigenvectors, k, k0, freq_hz, wavelength_m,
                   units, n_index, grid, free_edges=None, n_edges=None,
-                  verbose=True):
+                  verbose=True, min_feature_mm=None, scale=1.0):
     """Write surface.glb, modes.json, mode_XX.bin and mode_XX.vtu.
 
     ``eigenvectors`` are the PEC-reduced vectors; ``free_edges``/``n_edges`` let
@@ -361,6 +377,12 @@ def write_results(job_id, store_out, surface, points_m, tets, edges, tet_edges,
         # comparing them needs to know which is which without the log.
         "solver_backend": EIG.LAST_BACKEND_DESCRIPTION,
         "solver_worst_residual": EIG.LAST_WORST_RESIDUAL,
+        # What the mesh was actually asked for. The units alone do not pin the
+        # physical size once a scale factor exists, and the viewer, the bench
+        # and the next reader all need to know which object produced these
+        # frequencies without re-reading the Job.
+        "scale": float(scale),
+        "min_feature": None if min_feature_mm is None else float(min_feature_mm),
         "grid": {
             "nx": int(nx), "ny": int(ny), "nz": int(nz),
             "origin": [float(v) for v in origin],
@@ -468,6 +490,7 @@ def main(argv=None) -> int:
             job_id, args.units, args.n_index, args.n_modes,
             store_in, store_out, args.max_tets, args.grid,
             verbose=verbose, db=db,
+            min_feature_mm=args.min_feature, scale=args.scale,
         )
     except BaseException as exc:  # noqa: BLE001 - record, then re-raise as exit code
         print(f"[mse] FAILED: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)

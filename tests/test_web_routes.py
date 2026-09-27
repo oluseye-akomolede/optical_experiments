@@ -50,7 +50,8 @@ class FakeDb:
 
     # writes
     def create_job(self, job_id, filename, units, n_index, n_modes,
-                   target=DB.CLUSTER, est_tets=None):
+                   target=DB.CLUSTER, est_tets=None,
+                   min_feature_mm=None, scale=1.0):
         self.jobs[str(job_id)] = {
             "job_id": str(job_id), "created_at": "2026-09-26T00:00:00+00:00",
             "original_filename": filename, "units": units, "n_index": n_index,
@@ -58,6 +59,7 @@ class FakeDb:
             "message": None, "k8s_job_name": None, "peak_rss_mb": None,
             "finished_at": None,
             "target": target, "est_tets": est_tets,
+            "min_feature_mm": min_feature_mm, "scale": scale,
         }
 
     def mark_running(self, job_id, name):
@@ -185,7 +187,8 @@ class FakeLauncher:
             return {}                      # the e5b2e3e behaviour
         return {n: r for n, r in self.failed.items() if n in self.active}
 
-    def create(self, job_id, units, n_index, n_modes):
+    def create(self, job_id, units, n_index, n_modes,
+               min_feature_mm=None, scale=1.0):
         if self.quota_full:
             raise JOBS.QuotaExceeded("exceeded quota: count/jobs.batch")
         if self.fail_with is not None:
@@ -193,6 +196,16 @@ class FakeLauncher:
         name = JOBS.job_name(job_id)
         self.created.append({"job_id": str(job_id), "units": units,
                              "n_index": n_index, "n_modes": n_modes,
+                             "min_feature_mm": min_feature_mm, "scale": scale,
+                             # recorded so a test can assert the OPTIONAL flag is
+                             # absent, not merely falsy -- the real manifest omits
+                             # --min-feature rather than passing a zero, and that
+                             # distinction is what keeps 'auto' meaning 'no opinion'
+                             "args": list(JOBS.build_job_manifest(
+                                 job_id, units, n_index, n_modes, "img", "sec",
+                                 "ns", min_feature_mm=min_feature_mm,
+                                 scale=scale)["spec"]["template"]["spec"]
+                                 ["containers"][0]["args"]),
                              "name": name})
         self.active.append(name)
         return name
@@ -219,12 +232,22 @@ def closed_box_bytes():
     return trimesh.creation.box(extents=[10, 7, 5]).export(file_type="obj").encode()
 
 
-def upload(client, filename="box.obj", data=None, units="mm", n_index="1.0"):
-    return client.post("/", data={
+def upload(client, filename="box.obj", data=None, units="mm", n_index="1.0",
+           **extra):
+    """POST the upload form.
+
+    ``**extra`` carries the optional controls (``detail``, ``scale``) and is the
+    reason this helper does not have to grow a parameter every time the form
+    does: the fields are form values, and a test that names the one it cares
+    about reads better than a positional list nobody can remember.
+    """
+    fields = {
         "meshfile": (io_bytes(data if data is not None else closed_box_bytes()),
                      filename),
         "units": units, "n_index": n_index,
-    }, content_type="multipart/form-data")
+    }
+    fields.update(extra)
+    return client.post("/", data=fields, content_type="multipart/form-data")
 
 
 def io_bytes(data):
@@ -381,6 +404,90 @@ def test_the_upload_form_options_reach_the_job(tmp_path):
     assert (job["units"], job["n_index"]) == ("cm", 1.5)
     assert launcher.created[0]["units"] == "cm"
     assert launcher.created[0]["n_index"] == 1.5
+
+
+def test_the_detail_option_reaches_the_solver_not_just_the_form(tmp_path):
+    """The field the whole row exists for: it must not stop at the row.
+
+    ``min_feature_mm`` was accepted and validated and then dropped, so the mesh
+    was built at the physics edge while the route was computed as if it were
+    not. This asserts the full path the lead asked for -- the row AND the Job
+    the solver gets handed -- because passing one and not the other is exactly
+    the half-wired state that produced the bug.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    # 0.2 mm on the test's box is below the physics edge but still inside the
+    # cap. Worth knowing: a feature fine enough to blow the cap is REFUSED at
+    # upload rather than queued, which is the conservative-estimate behaviour
+    # doing its job -- 0.05 mm on this box estimates 39.2M elements.
+    upload(app.test_client(), detail="0.2")
+    (job,) = db.jobs.values()
+
+    assert job["min_feature_mm"] == 0.2
+    assert launcher.created[0]["min_feature_mm"] == 0.2
+    assert "--min-feature" in launcher.created[0]["args"]
+
+
+def test_auto_leaves_the_feature_unset_rather_than_zero(tmp_path):
+    """'auto' must be None, not 0.0 -- 0 is an edge length, and a wrong one.
+
+    A stored 0 would reach the solver as a declared feature of zero, which the
+    solver's own guard would then have to rescue. The absence has to stay an
+    absence; this is the could-not-ask shape at the form boundary.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    upload(app.test_client(), detail="auto")
+    (job,) = db.jobs.values()
+
+    assert job["min_feature_mm"] is None
+    assert launcher.created[0]["min_feature_mm"] is None
+    # and the job the solver is handed must not carry the flag at all
+    assert "--min-feature" not in launcher.created[0].get("args", [])
+
+
+def test_the_scale_reaches_the_row_and_the_job(tmp_path):
+    app, _store, db, launcher = make_app(tmp_path)
+    upload(app.test_client(), scale="1000")
+    (job,) = db.jobs.values()
+
+    assert job["scale"] == 1000.0
+    assert launcher.created[0]["scale"] == 1000.0
+
+
+def test_an_absent_scale_is_one_not_none(tmp_path):
+    """Blank must mean 1.0, so nothing downstream ever multiplies by None.
+
+    And the flag must be OMITTED, not passed as 1.0: an unscaled job's Job
+    spec has to stay byte-identical to what it was before the scale control
+    existed, because that spec is what the pre-existing tests were written
+    against and a gratuitous extra argument is the kind of change that quietly
+    invalidates their expectations.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+
+    assert job["scale"] == 1.0
+    assert launcher.created[0]["scale"] == 1.0
+    assert "--scale" not in launcher.created[0]["args"], (
+        "an unscaled job must not carry --scale; the omission is the contract"
+    )
+    assert "--min-feature" not in launcher.created[0]["args"]
+
+
+def test_a_refused_scale_says_what_the_limit_is(tmp_path):
+    """The message has to be actionable, so it carries the actual bounds."""
+    app, _store, db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+    client.post("/", data={
+        "meshfile": (io_bytes(closed_box_bytes()), "box.obj"),
+        "units": "mm", "n_index": "1.0", "scale": "1e12",
+    }, content_type="multipart/form-data")
+    with client.session_transaction() as session:
+        flashes = [str(m) for m in session.get("_flashes", [])]
+    assert any("between" in m for m in flashes), flashes
+    assert any("1000000000" in m or "1e+09" in m for m in flashes), flashes
+    assert not db.jobs
 
 
 # ---------------------------------------------------------------------------

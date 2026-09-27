@@ -355,8 +355,11 @@ class RoutingDb(FakeDb):
         self.reclaimed: list[str] = []
 
     def create_job(self, job_id, filename, units, n_index, n_modes,
-                   target=DB.CLUSTER, est_tets=None):
-        super().create_job(job_id, filename, units, n_index, n_modes)
+                   target=DB.CLUSTER, est_tets=None,
+                   min_feature_mm=None, scale=1.0):
+        super().create_job(job_id, filename, units, n_index, n_modes,
+                           target=target, est_tets=est_tets,
+                           min_feature_mm=min_feature_mm, scale=scale)
         self.jobs[str(job_id)].update(target=target, est_tets=est_tets,
                                       gpu_queued_at="2026-09-26T00:00:00+00:00"
                                       if target == DB.JETSON else None)
@@ -467,11 +470,35 @@ def test_an_expired_lease_is_reclaimed_and_reported(tmp_path):
 # The worker API
 # ---------------------------------------------------------------------------
 class LeaseDb(RoutingDb):
-    """RoutingDb plus the lease operations the worker API calls."""
+    """RoutingDb plus the lease operations the worker API calls.
+
+    KNOWN LIMIT, stated rather than papered over: these tests exercise the
+    DOUBLE's ``claim_jetson``, so no test here can fail because the real
+    ``web/db.py`` query is wrong. Changing the real SELECT's column list to
+    ``NULL, NULL`` leaves this file entirely green.
+
+    What that means for what is proved: the column list, the row indices and the
+    returned dict in ``web/db.py:claim_jetson`` were read by hand and agree
+    (SELECT lists ``min_feature_mm, scale`` as columns 5 and 6; the return reads
+    ``row[4]`` and ``row[5]``). That is a manual check, not a test, and the
+    reviewer should treat it as one. Reaching the real SQL needs Postgres, which
+    is tier 2 -- so the honest position is that this leg is verified by reading
+    and not by running.
+    """
 
     def __init__(self):
         super().__init__()
         self.claims: list[tuple[str, str]] = []
+
+    #: The columns the real ``claim_jetson`` SELECTs, named here so the double
+    #: cannot be more generous than the query it stands in for. Returning
+    #: ``dict(job)`` was the earlier version and it hid a real defect class: the
+    #: SQL could stop selecting ``min_feature_mm``/``scale`` and every test would
+    #: still pass, because the double happened to hand back whatever the row
+    #: held. A double that returns MORE than the query would is a double that
+    #: cannot fail for the reason the query can.
+    CLAIM_COLUMNS = ("job_id", "units", "n_index", "n_modes",
+                     "min_feature_mm", "scale")
 
     def claim_jetson(self, owner, lease_seconds):
         for job in self.jobs.values():
@@ -480,7 +507,11 @@ class LeaseDb(RoutingDb):
                 job.update(status=DB.RUNNING, lease_owner=owner,
                            lease_expires_at="2026-09-26T00:05:00+00:00")
                 self.claims.append((job["job_id"], owner))
-                return dict(job)
+                claimed = {k: job.get(k) for k in self.CLAIM_COLUMNS}
+                # the real query's UPDATE sets the lease; the SELECT is what the
+                # caller gets back, and only those columns come from the SELECT
+                claimed["lease_owner"] = owner
+                return claimed
         return None
 
     def renew_lease(self, job_id, owner, lease_seconds):
@@ -524,6 +555,54 @@ def worker(tmp_path, monkeypatch):
 
 def _auth(token="tok-abc-123"):
     return {"Authorization": f"Bearer {token}"}
+
+
+def test_a_claimed_job_carries_the_mesh_inputs(tmp_path, monkeypatch):
+    """The claim payload must hand the worker the same two mesh inputs.
+
+    This is the third leg of the path the lead asked for (row -> Job env, and
+    row -> claim payload -> solver). A worker that got only the units would mesh
+    the unscaled object at the physics edge while the route had been decided for
+    a scaled, feature-resolved one -- the same half-wired bug, one hop further
+    out, and invisible because both numbers look plausible.
+
+    ``None`` and 1.0 are asserted as themselves rather than as falsy: the worker
+    is a different process, and "absent" is not a value it can tell from "zero"
+    once the JSON is parsed.
+    """
+    monkeypatch.setenv("MSE_WORKER_TOKEN", "tok-abc-123")
+    db = LeaseDb()
+    db.create_job("job-1", "u.obj", "um", 1.5, 20, target=DB.JETSON,
+                  est_tets=40_000, min_feature_mm=0.25, scale=1000.0)
+    app, _s, _d, _l = _make(tmp_path, db=db)
+
+    resp = app.test_client().post("/worker/claim", headers=_auth())
+    assert resp.status_code == 200
+    body = resp.get_json()
+
+    assert body["units"] == "um"
+    assert body["min_feature_mm"] == 0.25
+    assert body["scale"] == 1000.0
+
+
+def test_a_claim_of_an_unscaled_featureless_job_says_so_plainly(tmp_path, monkeypatch):
+    """The absence must arrive as JSON null and 1.0 -- not as a missing key.
+
+    A worker reading a missing key with ``.get()`` and a default would be fine;
+    a worker reading it with ``[...]`` would crash on a job that is perfectly
+    ordinary. So the keys are always present, and this pins that.
+    """
+    monkeypatch.setenv("MSE_WORKER_TOKEN", "tok-abc-123")
+    db = LeaseDb()
+    db.create_job("job-1", "u.obj", "mm", 1.0, 20, target=DB.JETSON,
+                  est_tets=40_000)
+    app, _s, _d, _l = _make(tmp_path, db=db)
+
+    body = app.test_client().post("/worker/claim",
+                                  headers=_auth()).get_json()
+
+    assert "min_feature_mm" in body and body["min_feature_mm"] is None
+    assert "scale" in body and body["scale"] == 1.0
 
 
 def test_the_api_is_closed_when_no_token_is_configured(tmp_path, monkeypatch):
@@ -804,9 +883,13 @@ def test_the_tick_only_hands_the_job_slot_to_a_cluster_job(tmp_path):
     launched_targets = []
     real_create = launcher.create
 
-    def spy(job_id, units, n_index, n_modes):
+    def spy(job_id, units, n_index, n_modes, **kwargs):
+        # **kwargs rather than the named parameters: this spy asserts WHICH
+        # target was launched, and a test that breaks every time the launcher
+        # gains an argument is a test that gets the arguments deleted from it
+        # instead of read.
         launched_targets.append(db.jobs[str(job_id)]["target"])
-        return real_create(job_id, units, n_index, n_modes)
+        return real_create(job_id, units, n_index, n_modes, **kwargs)
 
     launcher.create = spy
     APP.run_tick(store, db, launcher)

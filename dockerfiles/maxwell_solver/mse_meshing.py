@@ -28,7 +28,20 @@ import os
 import numpy as np
 
 #: unit name -> metres per unit
-UNIT_SCALE = {"mm": 1e-3, "cm": 1e-2, "m": 1.0, "in": 0.0254}
+#:
+#: ``um`` and ``nm`` are here because optical structures are routinely specified
+#: in them: a 1550 nm telecom cavity is 1.55 um across, which in mm is a number
+#: nobody wants to type (0.00155). Adding a unit is not cosmetic -- the solver
+#: works in metres throughout, so a wrong scale is a wrong mode frequency by
+#: exactly that factor.
+UNIT_SCALE = {
+    "m": 1.0,
+    "cm": 1e-2,
+    "mm": 1e-3,
+    "um": 1e-6,
+    "nm": 1e-9,
+    "in": 0.0254,
+}
 
 #: VTK cell id for a linear tetrahedron
 VTK_TETRA = 10
@@ -83,6 +96,34 @@ def unit_scale(units: str) -> float:
         raise MeshingError(
             f"unsupported units {units!r}; expected one of {sorted(UNIT_SCALE)}"
         ) from None
+
+
+def apply_scale(surface, scale: float):
+    """Return ``surface`` with every vertex multiplied by ``scale``.
+
+    This is the whole of the free scale factor: the object is scaled before
+    anything else looks at it, so the volume, the surface edge, the target edge
+    length and the decimation all see the same size -- which is the only way
+    ``est_tets`` computed in the app can agree with the mesh the solver builds.
+
+    Scaling leaves the shape exactly similar, so the ``scale``-free quantities
+    (the *ratio* of surface edge to target edge, the face count decimation
+    chooses) are unchanged; only the quantities with a length dimension move,
+    and they move together. That is why this can be a single multiply at the
+    edge and not a parameter threaded through the sizing functions.
+    """
+    if surface is None:
+        return None
+    factor = float(scale)
+    if not np.isfinite(factor) or factor <= 0:
+        raise MeshingError(f"scale must be a positive number, not {scale!r}")
+    if factor == 1.0:
+        # Deliberately the same object: an unscaled upload must behave exactly
+        # as it did before this parameter existed, copy included.
+        return surface
+    scaled = surface.copy()
+    scaled.vertices = np.asarray(scaled.vertices, dtype=float) * factor
+    return scaled
 
 
 def load_surface(obj_bytes_or_path, units: str = "mm"):
@@ -417,6 +458,8 @@ def tetrahedralize(
     max_tets: int = 150_000,
     verbose: bool = True,
     enforce_resolution: bool = True,
+    min_feature_mm: float | None = None,
+    scale: float = 1.0,
 ):
     """Tetrahedralize a cleaned surface and return ``(points_m, tets)`` in metres.
 
@@ -433,15 +476,40 @@ def tetrahedralize(
     boundary vertices exactly as the user's .obj supplied them -- TetGen does
     not move vertices, so the geometry is preserved.
 
+    ``min_feature_mm`` is the owner's declared smallest feature, in the same
+    units as the upload; it lowers the target edge and never raises it.
+    ``scale`` multiplies every vertex before anything is measured, so the
+    volume, the surface edge and the target edge all describe the object the
+    solver was actually asked to solve.
+
     ``points_m`` is ``(n_points, 3)`` float64 in metres, ``tets`` is
     ``(n_tets, 4)`` indices into it. Raises :class:`MeshingError` when the
     result would blow the element cap.
     """
     import tetgen
 
+    surface = apply_scale(surface, scale)
+
     edge_length = target_edge_length(
         surface, n_modes=n_modes, units=units, n_index=n_index
     )
+
+    # The owner may name the smallest feature the modes depend on. The physics
+    # edge is what resolves the top mode; the feature edge is what resolves the
+    # object. Whichever is SMALLER wins, because either one left unresolved
+    # gives frequencies that are confidently wrong. Setting a feature larger
+    # than the physics edge therefore has no effect at all -- there is no path
+    # here that makes the mesh coarser than the physics alone.
+    if min_feature_mm is not None:
+        feature_edge = float(min_feature_mm)
+        if np.isfinite(feature_edge) and feature_edge > 0 and feature_edge < edge_length:
+            if verbose:
+                print(
+                    f"[mse] resolving the {feature_edge:g} {units} feature: target "
+                    f"edge {edge_length:.4g} {units} -> {feature_edge:g} {units}",
+                    flush=True,
+                )
+            edge_length = feature_edge
 
     # An over-fine surface floors the interior element size no matter what
     # maxvolume asks for, which is how an ordinary CAD or scan upload gets

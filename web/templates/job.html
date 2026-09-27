@@ -6,7 +6,17 @@
   <p class="muted small">
     Units {{ job.units }} &middot; refractive index {{ job.n_index }} &middot;
     {{ job.n_modes }} modes requested
+    {%- if job.scale and job.scale != 1.0 %} &middot; scaled &times;{{ '%g'|format(job.scale) }}{% endif %}
+    {%- if job.min_feature_mm %} &middot; resolving {{ '%g'|format(job.min_feature_mm) }} {{ job.units }} features{% endif %}
   </p>
+  {# The EFFECTIVE size, stated in plain numbers. With a scale factor and um/nm
+     units in play, "units" alone no longer says how big the object is, and the
+     frequencies are only right if the size is. #}
+  {% if effective_size %}
+    <p class="muted small" id="effective-size">
+      Inside the solver this object is {{ effective_size }} across.
+    </p>
+  {% endif %}
 
   {# Where this job runs. Shown from the ROUTING DECISION the app made at upload,
      not inferred from the status: "queued for the GPU" and "running on the GPU"

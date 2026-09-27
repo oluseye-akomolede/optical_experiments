@@ -144,13 +144,41 @@ def target_edge_length_mm(surface, n_modes: int, units: str) -> float:
     return float(MESH.target_edge_length(surface, n_modes, units=units))
 
 
-def estimate_tets(surface, n_modes: int, units: str, c: float | None = None) -> int:
+def effective_edge_mm(surface, n_modes: int, units: str,
+                      min_feature_mm: float | None = None) -> float:
+    """The edge length the solver will actually mesh to, in the user's units.
+
+    The physics edge resolves the top mode; a declared minimum feature resolves
+    the object. Whichever is SMALLER wins, matching
+    ``mse_meshing.tetrahedralize`` exactly. The solver is asked to do it this way
+    somewhere down the call chain; this function exists so the estimate and the
+    mesh cannot disagree about which number was used, which is what would make
+    routing wrong for precisely the detailed jobs the GPU is for.
+    """
+    edge = target_edge_length_mm(surface, n_modes, units)
+    if min_feature_mm is None:
+        return edge
+    feature = float(min_feature_mm)
+    if not (feature > 0) or feature != feature:
+        return edge
+    return min(edge, feature)
+
+
+def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
+                  min_feature_mm: float | None = None,
+                  scale: float = 1.0) -> int:
     """Predicted element count for meshing ``surface`` at ``n_modes``.
 
     Returns 0 when the surface is unusable, which the caller reads as "do not
     route on this" rather than "this is tiny": a failed estimate must never be
     the reason a job is sent to the slower machine. See the class of defect this
     rig calls *could-not-ask must not look like nothing-there*.
+
+    ``min_feature_mm`` and ``scale`` are the same two numbers the solver gets,
+    and they matter here for the same reason: the element count goes like
+    ``V / h^3``, so a scaled object and a finer target edge both move the count
+    hard -- a feature-driven refinement of 2x is 8x the elements, which is
+    exactly the difference between the cluster and the GPU queue.
     """
     if surface is None:
         return 0
@@ -165,10 +193,11 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None) -> 
             sys.path.insert(0, str(root))
         import mse_meshing as MESH  # noqa: PLC0415 - deliberately late
 
+        surface = MESH.apply_scale(surface, scale)
         volume_m3 = MESH.enclosure_volume_m3(surface, units)
-        edge = float(MESH.target_edge_length(surface, n_modes, units=units))
-        scale = MESH.unit_scale(units)
-        edge_m = edge * scale
+        edge = effective_edge_mm(surface, n_modes, units, min_feature_mm)
+        scale_m = MESH.unit_scale(units)
+        edge_m = edge * scale_m
     except Exception:  # noqa: BLE001 - an estimate must not break an upload
         return 0
 

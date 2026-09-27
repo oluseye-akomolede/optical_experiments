@@ -184,6 +184,10 @@ def _register_routes():
             "units": job["units"],
             "n_index": float(job["n_index"]),
             "n_modes": int(job["n_modes"]),
+            # Swapped from the job row by SQL, one for one: a NULL integer is
+            # not a value, so it stays JSON null.
+            "min_feature_mm": job.get("min_feature_mm"),
+            "scale": float(job.get("scale") or 1.0),
             "lease_seconds": lease_seconds,
         })
 

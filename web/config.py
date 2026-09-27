@@ -31,9 +31,17 @@ DEFAULT_BUCKET = "mse-web"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 #: what the solver supports
-UNIT_CHOICES = ("mm", "cm", "m", "in")
+UNIT_CHOICES = ("mm", "cm", "m", "um", "nm", "in")
 DEFAULT_UNITS = "mm"
 DEFAULT_N_MODES = 20
+
+#: bounds on the free scale factor. Not a technical limit -- a sanity rail, so a
+#: mistyped \"1e12\" is refused at upload rather than meshed into oblivion. The
+#: upper bound is generous because a metre-scale object in nm units is a real
+#: case (a 1 m model in nm is 1e9); the lower bound only has to exclude zero and
+#: the negatives.
+MAX_SCALE = 1e9
+MIN_SCALE = 1e-9
 
 #: how many modes the owner may ask for. A picklist, not a free field: the mode
 #: count is the single biggest lever on both the mesh size and the solve time

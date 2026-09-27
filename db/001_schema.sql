@@ -50,7 +50,12 @@ CREATE TABLE IF NOT EXISTS mse.jobs (
     message           text,
     k8s_job_name      text,
     peak_rss_mb       double precision,
-    finished_at       timestamptz
+    finished_at       timestamptz,
+    -- The mesh inputs the owner may set. Present here as well as in the upgrade
+    -- block below so a fresh database and an upgraded one end up identical;
+    -- `min_feature_mm` NULL means "the physics edge alone".
+    min_feature_mm    double precision,
+    scale             double precision NOT NULL DEFAULT 1.0
 );
 
 -- The solver used to run as a SparkApplication; it is now a plain batch/v1 Job,
@@ -146,6 +151,30 @@ BEGIN
         WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'gpu_queued_at'
     ) THEN
         ALTER TABLE mse.jobs ADD COLUMN gpu_queued_at timestamptz;
+    END IF;
+
+    -- The two mesh inputs the owner can set. Both are recorded rather than
+    -- derived: min_feature_mm is the smallest feature the modes must resolve
+    -- (NULL = the physics edge alone), and scale multiplies every vertex before
+    -- anything measures it. Without these a job's frequencies cannot be
+    -- explained from its row alone -- the same .obj at scale 1000 is a
+    -- different object, and the row would not say so.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'min_feature_mm'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN min_feature_mm double precision;
+    END IF;
+
+    -- NOT NULL DEFAULT 1: an old row is an unscaled upload by definition, so
+    -- backfilling 1 is the true value, not a placeholder that has to be
+    -- interpreted. The default is what keeps `scale` from ever being NULL in a
+    -- multiplication.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'scale'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN scale double precision NOT NULL DEFAULT 1.0;
     END IF;
 END $$;
 
