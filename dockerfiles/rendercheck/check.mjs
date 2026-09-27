@@ -19,6 +19,14 @@
 //   MSE_URL   the job page to load (required)
 //   OUT_DIR   where the screenshots go (default /out)
 //
+// Running it by hand: OUT_DIR must be writable by uid 10002 (the image's USER,
+// `rendercheck`). The Job is fine -- Kubernetes mounts its emptyDir writable --
+// but a host bind mount is not: `mkdir -p /some/dir` gives you 0755 owned by
+// you, uid 10002 gets the "other" bits (r-x) and every screenshot dies with
+// "EACCES: permission denied, open '/out/01-magnitude.png'". Measured: 0755,
+// 0775 and 2775 all fail; 0777 works. So `chmod 777` the host directory, or use
+// a named volume. This costs 20 minutes if you meet it without the note.
+//
 // Exit status is the result: 0 only if every check passed.
 
 import { chromium } from 'playwright-core';
