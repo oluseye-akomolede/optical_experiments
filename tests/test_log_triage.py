@@ -22,8 +22,10 @@ that -- not a flag invented for the test.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -203,6 +205,118 @@ def test_a_private_key_body_is_redacted_not_just_its_header(tmp_path):
     assert "line before" in result.stdout, result.stdout
 
 
+#: A legacy RFC-1421 ENCRYPTED key. Its body carries hyphens on line two
+#: ("Proc-Type: 4,ENCRYPTED"), which is what defeated the old `[^-]*` fence: the
+#: fence closed at that hyphen and every base64 line went through verbatim while
+#: the BEGIN line looked redacted. Reproduced from real openssl output.
+ENCRYPTED_PEM_BLOCK = """\
+before the key
+-----BEGIN RSA PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: AES-128-CBC,E4C1BCC919C362175F032727E3B49670
+
+eC0Grd53mqGgTmh4uTPwnv0zBo5ZBJxFiJx1aq6arLgUvVsf6/54MP/r3907oKEB
+0+lHpA3zNYFZQNwrybyuC6/viaymgLEbB+YR4cvFFerpfaAtnmjqo+y9QRzcjedG
+-----END RSA PRIVATE KEY-----
+after the key
+"""
+
+#: A PEM whose body has no Proc-Type/DEK-Info preamble at all.
+HEADERLESS_PEM_BLOCK = """\
+-----BEGIN PRIVATE KEY-----
+YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY3ODkwYWJjZGVm
+-----END PRIVATE KEY-----
+"""
+
+
+def test_an_encrypted_pem_does_not_leak_its_body(tmp_path):
+    """The encrypted form is the one the fence has to survive.
+
+    A `[^-]*` fence stops at the hyphen in "Proc-Type", so the key body passes
+    through untouched while the BEGIN line looks redacted -- a redaction that
+    reads as done. Asserting on the whole body, not one line, so a partial fix
+    that drops the preamble but keeps the base64 still fails.
+    """
+    log = tmp_path / "enc.pem"
+    log.write_text(ENCRYPTED_PEM_BLOCK)
+    result = run_triage([str(log)], env={"TRIAGE_RAW": "1"})
+    assert result.returncode == 0, result.stderr
+    for leaked in ("eC0Grd53mqGgTmh4uTPwnv0zBo5ZBJxFiJx1aq6arLgUvVsf6",
+                   "0+lHpA3zNYFZQNwrybyuC6/viaymgLEbB+YR4cvFFerpfaAtnmjq"):
+        assert leaked not in result.stdout, (
+            f"encrypted key material reached the output:\n{result.stdout}")
+    assert "[REDACTED]" in result.stdout, result.stdout
+    assert "after the key" in result.stdout, (
+        "the fence ran past the END line and ate the rest of the log")
+    assert "before the key" in result.stdout, result.stdout
+
+
+def test_a_headerless_pem_body_is_redacted(tmp_path):
+    """A bare body with no Proc-Type preamble, fenced only by BEGIN/END."""
+    log = tmp_path / "h.pem"
+    log.write_text(HEADERLESS_PEM_BLOCK)
+    result = run_triage([str(log)], env={"TRIAGE_RAW": "1"})
+    assert result.returncode == 0, result.stderr
+    assert "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY3ODkw" not in result.stdout
+    assert "[REDACTED]" in result.stdout, result.stdout
+
+
+def test_no_key_material_reaches_the_model_even_from_a_truncated_tail(tmp_path):
+    """What matters is what QWEN RECEIVES, not what the script prints.
+
+    A redaction bug that only affects a branch (say, the non-RAW path, or a key
+    that spans the tail cutoff) would pass a stdout test and still ship the key
+    to another process. So this asserts on the stub's stdin directly.
+    """
+    log = tmp_path / "tail.pem"
+    # The key starts well before the tail cutoff, so the tail contains a key
+    # whose BEGIN line is NOT present -- a truncated fence.
+    log.write_text("\n".join(f"filler {n}" for n in range(20)) + "\n"
+                   + ENCRYPTED_PEM_BLOCK)
+    capture = tmp_path / "stdin.txt"
+    fake = f"#!/bin/sh\ncat > {capture}\necho ok\n"
+    result = run_triage([str(log)], qwen=fake, tmp_path=tmp_path,
+                        env={"TRIAGE_TAIL": "40"})
+    assert result.returncode == 0, result.stderr
+    received = capture.read_text()
+    for leaked in ("eC0Grd53mqGgTmh4uTPwnv0zBo5ZBJxFiJx1aq6arLgUvVsf6",
+                   "0+lHpA3zNYFZQNwrybyuC6/viaymgLEbB+YR4cvFFerpfaAtnmjq"):
+        assert leaked not in received, (
+            f"KEY MATERIAL REACHED THE MODEL'S STDIN:\n{received}")
+    assert "DEK-Info" not in received, (
+        f"the encrypted key's preamble reached the model:\n{received}")
+
+
+def test_no_base64_key_line_reaches_the_model_for_any_pem_shape(tmp_path):
+    """The general form: no long base64 run may survive into stdin.
+
+    The two tests above name the exact strings from one generated key. This one
+    catches a key whose bytes we did not predict -- generated fresh here -- by
+    refusing any long base64-looking line, which is what key material looks like
+    regardless of how it was produced.
+    """
+    import subprocess as sp
+    keygen = sp.run(["openssl", "genrsa", "-traditional", "-aes128",
+                     "-passout", "pass:x", "2048"],
+                    capture_output=True, text=True)
+    if keygen.returncode != 0 or "BEGIN" not in keygen.stdout:
+        pytest.skip("openssl cannot generate a key here")
+    log = tmp_path / "fresh.pem"
+    log.write_text(keygen.stdout + "trailing line\n")
+    capture = tmp_path / "stdin.txt"
+    fake = f"#!/bin/sh\ncat > {capture}\necho ok\n"
+    result = run_triage([str(log)], qwen=fake, tmp_path=tmp_path)
+    assert result.returncode == 0, result.stderr
+    received = capture.read_text()
+    base64_lines = [ln for ln in received.splitlines()
+                    if len(ln) >= 20 and ln.strip("=+/").isalnum()]
+    assert not base64_lines, (
+        f"base64 key-body lines reached the model's stdin:\n" +
+        "\n".join(base64_lines))
+    assert "trailing line" in received, (
+        "the fence consumed the rest of the log")
+
+
 def test_a_harmless_line_is_not_mangled(tmp_path):
     """Redaction must not eat ordinary text.
 
@@ -300,6 +414,55 @@ def test_qwen_returning_nothing_is_non_zero(tmp_path):
     assert result.returncode != 0, (
         f"an empty qwen answer exited 0:\n{result.stdout}")
     assert "NOTHING WAS TRIAGED" in result.stderr, result.stderr
+
+
+def test_a_hanging_qwen_is_bounded_by_the_timeout(tmp_path):
+    """The comment claimed the call was bounded; the call was not.
+
+    A stub that sleeps forever used to hang the script forever -- and a hung
+    triage is indistinguishable from a log with nothing wrong, which is the one
+    outcome this tool must never produce. The timeout makes that a real
+    non-zero exit instead.
+
+    A SHORT timeout is set explicitly: the default (360s) is deliberately long
+    enough for a cold start, so waiting for it would make this test slow and
+    hide whether the mechanism works at all.
+    """
+    log = tmp_path / "h.log"
+    log.write_text("1 failed\n")
+    fake = "#!/bin/sh\ncat >/dev/null\nsleep 300\n"
+    t0 = time.monotonic()
+    result = run_triage([str(log)], qwen=fake, tmp_path=tmp_path,
+                        env={"TRIAGE_TIMEOUT": "2"})
+    elapsed = time.monotonic() - t0
+    assert result.returncode != 0, (
+        f"a hanging qwen exited 0 -- an empty all-clear:\n{result.stdout}")
+    assert elapsed < 60, (
+        f"the script ran {elapsed:.0f}s despite a 2s timeout -- it is not bounded")
+    assert "NOTHING WAS TRIAGED" in result.stderr, result.stderr
+    # The timeout must be NAMED, so an operator can tell a slow-but-working
+    # model from a dead endpoint. Collapsing both into "qwen failed" is how
+    # someone concludes the model is broken when it was only cold-starting.
+    assert "did not answer within 2s" in result.stderr, (
+        f"the timeout branch did not name the timeout:\n{result.stderr}")
+    assert "NOT a verdict" in result.stdout, result.stdout
+
+
+def test_the_timeout_default_allows_a_cold_start(tmp_path):
+    """The default must be generous: the model can take ~4 min to load.
+
+    A default that is too short turns every cold start into a false failure,
+    which trains an operator to ignore the message -- worse than no timeout.
+    Asserted on the UNIT (minutes, not seconds), not by waiting, so the test
+    stays fast while still pinning the decision.
+    """
+    text = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(r'TRIAGE_TIMEOUT:-(\d+)\}', text)
+    assert match, "the timeout default is no longer a literal in the script"
+    default = int(match.group(1))
+    assert default >= 240, (
+        f"the default timeout is {default}s, below the ~4 min a cold start can "
+        "take -- cold starts would be reported as failures")
 
 
 def test_the_header_always_precedes_the_model_output(tmp_path):

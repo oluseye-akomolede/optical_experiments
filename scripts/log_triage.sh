@@ -105,32 +105,47 @@ redact() {
         -e 's/(AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|MINIO_ROOT_PASSWORD|MINIO_SECRET_KEY)([[:space:]]*[=:][[:space:]]*)[^[:space:]"'"'"',;]+/\1\2[REDACTED]/g' \
         -e 's/(Bearer[[:space:]]+)[A-Za-z0-9._~+/-]+=*/\1[REDACTED]/Ig' \
         -e 's/(AKIA|ASIA)[A-Z0-9]{16}/\1[REDACTED]/g' \
-        -e 's/(-{5}BEGIN [A-Z ]*PRIVATE KEY-{5})[^-]*/\1 [REDACTED]/g' \
         -e 's/([?&](access_key|signature|sig|token|key)=)[^&[:space:]]+/\1[REDACTED]/Ig'
 }
 
 # Private keys are the one shape redaction cannot do line by line: the secret is
 # the base64 AFTER the header, so a header-only rule leaves the key material in
-# place while making the output look handled. Slurp the whole input so the rule
-# can span lines, and try the END-lookahead form first.
+# place while making the output look handled.
 #
-# One form, deliberately, and the loosest one. The tighter alternative uses a
-# lookahead for the END marker to keep it, but a lookahead is a gawk extension:
-# on mawk it is a syntax error, and the log this script exists to read would be
-# the thing that fails. So the END marker is consumed with the body. That is
-# also the safer direction -- the guaranteed outcome is "the key is gone", and
-# leaving the END line visible would mean guessing where a key stops.
+# The fence is anchored on LINE BOUNDARIES with a state machine, not on a run of
+# non-'-' characters. A `[^-]*` fence (an earlier version) stops at the first
+# '-' anywhere in the body, and a legacy RFC-1421 ENCRYPTED key carries
+# hyphens on its second line:
 #
-# `[^-]*` cannot cross another `-----`, so this never runs into unrelated lines;
-# a key with no END line at all is cut to EOF, which costs a log that could not
-# be read past the key anyway.
+#     -----BEGIN RSA PRIVATE KEY-----
+#     Proc-Type: 4,ENCRYPTED
+#     DEK-Info: AES-128-CBC,....
+#
+# so the fence closed immediately after "Proc" and the 25 base64 lines of the
+# key went through VERBATIM while the BEGIN line looked redacted -- the worst
+# shape a redaction failure can take. (Reproduce with `openssl genrsa
+# -traditional -aes128 -passout pass:pw 2048`.)
+#
+# So: delete every line from a BEGIN ... PRIVATE KEY line through a following
+# END ... PRIVATE KEY line. That covers the encrypted form, the plain form, a
+# headerless body, and a key whose END line is missing (it runs to EOF, which
+# costs a log that could not be read past the key anyway). It is a plain awk
+# loop, so mawk and gawk behave identically -- no lookahead, no gawk extension
+# on the path that has to work when a deploy log is unreadable.
+#
+# awk holds one boolean of state, so a multi-megabyte log cannot blow memory the
+# way accumulating the whole text into a variable would.
 reduced=$(printf '%s\n' "$body" | awk '
-    { s = s $0 "\n" }
-    END {
-        gsub(/-{5}BEGIN [A-Z ]*PRIVATE KEY-{5}[^-]*/,
-             "-----BEGIN PRIVATE KEY----- [REDACTED]\n", s)
-        printf "%s", s
-    }')
+    BEGIN { inkey = 0 }
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/ {
+        if (!inkey) { print "-----BEGIN PRIVATE KEY----- [REDACTED]"; inkey = 1 }
+        next
+    }
+    /-----END [A-Z ]*PRIVATE KEY-----/ {
+        if (inkey) { inkey = 0; next }
+    }
+    { if (!inkey) print }
+')
 reduced=$(printf '%s\n' "$reduced" | redact)
 
 if [ "$RAW" = "1" ]; then
@@ -162,13 +177,37 @@ if ! command -v qwen >/dev/null 2>&1; then
 fi
 
 # One call at a time (the GPUs are shared), and a cold start can take ~4 min, so
-# the timeout is generous -- but it IS bounded, because a hung triage that never
-# returns is indistinguishable from a log with nothing wrong.
-if ! out=$(printf '%s\n' "$reduced" | qwen "$instruction" 2>/tmp/log_triage_err.$$); then
+# the timeout is generous -- but it IS BOUNDED, enforced by `timeout` rather than
+# merely intended. An earlier version's comment said the same thing with no
+# `timeout` on the call at all, so a qwen that hung never returned and the script
+# hung with it: indistinguishable from a log with nothing wrong, which is the one
+# outcome this tool must never produce. `timeout` is coreutils, present wherever
+# the shell is; if it is somehow missing the call proceeds UNBOUNDED rather than
+# failing, and that is said out loud rather than silently.
+QWEN_TIMEOUT_S="${TRIAGE_TIMEOUT:-360}"
+timeout_cmd=()
+if command -v timeout >/dev/null 2>&1; then
+    timeout_cmd=(timeout "$QWEN_TIMEOUT_S")
+fi
+
+# The status is captured INSIDE the assignment, not read from `$?` afterwards:
+# `if ! cmd` leaves `$?` as 0 (the negation succeeded), so testing it after the
+# `if` would never match 124 and the timeout branch would be dead code that
+# reads exactly like a working one -- and the operator would get "qwen failed"
+# with no hint that a cold start or a busy GPU was the cause.
+out_status=0
+out=$(printf '%s\n' "$reduced" | "${timeout_cmd[@]}" qwen "$instruction" 2>/tmp/log_triage_err.$$) || out_status=$?
+if [ "$out_status" != "0" ]; then
     err=$(tail -n 3 /tmp/log_triage_err.$$ 2>/dev/null || true)
     rm -f /tmp/log_triage_err.$$
-    echo "log_triage: qwen failed to answer; NOTHING WAS TRIAGED." >&2
-    [ -n "$err" ] && echo "  qwen said: $err" >&2
+    if [ "$out_status" = "124" ]; then
+        echo "log_triage: qwen did not answer within ${QWEN_TIMEOUT_S}s; NOTHING WAS TRIAGED." >&2
+        echo "  A cold start can take ~4 min -- raise TRIAGE_TIMEOUT if the GPUs" >&2
+        echo "  are busy. This is NOT an all-clear." >&2
+    else
+        echo "log_triage: qwen failed to answer; NOTHING WAS TRIAGED." >&2
+        [ -n "$err" ] && echo "  qwen said: $err" >&2
+    fi
     exit 3
 fi
 rm -f /tmp/log_triage_err.$$
