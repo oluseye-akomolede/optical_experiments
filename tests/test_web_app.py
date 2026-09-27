@@ -684,6 +684,29 @@ def test_slice_positions_stay_inside_the_grid():
     assert FLD._index_for(grid, "x", -1e9) == 0
 
 
+def test_index_for_reads_each_axis_own_origin_not_the_arrays():
+    """``_index_for`` reads metadata, so it must use the (x, y, z) order.
+
+    The test above cannot see a swap: its grid is uniform (origin 0, spacing 1),
+    where every axis maps a position to the same index. This one uses the live
+    job's skewed grid, where the three origins and spacings all differ, so the
+    two orders disagree.
+    """
+    grid = _skewed_grid()
+    counts = {"x": grid["nx"], "y": grid["ny"], "z": grid["nz"]}
+    for axis in ("x", "y", "z"):
+        n = counts[axis]
+        mid = grid["origin"][("x", "y", "z").index(axis)] + \
+            grid["spacing"][("x", "y", "z").index(axis)] * (n - 1) / 2
+        assert FLD._index_for(grid, axis, mid) == n // 2, axis
+    # the endpoints pin the direction, so a reversed index cannot pass
+    assert FLD._index_for(grid, "z", grid["origin"][2]) == 0
+    assert FLD._index_for(grid, "z",
+                          grid["origin"][2] + grid["spacing"][2] * 31) == 31
+    assert FLD._index_for(grid, "x",
+                          grid["origin"][0] + grid["spacing"][0] * 63) == 63
+
+
 def test_modes_json_must_carry_a_usable_grid():
     with pytest.raises(FLD.FieldError):
         FLD.load_modes_json(json.dumps({"modes": []}).encode())

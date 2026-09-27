@@ -138,7 +138,13 @@ def slice_axes(grid: dict) -> list[dict]:
 
 
 def _index_for(grid: dict, axis: str, position_m: float) -> int:
-    """Nearest array index along one named axis for a physical position."""
+    """Nearest array index along one named axis for a physical position.
+
+    ``position_m`` is a physical coordinate and ``origin``/``spacing`` are the
+    grid metadata, so both are read in the metadata's **(x, y, z)** order. Only
+    ``counts`` is an array fact -- it is keyed by name, which is why this
+    function looked correct at a glance.
+    """
     nz, ny, nx = shape_of(grid)
     counts = {"x": nx, "y": ny, "z": nz}
     origin = float(grid["origin"][_meta_axis(axis)])
