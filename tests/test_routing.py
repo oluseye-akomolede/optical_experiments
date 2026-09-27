@@ -400,6 +400,14 @@ class RoutingDb(FakeDb):
         for job in self.jobs.values():
             if not job.get("lease_expired"):
                 continue
+            # A LEASE ONLY SPEAKS FOR A RUNNING ROW. This filter mirrors
+            # web/db.py, and it is not decoration: without it this double
+            # requeues a terminal row, which is the bug found live at 20:15Z
+            # (a FAILED job whose old mark_failed left the lease set was
+            # "claimable again" and got solved). A double that judged the lease
+            # alone would keep reporting that bug fixed.
+            if job.get("status") != DB.RUNNING:
+                continue
             # Counting here matches web/db.py, and it is the path a crash-looping
             # worker actually takes: it never calls /release, it dies. A double
             # that requeued on expiry without counting would show the loop
@@ -1259,6 +1267,36 @@ def test_the_bound_is_reachable_from_the_expiry_path_too(tmp_path, monkeypatch):
         "must apply here too")
     assert "job-1" not in requeued, (
         "the bounded-out row was still reported as requeued")
+
+
+def test_a_terminal_row_with_a_stale_lease_is_not_requeued(tmp_path):
+    """The 20:15Z resurrection, driven on the lease-path double directly.
+
+    The bug found live on the third deploy: ``reclaim_expired_leases`` selected
+    on the expired lease ALONE, so a FAILED row that the OLD ``mark_failed``
+    left leased was requeued to ``queued`` and a worker solved a job the owner
+    had been told was over ("its GPU worker's lease expired; the job is
+    claimable again").
+
+    SCOPE, and it is the same caveat the web-routes sibling carries: this drives
+    the DOUBLE's logic, so it pins that the double models the filter, not that
+    the real SQL has it. Real Postgres pins the SQL -- ``pg_race_check.py`` D3
+    is the leg that goes red when the real ``AND status = running`` is removed.
+    What this leg buys is that the double cannot quietly go back to modelling
+    the bug, which is how the unit suite came to be unable to see it.
+    """
+    db = LeaseDb()
+    _jetson_job(db, est_tets=20_000)
+
+    for status in (DB.FAILED, DB.DONE):
+        db.jobs["job-1"].update(status=status, stage=status, lease_owner="w-dead",
+                                lease_expired=True)
+        requeued = db.reclaim_expired_leases()
+        assert db.jobs["job-1"]["status"] == status, (
+            f"a {status} row was requeued by its stale lease; the lease only "
+            f"speaks for a RUNNING row")
+        assert "job-1" not in requeued, (
+            f"a {status} row was reported as reclaimed")
 
 
 def test_a_released_job_is_claimable_by_the_same_and_by_another_worker(

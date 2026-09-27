@@ -810,7 +810,18 @@ def test_a_solver_output_outside_the_allow_list_is_a_loud_failure(tmp_path):
 
 
 def test_a_job_with_no_result_files_is_refused(tmp_path):
+    """A directory that EXISTS and holds no results is a real verdict.
+
+    The setup is the point: this test originally wrote only ``input.obj`` and
+    never created ``jobs/j1``, so the old reader raised its
+    ``FileNotFoundError`` on a directory that was never there and the assertion
+    passed for the wrong reason -- the same shape as the live bug. The
+    directory is now created explicitly, so the test exercises the empty-solve
+    verdict rather than a missing directory. The missing-directory case has its
+    own test, which asserts it is NOT reported as an empty solve.
+    """
     store = STORE.LocalStore(tmp_path)
+    (tmp_path / "jobs" / "j1").mkdir(parents=True)
     store.write("jobs/j1/input.obj", b"x")
     with pytest.raises(W.WorkerError) as excinfo:
         W._result_names(store, "j1")
@@ -1091,3 +1102,53 @@ def test_gpu_memory_is_released_after_a_failed_job(tmp_path, server,
     assert calls == ["free"], (
         "the GPU memory was not released after a failed job -- this is the "
         "path a per-job leak accumulates on")
+
+
+def test_a_dir_that_was_never_found_is_not_reported_as_an_empty_solve(tmp_path):
+    """Absent-by-check and "the solver wrote nothing" are OPPOSITE readings.
+
+    This is the rig's signature defect as a unit test. The first reader built
+    its path by hand instead of asking the store, and a directory that was
+    never found has to say so -- it may not be reported as an empty solve, and
+    it must name the path it looked in so the report is checkable.
+    """
+    store = STORE.LocalStore(tmp_path)
+    # Nothing written at all: the store holds no such job.
+    with pytest.raises(W.ResultDirUnavailable) as nowhere:
+        W._result_names(store, "j1")
+    assert str(tmp_path) in str(nowhere.value), "the paths it tried must be named"
+
+    # The POSITIVE CONTROL: a directory that genuinely exists and holds no
+    # results is the other reading, and it is the one the empty verdict is for.
+    (tmp_path / "jobs" / "j1").mkdir(parents=True)
+    store.write("jobs/j1/input.obj", b"x")
+    with pytest.raises(W.WorkerError) as empty:
+        W._result_names(store, "j1")
+    assert "no result files" in str(empty.value)
+    assert not isinstance(empty.value, W.ResultDirUnavailable)
+
+
+def test_the_reader_agrees_with_the_key_scheme_the_writer_uses(tmp_path):
+    """One key scheme, stated twice, pinned against each other.
+
+    ``_result_names`` walked up from ``store.root`` and appended a literal
+    ``jobs/`` segment while the upload loop reads ``_key(job_id, name)``. Two
+    copies of one scheme agree today and drift the day either changes, and a
+    drift here fails a job AFTER a successful solve -- so it is asserted rather
+    than trusted. This is a statement about the pair, NOT a claim about the
+    deploy-3 failure: that was attributed to this line first, and the
+    attribution was wrong (the production wiring agrees).
+    """
+    store = STORE.LocalStore(tmp_path)
+    work_dir = tmp_path / "j1"
+    work_dir.mkdir(parents=True)
+    store.write(W._input_key("j1"), b"obj")
+    for name in ("modes.json", "surface.glb", "mode_01.bin", "mode_01.vtu"):
+        store.write(W._key("j1", name), b"x")
+
+    got = W._result_names(store, "j1")
+    # Every name the reader reports must be readable at the key the upload
+    # loop uses. This is the property that actually matters.
+    for name in got:
+        assert store._path(W._key("j1", name)).is_file(), name
+    assert got == ["mode_01.bin", "mode_01.vtu", "modes.json", "surface.glb"]

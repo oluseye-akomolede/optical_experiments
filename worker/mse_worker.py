@@ -40,6 +40,7 @@ import shutil
 import signal
 import sys
 import threading
+import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -57,6 +58,18 @@ DEFAULT_WORK_ROOT = Path.home() / "mse-worker" / "work"
 #: run) cannot overlap.
 DEFAULT_LOCK_PATH = Path.home() / "mse-bench" / ".gpu.lock"
 
+
+def _redact_token(text: str, token: str) -> str:
+    """Replace ``token`` (and its ``Bearer`` form) with a placeholder.
+
+    Applied to every line of a logged traceback. Returns ``text`` unchanged when
+    there is no token, which is the normal case in a test.
+    """
+    if not token:
+        return text
+    return text.replace(f"Bearer {token}", "Bearer <redacted>").replace(
+        token, "<redacted>")
+
 #: where the token and URL come from. Mode 600; the worker refuses to read a
 #: file anyone else can read.
 DEFAULT_ENV_FILE = Path.home() / ".config" / "mse-worker" / "env"
@@ -72,12 +85,34 @@ class WorkerError(Exception):
 
 
 class APIError(Exception):
-    """The app refused a call. Carries the server's own words."""
+    """The app refused a call. Carries the server's own words.
 
-    def __init__(self, status: int, body: str):
+    ``method`` and ``path`` are carried, not just the status, because the
+    status alone does not say WHICH call failed and a job makes five of them in
+    a row (input, progress, files, done, failed). "HTTP 500" with no path is the
+    difference between an upload route that is broken and a ``/done`` route that
+    is broken, and that is the one thing a reader of the journal most needs to
+    know.
+    """
+
+    def __init__(self, status: int, body: str, method: str = "", path: str = ""):
         self.status = status
         self.body = body
-        super().__init__(f"HTTP {status}: {body}")
+        self.method = method
+        self.path = path
+        where = f"{method} {path}" if method else "request"
+        super().__init__(f"HTTP {status} on {where}: {body}")
+
+    def describe(self) -> str:
+        """A one-line, journal-ready form. Never includes the token.
+
+        The token travels in an ``Authorization`` header, which this never
+        reads, so nothing here can leak it -- and the URL logged is ``self.url``
+        with no credentials, because the worker's config keeps the token
+        separate from the base URL.
+        """
+        where = f"{self.method} {self.path}" if self.method else "(unknown call)"
+        return f"HTTP {self.status} on {where}: {self.body}"
 
 
 class LeaseLost(Exception):
@@ -239,6 +274,14 @@ def classify(exc: BaseException) -> str:
     if isinstance(exc, WorkerError) and "asked to stop" in str(exc):
         # SIGTERM mid-solve: the operator is restarting the service. The job is
         # fine and must be requeued, not failed.
+        return "transient"
+    if isinstance(exc, ResultDirUnavailable):
+        # A LocalStore that could not enumerate the results it just wrote.
+        # TRANSIENT, against the default, because it is not a verdict about the
+        # job: nothing about this mesh or this solve is implicated, and the job
+        # is worth another attempt. It must be caught BEFORE the bare ``OSError``
+        # branch below, since ``FileNotFoundError`` is an ``OSError`` and would
+        # otherwise land in the same place for the wrong reason.
         return "transient"
     if isinstance(exc, (OSError, ConnectionError, TimeoutError)):
         # A dropped socket, a full disk, a permission blip on the work dir.
@@ -434,12 +477,13 @@ class WorkerAPI:
                 return resp.status, payload
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:500]
-            raise APIError(exc.code, detail) from None
+            raise APIError(exc.code, detail, method, path) from None
         except urllib.error.URLError as exc:
             # The app is unreachable. Its own message can name this host; the
             # token is not in it, and this is the operator's clue that the
             # tailnet or the deployment is the problem.
-            raise APIError(0, f"could not reach {self.url}: {exc.reason}") from None
+            raise APIError(0, f"could not reach {self.url}: {exc.reason}",
+                           method, path) from None
 
     def claim(self) -> dict | None:
         """One job, or ``None`` when the queue is empty (204)."""
@@ -640,13 +684,18 @@ class Worker:
     """
 
     def __init__(self, config: Config, api: WorkerAPI, lock: BenchLock,
-                 solve, store_factory, log=print, solver_dir: Path = _SOLVER_DIR):
+                 solve, store_factory, log=print, solver_dir: Path = _SOLVER_DIR,
+                 log_exception=None):
         self.config = config
         self.api = api
         self.lock = lock
         self._solve = solve
         self._store_factory = store_factory
         self.log = log
+        #: the traceback sink. Injected so a test can assert the traceback was
+        #: written WITHOUT capturing a real stdio journal, and defaulted so every
+        #: existing constructor call keeps working. See ``log_exception``.
+        self.log_exception = log_exception or self._default_log_exception
         self.solver_dir = Path(solver_dir)
         self.stop = threading.Event()
         self._stage = "starting"
@@ -664,6 +713,27 @@ class Worker:
 
     def _log(self, message: str) -> None:
         self.log(f"[mse-worker] {message}", flush=True)
+
+    def _default_log_exception(self, context: str, exc: BaseException) -> None:
+        """Write a traceback to the journal, with the token redacted.
+
+        ``traceback.format_exception`` renders the whole chain, which is the
+        point: on deploy 3 the worker logged a generic owner sentence and threw
+        the real one away, so "the problem has been recorded" was a lie and the
+        failure was undiagnosable. The owner-facing message stays generic; THIS
+        is where the truth goes.
+
+        Redaction is not optional even though the token is not normally in a
+        traceback: an ``APIError`` body is the app's own text, and a URL with a
+        query string or a header echoed into an error page can carry it. The
+        token is read from the config at call time and replaced wherever it
+        appears, so a leak has to get past an exact-string match AND the
+        ``Bearer`` prefix to show up.
+        """
+        self.log(context, flush=True)
+        for line in traceback.format_exception(type(exc), exc, exc.__traceback__):
+            self.log(_redact_token(line.rstrip("\n"), getattr(self.config, "token", "")),
+                     flush=True)
 
     # -- the heartbeat -----------------------------------------------------
 
@@ -882,7 +952,26 @@ class Worker:
         """
         kind = classify(exc)
         message = _owner_message(exc)
+        # The OWNER gets the generic sentence; the JOURNAL gets the truth. These
+        # two are deliberately different and the failure mode is when only the
+        # first is written -- which is what happened on deploy 3: every Jetson
+        # job failed right after a good solve, and the only record was "Something
+        # went wrong while computing the modes. The problem has been recorded",
+        # which was FALSE because nothing was recorded. A failure nobody can
+        # diagnose is a failure that will keep happening.
+        #
+        # The type, the exception's own message and a full traceback, at ERROR.
+        # ``log_exception`` redacts the token, so this is safe to journal.
         self._log(f"job {job_id} failed ({kind}): {message}")
+        self.log_exception(
+            f"[mse-worker] job {job_id} failed ({kind}); the owner was told: "
+            f"{message!r}", exc)
+        if isinstance(exc, APIError):
+            # The HTTP half in its own line, because it carries fields the
+            # traceback does not: the status, the method, the path and the
+            # app's own response body. On a 5xx the body is where the app's
+            # traceback would be, truncated to 500 chars by ``_request``.
+            self._log(f"job {job_id}: the app refused a call -- {exc.describe()}")
         if kind == "lease-lost":
             # ``_done`` raises LeaseLost rather than claiming a job it no longer
             # owns, and the app has already reassigned the row. Reporting
@@ -989,6 +1078,24 @@ def _input_key(job_id: str) -> str:
     return _key(job_id, "input.obj")
 
 
+class ResultDirUnavailable(WorkerError):
+    """``_result_names`` could not enumerate the results, and here is where.
+
+    Carries the paths it tried. The point is not the message -- it is that a
+    directory that was never found is reported as ABSENT-BY-CHECK, with the
+    paths named, instead of as "the solver wrote no result files". Those two
+    readings are opposite and only one of them is a defect in the solver.
+    """
+
+    def __init__(self, tried: list[Path], why: str):
+        listed = "; ".join(str(p) for p in tried)
+        super().__init__(
+            f"the worker could not list this job's result files ({why}). It "
+            f"looked in: {listed}. The listing itself is at fault -- retryable, "
+            f"and not a verdict on the solve."
+        )
+
+
 def _result_names(store, job_id: str) -> list[str]:
     """The result files the solver actually wrote, in a stable order.
 
@@ -997,25 +1104,82 @@ def _result_names(store, job_id: str) -> list[str]:
     the job would still be reported as done. Only names the API accepts are
     uploaded, and a name outside the allow-list is a loud failure rather than a
     silent skip -- the two cases mean opposite things.
+
+    WHERE IT LOOKS IS DERIVED. This walked up from ``store.root`` and appended a
+    literal ````jobs/```` segment, which is a second copy of the key scheme
+    ``_key`` already owns. It happens to agree with ``_key`` today (that is
+    checked, both here and in the rig suite), so it is not the deploy-3
+    failure -- that was attributed here first and the attribution was WRONG.
+    It is still a copy, and a copy that goes stale produces exactly the failure
+    this harness exists for, so it now asks the store for one path per key.
+
+    The two readings the caller must not confuse: a directory this could not
+    find is reported as ``ResultDirUnavailable`` with the paths named, because
+    only a directory that WAS found and holds nothing may be reported as an
+    empty solve.
     """
-    names = []
-    for path in sorted((store.root / "jobs" / job_id).iterdir()):
-        if not path.is_file() or path.name == "input.obj":
+    def path_for(key: str) -> Path:
+        try:
+            return Path(store._path(key))
+        except AttributeError:               # a store that does not expose it
+            return Path(store.root) / key
+
+    dirs: list[Path] = []
+    for key in (f"jobs/{job_id}", job_id):
+        candidate = path_for(key)
+        if candidate not in dirs:
+            dirs.append(candidate)
+    #: EVERY place the results can be, named deliberately rather than by the
+    #: accident that ``store.root`` happens to be the work directory today.
+    #: The staging directory is the one that caught a genuine bug in this
+    #: harness: a solve that takes its input from ``work/<id>`` and stages its
+    #: output under ``work/<id>.out/`` (the ``--local-in``/``--local-out``
+    #: shape the solver announces) puts its results where ``store.root`` cannot
+    #: see them at all, and every job would then fail AFTER a successful solve
+    #: with the generic owner sentence -- the deploy-3 symptom.
+    staging = Path(f"{store.root}.out")
+    if staging not in dirs:
+        dirs.append(staging)
+
+    #: A directory that is FOUND and is readable settles the question. The
+    #: purpose of the later candidates is the case where an earlier one does not
+    #: exist at all -- NOT the case where it exists and is empty. Falling
+    #: through on "empty" made the honest empty verdict unreachable and
+    #: mislabelled every empty result directory as "no directory was found",
+    #: which is false -- the same absent-vs-empty confusion this function exists
+    #: to fix, inside the fix.
+    found_a_directory = False
+    for path in dirs:
+        try:
+            entries = sorted(path.iterdir())
+        except (FileNotFoundError, NotADirectoryError):
             continue
-        if path.name in _UPLOAD_EXACT or _is_mode_file(path.name):
-            names.append(path.name)
-        else:
-            raise WorkerError(
-                f"the solver wrote {path.name!r}, which the worker API does not "
-                f"accept; add it to web/worker_api.py and here, or it will be "
-                f"lost while the job reports success"
-            )
-    if not names:
+        except OSError as exc:  # exists but unreadable -- also not the solver
+            raise ResultDirUnavailable([path], str(exc)) from exc
+        found_a_directory = True
+        names = []
+        for entry in entries:
+            if not entry.is_file() or entry.name == "input.obj":
+                continue
+            if entry.name in _UPLOAD_EXACT or _is_mode_file(entry.name):
+                names.append(entry.name)
+            else:
+                raise WorkerError(
+                    f"the solver wrote {entry.name!r}, which the worker API does "
+                    f"not accept; add it to web/worker_api.py and here, or it "
+                    f"will be lost while the job reports success"
+                )
+        if names:
+            return names
+
+    if found_a_directory:
         raise WorkerError(
             f"the solver wrote no result files for {job_id}; refusing to report "
             f"a job as done when there is nothing to show for it"
         )
-    return names
+    raise ResultDirUnavailable(
+        dirs, "no directory holding this job's results was found"
+    )
 
 
 def _is_mode_file(name: str) -> bool:

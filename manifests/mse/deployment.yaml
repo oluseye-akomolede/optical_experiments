@@ -35,8 +35,14 @@ spec:
           args:
             - |
               from db import JobStore
-              JobStore().apply_schema()
-              print("mse schema applied")
+              store = JobStore()
+              store.apply_schema()
+              # Retire leases left dangling on TERMINAL rows by the old
+              # mark_failed. A terminal row that still looks leased is what
+              # let reclaim requeue a failed job (found live 20:15Z). Runs
+              # every start; it is a no-op once the data is clean.
+              n = store.clear_terminal_leases()
+              print(f"mse schema applied; cleared {n} dangling terminal lease(s)")
           envFrom:
             - secretRef:
                 name: mse-db

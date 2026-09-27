@@ -129,6 +129,72 @@ class FakeDb:
         job = self.jobs.get(str(job_id))
         return bool(job and job.get("lease_owner") == owner)
 
+    # The three TERMINAL worker verbs, so this double matches the store the
+    # harness and the routing tests drive.
+    #
+    # SCOPE, because it is easy to over-read: they were missing here, but the
+    # route BODIES were not untested -- ``tests/test_worker.py`` drives the same
+    # blueprint on a real server against ``LeaseDb``, which has all three. What
+    # was missing is that anything using THIS double (the tick tests here, and
+    # ``scripts/jetson_worker_e2e.py``) hit an AttributeError the app turned into
+    # a 500. That is a REAL finding about the harness -- a 500 with no reason is
+    # exactly what made deploy 3 undiagnosable -- but it is not a hole in the
+    # worker-route coverage, and saying it was would be the same overclaim as
+    # reading a green suite as evidence a path works.
+    #
+    # All three return the real store's own bool/str, because the ROUTES branch
+    # on those values (``release_jetson`` -> None becomes a 409, "failed"
+    # becomes a terminal response) and a double that returned something else
+    # would test a branch the real store cannot take.
+    def finish_jetson(self, job_id, owner):
+        """Mark done iff ``owner`` still holds it; the real store's bool."""
+        job = self.jobs.get(str(job_id))
+        if not job or job.get("lease_owner") != owner:
+            return False
+        job.update(status=DB.DONE, stage=DB.DONE, finished_at="2026-09-26T00:00:00Z",
+                   message=None, lease_owner=None, lease_expires_at=None)
+        return True
+
+    def fail_jetson(self, job_id, owner, message):
+        job = self.jobs.get(str(job_id))
+        if not job or job.get("lease_owner") != owner:
+            return False
+        job.update(status=DB.FAILED, stage=DB.FAILED, message=message,
+                   finished_at="2026-09-26T00:00:00Z",
+                   lease_owner=None, lease_expires_at=None)
+        self.failures.append((str(job_id), message))
+        return True
+
+    def release_jetson(self, job_id, owner, message=""):
+        """``"released"``, ``"failed"`` at the bound, or ``None`` if not held.
+
+        The BOUND is modelled, not just the release: a double that always
+        returned "released" would make the route's terminal branch unreachable
+        and the crash-loop bound untestable at this level.
+        """
+        job = self.jobs.get(str(job_id))
+        if not job or job.get("lease_owner") != owner:
+            return None
+        if int(job.get("release_count", 0)) >= DB.MAX_RELEASES:
+            job.update(status=DB.FAILED, stage=DB.FAILED, message=message,
+                       finished_at="2026-09-26T00:00:00Z",
+                       lease_owner=None, lease_expires_at=None)
+            return "failed"
+        job.update(status=DB.QUEUED, stage=DB.QUEUED, message=message or None,
+                   lease_owner=None, lease_expires_at=None,
+                   release_count=int(job.get("release_count", 0)) + 1)
+        return "released"
+
+    def clear_terminal_leases(self):
+        """The startup repair: terminal rows stop looking leased. Returns a count."""
+        cleared = 0
+        for job in self.jobs.values():
+            if job.get("status") in DB.FINISHED and job.get("lease_owner"):
+                job["lease_owner"] = None
+                job["lease_expires_at"] = None
+                cleared += 1
+        return cleared
+
     # reads
     def get_job(self, job_id):
         return self.jobs.get(str(job_id))
@@ -157,16 +223,46 @@ class FakeDb:
         return sum(1 for j in self.jobs.values() if j["status"] == DB.RUNNING)
 
     def reclaim_expired_leases(self):
-        """The healthy case: with no leases in play, nothing was expired.
+        """Expire leases past their deadline, as the real store does.
 
-        The tick calls this on every pass, and "the double has no such method"
-        is an AttributeError, which the tick's middle ``except`` correctly reads
-        as a BROKEN STATEMENT -- degrading the scheduler over an omission in a
-        test double. A double that does not model a method the real store has
-        would make ``/healthz`` report degraded for a reason that cannot happen
-        in production, so the double has to answer it.
+        The ``lease_expired`` flag is this double's stand-in for
+        ``lease_expires_at < now()``.
+
+        **The ``status != running`` filter mirrors web/db.py's, and it is the
+        point of this method existing at all.** An earlier version returned
+        ``[]`` unconditionally, which is a double that cannot disagree with the
+        code: it made the 20:15Z resurrection unreachable in the unit suite, so
+        no test here could have caught it and none can now. With the filter
+        modelled, reverting the real SQL alone still leaves the suite green --
+        the real predicate is pinned on Postgres by ``pg_race_check.py`` D3 --
+        but a tick or double that requeues a TERMINAL row shows up here.
+
+        The rest of the healthy case is unchanged and still worth keeping: the
+        tick calls this on every pass, and "the double has no such method" is an
+        AttributeError, which the tick's middle ``except`` correctly reads as a
+        BROKEN STATEMENT -- degrading the scheduler over an omission in a test
+        double. A double that does not model a method the real store has would
+        make ``/healthz`` report degraded for a reason that cannot happen in
+        production, so the double has to answer it.
         """
-        return []
+        requeued = []
+        for job in self.jobs.values():
+            if not job.get("lease_expired"):
+                continue
+            if job.get("status") != DB.RUNNING:
+                continue
+            if int(job.get("release_count", 0)) >= DB.MAX_RELEASES:
+                job.update(status=DB.FAILED, stage=DB.FAILED,
+                           message="the GPU worker stopped responding and the "
+                                   f"job was retried up to {DB.MAX_RELEASES} "
+                                   "times; try again later",
+                           lease_owner=None, lease_expires_at=None)
+                continue
+            job.update(lease_owner=None, lease_expires_at=None,
+                       status=DB.QUEUED, stage=DB.QUEUED,
+                       release_count=int(job.get("release_count", 0)) + 1)
+            requeued.append(job["job_id"])
+        return requeued
 
     # set a job up as finished, with a mode table and field files on disk
     def finish(self, job_id, store, n_modes=2, achieved_median_edge_m=None):
@@ -1794,6 +1890,46 @@ def test_a_failed_jetson_row_is_not_cleared_by_a_later_tick(tmp_path):
         "a dead row and never learns to stop"
     )
     assert result["failed"] == 0, "it was already terminal; the tick did not re-fail it"
+
+
+def test_a_terminal_row_with_a_stale_lease_is_not_resurrected(tmp_path):
+    """The 20:15Z bug, at the level a unit test CAN see it: reclaim's filter.
+
+    Found live on the third deploy: the reaper failed a Jetson job while the OLD
+    ``mark_failed`` left its lease set, then ``reclaim_expired_leases`` found the
+    expired lease, requeued the TERMINAL row to ``queued``, and a worker claimed
+    and solved a job the owner had been told was FAILED. The web log read "its
+    GPU worker's lease expired; the job is claimable again".
+
+    SCOPE, stated because it is easy to over-read, and the same caveat as the
+    sibling test above: this drives ``FakeDb``, so it pins the TICK's and the
+    double's behaviour and NOT the real SQL. The double now carries the
+    ``status != RUNNING`` filter to mirror the store, so reverting the real
+    SQL's filter alone leaves this GREEN -- the real filter is pinned on real
+    Postgres by ``pg_race_check.py`` D3, which is the leg that goes red.
+
+    What it DOES pin, and what makes it worth keeping: the state is reachable at
+    all through the tick, and "already terminal" is not re-litigated by the next
+    pass. A tick that requeued it would show here.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    row = _make_jetson_row(db)
+    db.claim_jetson("w-integration", 300.0)
+
+    # The legacy shape, written by hand because the fixed code no longer makes
+    # it: terminal, still holding the lease, deadline in the past.
+    row.update(status=DB.FAILED, stage=DB.FAILED, lease_expired=True)
+
+    result = APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    assert db.jobs[str(row["job_id"])]["status"] == DB.FAILED, (
+        "a TERMINAL row must keep its outcome; a reclaim that judges the lease "
+        "without checking the status resurrects it and a worker solves a job "
+        "the owner was told was over"
+    )
+    assert result.get("reclaimed", []) == [], (
+        "nothing may be reported as reclaimed while the row stayed terminal"
+    )
 
 
 def _make_jetson_row(db):

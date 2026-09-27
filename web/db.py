@@ -27,6 +27,11 @@ FAILED = "failed"
 #: terminal states
 FINISHED = (DONE, FAILED)
 
+#: The startup repair of dangling leases on terminal rows. Not a job state --
+#: it is what ``clear_terminal_leases`` writes back into ``message`` so the
+#: rewrite is visible in the row instead of silent. See that method.
+RESTORED = "restored"
+
 #: which machine a job is for. ``cluster`` is a k8s Job (the pre-routing default,
 #: and what every existing row did); ``jetson`` waits for a GPU worker to claim
 #: it through the worker API.
@@ -184,6 +189,48 @@ class JobStore:
             sql = fh.read()
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(sql)
+
+    def clear_terminal_leases(self) -> int:
+        """Retire leases left dangling on TERMINAL rows. Returns how many.
+
+        LEGACY-DATA REPAIR, run once at startup. Rows failed by the old
+        ``mark_failed`` kept their lease, and such a row is a live trap even now
+        that ``reclaim_expired_leases`` filters on ``status = %s`` -- because the
+        worker API is a SEPARATE path that judges a row by its lease too. Leaving
+        the row claimable-but-terminal is the defect; this removes the only field
+        that makes it look alive.
+
+        **It cannot change a job's outcome, and that is why it is safe to run
+        unattended.** ``status``, ``stage`` and ``finished_at`` are untouched: a
+        done row stays done, a failed row stays failed. Only ``lease_owner`` and
+        ``lease_expires_at`` -- bookkeeping that should already have been NULL on
+        a terminal row -- are cleared.
+
+        **``message`` is APPENDED to, never replaced, and that is the whole
+        difference between a repair and a data loss.** There is nowhere else for
+        the old text to live -- this schema has no events table, and
+        ``finished_at`` says only *when* a row ended, not what it said. An
+        earlier draft of this method wrote the marker over the message, which
+        would have silently destroyed the one thing a FAILED row exists to carry:
+        the reason the owner was given. So the line is appended to whatever is
+        already there, which is both lossless and visible on the page the owner
+        is already reading. An empty message becomes the marker alone rather
+        than an empty string with a leading newline.
+
+        ``status = ANY(%s)`` over ``FINISHED`` rather than two ``= %s`` ORs: the
+        set of terminal states is already named once in ``FINISHED``, and a
+        third terminal state added later is then covered here automatically
+        instead of becoming a fresh dangling-lease hole.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL, "
+                "message = CASE WHEN message IS NULL OR message = '' THEN %s "
+                "               ELSE message || E'\\n' || %s END "
+                "WHERE status = ANY(%s) AND lease_owner IS NOT NULL",
+                (RESTORED, RESTORED, list(FINISHED)),
+            )
+            return int(cur.rowcount)
 
     # -- writes ------------------------------------------------------------
     def create_job(self, job_id, original_filename: str, units: str,
@@ -345,6 +392,29 @@ class JobStore:
         as none. The defect is the tick under-reporting its own work, not lost
         data. A caller that returns ``[]`` while rows moved is
         *could-not-ask looking like nothing-there*.
+
+        **``status = running`` on BOTH statements, and that is the second fix.**
+        A lease is only meaningful while a worker holds the row, so a row that
+        is ALREADY terminal has no business being judged on its lease at all --
+        yet the predicate here was the lease alone. That resurrected real jobs
+        in production: the reaper failed a Jetson job during a deploy while the
+        OLD ``mark_failed`` left its lease dangling, and this method then found
+        the expired lease, requeued the row to ``queued``, and a worker claimed
+        and solved a job the owner had been told was FAILED. Measured on the 3rd
+        deploy (20:15Z, job 375964fe): the web log read "its GPU worker's lease
+        expired; the job is claimable again".
+
+        The filter belongs on the OVER-BOUND statement too, for the same reason
+        and one more: without it, a terminal row with a legacy dangling lease
+        and a high ``release_count`` would be "failed" a second time, stamping a
+        fresh ``finished_at`` and a retries message on a job that finished hours
+        ago.
+
+        This is belt-and-braces with ``mark_failed`` clearing the lease. That
+        fix stops NEW terminal rows from holding one; this filter means a row
+        that is terminal for ANY reason -- legacy data, or a future path that
+        forgets to clear -- is not resurrected. ``clear_terminal_leases``
+        retires the legacy rows at startup.
         """
         with self._connect() as conn, conn.cursor() as cur:
             # (a) Requeue everything under the bound. No list parameter here, so
@@ -367,12 +437,13 @@ class JobStore:
                 "gpu_queued_at = now(), message = %s, "
                 "release_count = release_count + 1 "
                 "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
+                "AND status = %s "
                 "AND release_count < %s "
                 "RETURNING job_id",
                 (QUEUED, "queued",
                  _retry_message("the GPU worker stopped responding",
                                 MAX_RELEASES),
-                 MAX_RELEASES),
+                 RUNNING, MAX_RELEASES),
             )
             requeued = [str(r[0]) for r in cur.fetchall()]
 
@@ -382,8 +453,9 @@ class JobStore:
             cur.execute(
                 "SELECT job_id FROM mse.jobs "
                 "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
+                "AND status = %s "
                 "AND release_count >= %s",
-                (MAX_RELEASES,),
+                (RUNNING, MAX_RELEASES),
             )
             over = [str(r[0]) for r in cur.fetchall()]
             if over:
@@ -392,11 +464,12 @@ class JobStore:
                     "finished_at = now(), lease_owner = NULL, "
                     "lease_expires_at = NULL "
                     "WHERE job_id = ANY(%s::uuid[]) AND lease_owner IS NOT NULL "
+                    "AND status = %s "
                     "AND lease_expires_at < now()",
                     (FAILED, FAILED,
                      "the GPU worker stopped responding and the job was "
                      f"retried up to {MAX_RELEASES} times; try again later",
-                     over),
+                     over, RUNNING),
                 )
 
         # What actually moved, read back from the requeue's own RETURNING rather
@@ -711,12 +784,27 @@ class JobStore:
         lease must not have expired (a worker that vanished and came back must
         not write either). Checking only the owner would let a worker that slept
         through its lease resume writing over its successor's output.
+
+        **A TERMINAL row is never held, and that is the THIRD condition.** It is
+        the same bug as ``reclaim_expired_leases``' missing status filter, at the
+        other door: a row left terminal-but-leased by the old ``mark_failed``
+        satisfies both conditions above, so this returned True and ``_held``
+        waved a worker through to write progress and results onto a job the
+        owner had already been told was over. The two predicates must agree --
+        if reclaim refuses to requeue a terminal row, the worker gate must
+        refuse to serve it.
+
+        ``status = running`` rather than ``status <> 'failed' AND status <>
+        'done'`` so the shipped ``FINISHED`` tuple stays the single statement of
+        what terminal means; a third terminal state would otherwise be a fresh
+        hole here. A row that is ``queued`` cannot pass anyway, because queued
+        rows carry no lease.
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM mse.jobs WHERE job_id = %s AND lease_owner = %s "
-                "AND lease_expires_at > now()",
-                (str(job_id), owner),
+                "AND lease_expires_at > now() AND status = %s",
+                (str(job_id), owner, RUNNING),
             )
             return cur.fetchone() is not None
 

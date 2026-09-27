@@ -903,6 +903,225 @@ def check_expiry_bound_is_terminal(conn, r: Result, JobStore, bound: int):
             f"status={status!r} after {requeues} requeues (message {message!r})")
 
 
+def check_terminal_rows_are_never_reclaimed(conn, r: Result, JobStore):
+    """D3: a TERMINAL row with an expired lease must not be resurrected.
+
+    Found LIVE at 20:15Z on the 3rd deploy (job 375964fe). The web log read
+    "its GPU worker's lease expired; the job is claimable again", and then a
+    worker claimed it. That row was ``status='failed'``: the reaper failed it
+    during deploy attempt 2, while the OLD ``mark_failed`` left the lease set.
+    ``reclaim_expired_leases`` selected on the expired lease ALONE, so it
+    requeued a job the owner had already been told was over -- and the worker
+    went on to solve it.
+
+    Both terminal states are exercised. A FAILED row is the one seen in
+    production; a DONE row is the same hole by a different door (a job that
+    finished and then got requeued would be solved a second time), and the
+    filter is one predicate covering both, so the leg that only tested FAILED
+    could not tell ``status = 'failed'`` from ``status <> 'running'``.
+
+    The assertion is on the OWNER's row, not on the return value alone: the
+    return is what the caller acts on, but the damage is the row moving. Both
+    are read, because ``reclaim`` reporting ``[]`` while the row moved is
+    exactly the could-not-ask shape this file's own docstring calls out.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    for status in ("failed", "done"):
+        jid = str(uuid.uuid4())
+        _insert_jetson_job(conn, jid)
+        if _claim_row(store, jid, owner=f"w-d3-{status}") is None:
+            return r.check(f"D3 the seeding claim works ({status})", False,
+                           f"claim_jetson never returned {jid}")
+
+        # The legacy shape: terminal, but STILL CARRYING the worker's lease with
+        # its deadline in the past -- exactly the row the third deploy left
+        # behind. The owner is deliberately NOT nulled here: the stale lease is
+        # the bait, and a leg that cleared it first would be testing a row the
+        # fix is not needed for. Written with raw SQL because the code under
+        # test no longer produces this state -- that is the whole point.
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, finished_at = now() "
+                "WHERE job_id = %s",
+                (status, status, jid))
+            cur.execute("SELECT message FROM mse.jobs WHERE job_id = %s", (jid,))
+            message_before = cur.fetchone()[0]
+        conn.commit()
+        _expire_lease(conn, jid)
+
+        reclaimed = store.reclaim_expired_leases()
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, stage, message FROM mse.jobs "
+                        "WHERE job_id = %s", (jid,))
+            got_status, got_stage, got_message = cur.fetchone()
+            # The worker's own gate, which is the thing that must have changed:
+            # before the fix a reclaim put this row back to 'queued' with no
+            # lease, so claim_jetson handed a FAILED job to a worker.
+            cur.execute("SELECT count(*) FROM mse.jobs WHERE job_id = %s "
+                        "AND status = 'queued' AND lease_owner IS NULL", (jid,))
+            claimable = cur.fetchone()[0]
+
+        r.check(
+            f"D3 a {status.upper()} row with an expired lease keeps its outcome "
+            f"(reclaim must judge the lease only while a worker holds the row)",
+            got_status == status and got_stage == status
+            and jid not in reclaimed and claimable == 0,
+            f"status={got_status!r} stage={got_stage!r} reclaimed="
+            f"{jid in reclaimed} claimable={claimable} -- want status/stage "
+            f"{status!r}, not reclaimed, and NOT claimable by a worker")
+
+        # The negative control the fix's SIBLING depends on: the stale lease
+        # must still be there for the startup repair to find. A leg that cleared
+        # it would leave D4 testing a row that needs no repair, and would hide a
+        # repair that stopped working.
+        r.check(
+            f"D3 the {status.upper()} row still carries the stale lease for the "
+            f"startup repair to retire (a leg that cleared it first would leave "
+            f"D4 testing nothing)",
+            got_message == message_before,
+            f"message {message_before!r} -> {got_message!r} (reclaim must not "
+            f"rewrite a terminal row)")
+
+
+def check_clear_terminal_leases_retires_legacy_leases(conn, r: Result, JobStore):
+    """D4: the startup repair clears terminal leases and destroys no message.
+
+    Two properties, and the second is the one that could hurt someone. The
+    first is that the repair does what it says: a terminal row with a dangling
+    lease stops looking alive. The second is that it changes NO job's outcome
+    and loses NO text -- it runs unattended at every web start, over every
+    row the owner has ever finished, so ``status``, ``stage`` and
+    ``finished_at`` must be untouched and the owner's message must survive.
+
+    The message half has a positive control in the same leg: a row WITH a
+    message must still contain it afterwards, and a row WITHOUT one must end
+    up holding the marker alone rather than a leading newline. Without the
+    first control, "the message is still there" would also pass on a repair
+    that did nothing at all.
+
+    ``running`` is the negative control, and it is load-bearing: a repair that
+    cleared every lease in the table would be catastrophic -- it would strip
+    the lease from the job a worker is solving right now -- and would pass a
+    leg that only ever inserted terminal rows.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    jid_failed = str(uuid.uuid4())
+    jid_done = str(uuid.uuid4())
+    jid_live = str(uuid.uuid4())
+
+    for jid in (jid_failed, jid_done, jid_live):
+        _insert_jetson_job(conn, jid)
+        if _claim_row(store, jid, owner=f"w-d4-{jid[:4]}") is None:
+            return r.check("D4 the seeding claim works", False,
+                           f"claim_jetson never returned {jid}")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE mse.jobs SET status = 'failed', stage = 'failed', "
+            "finished_at = now(), message = %s WHERE job_id = %s",
+            ("the GPU worker could not complete this job", jid_failed))
+        cur.execute(
+            "UPDATE mse.jobs SET status = 'done', stage = 'done', "
+            "finished_at = now(), message = NULL WHERE job_id = %s", (jid_done,))
+    conn.commit()
+
+    # A live row's deadline must survive too, so the repair is checked for the
+    # thing it must NOT touch, not only the thing it must.
+    with conn.cursor() as cur:
+        cur.execute("SELECT lease_expires_at FROM mse.jobs WHERE job_id = %s",
+                    (jid_live,))
+        live_before = cur.fetchone()[0]
+
+    cleared = store.clear_terminal_leases()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT job_id, status, lease_owner, COALESCE(message, '') "
+            "FROM mse.jobs WHERE job_id = ANY(%s::uuid[])",
+            ([jid_failed, jid_done, jid_live],))
+        rows = {str(a): (b, c, d) for a, b, c, d in cur.fetchall()}
+        cur.execute("SELECT lease_expires_at, lease_owner FROM mse.jobs "
+                    "WHERE job_id = %s", (jid_live,))
+        live_after_expiry, live_after_owner = cur.fetchone()
+
+    f_status, f_owner, f_msg = rows[jid_failed]
+    d_status, d_owner, d_msg = rows[jid_done]
+    l_status, l_owner, _ = rows[jid_live]
+
+    r.check("D4 the repair clears the dangling lease on terminal rows",
+            f_owner is None and d_owner is None and cleared >= 2,
+            f"cleared={cleared} failed_owner={f_owner!r} done_owner={d_owner!r}")
+
+    r.check("D4 it changes no job's OUTCOME -- a done row stays done, a failed "
+            "row stays failed",
+            f_status == "failed" and d_status == "done",
+            f"failed row -> {f_status!r}, done row -> {d_status!r}")
+
+    r.check("D4 it APPENDS to the owner's message rather than replacing it",
+            "the GPU worker could not complete this job" in f_msg
+            and f_msg.rstrip().endswith("restored"),
+            f"message={f_msg!r}")
+
+    r.check("D4 an empty message becomes the marker alone, not a blank line",
+            d_msg == "restored",
+            f"message={d_msg!r}")
+
+    r.check("D4 it leaves the LEASE of a RUNNING row alone (the negative "
+            "control: a repair that cleared every lease would strip the job a "
+            "worker is solving right now)",
+            l_status == "running" and l_owner is not None
+            and live_after_owner is not None
+            and live_after_expiry == live_before,
+            f"running row status={l_status!r} owner={l_owner!r} "
+            f"expiry {live_before} -> {live_after_expiry}")
+
+
+def check_a_terminal_row_serves_no_worker_write(conn, r: Result, JobStore):
+    """D5: the OTHER door -- the worker gate must refuse a terminal row too.
+
+    D3 pins ``reclaim_expired_leases``, but that is only one of the two places a
+    lease is judged. ``lease_held_by`` gates EVERY worker write through
+    ``_held``, and it originally checked only owner and expiry -- so a terminal
+    row left leased by the old ``mark_failed`` returned True and a worker was
+    waved through to write progress and results onto a job the owner had already
+    been told was over.
+
+    The assertion is the ``_held`` decision itself, not the columns, because
+    that is what a worker experiences: the 409 is what stops it. Mutation: drop
+    ``AND status = running`` and this leg goes red.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    _insert_jetson_job(conn, jid)
+    if _claim_row(store, jid, owner="w-d5") is None:
+        return r.check("D5 the seeding claim works", False,
+                       f"claim_jetson never returned {jid}")
+
+    # The positive control FIRST, on the running row: the gate must be open
+    # while the worker legitimately holds it. Without this, "the gate refused"
+    # would also pass on a predicate that refuses everything.
+    held_running = store.lease_held_by(jid, "w-d5")
+
+    with conn.cursor() as cur:
+        cur.execute("UPDATE mse.jobs SET status = 'failed', stage = 'failed', "
+                    "finished_at = now() WHERE job_id = %s", (jid,))
+    conn.commit()
+
+    held_terminal = store.lease_held_by(jid, "w-d5")
+
+    r.check("D5 a worker holding the lease on a RUNNING row may write (the "
+            "positive control: a gate that refuses everything fails here)",
+            held_running is True,
+            f"lease_held_by on its own running row returned {held_running!r}")
+
+    r.check("D5 a worker is REFUSED on a row failed underneath it (a terminal "
+            "row must serve no worker write, even with the lease still set)",
+            held_terminal is False,
+            f"lease_held_by returned {held_terminal!r} for a FAILED row -- want "
+            f"False (the 409 that stops the worker)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Race/lease checks against a throwaway Postgres. The "
@@ -982,6 +1201,16 @@ def main() -> int:
         # first read as a D2 that failed.
         check_a_claimed_jetson_job_is_not_reaped_by_the_tick(conn, r, JobStore,
                                                              load_app_module())
+        # D3/D4: the OTHER direction of the same lease. D1/D2 are about a
+        # worker being stopped; these are about a terminal job being brought
+        # back. Found live at 20:15Z, the same class as the bugs above, and
+        # likewise invisible to a unit test that drives a double.
+        check_terminal_rows_are_never_reclaimed(conn, r, JobStore)
+        check_clear_terminal_leases_retires_legacy_leases(conn, r, JobStore)
+        # D5: the worker gate's half. D3 stops a terminal row being REQUEUED;
+        # this stops one being SERVED. Both must refuse, or the worker still
+        # writes onto a job the owner was told was over.
+        check_a_terminal_row_serves_no_worker_write(conn, r, JobStore)
     finally:
         conn.close()
     print("RESULT:", "PASS" if r.ok else "FAIL")

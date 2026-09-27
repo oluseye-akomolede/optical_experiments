@@ -28,9 +28,22 @@ import mse_meshing as MESH  # noqa: E402
 
 
 class FakeGrid:
+    """The interface ``mse_meshing`` reads: tetgen's own ``.node`` and ``.elem``.
+
+    This fake used to expose ``points`` and ``cells_dict[VTK_TETRA]``, which is
+    the ``tet.grid`` (pyvista) shape. The solver no longer builds a pyvista grid
+    at all -- VTK is what the image is shedding -- so a fake still modelling
+    ``cells_dict`` would be a fake of an interface nothing calls, and every test
+    below would pass while proving nothing about the code that runs. The rig has
+    a memory for exactly this ("a double that models the fix, not the bug").
+
+    ``test_the_fake_models_what_the_solver_reads`` asserts the fake and the real
+    ``mse_meshing`` agree on the shape, so this cannot drift back.
+    """
+
     def __init__(self, points, tets):
-        self.points = points
-        self.cells_dict = {MESH.VTK_TETRA: tets}
+        self.node = points
+        self.elem = tets
 
 
 #: A real Kuhn-split cube: 6 tets that tile the unit cube exactly. Every edge
@@ -95,7 +108,11 @@ class FakeTetGen:
         copies = self._copies_for(maxvolume)
         points = self._points_for()
         tets = np.tile(_CUBE_TETS, (copies, 1))
-        self.grid = FakeGrid(points, tets)
+        # ``.node``/``.elem`` -- the interface mse_meshing reads now. Provided
+        # alongside a ``grid`` so a future caller cannot silently depend on the
+        # pyvista shape coming back.
+        self.node = points
+        self.elem = tets
 
     def _copies_for(self, maxvolume) -> int:
         """How many times to replicate the unit cube **as an element count**.
@@ -656,3 +673,147 @@ def test_a_five_nanometre_object_meshes(monkeypatch):
     # ...and the frame TetGen saw was still the O(1) one.
     v = seen["vertices"]
     assert float(np.max(v.max(axis=0) - v.min(axis=0))) == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# The two facts the tet.grid -> tet.node/tet.elem swap rests on
+#
+# Both are silent when wrong, which is why they are pinned against the REAL
+# tetgen rather than argued in a comment. The rig's recurring defect is a check
+# that cannot fail -- a fake agreeing with itself -- so these run real meshes and
+# compare the new read against the old one that is being removed.
+# ---------------------------------------------------------------------------
+
+def _real_tetgen_available() -> bool:
+    try:
+        import tetgen  # noqa: F401,PLC0415
+    except Exception:  # noqa: BLE001 - absence is a fact to report, not an error
+        return False
+    return True
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+def test_tetrahedralize_returns_zero_based_in_range_indices():
+    """Drive the REAL ``tetrahedralize`` and check the indices it hands back.
+
+    This replaces a test that built its own ``tetgen.TetGen`` and compared
+    ``tet.elem`` against ``cells_dict[VTK_TETRA]``. That test could not fail on
+    the code it was written to protect: it never called ``tetrahedralize``, so
+    it pinned *tetgen's* behaviour, and mutating the solver's read to ``elem - 1``
+    left it green. It was a check that could not see the defect. (Measured: the
+    mutation passed it.)
+
+    The property that actually matters is the one the solver depends on -- every
+    index it returns is a valid row of the points it returns alongside. A
+    ``- 1`` shifts the minimum below zero; a ``+ 1`` runs past the end; either
+    is caught here, and neither is caught by comparing two raw tetgen arrays.
+    """
+    surface = trimesh.creation.box(extents=[4.0, 6.0, 3.0])   # metres
+    points, tets = MESH.tetrahedralize(surface, "m", n_modes=4, max_tets=5000,
+                                       verbose=False, enforce_resolution=False)
+
+    assert tets.ndim == 2 and tets.shape[1] == 4, tets.shape
+    assert tets.shape[0] > 1, "need more than one element to mean anything"
+    n_points = np.asarray(points).shape[0]
+    assert int(tets.min()) == 0, (
+        f"lowest index is {int(tets.min())}, not 0 -- the read is off by a "
+        f"constant (a 1-based read gives -1 here)"
+    )
+    assert int(tets.max()) == n_points - 1, (
+        f"highest index {int(tets.max())} != n_points-1 ({n_points - 1}); the "
+        f"indices do not address the points returned with them"
+    )
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+def test_tetrahedralize_preserves_the_axis_order_of_the_surface():
+    """Drive the REAL ``tetrahedralize`` and check the axes are not swapped.
+
+    Same lesson as the index test above: a test that builds its own ``TetGen``
+    pins tetgen, not this module. This one goes through ``tetrahedralize`` and
+    asserts the returned points carry the SURFACE's own extents in the same
+    order -- so reading ``node[:, [0, 2, 1]]`` (a y/z swap, which every edge
+    length survives) fails here.
+
+    A box with three distinct extents is the fixture: a transposed read cannot
+    reproduce them, and an (x,y,z)-preserving read must.
+    """
+    extents = [4.0, 6.0, 3.0]     # metres, all different
+    surface = trimesh.creation.box(extents=extents)
+    points, _ = MESH.tetrahedralize(surface, "m", n_modes=4, max_tets=5000,
+                                    verbose=False, enforce_resolution=False)
+
+    span = np.asarray(points).max(axis=0) - np.asarray(points).min(axis=0)
+    # The box is centred on the origin and lies on the axes, so the mesh span
+    # must reproduce the extents in the SAME order. Rounded: TetGen's hull is
+    # the box to within its own tolerance.
+    assert np.allclose(span, extents, rtol=1e-6, atol=1e-9), (
+        f"mesh spans {span} do not match the box extents {extents} in order -- "
+        f"the coordinate columns are not x, y, z (a swap looks plausible on "
+        f"every edge length and every element count)"
+    )
+
+
+def test_the_fake_models_what_the_solver_reads():
+    """The FakeGrid must expose ``.node``/``.elem``, the interface actually read.
+
+    A fake of an interface nothing calls makes every test above vacuous: it can
+    only fail on a change to the fake. This assertion is what keeps the fake and
+    ``mse_meshing`` from drifting apart again -- it is deliberately a test about
+    the DOUBLE, because the double is where this class of bug hides.
+    """
+    fake = FakeGrid(np.zeros((4, 3)), np.zeros((1, 4), dtype=np.int64))
+    assert hasattr(fake, "node"), "the solver reads tet.node; the fake must too"
+    assert hasattr(fake, "elem"), "the solver reads tet.elem; the fake must too"
+    assert np.asarray(fake.elem).shape[1] == 4, "tetrahedra are 4-node cells"
+    # And the source really is read through those names -- not through a
+    # ``grid`` that happens to still exist.
+    #
+    # COMMENTS ARE STRIPPED FIRST, and that is not tidiness. The first version
+    # of this check searched the raw source and failed on its own explanatory
+    # comment, which mentions the old attribute by name to say why it is gone.
+    # A probe that cannot tell prose from code reports a defect in a comment --
+    # the same "the instrument, not the world" shape this whole file guards
+    # against. Strip first, then ask.
+    import inspect
+
+    src = inspect.getsource(MESH.tetrahedralize)
+    code = _strip_comments_and_docstrings(src)
+    assert ".elem" in code and ".node" in code, (
+        "mse_meshing no longer reads .node/.elem; this fake and the whole block "
+        "of tests built on it would be modelling nothing"
+    )
+    assert "cells_dict" not in code, (
+        f"mse_meshing still reads cells_dict in CODE (comment mentions are "
+        f"fine and expected); the pyvista grid was supposed to be gone.\n{code}"
+    )
+
+
+def _strip_comments_and_docstrings(src: str) -> str:
+    """Source with comments and docstrings removed, leaving executable code.
+
+    ``tokenize`` rather than a regex: a ``#`` inside a string literal is not a
+    comment, and a naive strip would miscount those. ``AST`` is the other
+    candidate but it discards nothing -- the tokens are what we want to read.
+    """
+    import io
+    import tokenize
+
+    kept: list[tokenize.TokenInfo] = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type == tokenize.COMMENT:
+                continue
+            kept.append(tok)
+    except tokenize.TokenError:
+        # An unparsable fragment means the probe cannot speak -- say so by
+        # returning it unchanged rather than silently reporting "no defect".
+        return src
+    # ``untokenize``, NOT a " ".join of token strings: joining bare tokens puts
+    # spaces inside ``tet.elem`` (it lexes as NAME . NAME) so the substring is
+    # gone and every assert below reads as a missing attribute. An earlier
+    # version of this helper did exactly that and reported a defect that was
+    # not there -- the join was the bug, not the source.
+    return tokenize.untokenize(kept)

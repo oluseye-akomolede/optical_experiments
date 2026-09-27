@@ -28,6 +28,7 @@ from pathlib import Path
 import psycopg2
 from flask import (Flask, abort, flash, jsonify, make_response, redirect,
                    render_template, request, send_file, url_for)
+from werkzeug.exceptions import HTTPException
 from flask.json.provider import DefaultJSONProvider
 
 import config as CFG
@@ -271,7 +272,101 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
     WORKER.register(app, jobs_db, store)
     WORKER.register_blueprint(app)
 
+    _log_worker_failures(app)
+
     return app, store, jobs_db, launcher
+
+
+#: One slot for the reason of the request IN FLIGHT. A dict rather than a
+#: module global holding a string, so the mutation is a rebind a test can see.
+#: Keyed on nothing: the wrapper and ``after_request`` both run inside ONE
+#: request, and a stale entry would mislabel the NEXT request's reason, which is
+#: why ``after_request`` POPS rather than reads.
+_WORKER_ABORT_REASON: dict[str, str] = {}
+
+
+def _log_worker_failures(app) -> None:
+    """Log the reason for every non-2xx the worker API returns.
+
+    On deploy 3 every Jetson job failed right after a successful solve and the
+    app said nothing at all: a 4xx/5xx on ``/worker/*`` was returned to the
+    worker and forgotten, so the worker's journal held only the generic owner
+    sentence and the app's log held nothing. The one place that knew the reason
+    -- the abort's description, or the traceback of a raised exception -- kept
+    it to itself, and the failure could not be diagnosed from either side.
+
+    This is the app's half of the fix; the worker's half is ``log_exception`` in
+    ``worker/mse_worker.py``. Together they mean a failing worker call leaves a
+    record on both ends, which is what makes the two ends reconcilable.
+
+    WARNING, not ERROR: a 409 is a NORMAL outcome here -- it is how a worker
+    learns its lease is gone -- and logging it at ERROR would train whoever
+    reads the log to ignore the level that matters.
+
+    **WHY THE HANDLERS ARE WRAPPED RATHER THAN A SIGNAL USED.** The obvious hook
+    is Flask's own ``got_request_exception`` signal, and it does not work here:
+    reading Flask 3.1's ``app.py``, that signal is sent from ``handle_exception``
+    ALONE -- the unhandled path that produces a 500 -- while an ``abort()``
+    becomes a response in ``handle_user_exception`` and returns before any signal
+    fires. Every failure this blueprint produces is an ``abort``, so a
+    signal-based hook logged NOTHING for them; measured, not assumed, because
+    that hook was written first and reported "no reason given" for a 503 whose
+    description was right there. ``request.routing_exception`` is no help either
+    -- it is set only for URL-ROUTING failures.
+
+    Wrapping both handlers is what sees every reason, because every failure on
+    this blueprint leaves Flask through one of the two. ``after_request`` stays
+    as well, for the responses that never raise at all: a route returning
+    ``(..., 4xx)`` directly has no exception, and a handler-only hook would miss
+    it.
+    """
+    original_user = app.handle_user_exception
+    original_500 = app.handle_exception
+
+    def _note(exception) -> None:
+        """Stash the reason for the request in flight, if it is a worker one."""
+        try:
+            path = request.path
+        except RuntimeError:      # no request context: nothing to attribute
+            return
+        if not path.startswith("/worker/"):
+            return
+        if isinstance(exception, HTTPException):
+            _WORKER_ABORT_REASON["reason"] = (
+                getattr(exception, "description", "") or str(exception))
+        else:
+            # A real exception: the traceback IS the reason, and ERROR is the
+            # right level, because an unhandled raise is a bug in the app rather
+            # than a worker that lost its lease.
+            app.logger.exception(
+                "worker API %s %s raised %s", request.method, path,
+                type(exception).__name__)
+
+    def user_handler(exception):  # noqa: ANN001
+        _note(exception)
+        return original_user(exception)
+
+    def server_handler(exception):  # noqa: ANN001
+        _note(exception)
+        return original_500(exception)
+
+    app.handle_user_exception = user_handler
+    app.handle_exception = server_handler
+
+    @app.after_request
+    def _record_worker_failure(response):  # noqa: ANN001 - Flask's signature
+        if not request.path.startswith("/worker/"):
+            return response
+        if response.status_code < 400:
+            return response
+        # Consumed once, so a later request cannot inherit this one's reason.
+        reason = _WORKER_ABORT_REASON.pop("reason", "")
+        if not reason and response.status_code >= 500:
+            reason = "no reason given (the traceback above, if any, is the rest)"
+        app.logger.warning(
+            "worker API %s %s -> %s (%s)", request.method, request.path,
+            response.status_code, reason or "no reason given")
+        return response
 
 
 def run_tick(store, jobs_db, launcher, log=print) -> dict:

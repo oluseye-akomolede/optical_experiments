@@ -515,12 +515,34 @@ def tetrahedralize(
             order=1, mindihedral=20, minratio=2.0,
             maxvolume=maxvolume, fixedvolume=True,
         )
-        grid = tet.grid
-        tets = np.asarray(grid.cells_dict[VTK_TETRA], dtype=np.int64)
+        # Read the mesh from tetgen's OWN arrays, not from ``tet.grid``.
+        #
+        # ``tet.grid`` builds a pyvista.UnstructuredGrid, and pyvista pulls in
+        # VTK -- the single heaviest dependency in this image (~1 GB of the
+        # 1.74 GB, plus 212 MB of apt shared libraries that exist only for it).
+        # The mesh is available without any of that.
+        #
+        # The two facts this swap depends on are MEASURED, not assumed, because
+        # either being wrong is silent -- an off-by-one index produces a mesh
+        # that is nearly right and tetrahedralizes without error:
+        #
+        #   * ``.elem`` is 0-BASED and byte-identical to ``cells_dict[VTK_TETRA]``
+        #     (verified on both a single tet and a 32-tet sphere; the index range
+        #     is 0..n_nodes-1, so a 1-based read would run past the end of
+        #     ``.node``). This is the opposite of what tetgen's FILE format docs
+        #     suggest -- the 1-based rule applies to the .ele file, not this
+        #     array -- which is exactly why it is pinned by a test rather than
+        #     taken from the docs.
+        #   * ``.node`` is exactly 3 columns (x, y, z), with no trailing region
+        #     attribute being read as a coordinate.
+        #
+        # tests/test_meshing_guard.py holds both, so a future tetgen that
+        # changes either fails there rather than in a deployed solve.
+        tets = np.asarray(tet.elem, dtype=np.int64)
         # Map the points straight back to the scaled surface's units. This is
         # the exact inverse of the mapping above, and it happens per attempt
         # because each retry re-tetrahedralizes and returns fresh points.
-        points = (np.asarray(grid.points, dtype=float) / canonical_scale
+        points = (np.asarray(tet.node, dtype=float)[:, :3] / canonical_scale
                   + canonical_offset)
         n_tets = int(tets.shape[0])
 
