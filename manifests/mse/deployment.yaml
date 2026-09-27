@@ -69,6 +69,24 @@ spec:
                   # flask only needs this to sign its own flash cookie; a
                   # missing key is not worth failing a rollout over
                   optional: true
+            # The shared secret the Jetson worker presents on /worker/*. It is
+            # NOT optional in effect: without it worker_api.py has no token to
+            # check against and CLOSES the API (503), which is the designed
+            # fail-safe -- a missing secret must never mean an OPEN endpoint.
+            # That also means a missing key here is invisible in a rollout and
+            # only shows up as a worker that can never claim a job, so the
+            # value is wired from the start rather than discovered later.
+            #
+            # A missing key is tolerated at POD level (optional: true) purely so
+            # the web app still serves uploads and the job pages while the
+            # operator provisions it; the closed-API behaviour above is what
+            # keeps that safe.
+            - name: MSE_WORKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mse-web-secrets
+                  key: MSE_WORKER_TOKEN
+                  optional: true
           envFrom:
             - secretRef:
                 name: mse-minio

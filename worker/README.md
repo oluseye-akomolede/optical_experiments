@@ -14,16 +14,37 @@ process down.
 
 Three steps. Replace `<user>` with the desktop user the Orin runs as.
 
-**1. Put the code and the unit where the unit expects them.**
+**1. Put the whole reviewed tree and the unit where the unit expects them.**
+
+The unit runs `~/mse-worker/app/worker/mse_worker.py`, and the worker imports
+the solver from `../dockerfiles/maxwell_solver` **relative to its own file**
+(`_SOLVER_DIR = Path(__file__).resolve().parent.parent / "dockerfiles" /
+"maxwell_solver"`). So the archive must be the whole tree: copying
+`mse_worker.py` on its own puts the script at `~/mse-worker/mse_worker.py`,
+which makes `_SOLVER_DIR` resolve to `~/dockerfiles/maxwell_solver` — a
+directory that does not exist, and the failure appears at import time as a
+missing module.
 
 ```sh
-mkdir -p ~/mse-worker
-cp worker/mse_worker.py ~/mse-worker/
+mkdir -p ~/mse-worker ~/.config/systemd/user
+git archive --format=tar <reviewed-sha> | tar -x -C ~/mse-worker/app --strip-components=0
+# ...or from a checkout:  git -C <checkout> archive <sha> | tar -x -C ~/mse-worker/app
 cp worker/mse-worker.service ~/.config/systemd/user/
 ```
 
-`~/mse-worker` must also contain the solver checkout that `mse_worker.py`
-imports, plus the Jetson cuDSS tree the unit names in `LD_LIBRARY_PATH`.
+Two directories are symlinked rather than copied, so the deploy names the bench
+artefacts instead of duplicating them:
+
+```sh
+ln -sfn ~/mse-bench/gpu-venv          ~/mse-worker/venv       # the GPU venv
+ln -sfn ~/mse-bench/cudss-jetson-071  ~/cudss-0.7.1           # the Jetson cuDSS tree
+```
+
+`~/cudss-0.7.1` is the path the unit's `LD_LIBRARY_PATH` and `CUDSS_MT_LIB`
+already name, which is why the symlink is at the home directory and not inside
+`~/mse-worker`. It must be NVIDIA's **Jetson aarch64** cuDSS 0.7.1 — the pip
+`nvidia-cudss-cu12` wheel is an SBSA build and aborts in `cudss.create()`; the
+same goes for the pip cublas/nvrtc wheels.
 
 **2. Create the env file the token lives in — mode 600.**
 
@@ -51,18 +72,31 @@ journalctl --user -u mse-worker -f
 ```
 
 It is a **user** unit, so it stops when the user logs out unless lingering is
-on. One-time fix:
+on. **Lingering is currently OFF on the Orin** (`loginctl show-user <user> -p
+Linger` reports `Linger=no`), and the one-time fix needs root:
 
 ```sh
 sudo loginctl enable-linger <user>
 ```
 
+Our rules forbid us from running `sudo`, so **whether to enable it is the
+owner's call, not the deployer's**. Until it is enabled the worker runs only
+while that desktop session is logged in, and a logout silently stops it —
+which matters because the failure is quiet: the Jetson simply stops claiming
+jobs and the queue backs up with nothing reporting an error. If the owner does
+not want lingering, the worker needs a login session kept open instead.
+
 ## Running it by hand
 
 ```sh
-~/mse-worker/mse_worker.py --once        # one job, then exit (diagnostic)
-~/mse-worker/mse_worker.py               # the service loop
+~/mse-worker/venv/bin/python ~/mse-worker/app/worker/mse_worker.py --once  # one job
+~/mse-worker/venv/bin/python ~/mse-worker/app/worker/mse_worker.py         # the loop
 ```
+
+By hand it must be that interpreter explicitly. The script's
+`#!/usr/bin/env python3` shebang resolves to the system python, which has no
+cupy and no nvmath, so running it directly dies at import with a traceback that
+looks like a code fault rather than a deployment one.
 
 ## The bench lock
 

@@ -1,9 +1,21 @@
 # The Jetson GPU worker, as a systemd USER unit.
 #
-# Install (the lead does this -- see worker/README.md for the full sequence):
-#   mkdir -p ~/.config/systemd/user
-#   cp mse-worker.service ~/.config/systemd/user/
-#   cp mse_worker.py ~/mse-worker/          # alongside the solver checkout
+# Install (the lead does this -- see worker/README.md for the full sequence).
+# The layout this unit encodes, and which the deploy must create:
+#
+#   ~/mse-worker/app       a git archive of the REVIEWED sha. It must be the
+#                          whole tree, not just mse_worker.py: the worker
+#                          imports the solver from ../dockerfiles/maxwell_solver
+#                          relative to its own file, so a lone script leaves
+#                          that import pointing at a directory that is not
+#                          there. The whole tree makes app/worker/mse_worker.py
+#                          and app/dockerfiles/maxwell_solver both exist.
+#   ~/mse-worker/venv      the GPU venv (the lead symlinks it to the bench venv)
+#
+# WorkingDirectory is ~/mse-worker, so Documentation= reaches the copy of
+# worker/README.md inside the archive (app/worker/README.md) rather than a file
+# at the top of ~/mse-worker, which this layout does not create.
+#
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now mse-worker
 #
@@ -30,13 +42,23 @@
 
 [Unit]
 Description=MSE GPU worker (claim one Jetson job at a time and solve it)
-Documentation=file:%h/mse-worker/README.md
+Documentation=file:%h/mse-worker/app/worker/README.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/mse-worker/mse_worker.py
+# The interpreter is named EXPLICITLY, never left to the script's
+# `#!/usr/bin/env python3` shebang: that resolves to the SYSTEM python on the
+# Orin, which has no cupy and no nvmath, so the worker would die at import with
+# a traceback that looks like a code fault rather than a deployment one.
+# `-u` keeps stdout unbuffered so journalctl shows progress as it happens
+# instead of in one block when the buffer fills.
+ExecStart=%h/mse-worker/venv/bin/python -u %h/mse-worker/app/worker/mse_worker.py
+# The CWD matters as much as the path: the worker resolves its solver directory
+# and writes its scratch relative to the process, and starting it from $HOME
+# rather than the app tree is how a relative path lands somewhere unexpected.
+WorkingDirectory=%h/mse-worker
 EnvironmentFile=%h/.config/mse-worker/env
 
 # --- the Jetson CUDA environment -------------------------------------------
