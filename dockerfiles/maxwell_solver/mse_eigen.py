@@ -34,11 +34,21 @@ import numpy as np
 from scipy import sparse
 from scipy.sparse import linalg as spla
 
+import mse_backend as BACKEND
+
 #: shift magnitude as a fraction of (pi/D)^2; the first physical mode is near there
 SHIFT_FRACTION = 1.0
 
 #: eigenvalues below this fraction of the largest returned one are spurious
 SPURIOUS_FRACTION = 1e-6
+
+#: which backend the last ``solve_modes`` call used, and how much residual its
+#: GPU refinement left behind. Read by the caller for the log line and for
+#: ``modes.json``; the return tuple is unchanged because all seven call sites
+#: unpack three values and none of them needs this.
+LAST_BACKEND: str = BACKEND.CPU
+LAST_BACKEND_DESCRIPTION: str = BACKEND.CPU
+LAST_WORST_RESIDUAL: float | None = None
 
 
 class EigenError(Exception):
@@ -122,6 +132,7 @@ def solve_modes(
     constrained: np.ndarray,
     verbose: bool = True,
     spd_ordering: bool = True,
+    backend: str | None = None,
 ):
     """Solve for the lowest ``n_modes`` physical eigenvalues of ``A x = k^2 B x``.
 
@@ -129,9 +140,20 @@ def solve_modes(
     ``tet_edges`` and ``constrained`` refer to the *unreduced* numbering so the
     gradient projector can be built.
 
+    ``backend`` is ``"cpu"`` or ``"gpu"``; ``None`` reads ``MSE_SOLVER_BACKEND``.
+    Both SPD factorisations go through it -- see :mod:`mse_backend` for why both
+    and not just the larger one. Which backend ran is left in
+    :data:`LAST_BACKEND` / :data:`LAST_BACKEND_DESCRIPTION`, along with the
+    worst refined residual in :data:`LAST_WORST_RESIDUAL`.
+
     Returns ``(eigenvalues, eigenvectors, sigma)`` with eigenvalues ``k^2`` in
     ``1/m^2``, ascending.
     """
+    global LAST_BACKEND, LAST_BACKEND_DESCRIPTION, LAST_WORST_RESIDUAL
+    backend = backend or BACKEND.selected_backend()
+    LAST_BACKEND = backend
+    LAST_BACKEND_DESCRIPTION = BACKEND.describe(backend)
+    LAST_WORST_RESIDUAL = None
     n_free = A.shape[0]
     if n_free < 2 * n_modes + 2:
         raise EigenError(
@@ -183,7 +205,9 @@ def solve_modes(
     # negative shift => K = A + s B is SPD
     K = (A + s * B).tocsc()
     try:
-        K_lu = spla.splu(K, **spd_lu)
+        K_lu = BACKEND.factor(K, label="K", spd_lu=spd_lu, backend=backend)
+    except BACKEND.BackendError:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise EigenError(f"could not factor A + sB: {exc}") from exc
 
@@ -197,7 +221,9 @@ def solve_modes(
     # arguments. Checked rather than assumed -- the test suite factors both on a
     # small box and asserts the same eigenvalues as the default ordering.
     try:
-        S_lu = spla.splu(S, **spd_lu)
+        S_lu = BACKEND.factor(S, label="S", spd_lu=spd_lu, backend=backend)
+    except BACKEND.BackendError:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise EigenError(f"could not factor G^T B G: {exc}") from exc
 
@@ -250,6 +276,16 @@ def solve_modes(
 
     eigenvalues = eigenvalues[:n_modes]
     eigenvectors = eigenvectors[:, :n_modes]
+
+    # The GPU factor records the worst refined residual it saw. Collect it here
+    # so the run can report the margin it had -- a check that passed says far
+    # more when you know whether it passed at 1e-12 or at 9e-7.
+    residuals = [
+        r for r in (
+            getattr(lu, "worst_residual", None) for lu in (K_lu, S_lu)
+        ) if isinstance(r, float)
+    ]
+    LAST_WORST_RESIDUAL = max(residuals) if residuals else None
 
     if verbose:
         print(f"[mse] solved {n_modes} modes, sigma={sigma:.4e} 1/m^2, "

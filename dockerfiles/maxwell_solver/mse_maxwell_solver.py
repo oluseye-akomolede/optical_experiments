@@ -137,11 +137,22 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
     # -- solving ----------------------------------------------------------
     stage("solving")
     t0 = time.time()
+    # Not gated on `verbose`: which machine factorised the matrices is not
+    # progress chatter, it is the first thing to check when a run is slower or
+    # less accurate than expected. Reported after the call, from what the solver
+    # actually used, so an env var that was ignored cannot look like one that
+    # took effect.
     eigenvalues, eigenvectors, sigma = EIG.solve_modes(
         A_free, B_free, n_modes, points_m,
         edges=edges, tets=tets, tet_edges=tet_edges,
         free_edges=free_edges, constrained=constrained, verbose=verbose,
     )
+    residual_note = (
+        f", worst refined residual {EIG.LAST_WORST_RESIDUAL:.2e}"
+        if EIG.LAST_WORST_RESIDUAL is not None else ""
+    )
+    print(f"[mse] solver backend: {EIG.LAST_BACKEND_DESCRIPTION}{residual_note}",
+          flush=True)
     timings["solving"] = time.time() - t0
 
     # The projection removes the gradient null space exactly, so a zero or
@@ -260,6 +271,12 @@ def write_results(job_id, store_out, surface, points_m, tets, edges, tet_edges,
         "n_index": float(n_index),
         "n_tets": int(tets.shape[0]),
         "n_edges": int(edges.shape[0]),
+        # Which machine factorised K and S, and for the GPU path how much
+        # residual the refinement left. Recorded because two runs of the same
+        # upload on different backends should differ only in time, and a reader
+        # comparing them needs to know which is which without the log.
+        "solver_backend": EIG.LAST_BACKEND_DESCRIPTION,
+        "solver_worst_residual": EIG.LAST_WORST_RESIDUAL,
         "grid": {
             "nx": int(nx), "ny": int(ny), "nz": int(nz),
             "origin": [float(v) for v in origin],
