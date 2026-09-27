@@ -51,22 +51,33 @@ def take_lock() -> None:
     """Refuse to run if another instance is mid-reversion.
 
     ``O_CREAT | O_EXCL`` is atomic, so two processes cannot both believe they
-    hold it. A stale lock from a killed run is the cost of that safety; the
-    message says which file to remove, and the pid in it says whether it is
-    still alive.
+    hold it.
+
+    A stale lock from a killed run is NOT cleared automatically, and that is
+    deliberate rather than an oversight. A run killed mid-case leaves a *dirty
+    tree* -- the file it was reverting is still reverted -- and the stale lock is
+    the only thing stopping the next run from building on that. The mutation
+    window is most of the run, so a kill almost always lands on a reverted file.
+    Clearing a stale lock by pid-liveness or a timeout would let run two revert
+    files on top of run one's half-restored tree. The refusal is load-bearing;
+    clear it by hand, after ``git status``.
     """
     try:
         fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         try:
-            holder = LOCK.read_text().strip()
+            # ``read_text`` succeeds on the window between the create above and
+            # the write below, returning '' -- so the OSError fallback does not
+            # cover it and the message would read "in progress (pid )."
+            holder = LOCK.read_text().strip() or "unknown"
         except OSError:
             holder = "unknown"
         raise SystemExit(
             f"another check_discriminating run is in progress (pid {holder}).\n"
             "It rewrites the tree and restores it, so running two at once would "
             "corrupt both.\n"
-            f"If that process is gone, remove {LOCK} and retry."
+            f"If that process is gone, the tree may be half-reverted -- run "
+            f"'git status' before removing {LOCK} and retry."
         )
     os.write(fd, str(os.getpid()).encode())
     os.close(fd)
