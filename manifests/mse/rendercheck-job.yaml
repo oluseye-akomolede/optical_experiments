@@ -1,0 +1,51 @@
+# Post-deploy render check: loads a finished job's page from the live service in
+# headless Chromium (SwiftShader) and fails unless the volume plot really draws.
+# Run it after every viewer deploy, with no solver Job in flight (the namespace
+# allows one Job at a time), and roll back if it fails:
+#
+#   kubectl -n mode-search-engine delete job mse-rendercheck --ignore-not-found
+#   kubectl -n mode-search-engine apply -f rendercheck-job.yaml
+#   kubectl -n mode-search-engine wait --for=condition=complete job/mse-rendercheck --timeout=900s
+#   kubectl -n mode-search-engine logs job/mse-rendercheck
+#
+# Set the image tag to the deployed sha, and MSE_URL to a finished job with at
+# least two modes (the check selects mode 2).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mse-rendercheck
+  namespace: mode-search-engine
+  labels:
+    app: mse-rendercheck
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 3600     # long enough to read the logs afterwards
+  template:
+    metadata:
+      labels:
+        app: mse-rendercheck
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: mse-harbor-pull
+      containers:
+        - name: rendercheck
+          image: harbor.arcadia-ecs.local/mode-search-engine/mse-rendercheck:8e27869
+          env:
+            - name: MSE_URL
+              value: http://mse-web.mode-search-engine.svc.cluster.local/jobs/08f832dd-26ba-410f-afe5-ad5dfd08a167
+            - name: OUT_DIR
+              value: /out
+          resources:
+            requests: {cpu: "2", memory: 2Gi}
+            limits: {cpu: "2", memory: 2Gi}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - {name: out, mountPath: /out}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: out, emptyDir: {}}
+        - {name: tmp, emptyDir: {}}
