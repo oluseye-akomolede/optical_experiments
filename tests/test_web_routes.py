@@ -704,6 +704,128 @@ def test_the_index_and_the_fetch_agree_on_which_modes_exist(tmp_path):
         1: False, 2: False, 3: False, 4: True}
 
 
+# ---------------------------------------------------------------------------
+# The volume plot's field endpoint
+# ---------------------------------------------------------------------------
+def test_the_field_route_serves_float16_that_decodes_back_to_the_mode(tmp_path):
+    """The bytes the browser textures are the mode, in half precision.
+
+    Round-trips through the real decoder rather than trusting the header: what
+    matters is that a texture built from this payload shows the field the solver
+    wrote, at half precision, with ``(nz, ny, nx, 3)`` samples in the order the
+    grid expects.
+    """
+    import gzip
+    import struct
+
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=3)
+
+    response = app.test_client().get(
+        f"/jobs/{job['job_id']}/field/2.bin")
+    assert response.status_code == 200
+    assert response.headers["Content-Encoding"] == "gzip"
+    assert response.headers["X-Field-Dtype"] == "float16-le"
+
+    raw = gzip.decompress(response.data)
+    original = np.frombuffer(
+        store.read(STORE.job_key(job["job_id"], "mode_02.bin")), dtype="<f4")
+    half = np.frombuffer(raw, dtype="<f2")
+    assert half.size == original.size
+    # Every finite sample agrees to half precision; the count of NaN matches.
+    finite = ~np.isnan(original)
+    assert int(np.isnan(half).sum()) == int((~finite).sum())
+    assert np.allclose(half[finite].astype("f4"), original[finite], atol=1e-3)
+
+
+def test_the_field_route_keeps_nan_transparent_where_the_solver_put_it(tmp_path):
+    """NaN is the object's outside; the plot shows it by *not* showing it.
+
+    If the encoder wrote a number here the browser would paint coloured fog
+    around the object, which still looks like a plausible picture and so would
+    not be noticed. The route must carry NaN through unchanged.
+    """
+    import gzip
+
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=3)
+
+    # The default fixture writes a finite field, so it could not exercise this
+    # at all -- the assertion below would have been vacuous. Write a blob that
+    # is NaN over part of its samples, in the shape the grid requires, then
+    # check the encoder preserved the NaN mask exactly.
+    key = STORE.job_key(job["job_id"], "mode_01.bin")
+    source = np.frombuffer(store.read(key), dtype="<f4").copy()
+    source[: source.size // 3] = np.nan
+    store.write(key, source.tobytes())
+
+    raw = gzip.decompress(app.test_client().get(
+        f"/jobs/{job['job_id']}/field/1.bin").data)
+    half = np.frombuffer(raw, dtype="<f2")
+    assert np.isnan(half).sum() > 0, "the fixture must have NaN to test with"
+    assert np.array_equal(np.isnan(half), np.isnan(source))
+
+
+def test_both_field_routes_agree_on_which_modes_exist(tmp_path):
+    """The index and the binary fetch must resolve the same file.
+
+    The reviewer's original bug was two routes resolving one filename
+    differently, so a mode the list promised 404ed on fetch. The field route
+    resolves ``FIELD_NAME`` too, and this pins that they stay in step: a mode
+    the index marks available must serve bytes, and one it hides must not.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=4)
+    (Path(store.root) / STORE.job_key(job["job_id"], "mode_02.bin")).unlink()
+
+    client = app.test_client()
+    index = client.get(f"/jobs/{job['job_id']}/slices.json").get_json()
+    for mode in index["modes"]:
+        served = client.get(f"/jobs/{job['job_id']}/field/{mode['index']}.bin")
+        if mode["available"]:
+            assert served.status_code == 200, mode["index"]
+        else:
+            assert served.status_code == 404, mode["index"]
+
+
+def test_a_mode_the_job_lacks_is_404_on_the_field_route(tmp_path):
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=3)
+
+    client = app.test_client()
+    for bad in ("4", "0"):
+        assert client.get(
+            f"/jobs/{job['job_id']}/field/{bad}.bin").status_code == 404
+
+
+def test_an_unreachable_store_is_a_502_on_the_field_route_too(tmp_path):
+    """Same invariant as the index: a store we cannot ask is not "no mode".
+
+    A 404 here would tell the viewer this mode is missing and let it move on
+    quietly; the truth is that we could not find out. That distinction is what
+    ``available: false`` is only ever allowed to mean from a *successful* check.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=3)
+
+    def boom(*_a, **_k):
+        raise STORE.StorageError("the store is unreachable")
+
+    app.extensions["mse"]["store"].read = boom
+    assert app.test_client().get(
+        f"/jobs/{job['job_id']}/field/1.bin").status_code == 502
+
+
 def test_an_unreachable_store_is_an_error_not_a_page_of_missing_modes(tmp_path):
     """A store we cannot ask must not answer "all modes are gone".
 

@@ -16,14 +16,15 @@ presigned.
 
 from __future__ import annotations
 
+import gzip
 import os
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 
-from flask import (Flask, abort, flash, jsonify, redirect, render_template,
-                   request, send_file, url_for)
+from flask import (Flask, abort, flash, jsonify, make_response, redirect,
+                   render_template, request, send_file, url_for)
 from flask.json.provider import DefaultJSONProvider
 
 import config as CFG
@@ -162,6 +163,43 @@ def create_app(config: dict | None = None) -> Flask:
             # are available -- and a 200 here would say all of them are gone.
             abort(502)
         return jsonify(index)
+
+    @app.route("/jobs/<job_id>/field/<int:number>.bin")
+    def job_field(job_id, number):
+        """One mode's field as float16 bytes, for the volume plot.
+
+        Raw little-endian float16, ``(nz, ny, nx, 3)`` C order, NaN outside the
+        object -- the browser uploads it straight into a HalfFloat 3D texture,
+        so any reshaping here would only add a chance to get the axis order
+        wrong. gzip because the payload is large and mostly smooth; the ratio is
+        modest (the object fills most of its bounding box, so few samples are
+        NaN) but it is still a third off.
+
+        Availability answers exactly as ``slices/<n>.json`` did: 404 for a mode
+        the table does not have or whose file is gone, 502 when storage cannot
+        be reached, so the viewer's existing failure handling still holds.
+        """
+        manifest = _done_manifest(store, jobs_db, job_id)
+        mode = next((m for m in manifest.get("modes", [])
+                     if int(m["index"]) == number), None)
+        if mode is None:
+            abort(404)
+        try:
+            field = FLD.decode_mode(
+                store.read(STORE.job_key(job_id, FIELD_NAME.format(number))),
+                manifest["grid"])
+        except (FileNotFoundError, FLD.FieldError):
+            abort(404)
+        except STORE.StorageError:
+            # As on the index route: a store that cannot answer must not look
+            # like a mode that is not there.
+            abort(502)
+        payload = FLD.encode_field16(field, manifest["grid"])
+        response = make_response(gzip.compress(payload, 6))
+        response.headers["Content-Type"] = "application/octet-stream"
+        response.headers["Content-Encoding"] = "gzip"
+        response.headers["X-Field-Dtype"] = "float16-le"
+        return response
 
     @app.route("/jobs/<job_id>/slices/<int:number>.json")
     def job_slices_for_mode(job_id, number):
@@ -475,6 +513,15 @@ def _done_manifest(store, jobs_db, job_id) -> dict:
         abort(502)
     except FileNotFoundError:
         abort(404)
+    except STORE.StorageError:
+        # A store we cannot reach is not a job that is gone. Every derived
+        # payload route reads the manifest first, so without this the whole
+        # viewer answers 500 during a storage outage -- which reads as a broken
+        # app rather than as "we could not check", the distinction this file
+        # keeps having to make. (Found by a test for the field route; the bug
+        # was in this shared helper, so it was already reachable from the
+        # index and per-mode routes.)
+        abort(502)
 
 
 def _mode_index(manifest: dict, store, job_id: str) -> dict:

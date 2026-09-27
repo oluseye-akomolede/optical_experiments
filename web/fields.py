@@ -69,6 +69,36 @@ def decode_mode(data: bytes, grid: dict) -> np.ndarray:
     return field.reshape(shape_of(grid) + (3,))
 
 
+def encode_field16(field: np.ndarray, grid: dict) -> bytes:
+    """Encode a vector field as little-endian ``float16``, C order, NaN kept.
+
+    This is what the volume plot downloads. Two things it must not do:
+
+    - **Lose the NaN.** The solver marks everything outside the object NaN, and
+      the browser renders NaN as fully transparent -- that is how the object's
+      shape appears at all. A NaN written as some finite number would fill the
+      outside with coloured fog. IEEE half precision has NaN, so ``astype``
+      carries it through; ``nan`` is written with the same payload, so no
+      comparison downstream can be confused by payload bits.
+    - **Re-order the samples.** The array is already ``(nz, ny, nx, 3)``, which
+      is the layout the texture wants; only the dtype changes. Reshaping here
+      would risk the x/z swap this module has been bitten by before.
+
+    Half precision is a product decision, not a shortcut: the wire size is
+    halved and the solver has already normalised every mode to ``max |E| = 1``,
+    so ~3 significant digits resolve more finely than the colour map that will
+    read them. The exact values stay available in the ``.vtu`` download.
+    """
+    if field.shape != shape_of(grid) + (3,):
+        raise FieldError(
+            f"field shape {field.shape} does not match the grid {shape_of(grid)}")
+    half = field.astype("<f2", copy=True)
+    # np.nan is not guaranteed to survive a cast with a canonical payload; write
+    # the canonical quiet NaN explicitly so the bytes are predictable.
+    half[np.isnan(field)] = np.float16("nan")
+    return half.tobytes(order="C")
+
+
 def field_is_readable(grid: dict, size_bytes: int | None) -> bool:
     """Could ``decode_mode`` read a blob of this length, without fetching it?
 
