@@ -23,7 +23,8 @@ import * as THREE from './vendor/three.module.min.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
 import { GLTFLoader } from './vendor/GLTFLoader.js';
 import { wantsFetch, modeFieldUrl, storeFields } from './modecache.js';
-import { boxCentre, componentVolume, float32ToHalf, halfToFloat32, SYSTEM_NAMES,
+import { boxCentre, componentShare, componentVolume, float32ToHalf,
+         halfToFloat32, SYSTEM_NAMES,
          SYSTEM_LABELS, COMPONENT_NAMES, COMPONENT_LABELS, DEFAULT_SYSTEM,
          DEFAULT_COMPONENT }
   from './components.js';
@@ -483,6 +484,11 @@ function loadFieldData(jobId, statusData) {
   let system = DEFAULT_SYSTEM;
   let name = DEFAULT_COMPONENT;
   let texture = null;
+  // The share of |E| the chosen component reaches in the mode on screen, in
+  // 0..1, or null when it could not be measured. Held here so the mode caption
+  // toggling and the component caption cannot disagree: both read it, and it is
+  // set at exactly the one place the picture is rebuilt.
+  let volumeShare = null;
 
   function boundsOf(grid) {
     const lo = grid.origin.slice();
@@ -649,6 +655,66 @@ function loadFieldData(jobId, statusData) {
     const hi = document.getElementById('legend-hi');
     if (lo) lo.textContent = signed ? `−${label}` : '0';
     if (hi) hi.textContent = signed ? `+${label}` : `${label} max`;
+    paintComponentNote(signed);
+  }
+
+  // The caption that tells a faint component apart from a broken one.
+  //
+  // It exists because of a specific misreading -- mine, corrected by the lead.
+  // Mode 1's cylindrical Erho draws as an almost empty frame, and an almost
+  // empty frame is what a render bug looks like, so I first read it as one and
+  // proposed rescaling the component. It is not a bug: mode 1 is the
+  // z-polarised (1,1,0) mode, and its Erho reaches only 8% of the mode's own
+  // peak |E|, so a faint cloud is the honest picture. Measured in this build:
+  // 31 field pixels of 294402. Mode 2's Erho reaches 98% and draws strongly.
+  // Same control, opposite pictures, both correct -- so the fix is not to
+  // change the scale (which would inflate a small component into a confident
+  // lie) but to say plainly which case the viewer is looking at.
+  //
+  // The number comes from componentShare() off the same decoded field the
+  // picture is built from, so the caption can never describe a different field
+  // from the one on screen. When the share cannot be measured the caption says
+  // so rather than printing a plausible number -- a caption that reads like a
+  // measurement when it is not one is the could-not-ask defect wearing a
+  // caption's clothes.
+  const SMALL_SHARE = 0.2;
+
+  function percent(share) {
+    return `${Math.round(share * 100)}%`;
+  }
+
+  function paintComponentNote(signed) {
+    const note = document.getElementById('component-note');
+    if (!note) return;
+    const label = COMPONENT_LABELS[name] || name;
+
+    // |E| is the mode's own peak by definition; there is nothing to qualify.
+    if (!signed || name === 'E') { note.hidden = true; return; }
+    note.hidden = false;
+
+    if (volumeShare === null || !Number.isFinite(volumeShare)) {
+      note.textContent =
+        `Could not measure how much ${label} contributes to this mode, so ` +
+        'this picture is not evidence that the component is small.';
+      return;
+    }
+
+    const share = percent(volumeShare);
+    if (volumeShare < SMALL_SHARE) {
+      // The whole point: name the smallness, in the picture's own terms, so a
+      // viewer does not read the faintness as a fault. The reason is physical
+      // -- a mode polarised the other way is small in this component.
+      note.textContent =
+        `${label} is small in this mode: it reaches only ${share} of the ` +
+        `mode's peak |E|, so this component draws as a faint cloud. The same ` +
+        `control is strong in other modes. The bar below is unchanged -- it ` +
+        `is the shared ${label} scale for every mode, not a scale for this ` +
+        'component alone.';
+    } else {
+      note.textContent =
+        `${label} reaches ${share} of this mode's peak |E|, so it draws on ` +
+        'the shared scale and should read as strongly as |E| does.';
+    }
   }
 
   // `t` is the ramp's own coordinate: 0..1 for the sequential table, -1..1 for
@@ -700,6 +766,10 @@ function loadFieldData(jobId, statusData) {
     const grid = manifest.grid;
     const buffer = mode.fields;
     if (!buffer || !buffer.byteLength) return null;
+    // The share is measured here, off the same decoded vector the scalar volume
+    // is built from, so the caption can never describe a different field from
+    // the one on screen.
+    volumeShare = null;
     const count = grid.nx * grid.ny * grid.nz;
     const expected = count * 3 * 2;   // three components, two bytes each
     if (buffer.byteLength !== expected) {
@@ -719,6 +789,7 @@ function loadFieldData(jobId, statusData) {
     const positions = positionsOf(grid);
     const centre = boxCentre(grid);
     const scalar = componentVolume(vec, positions, centre, system, name);
+    volumeShare = componentShare(vec, positions, centre, system, name);
 
     // Normalise the chosen component by its own peak, so the shader's "1.0 is
     // the strongest sample in this picture" is true.

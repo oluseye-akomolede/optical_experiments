@@ -167,6 +167,68 @@ export function componentVolume(vec, positions, centre, system, name) {
   return out;
 }
 
+/**
+ * How strong the chosen component is in this mode, relative to the mode's own
+ * peak |E|, as a fraction in 0..1.
+ *
+ * The plot draws every component on ONE shared scale per mode -- the mode's
+ * max |E| -- so that a component is directly comparable with the same
+ * component in the next mode, and with |E| in this one. That is the right
+ * scale, but it has a consequence the picture alone cannot explain: a
+ * component that is genuinely small in this mode draws as a very faint cloud,
+ * and a faint cloud is exactly what a rendering bug looks like.
+ *
+ * It is not a rendering bug, and the two must be told apart. Measured on the
+ * live job: mode 1 is the z-polarised (1,1,0) mode, whose Erho reaches only 8%
+ * of its own peak |E| and draws as almost nothing, while mode 2's Erho reaches
+ * 98% and draws strongly. The same control, two opposite pictures, both
+ * correct.
+ *
+ * The comparison is a high percentile rather than the maximum because a
+ * component's single largest sample can be a local spike on an otherwise small
+ * field: mode 1's Erho has a maximum of 42% of |E| contributed by one corner
+ * sample, while its 99th percentile is 8%. The p99 is what the eye sees.
+ *
+ * Returns null when the answer would be meaningless -- no finite samples, no
+ * non-zero peak to compare against -- rather than a fabricated 0 or 1. A
+ * caller that cannot measure must say so, not print a number that reads like a
+ * measurement (the could-not-ask rule).
+ */
+export function componentShare(vec, positions, centre, system, name) {
+  if (system === 'magnitude' || name === 'E') return 1;
+  const n = positions.length / 3;
+  const v = [0, 0, 0];
+  const p = [0, 0, 0];
+  const mags = [];
+  const comps = [];
+  for (let i = 0; i < n; i += 1) {
+    const o = i * 3;
+    v[0] = vec[o]; v[1] = vec[o + 1]; v[2] = vec[o + 2];
+    if (Number.isNaN(v[0]) || Number.isNaN(v[1]) || Number.isNaN(v[2])) continue;
+    p[0] = positions[o]; p[1] = positions[o + 1]; p[2] = positions[o + 2];
+    const m = Math.hypot(v[0], v[1], v[2]);
+    const c = componentOf(v, p, centre, system, name);
+    if (!Number.isFinite(m) || !Number.isFinite(c)) continue;
+    mags.push(m);
+    comps.push(Math.abs(c));
+  }
+  if (!mags.length) return null;
+  const peak = percentile(mags, 0.99);
+  if (!peak) return null;
+  return percentile(comps, 0.99) / peak;
+}
+
+/** Linear-interpolated percentile of an unsorted array. 0..1, inclusive. */
+function percentile(values, q) {
+  const sorted = values.slice().sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const at = q * (sorted.length - 1);
+  const lo = Math.floor(at);
+  const hi = Math.ceil(at);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (at - lo);
+}
+
 // --------------------------------------------------------------------------
 // float32 -> float16 (IEEE 754 binary16), round-to-nearest-even
 // --------------------------------------------------------------------------

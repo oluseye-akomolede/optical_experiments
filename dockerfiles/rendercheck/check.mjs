@@ -245,6 +245,14 @@ try {
     const problem = divergingProblem(sample, what);
     if (problem) fail(problem); else ok(divergingNote(sample, what));
   };
+
+  // The component caption's text, or '' when it is hidden or absent. Both are
+  // "no caption", which is the failure the caller reports.
+  const erhoCaption = async (page) => page.evaluate(() => {
+    const el = document.getElementById('component-note');
+    if (!el || el.hidden) return '';
+    return el.textContent.trim();
+  });
   diverging(ez, 'Ez');
 
   await page.selectOption('#component-system', 'cylindrical');
@@ -257,8 +265,92 @@ try {
   } else {
     ok('the coordinate-system selector changes the picture');
   }
-  drew(erho, 'Erho');
-  diverging(erho, 'Erho');
+  // The faint-component caption, asserted where it is faint and where it is
+  // not. This is the check for a misreading that actually happened: mode 1's
+  // Erho draws as an almost empty frame because the component is genuinely
+  // small in this mode (8% of the mode's peak |E|), and an almost empty frame
+  // is exactly what a render bug looks like. The picture cannot say which it
+  // is; the caption has to.
+  //
+  // The caption is read BEFORE the draw is judged, because the two are one
+  // claim between them: "this component is small here, and the page says so".
+  // Judging the draw alone would fail correct data -- mode 1's Erho really does
+  // draw 31 pixels -- and a check that fails on correct data is worse than no
+  // check, because it will be ignored and then it is not there for the failures
+  // that matter.
+  //
+  // Asserting only the faint case would be half a check: a caption that is
+  // hard-coded to "this component is small" would pass it while telling every
+  // user a lie. The strong case below is the control.
+  const erhoCaptionText = await erhoCaption(page);
+  const erhoCaptionedSmall =
+    /\bsmall\b/i.test(erhoCaptionText) && /\b8\s*%/.test(erhoCaptionText);
+
+  if (!erhoCaptionText) {
+    fail('the component caption is empty on a component that draws as a ' +
+         'faint cloud -- a viewer has no way to tell a small component from ' +
+         'a broken one');
+  } else if (!erhoCaptionedSmall) {
+    fail(`the component caption does not name Erho as small in mode 1, ` +
+         `where it reaches 8% of the mode's peak |E|: ` +
+         `${JSON.stringify(erhoCaptionText)}`);
+  } else {
+    ok(`the faint component is captioned: ${JSON.stringify(erhoCaptionText)}`);
+  }
+
+  // A faint frame is a failure ONLY when nothing explains it. With the caption
+  // naming the component as small, 31 pixels is the honest picture and the
+  // check says so; silence there is the defect.
+  const erhoDrawProblem = drawProblem(erho, 'Erho');
+  if (erhoDrawProblem && !erhoCaptionedSmall) {
+    fail(erhoDrawProblem);
+  } else if (erhoDrawProblem) {
+    ok(`Erho draws ${erho.coloured} px in mode 1, which is correct here and ` +
+       'is what the caption above explains');
+  } else {
+    drew(erho, 'Erho');
+  }
+  // The divergence check only applies to a frame that drew enough to judge; a
+  // 31-pixel frame has no lobes to find, and calling that a colour failure
+  // would be the same mistake as failing the draw.
+  if (!erhoDrawProblem) diverging(erho, 'Erho');
+
+  // Mode 2 is the control case: the SAME component and coordinate system, in a
+  // mode where Erho reaches 98% of |E|. It must draw strongly and must not be
+  // captioned as small. Together the two say the caption tracks the field
+  // rather than the component's name.
+  //
+  // NOTE: this switches the page to mode 2 and leaves it there, so the rotation
+  // below operates on MODE 2's picture. Any assertion about the rotated frame
+  // must therefore compare it with erho2, not erho.
+  await page.click('#modes-body tr:nth-child(2)');
+  await page.waitForTimeout(4000);
+  const erho2 = await shoot('05-cylindrical-erho-mode2.png');
+  drew(erho2, 'Erho in mode 2');
+  diverging(erho2, 'Erho in mode 2');
+  {
+    const text = await erhoCaption(page);
+    if (!text) {
+      fail('the component caption is empty on mode 2, where Erho reaches 98% ' +
+           'of the peak |E|');
+    } else if (/\bsmall\b/i.test(text)) {
+      fail(`the component caption calls Erho small in mode 2, where it reaches ` +
+           `98% of the mode's peak |E| -- the caption is not tracking the ` +
+           `field: ${JSON.stringify(text)}`);
+    } else {
+      ok(`the strong component is captioned as strong: ${JSON.stringify(text)}`);
+    }
+  }
+  // And the two modes must not be the same picture: if switching modes left the
+  // texture untouched, both captions and both frames above would be describing
+  // one field.
+  if (erho2.hash === erho.hash) {
+    fail('mode 2 drew a byte-identical frame to mode 1 -- the mode selection is ' +
+         'not reaching the texture, so the caption comparison above is ' +
+         'comparing one field with itself');
+  } else {
+    ok('selecting a mode changes the picture');
+  }
 
   // Drag the canvas and require the picture to move. This is the "rotatable"
   // half of what the owner asked for, and a camera that is not the one drawing
@@ -281,15 +373,38 @@ try {
   // preceding component drew nothing, the two frames are the same background
   // and the comparison above cannot tell "did not rotate" from "nothing there
   // to rotate" -- so the two are checked together rather than either alone.
-  if (magnitudeDrew && drawProblem(rotated, 'the rotated frame')) {
-    fail('the rotated frame is empty -- rotating lost the plot');
+  //
+  // What is asserted is that rotating did not leave the plot GONE -- not that
+  // it kept most of its pixels. A rotation genuinely changes how much of the
+  // volume projects onto the screen, so the count can drop a long way and be
+  // entirely correct; measured on the real job, mode 2's Erho went from 58101
+  // field pixels to 19116 after the drag below and that is the right picture
+  // from another angle. An earlier version of this guard required the rotated
+  // frame to keep half its pixels and would have failed that correct frame,
+  // which is the over-tight predicate this check has been burned by before.
+  //
+  // The real failure it exists for is "rotation lost the plot", so that is what
+  // it tests: something must still be there, and the frame-by-frame comparison
+  // above already established the camera moved.
+  if (magnitudeDrew && rotated.coloured < 500) {
+    fail(`the rotated frame has only ${rotated.coloured} field pixels ` +
+         `(against ${erho2.coloured} before the drag) -- rotating lost the plot`);
   }
   // And the rotated frame must still be drawn in its own hues. The defect this
   // catches is the black half-disc, seen on a rotated Erho: the negative lobe
   // clamped to black, so the frame changed when dragged (the test above passed)
   // while half the object had silently stopped being drawn. "The picture moved"
   // and "the picture is still there" are different claims.
-  if (magnitudeDrew) diverging(rotated, 'the rotated frame');
+  //
+  // It applies only when there is enough in the frame to judge: a 31-pixel
+  // frame has no lobes to find and calling that a colour failure would be the
+  // same error as failing the faint draw above.
+  if (magnitudeDrew && !drawProblem(rotated, 'the rotated frame')) {
+    diverging(rotated, 'the rotated frame');
+  } else if (magnitudeDrew) {
+    ok('the rotated frame carries ' + rotated.coloured + ' field pixels -- ' +
+       'faint because the component is, which the caption explains');
+  }
 
   if (consoleErrors.length) {
     // Console errors are reported but are only fatal when they are the viewer's
@@ -305,7 +420,8 @@ try {
   }
 
   writeFileSync(join(outDir, 'report.json'), JSON.stringify({
-    url, gl, magnitude, ez, erho, rotated, problems, notes, consoleErrors,
+    url, gl, magnitude, ez, erho, erho2, rotated, problems, notes,
+    consoleErrors,
   }, null, 2));
 } catch (error) {
   fail(`the check itself threw: ${error && error.stack ? error.stack : error}`);

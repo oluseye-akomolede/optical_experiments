@@ -150,3 +150,60 @@ test('the raymarch step is a fraction of the box, not a physical length', () => 
     'any physical length or hard-coded scale here makes the plot\'s opacity ' +
     'depend on the grid rather than on the field');
 });
+
+test('the faint-component caption is driven by the measured share, not the name', () => {
+  // The render check asserts the caption's *text* against a live page; this
+  // asserts the wiring that produces it, which is the part a live page cannot
+  // distinguish. Two ways the caption goes wrong and both look fine on screen:
+  //
+  //  1. It never fires, so a faint component is again indistinguishable from a
+  //     broken one -- the whole reason the caption exists.
+  //  2. It fires off the component's *name* rather than the measured share, so
+  //     it calls Erho small in every mode and tells the user a lie about mode 2
+  //     (where Erho reaches 98% of |E|).
+  assert.match(source, /volumeShare\s*=\s*componentShare\(/,
+    'the viewer no longer measures the component share, so any caption must be ' +
+    'guessing from the component name alone');
+
+  const note = /function paintComponentNote\([^)]*\)\s*\{([\s\S]*?)\n  \}/.exec(source);
+  assert.ok(note, 'paintComponentNote has gone -- the faint-component caption ' +
+                  'is no longer rendered at all');
+  assert.match(note[1], /volumeShare\s*<\s*SMALL_SHARE/,
+    'the caption no longer compares the measured share against a threshold, so ' +
+    'it cannot be tracking the field');
+  // The unmeasurable branch. This assertion started out checking only that the
+  // `volumeShare === null` CONDITION survived, and mutation testing showed why
+  // that is not enough: replacing the branch's whole body -- the honest "Could
+  // not measure" message -- with `volumeShare = 1;` left the condition in place
+  // and the guard passed. A guard satisfied by the test in an if-statement
+  // says nothing about what the branch does, and the branch is where the
+  // could-not-ask honesty lives. So the branch body is now required to produce
+  // a message that says it could not measure.
+  const unmeasurable =
+    /if\s*\(\s*volumeShare === null \|\| !Number\.isFinite\(volumeShare\)\s*\)\s*\{([\s\S]*?)\n    \}/
+      .exec(note[1]);
+  assert.ok(unmeasurable,
+    'the caption no longer has an unmeasurable-share branch, so a share that ' +
+    'could not be measured is reported as though it had been');
+  assert.match(unmeasurable[1], /Could not measure/i,
+    'the unmeasurable-share branch no longer says it could not measure -- a ' +
+    'caption that reads like a measurement when it is not one is the ' +
+    'could-not-ask defect wearing a caption\'s clothes');
+  assert.match(unmeasurable[1], /return\s*;/,
+    'the unmeasurable-share branch must return, not fall through and print a ' +
+    'share it never measured');
+
+  // And it must be reachable: a caption nothing calls is the same as no caption.
+  assert.match(source, /paintComponentNote\(/,
+    'paintComponentNote is defined but never called');
+  const legend = /function paintLegend\(\)\s*\{([\s\S]*?)\n  \}/.exec(source);
+  assert.ok(legend && /paintComponentNote\(/.test(legend[1]),
+    'paintLegend no longer refreshes the component caption, so the caption goes ' +
+    'stale as soon as the mode or component changes');
+
+  // The DOM node the caption writes into, and the marker the render check reads.
+  const html = readFileSync(new URL('../../web/templates/job.html', import.meta.url), 'utf8');
+  assert.match(html, /id="component-note"/,
+    'the page no longer has the #component-note element the caption and the ' +
+    'render check both address');
+});

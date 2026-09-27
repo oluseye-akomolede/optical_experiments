@@ -10,8 +10,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { componentOf, componentVolume, boxCentre, SYSTEMS, SYSTEM_NAMES,
-         COMPONENT_NAMES, SYSTEM_LABELS, COMPONENT_LABELS,
+import { componentOf, componentShare, componentVolume, boxCentre, SYSTEMS,
+         SYSTEM_NAMES, COMPONENT_NAMES, SYSTEM_LABELS, COMPONENT_LABELS,
          DEFAULT_SYSTEM, DEFAULT_COMPONENT }
   from '../../web/static/components.js';
 
@@ -179,4 +179,113 @@ test('the default selection is one the transform can actually answer', () => {
   assert.ok(SYSTEMS[DEFAULT_SYSTEM], 'default system is not offered');
   assert.ok(SYSTEMS[DEFAULT_SYSTEM].includes(DEFAULT_COMPONENT),
             'default component is not in the default system');
+});
+
+// --------------------------------------------------------------------------
+// componentShare: the number the faint-component caption is built from.
+//
+// The caption's whole job is to tell a genuinely small component apart from a
+// broken render, so the failure that matters is a share that is *wrong in the
+// reassuring direction* -- reporting a healthy number for a component that is
+// barely there, or a number at all when it could not be measured.
+// --------------------------------------------------------------------------
+
+test('a component equal to |E| everywhere has share 1', () => {
+  // A field pointing along +z everywhere with rising magnitude: Ez is |E|.
+  const n = 8;
+  const vec = new Float32Array(n * 3);
+  const pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i += 1) {
+    vec[i * 3 + 2] = 0.1 * (i + 1);
+    pos[i * 3] = i;
+  }
+  const share = componentShare(vec, pos, C, 'cartesian', 'Ez');
+  assert.ok(Math.abs(share - 1) < 1e-6, `expected 1, got ${share}`);
+});
+
+test('a component an order of magnitude smaller than |E| reports that', () => {
+  // Ex is 0.1 while |E| is hypot(0.1, 1.0) -- so the share is the ratio of the
+  // two, roughly a tenth. This is the case the caption exists for: a predicate
+  // that reported anything near 1 here would caption a nearly-empty picture as
+  // fine. Note the share is |Ex| / |E|, NOT |Ex| / |Ez|: writing the fixture as
+  // though |E| were the z-component alone is the mistake that first made this
+  // test fail.
+  const n = 16;
+  const vec = new Float32Array(n * 3);
+  const pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i += 1) {
+    vec[i * 3] = 0.1;
+    vec[i * 3 + 2] = 1.0;
+    pos[i * 3] = i;
+  }
+  const expected = 0.1 / Math.hypot(0.1, 1.0);
+  const share = componentShare(vec, pos, C, 'cartesian', 'Ex');
+  assert.ok(Math.abs(share - expected) < 1e-6,
+            `expected ${expected}, got ${share}`);
+  assert.ok(share < 0.12, `the share must be small here; got ${share}`);
+});
+
+test('|E| is its own share, so it is never captioned as small', () => {
+  const vec = new Float32Array([0, 0, 7, 0, 0, 3]);
+  const pos = new Float32Array([0, 0, 0, 1, 1, 1]);
+  for (const [system, name] of [['magnitude', 'E'], ['cartesian', 'E']]) {
+    assert.equal(componentShare(vec, pos, C, system, name), 1);
+  }
+});
+
+test('one local spike does not carry the share', () => {
+  // This is the real shape of the trap: mode 1's Erho has a maximum of 42% of
+  // |E| contributed by a single corner sample, but a p99 of 8%. A share taken
+  // from the maximum would caption a nearly-invisible picture as "reaches 42%
+  // of the peak", which reads as healthy. Take it from the percentile.
+  const n = 1000;
+  const vec = new Float32Array(n * 3);
+  const pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i += 1) {
+    vec[i * 3] = i === 0 ? 1.0 : 0.01;   // one spike, a flat small field
+    vec[i * 3 + 2] = 1.0;
+    pos[i * 3] = i;
+  }
+  const share = componentShare(vec, pos, C, 'cartesian', 'Ex');
+  assert.ok(share < 0.05,
+            `one spike must not set the share; got ${share}`);
+});
+
+test('NaN samples are skipped rather than counted as zero', () => {
+  // The solver writes NaN outside the object. Those samples are not evidence
+  // that the component is small, and folding them in as zeros would drag the
+  // percentile down and caption a strong component as faint.
+  const n = 100;
+  const vec = new Float32Array(n * 3);
+  const pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i += 1) {
+    const outside = i < 90;              // 90% outside the object
+    vec[i * 3] = outside ? NaN : 0.8;
+    vec[i * 3 + 2] = outside ? NaN : 1.0;
+    pos[i * 3] = i;
+  }
+  // The finite samples are Ex = 0.8, Ez = 1.0, so |E| = hypot(0.8, 1.0) and the
+  // share is the ratio -- decided entirely by the 10% that are finite.
+  const expected = 0.8 / Math.hypot(0.8, 1.0);
+  const share = componentShare(vec, pos, C, 'cartesian', 'Ex');
+  assert.ok(Math.abs(share - expected) < 1e-6,
+            `expected the finite samples to decide (${expected}), got ${share}`);
+});
+
+test('a field with nothing finite has no share, rather than a fabricated 0', () => {
+  // The could-not-ask rule: a caption that cannot measure must not print a
+  // number that reads like a measurement. null is the honest answer.
+  const n = 4;
+  const vec = new Float32Array(n * 3).fill(NaN);
+  const pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i += 1) pos[i * 3] = i;
+  assert.equal(componentShare(vec, pos, C, 'cartesian', 'Ex'), null);
+});
+
+test('an all-zero field has no share either', () => {
+  const n = 4;
+  const vec = new Float32Array(n * 3);
+  const pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i += 1) pos[i * 3] = i;
+  assert.equal(componentShare(vec, pos, C, 'cartesian', 'Ex'), null);
 });
