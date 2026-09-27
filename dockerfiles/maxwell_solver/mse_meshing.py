@@ -27,34 +27,30 @@ import os
 
 import numpy as np
 
-#: unit name -> metres per unit
-#:
-#: ``um`` and ``nm`` are here because optical structures are routinely specified
-#: in them: a 1550 nm telecom cavity is 1.55 um across, which in mm is a number
-#: nobody wants to type (0.00155). Adding a unit is not cosmetic -- the solver
-#: works in metres throughout, so a wrong scale is a wrong mode frequency by
-#: exactly that factor.
-UNIT_SCALE = {
-    "m": 1.0,
-    "cm": 1e-2,
-    "mm": 1e-3,
-    "um": 1e-6,
-    "nm": 1e-9,
-    "in": 0.0254,
-}
-
-#: VTK cell id for a linear tetrahedron
-VTK_TETRA = 10
-
-#: TetGen's ``maxvolume`` is a volume bound, but the elements it emits with
-#: ``minratio``/``mindihedral`` run larger than the bound. Calibrated so that
-#: ``target_maxvolume`` actually lands near the requested edge length.
-TETGEN_VOLUME_SLACK = 4.0
-
-#: How much larger than the requested edge length the achieved median edge may
-#: be before we refuse to solve. A mesh this coarse no longer resolves the
-#: requested modes, and the frequencies would be wrong without anything failing.
-MAX_EDGE_OVERSHOOT = 1.6
+# Re-exported from :mod:`mse_common`, which is the ONE definition. This module
+# keeps the names because the solver's own code, the worker, the bench scripts
+# and the tests all reach them as ``mse_meshing.X`` or ``MESH.X``; the web image
+# imports :mod:`mse_common` directly instead, because it does not ship this file
+# and must not have to. A re-export is a binding, not a copy -- there is exactly
+# one value for each of these in a process, so nothing can drift.
+from mse_common import (  # noqa: F401
+    DEFAULT_CPU_MAX_TETS,
+    DEFAULT_MAX_TETS,
+    MAX_EDGE_OVERSHOOT,
+    REROUTE_TOKEN,
+    TETGEN_VOLUME_SLACK,
+    UNIT_SCALE,
+    VTK_TETRA,
+    WEYL_SAFETY,
+    MeshingError,
+    apply_scale,
+    effective_edge_m,
+    enclosure_volume_m3,
+    estimate_tet_count,
+    target_edge_length,
+    target_maxvolume,
+    unit_scale,
+)
 
 #: How many times to re-tetrahedralize while trying to fit the element cap.
 MAX_MESH_ATTEMPTS = 4
@@ -74,8 +70,6 @@ SURFACE_DECIMATE_TRIGGER = 0.7
 CAP_RETRY_RESPONSE = 0.20
 
 
-class MeshingError(Exception):
-    """A failure the user can act on (bad file, open surface, mesh too big)."""
 
 
 def _coarse_message(n_modes: int, achieved: float, target: float,
@@ -88,90 +82,10 @@ def _coarse_message(n_modes: int, achieved: float, target: float,
     )
 
 
-def unit_scale(units: str) -> float:
-    """Metres per unit for one of the supported unit names."""
-    try:
-        return UNIT_SCALE[units]
-    except KeyError:
-        raise MeshingError(
-            f"unsupported units {units!r}; expected one of {sorted(UNIT_SCALE)}"
-        ) from None
 
 
-def apply_scale(surface, scale: float):
-    """Return ``surface`` with every vertex multiplied by ``scale``.
-
-    This is the whole of the free scale factor: the object is scaled before
-    anything else looks at it, so the volume, the surface edge, the target edge
-    length and the decimation all see the same size -- which is the only way
-    ``est_tets`` computed in the app can agree with the mesh the solver builds.
-
-    Scaling leaves the shape exactly similar, so the ``scale``-free quantities
-    (the *ratio* of surface edge to target edge, the face count decimation
-    chooses) are unchanged; only the quantities with a length dimension move,
-    and they move together. That is why this can be a single multiply at the
-    edge and not a parameter threaded through the sizing functions.
-    """
-    if surface is None:
-        return None
-    factor = float(scale)
-    if not np.isfinite(factor) or factor <= 0:
-        raise MeshingError(f"scale must be a positive number, not {scale!r}")
-    if factor == 1.0:
-        # Deliberately the same object: an unscaled upload must behave exactly
-        # as it did before this parameter existed, copy included.
-        return surface
-    scaled = surface.copy()
-    scaled.vertices = np.asarray(scaled.vertices, dtype=float) * factor
-    return scaled
 
 
-def effective_edge_m(
-    scaled_surface,
-    n_modes: int,
-    units: str,
-    min_feature_m: float | None = None,
-    n_index: float = 1.0,
-) -> float:
-    """The edge length the mesh is built to, in METRES on the scaled surface.
-
-    This is the ONE place the physics edge and the owner's declared smallest
-    feature are compared. Both callers -- ``tetrahedralize`` and the web app's
-    ``estimate_tets`` -- call it and neither re-derives the comparison, because
-    the whole class of bug this replaces was two call sites combining the same
-    two numbers in two different length spaces.
-
-    The arguments are already in the one space that matters:
-
-    * ``scaled_surface`` has been through :func:`apply_scale`, so every length
-      measured on it is the object the solver was actually asked to solve.
-    * ``min_feature_m`` is METRES, converted once at the edge of the system
-      (the upload form, from its own unit selector) and carried in metres from
-      there. It is NOT converted here -- that is deliberate. The parameter used
-      to be called ``min_feature_mm`` and arrived as a bare number in the
-      object's units, which meant every reader had to know *which* unit it was
-      and every one of them could get it wrong. A value that is already metres
-      cannot be converted wrongly.
-
-    ``target_edge_length`` returns the user's units, so it is converted here --
-    ``physics_m`` is the only length in this function that needs a factor, and
-    it needs exactly one.
-    """
-    physics_m = target_edge_length(
-        scaled_surface, n_modes=n_modes, units=units, n_index=n_index
-    ) * unit_scale(units)
-
-    if min_feature_m is None:
-        return physics_m
-    feature_m = float(min_feature_m)
-    if not np.isfinite(feature_m) or feature_m <= 0:
-        # A nonsense feature is ignored rather than divided by. Same rule as
-        # the app's validation, applied here too because this function is
-        # reachable from the solver's own CLI.
-        return physics_m
-    # Whichever is SMALLER wins: a feature left unresolved and a top mode left
-    # unresolved both give frequencies that are confidently wrong.
-    return min(physics_m, feature_m)
 
 
 def load_surface(obj_bytes_or_path, units: str = "mm"):
@@ -407,95 +321,14 @@ def decimate_to_edge_length(surface, edge_length: float, verbose: bool = True):
 #: mildly under-predicts for a small cavity (for the 10x7x5 box at N=20 it gives
 #: k = 1.19/mm against a true 1.262/mm, about 6%), so the geometric estimate is
 #: scaled by this before it becomes a wavelength.
-WEYL_SAFETY = 1.2
 
 
-def enclosure_volume_m3(surface, units: str) -> float:
-    """Volume actually enclosed by the surface, in cubic metres.
-
-    NOT the bounding box: Weyl's law counts modes per unit *enclosed* volume, so
-    a hollow or non-convex object needs its own volume or the mesh comes out far
-    too fine. Falls back to the box volume when trimesh cannot produce a signed
-    volume (a degenerate or nearly-closed surface), because a coarse estimate
-    only costs accuracy, while raising here would refuse a usable upload.
-    """
-    scale = unit_scale(units)
-    try:
-        volume = float(abs(surface.volume)) * scale ** 3
-    except Exception:  # noqa: BLE001 - trimesh raises several things here
-        volume = 0.0
-    if not np.isfinite(volume) or volume <= 0:
-        bounds = np.asarray(surface.bounds, dtype=float)
-        extent = bounds[1] - bounds[0]
-        volume = float(np.prod(extent)) * scale ** 3
-    if not np.isfinite(volume) or volume <= 0:
-        raise MeshingError("this object has no enclosed volume to mesh")
-    return volume
 
 
-def target_edge_length(
-    surface,
-    n_modes: int,
-    units: str,
-    n_index: float = 1.0,
-) -> float:
-    """Element edge length (in the user's units) that resolves the top mode.
-
-    The mode *count* in three dimensions follows Weyl's law,
-    ``N(k) ~ V k^3 / (3 pi^2)``, so the k of the N-th mode is
-
-        k_N ~ (3 pi^2 N / V)^(1/3)
-
-    with V the enclosed volume. k grows like the CUBE ROOT of the mode number,
-    not linearly -- an earlier version of this function used
-    ``k_high = n_modes * pi / D`` (D = bbox diagonal), which over-refines badly:
-    for the 10x7x5 box at 20 modes it asked for k = 4.76/mm when the true 20th
-    mode is at 1.262/mm, about 4x too fine in edge length and ~60x too many
-    elements.
-
-    n_index deliberately does not enter: the geometric k is independent of the
-    filling medium (the in-medium wavelength is what changes, and that is
-    handled downstream). The parameter is kept for call compatibility.
-    """
-    scale = unit_scale(units)
-    volume_m3 = enclosure_volume_m3(surface, units)
-    count = max(int(n_modes), 1)
-
-    k_high = WEYL_SAFETY * (3.0 * np.pi ** 2 * count / volume_m3) ** (1.0 / 3.0)
-    wavelength_m = 2.0 * np.pi / max(k_high, 1e-30)
-
-    edges_per_wavelength = float(os.getenv("MSE_EDGES_PER_WAVELENGTH", "7"))
-    edge_m = wavelength_m / edges_per_wavelength
-    return edge_m / scale                            # back to the user's units
 
 
-def target_maxvolume(surface, edge_length: float) -> float:
-    """TetGen ``maxvolume`` that gives roughly the requested edge length.
-
-    TetGen's ``maxvolume`` is a bound on element volume, not edge length. For an
-    equilateral-ish tet of edge ``h`` the volume is ``h^3 / (6 sqrt(2))``; TetGen
-    with ``minratio``/``mindihedral`` produces elements somewhat larger than that
-    bound, so we scale by ``TETGEN_VOLUME_SLACK``. Calibrated against real
-    tetrahedralizations: the exact factor only needs to be within ~2x, because
-    the achieved edge length is what the accuracy depends on and the hard
-    ``MSE_MAX_TETS`` cap is enforced on the count TetGen actually returns.
-    """
-    h = float(edge_length)
-    return TETGEN_VOLUME_SLACK * (h ** 3) / (6.0 * np.sqrt(2.0))
 
 
-def estimate_tet_count(surface, edge_length: float) -> tuple[int, float]:
-    """Rough ``(n_tets, volume)`` estimate for a mesh of the given edge length.
-
-    The volume is the bounding-box volume, which overestimates a non-convex
-    object but is far better behaved than an ``A^(3/2)`` guess (that formula is
-    off by ~2.6x for a plain box). It only needs to be the right order of
-    magnitude: the real count is read back from TetGen and capped there.
-    """
-    bounds = np.asarray(surface.bounds, dtype=float)
-    volume = max(float(np.prod(bounds[1] - bounds[0])), 1e-18)
-    maxvolume = target_maxvolume(surface, edge_length)
-    return int(volume / max(maxvolume, 1e-30)), volume
 
 
 # The median edge the LAST tetrahedralize() actually achieved, in metres on
@@ -581,14 +414,29 @@ def tetrahedralize(
     # in the scaled surface's own units, which is the space TetGen's maxvolume
     # and the decimation speak. Derived from ``edge_m`` rather than recomputed,
     # so the two cannot drift.
-    edge_m = effective_edge_m(
-        surface, n_modes=n_modes, units=units,
-        min_feature_m=min_feature_m, n_index=n_index,
-    )
-    edge_units = edge_m / unit_scale_m
+    # Both helpers are called as MODULE GLOBALS (``target_edge_length(...)``,
+    # not ``mse_common.target_edge_length(...)``) so that a module-level override
+    # is honoured. That is not a style choice: this module's contract is that
+    # ``mse_meshing.target_edge_length`` can be replaced to script the edge, and
+    # the guard tests -- the ones that prove the resolution rule fires at the
+    # right ratio -- do exactly that. Importing the helper by name would bind it
+    # once, silently ignore every patch, and leave those tests passing for the
+    # wrong reason. ``python -m pytest --strict-markers`` cannot see that; a
+    # reader can.
+    #
+    # ``physics_m`` is recomputed from ``target_edge_length`` rather than taken
+    # from ``effective_edge_m``'s internals because it is the OTHER branch of the
+    # same ``min``: it is what the mesh would have been built to with no feature
+    # declared, which is what the verbose line compares against.
     physics_m = target_edge_length(
         surface, n_modes=n_modes, units=units, n_index=n_index
     ) * unit_scale_m
+    edge_m = effective_edge_m(
+        surface, n_modes=n_modes, units=units,
+        min_feature_m=min_feature_m, n_index=n_index,
+        physics_m=physics_m,
+    )
+    edge_units = edge_m / unit_scale_m
     if verbose and min_feature_m is not None and edge_m < physics_m:
         print(
             f"[mse] resolving the {edge_m:g} m feature: target edge "

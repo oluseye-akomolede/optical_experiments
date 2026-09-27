@@ -94,11 +94,30 @@ DEFAULT_GPU_MIN_TETS = 15_000
 #: failed inside the solver with a limit the app had already approved. One
 #: import makes that impossible rather than merely fixed.
 #:
-#: The import is guarded because ``web/`` is deployed as its own image and the
-#: solver package lives beside the repo, not on the app's path by default. If it
-#: cannot be found the app FAILS TO IMPORT rather than falling back to a
-#: restated number -- a silent fallback is the defect this import removes.
-def _solver_dir() -> str:
+#: The values come from ``mse_common``, NOT from ``mse_maxwell_solver``, and the
+#: difference is not stylistic -- it is a production outage. The web image is
+#: built from ``dockerfiles/web/Dockerfile``, which copies ``web/``, ``db/`` and
+#: this one shared module. It does NOT copy the solver package, so importing the
+#: solver here built, pushed, and then died at container start:
+#:
+#:     /opt/app/config.py:112
+#:     ModuleNotFoundError: No module named 'mse_maxwell_solver'
+#:
+#: Every test passed, because the tests put ``dockerfiles/maxwell_solver`` on
+#: ``sys.path``; nothing in the suite started the web IMAGE. ``mse_common`` is
+#: the part both images share and imports only numpy, so both can have it. If
+#: the module cannot be found the app FAILS TO IMPORT rather than falling back
+#: to a restated number -- a silent fallback is the defect this import removes.
+def _common_dir() -> str:
+    """Put the shared module's directory on the path, wherever it lives here.
+
+    Two layouts, one line each: in the repo the shared module sits in
+    ``dockerfiles/maxwell_solver/`` beside the solver, and in the image both are
+    flattened into ``/opt/app/``. The Dockerfile sets ``PYTHONPATH`` for the
+    image case, so this is the checkout case; both are needed because the same
+    source tree is imported both ways and a path that works in only one of them
+    is exactly how the crashloop got in.
+    """
     import sys
     from pathlib import Path
 
@@ -108,8 +127,8 @@ def _solver_dir() -> str:
     return str(root)
 
 
-_solver_dir()
-from mse_maxwell_solver import DEFAULT_CPU_MAX_TETS, DEFAULT_MAX_TETS  # noqa: E402
+_common_dir()
+from mse_common import DEFAULT_CPU_MAX_TETS, DEFAULT_MAX_TETS  # noqa: E402
 
 #: an upload is refused outright only above TWICE that, because the estimate can
 #: be up to 2x high (worst over-estimate measured) and refusing at 1x would turn
@@ -192,7 +211,12 @@ def gpu_min_tets() -> int:
 
 
 def max_tets() -> int:
-    """The absolute element cap, mirrored from the solver's own limit."""
+    """The absolute element cap, mirrored from the solver's own limit.
+
+    The default is ``mse_common.DEFAULT_MAX_TETS`` -- the same object the solver
+    reads, not a copy of it. See the import comment above for why the web app
+    must reach it without importing the solver package.
+    """
     return _positive_int("MSE_MAX_TETS", DEFAULT_MAX_TETS)
 
 
@@ -200,7 +224,7 @@ def cpu_max_tets() -> int:
     """Element count above which the CLUSTER cannot solve a job but the GPU can.
 
     A routing boundary, not a capability limit -- the same distinction the
-    solver makes at ``mse_maxwell_solver.DEFAULT_CPU_MAX_TETS``. The app sends it
+    solver makes at ``mse_common.DEFAULT_CPU_MAX_TETS``. The app sends it
     to every cluster Job so the solver's re-decision on the exact count lands in
     the same place as the app's upload-time decision, instead of re-deciding with
     a constant the app never saw. ``MSE_CPU_MAX_TETS`` overrides it.

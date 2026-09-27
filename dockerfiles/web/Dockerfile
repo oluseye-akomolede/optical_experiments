@@ -21,6 +21,19 @@ RUN pip install --no-cache-dir -r /opt/app/requirements.txt
 
 COPY web/ /opt/app/
 COPY db/ /opt/mse/
+# The ONE module both images share: the element caps, the unit table and the
+# sizing functions. The app needs them (it sizes the upload and routes the job)
+# and must NOT import the solver package to get them -- that package is not in
+# this image, and importing it here is exactly what crashlooped the dispatch
+# deploy: `/opt/app/config.py:112 ModuleNotFoundError: No module named
+# 'mse_maxwell_solver'`. mse_common imports only numpy, so the web image gains
+# nothing but a 20 KB file, and there is still exactly one definition of each
+# constant for both images to read.
+COPY dockerfiles/maxwell_solver/mse_common.py /opt/app/
+# The app adds this directory to sys.path for a checkout; in the image the
+# module is already here, so name it explicitly rather than relying on the
+# interpreter's default path.
+ENV PYTHONPATH=/opt/app
 
 # The DDL lives at a fixed path in the image rather than being found by a
 # relative climb from the module, which is what made the first deploy fragile.

@@ -16,6 +16,16 @@ Job is deleted as soon as its result is in the database rather than waiting for
 from __future__ import annotations
 
 import re
+import sys
+from pathlib import Path
+
+# The shared module, reached the way web/config.py does it: the web image ships
+# mse_common next to the app, a checkout has it beside the solver. Both paths
+# are in place because the same source is imported both ways.
+_COMMON_ROOT = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
+if str(_COMMON_ROOT) not in sys.path:
+    sys.path.insert(0, str(_COMMON_ROOT))
+import mse_common as COMMON  # noqa: E402
 
 #: label values must be DNS-1123-ish; a job id is a uuid but be defensive
 _UNSAFE = re.compile(r"[^a-z0-9.-]")
@@ -452,10 +462,15 @@ def _pods_have_reason(pods, reason: str) -> bool:
 
 
 #: the token the solver writes to its termination log when it is on the wrong
-#: machine. Kept in step with ``mse_maxwell_solver.REROUTE_TOKEN`` by the
-#: tier-1 test that imports both and asserts they are equal -- a copy of a
-#: constant that can drift is worse than no constant.
-REROUTE_TOKEN = "MSE_REROUTE"
+#: machine.
+#:
+#: IMPORTED from ``mse_common``, which the web image ships and the solver reads
+#: through ``mse_maxwell_solver`` -- one definition, so the app's grep can never
+#: look for a string the solver has stopped writing. It used to be retyped here
+#: with a test asserting the two literals were equal, which is the same
+#: arrangement one step later: two copies and a guard that notices the drift
+#: only if someone runs it.
+REROUTE_TOKEN = COMMON.REROUTE_TOKEN
 
 
 def wants_reroute(pods, token: str = REROUTE_TOKEN) -> bool:

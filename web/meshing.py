@@ -1,9 +1,10 @@
 """Upload validation: the same checks the solver will apply, done early.
 
 Rejecting a bad .obj here costs the owner a second; letting it through costs ten
-minutes of a solver Job that is certain to fail. The rules mirror
-``dockerfiles/maxwell_solver/mse_meshing.py`` deliberately -- the solver is the
-authority, this is the courteous early answer.
+minutes of a solver Job that is certain to fail. The rules come from the shared
+module ``dockerfiles/maxwell_solver/mse_common.py`` deliberately -- the solver is
+the authority, this is the courteous early answer, and sharing the definition is
+what keeps the two from disagreeing.
 """
 
 from __future__ import annotations
@@ -126,12 +127,24 @@ def load_surface(data: bytes):
 EST_TETS_C = 14.0
 
 
-def target_edge_length_mm(surface, n_modes: int, units: str) -> float:
-    """The solver's target edge length, in the user's units.
+def _common_module():
+    """``mse_common``: the sizing helpers both images share.
 
-    Imported from the solver rather than reimplemented: the estimate is only
-    useful if it predicts what the solver will actually do, and a copy of the
-    formula here would drift from the original at the first calibration.
+    THIS USED TO IMPORT ``mse_meshing``. That module lives in
+    ``dockerfiles/maxwell_solver/``, which the web Dockerfile does not copy, so
+    the web image built, pushed and crashlooped at container start:
+
+        ModuleNotFoundError: No module named 'mse_maxwell_solver'
+
+    (and the same for every ``mse_meshing`` import here). The tests never caught
+    it because they put the solver directory on ``sys.path``; no test started
+    the IMAGE. ``mse_common`` is copied into the web image and imports only
+    numpy, so every function this file needs comes from there now -- the same
+    single definition the solver uses, reached through a module the app
+    actually has.
+
+    Imported late so tier-1 tests stay cheap: numpy is already loaded by then,
+    and the heavy solver stack is never touched at all.
     """
     import sys
     from pathlib import Path
@@ -139,53 +152,43 @@ def target_edge_length_mm(surface, n_modes: int, units: str) -> float:
     root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    import mse_meshing as MESH  # noqa: PLC0415 - deliberately late
+    import mse_common  # noqa: PLC0415 - deliberately late
 
-    return float(MESH.target_edge_length(surface, n_modes, units=units))
+    return mse_common
 
 
-def _solver_module():
-    """The solver's meshing module, imported late so tier-1 tests stay cheap."""
-    import sys
-    from pathlib import Path
+def target_edge_length_mm(surface, n_modes: int, units: str) -> float:
+    """The solver's target edge length, in the user's units.
 
-    root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-    import mse_meshing as MESH  # noqa: PLC0415 - deliberately late
-
-    return MESH
+    Imported from the shared module rather than reimplemented: the estimate is
+    only useful if it predicts what the solver will actually do, and a copy of
+    the formula here would drift from the original at the first calibration.
+    """
+    COMMON = _common_module()
+    return float(COMMON.target_edge_length(surface, n_modes, units=units))
 
 
 #: How far above the requested edge a mesh may land before the solver refuses it.
 #: Re-exported so the job page can state the allowance in the same number the
 #: mesher enforces, rather than a copy that could drift from it.
-MAX_EDGE_OVERSHOOT = _solver_module().MAX_EDGE_OVERSHOOT
+MAX_EDGE_OVERSHOOT = _common_module().MAX_EDGE_OVERSHOOT
 
 
 def unit_scale_m(units: str) -> float:
-    """Metres per unit, from the solver's own table.
+    """Metres per unit, from the shared table.
 
     Re-exported so the upload form converts a feature to metres with the SAME
     table the mesher uses. A second copy of ``{"mm": 1e-3, ...}`` here would be a
     place for the two to disagree, and a disagreement is a length-space bug.
     """
-    import sys
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-    import mse_meshing as MESH  # noqa: PLC0415 - deliberately late
-
-    return float(MESH.unit_scale(units))
+    return float(_common_module().unit_scale(units))
 
 
 def effective_edge_mm(surface, n_modes: int, units: str,
                       min_feature_m: float | None = None) -> float:
     """The edge length the solver will mesh to, in the user's units.
 
-    A thin conversion over ``mse_meshing.effective_edge_m``, which owns the
+    A thin conversion over ``mse_common.effective_edge_m``, which owns the
     physics-edge/feature comparison. Kept for callers that want user units (the
     page shows the owner the unit they chose), so the comparison itself lives in
     exactly ONE place and cannot drift between the estimate and the mesh.
@@ -194,17 +197,10 @@ def effective_edge_mm(surface, n_modes: int, units: str,
     on the scaled object, so converting an unscaled one back to user units would
     describe a different object.
     """
-    import sys
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-    import mse_meshing as MESH  # noqa: PLC0415 - deliberately late
-
-    return float(MESH.effective_edge_m(
+    COMMON = _common_module()
+    return float(COMMON.effective_edge_m(
         surface, n_modes=n_modes, units=units, min_feature_m=min_feature_m,
-    )) / MESH.unit_scale(units)
+    )) / COMMON.unit_scale(units)
 
 
 def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
@@ -224,7 +220,7 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
     feature-driven refinement of 2x is 8x the elements, which is exactly the
     difference between the cluster and the GPU queue.
 
-    The edge comes from ``mse_meshing.effective_edge_m``, in METRES, on the
+    The edge comes from ``mse_common.effective_edge_m``, in METRES, on the
     SCALED surface -- one length space, one comparison, shared with the solver.
     An earlier version took it from ``effective_edge_mm``, which converted the
     metre edge back to *user units of an already-scaled surface*; multiplying
@@ -236,17 +232,11 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
     import numpy as np
 
     try:
-        import sys
-        from pathlib import Path
+        COMMON = _common_module()
 
-        root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
-        if str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-        import mse_meshing as MESH  # noqa: PLC0415 - deliberately late
-
-        surface = MESH.apply_scale(surface, scale)
-        volume_m3 = MESH.enclosure_volume_m3(surface, units)
-        edge_m = MESH.effective_edge_m(
+        surface = COMMON.apply_scale(surface, scale)
+        volume_m3 = COMMON.enclosure_volume_m3(surface, units)
+        edge_m = COMMON.effective_edge_m(
             surface, n_modes=n_modes, units=units, min_feature_m=min_feature_m,
         )
     except Exception:  # noqa: BLE001 - an estimate must not break an upload

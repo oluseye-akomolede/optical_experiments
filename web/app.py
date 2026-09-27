@@ -777,10 +777,13 @@ def _effective_size(job: dict) -> str | None:
         factor = float(scale) if scale not in (None, "") else 1.0
         if factor == 1.0:
             return None
+        # mse_common, not mse_meshing: the web image ships the shared module and
+        # not the solver package (see config.py's import comment), and all this
+        # caption needs is the unit table -- the same one object either way.
         root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
         if str(root) not in sys.path:
             sys.path.insert(0, str(root))
-        import mse_meshing as MESH  # noqa: PLC0415 - deliberately late, as elsewhere
+        import mse_common as MESH  # noqa: PLC0415 - deliberately late, as elsewhere
 
         # The equivalent size in mm, which is the unit the owner reads the
         # upload form in: scaling by 1000 in mm is the same object as 1000x the

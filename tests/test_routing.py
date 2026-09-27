@@ -230,14 +230,22 @@ def test_the_mode_count_choice_reaches_the_job(tmp_path):
 # ---------------------------------------------------------------------------
 # The reroute signal, end to end
 # ---------------------------------------------------------------------------
-def test_the_two_copies_of_the_token_agree():
-    """The solver writes it and the app looks for it. They are separate images
-    with no import between them, so this is the only thing keeping the two
-    string literals equal -- exactly the kind of copy that drifts silently.
+def test_the_token_is_one_definition_not_two_that_agree():
+    """The solver writes it and the app looks for it -- ONE string, one source.
+
+    This used to be an equality between two retyped literals, with this test as
+    the thing keeping them equal. That is the weaker arrangement: it holds only
+    while somebody runs it, and the copy in ``web/jobs.py`` could drift the
+    moment nobody did. Both sides now import ``mse_common.REROUTE_TOKEN``, which
+    the web image ships, so there is one string in the process and nothing to
+    drift. ``is`` rather than ``==``: two equal literals would still be two
+    definitions, and this test exists to rule that out, not to re-check equality.
     """
+    import mse_common
     import mse_maxwell_solver as SOLVER
 
-    assert SOLVER.REROUTE_TOKEN == JOBS.REROUTE_TOKEN
+    assert SOLVER.REROUTE_TOKEN is mse_common.REROUTE_TOKEN
+    assert JOBS.REROUTE_TOKEN is mse_common.REROUTE_TOKEN
 
 
 def test_the_solver_writes_the_token_only_for_the_reroutable_outcome():

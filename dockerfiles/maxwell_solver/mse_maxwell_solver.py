@@ -34,6 +34,7 @@ import numpy as np  # noqa: E402  (must follow the thread caps)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import mse_common  # noqa: E402
 import mse_db  # noqa: E402
 import mse_eigen as EIG  # noqa: E402
 import mse_fem as F  # noqa: E402
@@ -41,25 +42,17 @@ import mse_fields as FLD  # noqa: E402
 import mse_meshing as MESH  # noqa: E402
 import mse_storage as STORE  # noqa: E402
 
-#: default element cap. Chosen so a worst-case solve stays well under the 14Gi
-#: container limit; the lead calibrates the real figure on the Jetson.
-#:
-#: THE ONE SOURCE OF TRUTH for this number. ``web/config.py`` imports it rather
-#: than keeping its own copy, and both the cluster Job env and the worker's
-#: claim payload carry the value this function resolves. It used to be 80_000
-#: here while the app capped uploads at 600_000, with nothing passing the app's
-#: number to the solver: every job the app accepted above 80k tets -- exactly
-#: the large jobs the GPU exists for -- died in the solver on a limit the app
-#: had already told the owner was fine. Two constants that must agree and are
-#: never compared is the whole defect class; there is now one constant.
-DEFAULT_MAX_TETS = 600_000
-
-#: elements above which the CLUSTER cannot solve a job, but the GPU still can.
-#: The upload-time estimate decides the route, but an estimate can be wrong in
-#: either direction; this is the exact count re-deciding, at the first point the
-#: exact count exists. Deliberately lower than DEFAULT_MAX_TETS: it is a
-#: routing boundary, not a capability limit.
-DEFAULT_CPU_MAX_TETS = 150_000
+# Re-exported from :mod:`mse_common`. These two constants and the reroute token
+# are needed by the WEB app as well, and the web image does not ship this file.
+# They live in mse_common so that the app can import them without importing the
+# solver; the names are re-exported here because the solver's own code, the
+# worker, the bench scripts and the tests all reach them as
+# ``mse_maxwell_solver.X``. A re-export is a binding, not a copy.
+from mse_common import (  # noqa: E402,F401
+    DEFAULT_CPU_MAX_TETS,
+    DEFAULT_MAX_TETS,
+    REROUTE_TOKEN,
+)
 
 #: the cap a *solve* runs with. Settable, because tests assert on the guard at a
 #: tiny count rather than by meshing 600k tetrahedra.
@@ -100,12 +93,6 @@ def set_max_tets(limit: int | None) -> None:
     """
     global _MAX_TETS_OVERRIDE
     _MAX_TETS_OVERRIDE = None if limit is None else max(1, int(limit))
-
-#: what a ``TooBigForProcessor`` writes into its termination message. The app
-#: reads this string back out of the pod's last state to tell "this job is on
-#: the wrong machine" from "this job is broken" -- see the class docstring.
-REROUTE_TOKEN = "MSE_REROUTE"
-
 
 class TooBigForProcessor(Exception):
     """This job is fine but this machine is not -- re-route it, do not fail it.
