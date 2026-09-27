@@ -34,7 +34,8 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
                        solver_image: str, pull_secret: str, namespace: str,
                        cpu: str = "4", memory: str = "14Gi",
                        active_deadline_seconds: int = 1800,
-                       ttl_seconds_after_finished: int = 30):
+                       ttl_seconds_after_finished: int = 30,
+                       cpu_max_tets: int | None = None):
     """Return the ``batch/v1`` Job manifest that solves one upload.
 
     Pure: no environment lookups, no cluster calls, no time.
@@ -55,6 +56,19 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
         "--n-index", repr(float(n_index)),
         "--n-modes", str(int(n_modes)),
     ]
+    env = [
+        # Named explicitly, not left to the solver's default. This image has no
+        # CUDA stack, so "cpu" is the only value that can work here -- but a
+        # default that agrees with the image is a default that hides a mistake,
+        # and the backend is the first thing to check when a run is slow.
+        {"name": "MSE_SOLVER_BACKEND", "value": "cpu"},
+    ]
+    if cpu_max_tets is not None:
+        # The solver re-decides the route on the exact tetrahedron count, at the
+        # first point that count exists. Handing it the same boundary the app
+        # routed on is what makes that second decision agree with the first
+        # instead of inventing a different one.
+        env.append({"name": "MSE_CPU_MAX_TETS", "value": str(int(cpu_max_tets))})
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -80,6 +94,7 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
                             "name": "solver",
                             "image": solver_image,
                             "args": args,
+                            "env": env,
                             "envFrom": [
                                 {"secretRef": {"name": "mse-minio"}},
                                 {"secretRef": {"name": "mse-db"}},
@@ -106,12 +121,14 @@ class K8sJobLauncher:
     def __init__(self, namespace: str, image: str, pull_secret: str,
                  cpu: str = "4", memory: str = "14Gi",
                  active_deadline_seconds: int = 1800,
-                 ttl_seconds_after_finished: int = 30, dry_run: bool = False):
+                 ttl_seconds_after_finished: int = 30, dry_run: bool = False,
+                 cpu_max_tets: int | None = None):
         self.namespace = namespace
         self.image = image
         self.pull_secret = pull_secret
         self.cpu = cpu
         self.memory = memory
+        self.cpu_max_tets = cpu_max_tets
         self.active_deadline_seconds = active_deadline_seconds
         self.ttl_seconds_after_finished = ttl_seconds_after_finished
         self.dry_run = dry_run
@@ -137,6 +154,7 @@ class K8sJobLauncher:
             self.namespace, cpu=self.cpu, memory=self.memory,
             active_deadline_seconds=self.active_deadline_seconds,
             ttl_seconds_after_finished=self.ttl_seconds_after_finished,
+            cpu_max_tets=self.cpu_max_tets,
         )
 
     # -- cluster state -----------------------------------------------------
@@ -218,13 +236,18 @@ class K8sJobLauncher:
         states: dict[str, str] = {}
         for job in jobs.items:
             job_status = getattr(job, "status", None)
-            if _names_the_failure_itself(_job_condition_reason(job_status)):
-                # The Job's own reason is the whole answer and no pod can improve
-                # on it, so skip the extra list call.
-                reason = _failed_reason(job)
+            pods = None if _names_the_failure_itself(
+                _job_condition_reason(job_status)) else self._job_pods(job)
+            reason = _failed_reason(job, pods)
+            if reason is None:
+                continue
+            # A job that died asking to be re-routed says so in its pod's last
+            # state, which is the only channel a dead container has. `_failed_reason`
+            # reads the pods for OOMKilled and would not recognise this, so the
+            # pods are inspected once more here rather than in a second list call.
+            if _REROUTE_REASON is not None and wants_reroute(pods):
+                states[job.metadata.name] = _REROUTE_REASON
             else:
-                reason = _failed_reason(job, self._job_pods(job))
-            if reason is not None:
                 states[job.metadata.name] = reason
         return states
 
@@ -396,6 +419,53 @@ def _pods_have_reason(pods, reason: str) -> bool:
     return False
 
 
+#: the token the solver writes to its termination log when it is on the wrong
+#: machine. Kept in step with ``mse_maxwell_solver.REROUTE_TOKEN`` by the
+#: tier-1 test that imports both and asserts they are equal -- a copy of a
+#: constant that can drift is worse than no constant.
+REROUTE_TOKEN = "MSE_REROUTE"
+
+
+def wants_reroute(pods, token: str = REROUTE_TOKEN) -> bool:
+    """Whether any of these pods asked to be re-routed to another machine.
+
+    **Only a positive read counts.** A missing pod, a pod with no termination
+    message, a message that was truncated, an unreadable field -- every one of
+    them returns False, because the cost of the two mistakes is not symmetric:
+
+    * Wrongly rerouting a job that genuinely failed (a bad mesh, a bug) puts it
+      back in the queue, where it fails again on the other machine -- and, if the
+      other machine also reroutes it, could ping-pong.
+    * Wrongly *not* rerouting a job that asked costs the owner one upload, with
+      "too large for the processors available" on the job page, which is honest
+      and actionable.
+
+    This is the same rule the rig calls *could-not-ask must not look like
+    nothing-there*: "we could not read the message" is not evidence of anything
+    and must not be treated as "yes".
+
+    The token is matched as a substring because the solver writes
+    ``"<token>: <explanation>"``; the explanation is for a human reading the pod
+    and is deliberately not parsed.
+    """
+    for pod in pods or []:
+        pod_status = _attr(pod, "status") or pod
+        for cs in (_attr(pod_status, "container_statuses") or []):
+            for state_name in ("last_state", "state"):
+                state = _attr(cs, state_name)
+                if state is None and isinstance(cs, dict):
+                    state = cs.get(state_name)
+                terminated = _attr(state, "terminated")
+                if terminated is None and isinstance(state, dict):
+                    terminated = state.get("terminated")
+                if terminated is None:
+                    continue
+                message = _attr(terminated, "message", "") or ""
+                if token in str(message):
+                    return True
+    return False
+
+
 def _attr(obj, name, default=None):
     """``getattr`` that also reads a plain dict, for fakes and real objects."""
     if isinstance(obj, dict):
@@ -423,11 +493,25 @@ FAILURE_DEFAULT = (
 )
 
 
+#: the reason string that means "this job is on the wrong machine, move it".
+#: Deliberately not a Kubernetes reason and deliberately not in
+#: ``FAILURE_MESSAGES``: it is never shown to the owner, it is acted on. It
+#: exists so the reroute decision survives the trip through ``job_states``
+#: (a dict of name -> string) without widening that contract.
+_REROUTE_REASON = "MseReroute"
+
+
 def failure_message(reason: str | None) -> str:
     """Plain English for the owner, from a Kubernetes reason.
 
     Unknown reasons fall back rather than leaking a Kubernetes token into the
     UI, and the reason is never interpolated verbatim.
+
+    ``MseReroute`` deliberately falls back to the generic message: it is an
+    instruction to the scheduler, not a diagnosis for a human, and if it ever
+    reaches here the job has already failed to reroute (or rerouted and failed
+    again) -- the owner then gets the actionable "too large for the processors
+    available", not the word ``MseReroute``.
     """
     if reason:
         return FAILURE_MESSAGES.get(reason, FAILURE_DEFAULT)

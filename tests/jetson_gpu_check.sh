@@ -7,15 +7,27 @@
 # factorisation is correct and that single+refine really matches double.
 #
 # Usage (on the Jetson, from a checkout on the branch under test):
-#   bash tests/jetson_gpu_check.sh <path-to-cudss-0.7.1>
+#   bash tests/jetson_gpu_check.sh <path-to-cudss-0.7.1> [python]
 #
-# Copy this to the Jetson or run it from the shared checkout; it takes the cuDSS
-# prefix as its only argument because that path is machine-specific.
+# Copy this to the Jetson or run it from the shared checkout. The cuDSS prefix
+# is machine-specific and required. The interpreter is the second argument (or
+# $MSE_PYTHON) because the Jetson's cuDSS stack lives in a venv, NOT in the
+# cluster image's python -- running the system python3 there imports neither
+# cupy nor nvmath, and every GPU run would report a missing stack that is in
+# fact installed. Default: python3.
 
 set -euo pipefail
 
-CUDSS="${1:?usage: $0 <cudss-0.7.1-prefix>}"
+CUDSS="${1:?usage: $0 <cudss-0.7.1-prefix> [python]}"
+PYTHON="${2:-${MSE_PYTHON:-python3}}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+  echo "error: interpreter '$PYTHON' not found." >&2
+  echo "Pass the venv's python as the second argument, e.g." >&2
+  echo "  bash $0 $CUDSS /path/to/jetson-gpu-venv/bin/python" >&2
+  exit 2
+fi
 
 # Jetson environment. All four are load-bearing; the README in
 # scratch/gpu-reference/ records what breaks without them.
@@ -26,7 +38,7 @@ export PYTHONPATH="$REPO/dockerfiles/maxwell_solver:$REPO/tests:${PYTHONPATH:-}"
 
 # nvmath-python must be 0.9.0 (1.0's CUDA-13 bindings abort on the CUDA 12
 # driver) and cuDSS must be the linux-aarch64 redist, not the pip wheel.
-python3 - <<'PY'
+"$PYTHON" - <<'PY'
 import nvmath, sys
 print(f"[check] nvmath-python {nvmath.__version__}", flush=True)
 if nvmath.__version__.split(".")[0] != "0":
@@ -43,7 +55,7 @@ run() {
     env MSE_SOLVER_BACKEND="$backend" \
         MSE_GPU_PRECISION="$precision" \
         MSE_THREADS=4 \
-    bash -c "cd '$REPO' && python3 tests/bench_box.py --n-modes 20"
+    bash -c "cd '$REPO' && '$PYTHON' tests/bench_box.py --n-modes 20 --write"
 }
 
 # 1. the CPU reference

@@ -32,7 +32,8 @@ import db as DB
 import fields as FLD
 import jobs as JOBS
 import storage as STORE
-from meshing import UploadError, validate_upload
+import worker_api as WORKER
+from meshing import (UploadError, estimate_tets, load_surface, validate_upload)
 
 #: where the solver puts one mode's field, and the ONE place that decides it.
 #: Both the index (which reads a size to decide `available`) and the fetch route
@@ -100,6 +101,8 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
             return _handle_upload(app, store, jobs_db)
         return render_template("index.html", jobs=jobs_db.list_jobs(25),
                               units=CFG.UNIT_CHOICES, default_units=CFG.DEFAULT_UNITS,
+                              mode_choices=CFG.MODE_CHOICES,
+                              default_n_modes=CFG.DEFAULT_N_MODES,
                               max_mb=CFG.MAX_UPLOAD_BYTES // (1024 * 1024))
 
     @app.route("/jobs/<job_id>")
@@ -217,6 +220,11 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
         response.headers["X-Field-Dtype"] = "float16-le"
         return response
 
+    # The GPU workers are a separate queue with a separate entry point, so they
+    # do not go through the Flask app object the pages are built on.
+    WORKER.register(app, jobs_db, store)
+    WORKER.register_blueprint(app)
+
     return app, store, jobs_db, launcher
 
 
@@ -226,7 +234,25 @@ def run_tick(store, jobs_db, launcher, log=print) -> dict:
     Safe to call concurrently and safe to call when nothing is queued. Returns a
     small summary so the tests (and the log) can see what it decided.
     """
-    result = {"deleted": [], "failed": 0, "launched": None, "waited": False}
+    result = {"deleted": [], "failed": 0, "launched": None, "waited": False,
+              "rerouted": 0, "reclaimed": []}
+
+    # -- the GPU queue ------------------------------------------------------
+    #
+    # Two things can go wrong with a job that was routed to the Jetson, and both
+    # end the same way: it goes back on the cluster queue. Doing this FIRST, and
+    # before the Job slot is considered, means the cluster picks the job up on
+    # the same tick that it gives up on the GPU.
+    #
+    # 1. Nobody claimed it. The Jetson may be off, busy with another rig, or its
+    #    worker may be wedged. `gpu_queued_at` is the clock.
+    # 2. A worker claimed it and died. Its lease expired with no renewal.
+    #
+    # Both are best-effort: a database error here must not stop the rest of the
+    # tick, because the cluster queue still works and it is the fallback that
+    # failed, not the solver.
+    result["reclaimed"] = _reclaim_expired_leases(jobs_db, log)
+    result["rerouted"] = _reroute_abandoned_gpu_jobs(jobs_db, launcher, log)
 
     # A Job whose result is already in the database is holding the namespace's
     # single quota slot for nothing -- the quota counts finished Jobs too. Delete
@@ -286,6 +312,78 @@ def run_tick(store, jobs_db, launcher, log=print) -> dict:
     result["launched"] = name
     log(f"[mse-web] started {name} for job {job['job_id']}")
     return result
+
+
+def _reclaim_expired_leases(jobs_db, log=print) -> list[str]:
+    """Expire leases whose worker stopped renewing. Returns the job ids.
+
+    An expired lease is the only evidence a dead GPU worker leaves: it renews on
+    every progress call, so a lease that ran out was not renewed, and a worker
+    that cannot renew is a worker that is not running the job any more. The row
+    goes back in the claimable pool; the wait-window fallback below is what
+    ultimately moves it to the cluster if no worker comes back for it.
+    """
+    try:
+        ids = jobs_db.reclaim_expired_leases()
+    except Exception as exc:  # noqa: BLE001 - never let a tick crash the loop
+        log(f"[mse-web] could not reclaim expired GPU leases: {exc}")
+        return []
+    for job_id in ids:
+        log(f"[mse-web] job {job_id}: its GPU worker's lease expired; "
+            f"the job is claimable again")
+    return ids
+
+
+def _reroute_abandoned_gpu_jobs(jobs_db, launcher, log=print) -> int:
+    """Move GPU jobs nobody claimed in time back to the cluster. Returns how many.
+
+    The dispatch's fallback: a job that waited longer than ``MSE_GPU_WAIT_S``
+    for a worker was routed on an estimate, and the estimate is no longer worth
+    holding the job hostage. It goes back on the cluster queue where it is
+    bounded by the same single Job slot as everything else.
+
+    **The cluster's limit is respected, not assumed.** A job whose estimate is
+    over ``MSE_CPU_MAX_TETS`` cannot be solved on the cluster, so rerouting it
+    would only make it fail there after a queue wait. That case is left on the
+    GPU queue and logged plainly: a job waiting for a worker that may still come
+    is better than a job guaranteed to fail. This mirrors the solver's own split
+    between "wrong machine" and "too big for any machine".
+    """
+    if launcher is None:
+        return 0
+    try:
+        waiting = jobs_db.jetson_waiting(CFG.gpu_wait_seconds())
+    except Exception as exc:  # noqa: BLE001 - never let a tick crash the loop
+        log(f"[mse-web] could not list waiting GPU jobs: {exc}")
+        return 0
+
+    if not waiting:
+        return 0
+
+    # No GPU worker is configured, so no worker is coming and waiting out the
+    # window is pointless. Only meaningful when a token is absent, which is also
+    # when the worker API answers 503.
+    if not WORKER.configured_token():
+        log("[mse-web] no GPU worker token is configured, so the GPU queue "
+            "cannot drain; rerouting eligible jobs now")
+
+    limit = CFG.max_tets()
+    moved = 0
+    for entry in waiting:
+        job_id = entry["job_id"]
+        est = entry.get("est_tets")
+        if est is not None and int(est) > limit:
+            log(f"[mse-web] job {job_id}: estimated {int(est):,} elements, over "
+                f"the {limit:,} the cluster can solve; it stays queued for the GPU")
+            continue
+        if jobs_db.reroute_to_cluster(
+                job_id,
+                "This object was queued for the graphics processor, which has "
+                "not picked it up, so it has been moved to the cluster queue."):
+            moved += 1
+            log(f"[mse-web] job {job_id}: no GPU worker claimed it in "
+                f"{CFG.gpu_wait_seconds():.0f}s; moved to the cluster queue")
+    return moved
 
 
 def _fail_dead_jobs(launcher, jobs_db, log=print) -> int:
@@ -353,12 +451,33 @@ def _fail_dead_jobs(launcher, jobs_db, log=print) -> int:
             continue
         name = job.get("k8s_job_name")
         if name and name in states:
-            message = JOBS.failure_message(states[name])
+            reason = states[name]
         elif name and name in present:
             continue                       # alive and well; not ours to touch
         else:
-            message = JOBS.failure_message(None)
-        jobs_db.mark_failed(job["job_id"], message)
+            reason = None
+
+        # The solver knows the exact element count and the app does not, so a
+        # job that says "this machine is too small for me" is re-queued rather
+        # than failed. The move is guarded on the row still being a *cluster*
+        # job: the solver only ever raises this on the cpu backend, and a jetson
+        # row that somehow carries the reason must not be sent to the cluster
+        # it was routed away from a moment ago.
+        if reason == JOBS._REROUTE_REASON and job.get("target") != DB.JETSON:
+            if jobs_db.reroute_to_cluster(
+                    job["job_id"],
+                    "This object needs more elements than the cluster solver "
+                    "can handle, so it has been queued for the graphics "
+                    "processor instead."):
+                log(f"[mse-web] job {job['job_id']} re-routed to the GPU queue: "
+                    f"its Job {name or '<unnamed>'} reported the mesh is too "
+                    f"large for the cluster")
+                continue
+            # Nothing moved: the row was not a queued cluster job any more, so
+            # someone else already dealt with it. Fall through to the plain
+            # failure rather than claim a reroute that did not happen.
+
+        jobs_db.mark_failed(job["job_id"], JOBS.failure_message(reason))
         failed += 1
         log(f"[mse-web] job {job['job_id']} failed: its Job "
             f"{name or '<unnamed>'} is {('reported FAILED' if name in states else 'gone')}")
@@ -433,12 +552,55 @@ def _handle_upload(app, store, jobs_db):
         flash("The refractive index must be 1.0 or greater.")
         return redirect(url_for("index"))
 
+    try:
+        n_modes = int(request.form.get("n_modes", CFG.DEFAULT_N_MODES))
+    except ValueError:
+        flash("Please choose one of the offered mode counts.")
+        return redirect(url_for("index"))
+    if n_modes not in CFG.MODE_CHOICES:
+        flash("Please choose one of the offered mode counts.")
+        return redirect(url_for("index"))
+
+    # The optional minimum-feature-size control. Blank means "auto": the solver's
+    # own physics-determined edge length, unchanged.
+    detail = (request.form.get("detail") or "").strip()
+    min_feature_mm = None
+    if detail and detail != "auto":
+        try:
+            min_feature_mm = float(detail)
+        except ValueError:
+            flash("The smallest feature must be a number in millimetres, or "
+                  "left on automatic.")
+            return redirect(url_for("index"))
+        if not (min_feature_mm > 0) or min_feature_mm != min_feature_mm:
+            flash("The smallest feature must be greater than zero millimetres.")
+            return redirect(url_for("index"))
+
     data = uploaded.read()
     try:
         validate_upload(uploaded.filename, data, CFG.MAX_UPLOAD_BYTES)
     except UploadError as exc:
         flash(str(exc))
         return redirect(url_for("index"))
+
+    # Decide the route from the geometry, before anything is queued. The
+    # estimate is deliberately conservative, and an estimate that FAILED (0,
+    # meaning "could not ask") routes to the cluster rather than the GPU: a
+    # failed estimate must never send a job to the slower machine, and it is the
+    # failure mode this rig keeps finding where a non-answer is read as one.
+    surface = load_surface(data)
+    est_tets = estimate_tets(surface, n_modes, units, c=CFG.est_tets_c())
+
+    if est_tets > CFG.upload_refuse_tets():
+        flash(
+            f"This model is too detailed to solve: it needs roughly "
+            f"{est_tets:,} elements and the most we can solve is "
+            f"{CFG.max_tets():,}. Please simplify the model (fewer tiny "
+            f"features, or a coarser surface) and upload it again."
+        )
+        return redirect(url_for("index"))
+
+    target = DB.JETSON if est_tets >= CFG.gpu_min_tets() else DB.CLUSTER
 
     job_id = uuid.uuid4()
     try:
@@ -448,7 +610,7 @@ def _handle_upload(app, store, jobs_db):
         return redirect(url_for("index"))
 
     jobs_db.create_job(job_id, uploaded.filename, units, n_index,
-                       CFG.DEFAULT_N_MODES)
+                       n_modes, target=target, est_tets=est_tets)
 
     # Try to start it right away; if the slot is busy it simply stays queued and
     # the tick will pick it up.

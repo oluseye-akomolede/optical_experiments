@@ -69,3 +69,112 @@ def validate_upload(filename: str, data: bytes, max_bytes: int) -> None:
             "The solver treats your object as a cavity, so it must be sealed. "
             "Please close the holes and upload it again."
         )
+
+    return mesh
+
+
+def load_surface(data: bytes):
+    """The validated surface for ``data``, or ``None`` if it cannot be read.
+
+    ``validate_upload`` already emptied this bottle; re-reading is cheap
+    (trimesh on a 50 MB .obj is tens of milliseconds) and keeps the estimate and
+    the validation looking at the same object rather than threading a mesh
+    through two call sites.
+    """
+    import trimesh
+
+    try:
+        mesh = trimesh.load(io.BytesIO(data), file_type="obj")
+    except Exception:  # noqa: BLE001 - validate_upload already reported this
+        return None
+    if isinstance(mesh, trimesh.Scene):
+        geometries = [g for g in mesh.geometry.values() if len(g.faces)]
+        if not geometries:
+            return None
+        mesh = max(geometries, key=lambda g: len(g.faces))
+    if mesh is None or len(mesh.faces) == 0:
+        return None
+    return mesh
+
+
+# --------------------------------------------------------------------------
+# The upload-time tet estimate -- how the route is chosen before anything runs
+# --------------------------------------------------------------------------
+#
+# Why an estimate at all: the routing decision (cluster CPU vs Jetson GPU) has
+# to be made at upload, before any work is queued, and the only way to know the
+# real element count is to run TetGen, which is the expensive thing being
+# scheduled. So the count is predicted from the geometry alone.
+#
+# The model: ``est_tets = C * V / h^3``, where V is the ENCLOSED volume (the
+# solver's own sizing input) and h the target edge length the solver would use
+# at this mode count. C was fitted on 13 measured meshes spanning smooth boxes,
+# a sphere and a bumpy sphere at 7-25 edges per wavelength.
+#
+# C = 14 is the CONSERVATIVE fit: it keeps the estimate at or above the measured
+# count on nearly every point. The asymmetry is deliberate -- an under-estimate
+# sends a big job to the CPU, where it dies at the memory limit after minutes of
+# work, while an over-estimate costs a small job about a second on the GPU.
+#
+# A term for the surface was tried and dropped. The measured meshes include a
+# non-monotonic pair (the bumpy sphere needs FEWER elements at 25 edges per
+# wavelength than at 22) because the surface floors the interior: a fine or
+# curved surface forces refinement the volume law cannot see, and C absorbs that
+# in the conservative direction instead. See the rig memory on this.
+
+#: coefficient of the fit; overridden by MSE_EST_TETS_C
+EST_TETS_C = 14.0
+
+
+def target_edge_length_mm(surface, n_modes: int, units: str) -> float:
+    """The solver's target edge length, in the user's units.
+
+    Imported from the solver rather than reimplemented: the estimate is only
+    useful if it predicts what the solver will actually do, and a copy of the
+    formula here would drift from the original at the first calibration.
+    """
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    import mse_meshing as MESH  # noqa: PLC0415 - deliberately late
+
+    return float(MESH.target_edge_length(surface, n_modes, units=units))
+
+
+def estimate_tets(surface, n_modes: int, units: str, c: float | None = None) -> int:
+    """Predicted element count for meshing ``surface`` at ``n_modes``.
+
+    Returns 0 when the surface is unusable, which the caller reads as "do not
+    route on this" rather than "this is tiny": a failed estimate must never be
+    the reason a job is sent to the slower machine. See the class of defect this
+    rig calls *could-not-ask must not look like nothing-there*.
+    """
+    if surface is None:
+        return 0
+    import numpy as np
+
+    try:
+        import sys
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        import mse_meshing as MESH  # noqa: PLC0415 - deliberately late
+
+        volume_m3 = MESH.enclosure_volume_m3(surface, units)
+        edge = float(MESH.target_edge_length(surface, n_modes, units=units))
+        scale = MESH.unit_scale(units)
+        edge_m = edge * scale
+    except Exception:  # noqa: BLE001 - an estimate must not break an upload
+        return 0
+
+    if not np.isfinite(volume_m3) or volume_m3 <= 0:
+        return 0
+    if not np.isfinite(edge_m) or edge_m <= 0:
+        return 0
+    coefficient = EST_TETS_C if c is None else float(c)
+    return int(coefficient * volume_m3 / (edge_m ** 3))

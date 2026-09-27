@@ -27,6 +27,13 @@ FAILED = "failed"
 #: terminal states
 FINISHED = (DONE, FAILED)
 
+#: which machine a job is for. ``cluster`` is a k8s Job (the pre-routing default,
+#: and what every existing row did); ``jetson`` waits for a GPU worker to claim
+#: it through the worker API.
+CLUSTER = "cluster"
+JETSON = "jetson"
+TARGETS = (CLUSTER, JETSON)
+
 
 def dsn_from_env() -> dict:
     """Connection parameters from the environment (never from a file)."""
@@ -124,15 +131,26 @@ class JobStore:
 
     # -- writes ------------------------------------------------------------
     def create_job(self, job_id, original_filename: str, units: str,
-                   n_index: float, n_modes: int) -> None:
-        """Create the upload row. Status starts ``queued``, not ``running``."""
+                   n_index: float, n_modes: int, target: str = CLUSTER,
+                   est_tets: int | None = None) -> None:
+        """Create the upload row. Status starts ``queued``, not ``running``.
+
+        ``target`` is the machine the upload-time estimate chose. It is recorded
+        rather than recomputed later because the estimate is the *decision*, and
+        a wrong route is diagnosed by comparing it against the count the solver
+        reports. A job queued for the Jetson also gets ``gpu_queued_at``, which
+        is what the fallback timer counts from.
+        """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO mse.jobs "
-                "(job_id, original_filename, units, n_index, n_modes, status, stage) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                "(job_id, original_filename, units, n_index, n_modes, status, stage, "
+                " target, est_tets, gpu_queued_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "        CASE WHEN %s = 'jetson' THEN now() END)",
                 (str(job_id), original_filename, units, float(n_index),
-                 int(n_modes), QUEUED, QUEUED),
+                 int(n_modes), QUEUED, QUEUED, target,
+                 None if est_tets is None else int(est_tets), target),
             )
 
     def mark_failed(self, job_id, message: str) -> None:
@@ -153,6 +171,57 @@ class JobStore:
                 (RUNNING, "meshing", k8s_job_name, str(job_id)),
             )
 
+    def reroute_to_cluster(self, job_id, reason: str) -> bool:
+        """Move a jetson job back to the cluster queue. Returns whether it moved.
+
+        This is the fallback for a GPU that never came: the job's estimate put it
+        on the jetson queue, no worker claimed it inside ``MSE_GPU_WAIT_S`` (or a
+        worker claimed it and died), and the cluster can still solve it. It is
+        the same job, so nothing is re-uploaded -- only ``target`` changes and
+        the queue position resets, which is honest: it is genuinely queued again.
+
+        Guarded on ``target = 'jetson'`` so two ticks racing cannot reroute (and
+        re-log) the same job twice, and so a job a worker is *actively* holding
+        cannot be yanked out from under it. Returns False when nothing moved,
+        which is not an error: it means someone else got there first.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET target = %s, stage = %s, message = %s, "
+                "lease_owner = NULL, lease_expires_at = NULL, gpu_queued_at = NULL "
+                "WHERE job_id = %s AND target = %s AND status = %s",
+                (CLUSTER, QUEUED, reason, str(job_id), JETSON, QUEUED),
+            )
+            return cur.rowcount > 0
+
+    def reclaim_expired_leases(self) -> list[str]:
+        """Expire leases past their deadline. Returns the job ids reclaimed.
+
+        An expired lease means the worker died: it renews on every progress
+        call, so a lease that ran out with no renewal has no live owner. The
+        lease fields are cleared, which puts the row back in the claim query --
+        another worker may take it, and if none does the ``MSE_GPU_WAIT_S``
+        fallback reroutes it to the cluster.
+
+        Only ``lease_owner``/``lease_expires_at`` are touched; the row stays
+        ``jetson`` and ``running``. That is deliberate: the job genuinely is
+        mid-flight on the GPU queue, and a worker picking it up again is the
+        cheapest correct outcome -- re-running from the start costs one solve,
+        while rerouting to the cluster costs a solve *and* the slower machine.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id FROM mse.jobs "
+                "WHERE lease_owner IS NOT NULL AND lease_expires_at < now()",
+            )
+            ids = [str(row[0]) for row in cur.fetchall()]
+            if ids:
+                cur.execute(
+                    "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL "
+                    "WHERE lease_owner IS NOT NULL AND lease_expires_at < now()",
+                )
+        return ids
+
     def set_k8s_job_name(self, job_id, k8s_job_name: str) -> None:
         """Record the Job name even if the Job could not be created."""
         with self._connect() as conn, conn.cursor() as cur:
@@ -167,7 +236,7 @@ class JobStore:
             cur.execute(
                 "SELECT job_id, created_at, original_filename, units, n_index, "
                 "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
-                "finished_at FROM mse.jobs WHERE job_id = %s",
+                "finished_at, target, est_tets FROM mse.jobs WHERE job_id = %s",
                 (str(job_id),),
             )
             row = cur.fetchone()
@@ -178,7 +247,8 @@ class JobStore:
             cur.execute(
                 "SELECT job_id, created_at, original_filename, units, n_index, "
                 "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
-                "finished_at FROM mse.jobs ORDER BY created_at DESC LIMIT %s",
+                "finished_at, target, est_tets FROM mse.jobs "
+                "ORDER BY created_at DESC LIMIT %s",
                 (int(limit),),
             )
             rows = cur.fetchall()
@@ -199,19 +269,168 @@ class JobStore:
         ]
 
     # -- the queue ---------------------------------------------------------
-    def next_queued(self) -> dict | None:
-        """Oldest upload still waiting for the Job slot."""
+    def next_queued(self, target: str = CLUSTER) -> dict | None:
+        """Oldest upload still waiting for the Job slot on ``target``.
+
+        Filtered by target: the namespace admits exactly one ``batch/v1`` Job, so
+        a jetson row reaching the launcher would occupy that slot while the app
+        waited for a GPU worker that is not coming. Jetson rows are claimed by
+        the worker API instead -- see ``claim_jetson``.
+        """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT job_id, original_filename, units, n_index, n_modes "
-                "FROM mse.jobs WHERE status = %s ORDER BY created_at LIMIT 1",
-                (QUEUED,),
+                "SELECT job_id, original_filename, units, n_index, n_modes, est_tets "
+                "FROM mse.jobs WHERE status = %s AND target = %s "
+                "ORDER BY created_at LIMIT 1",
+                (QUEUED, target),
             )
             row = cur.fetchone()
         if not row:
             return None
         return {"job_id": str(row[0]), "original_filename": row[1],
-                "units": row[2], "n_index": row[3], "n_modes": row[4]}
+                "units": row[2], "n_index": row[3], "n_modes": row[4],
+                "est_tets": row[5]}
+
+    def jetson_waiting(self, older_than_seconds: float) -> list[dict]:
+        """Jetson rows nobody has claimed for longer than the wait window.
+
+        ``gpu_queued_at`` is the clock, not ``created_at``: a job that was tried
+        on the cluster and rerouted has an old ``created_at`` but has only just
+        become a GPU candidate, and counting from ``created_at`` would reroute it
+        back to the cluster immediately.
+
+        ``lease_owner IS NULL`` excludes the row a worker is actively holding --
+        a slow solve is not an abandoned one, and pulling a live job's row out
+        from under it would duplicate the work it is already doing.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id, est_tets FROM mse.jobs "
+                "WHERE target = %s AND status = %s AND lease_owner IS NULL "
+                "AND gpu_queued_at IS NOT NULL "
+                "AND gpu_queued_at < now() - make_interval(secs => %s) "
+                "ORDER BY gpu_queued_at",
+                (JETSON, QUEUED, float(older_than_seconds)),
+            )
+            return [{"job_id": str(r[0]), "est_tets": r[1]} for r in cur.fetchall()]
+
+    def claim_jetson(self, owner: str, lease_seconds: float) -> dict | None:
+        """Atomically take the oldest unclaimed jetson job for ``owner``.
+
+        ``FOR UPDATE SKIP LOCKED`` is the whole point: two workers polling at the
+        same instant must get *different* jobs or no job, never the same one. A
+        plain ``SELECT`` followed by an ``UPDATE`` would let both read the same
+        row and both start solving it -- the classic double-claim, and it would
+        only show up as two workers fighting over one job's output files.
+
+        Returns ``None`` when there is nothing to claim, which is the normal
+        case (204), not an error.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id, units, n_index, n_modes FROM mse.jobs "
+                "WHERE target = %s AND status = %s AND lease_owner IS NULL "
+                "ORDER BY created_at "
+                "FOR UPDATE SKIP LOCKED LIMIT 1",
+                (JETSON, QUEUED),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            job_id = str(row[0])
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, k8s_job_name = NULL, "
+                "lease_owner = %s, "
+                "lease_expires_at = now() + make_interval(secs => %s) "
+                "WHERE job_id = %s",
+                (RUNNING, "queued", owner, float(lease_seconds), job_id),
+            )
+        return {"job_id": job_id, "units": row[1], "n_index": row[2],
+                "n_modes": row[3], "lease_owner": owner}
+
+    def renew_lease(self, job_id, owner: str, lease_seconds: float) -> bool:
+        """Extend ``owner``'s lease. Returns whether it still holds it.
+
+        Guarded on ``lease_owner = owner``, so a worker whose lease expired and
+        was taken by someone else cannot renew its way back in -- it gets False
+        and must stop writing. This is the only defence against two workers
+        writing one job's files after a network partition.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET lease_expires_at = "
+                "now() + make_interval(secs => %s) "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (float(lease_seconds), str(job_id), owner),
+            )
+            return cur.rowcount > 0
+
+    def set_jetson_stage(self, job_id, stage: str) -> None:
+        """Record a worker-reported stage on a jetson job.
+
+        Deliberately unguarded on the lease: this is a progress label, not a
+        result. A worker that lost its lease mid-solve writing a stale stage
+        costs the owner a slightly wrong word on a page that is about to be
+        rewritten by the winner; refusing it would cost nothing but would put a
+        lease check on the heartbeat path, where a false negative stops a live
+        solve.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET stage = %s, status = %s "
+                "WHERE job_id = %s AND target = %s",
+                (stage, RUNNING, str(job_id), JETSON),
+            )
+
+    def finish_jetson(self, job_id, owner: str) -> bool:
+        """Mark a jetson job done, if ``owner`` still holds the lease.
+
+        Returns whether it moved. The caller has already checked the lease, but
+        this checks again inside the same statement: between the check and the
+        write, a lease can expire and another worker can take the job -- and the
+        loser must not be the one that marks it done.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, finished_at = now(), "
+                "lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (DONE, DONE, str(job_id), owner),
+            )
+            return cur.rowcount > 0
+
+    def release_jetson(self, job_id, owner: str) -> bool:
+        """Drop ``owner``'s lease, returning the job to the claimable pool.
+
+        Used when the worker reports it is giving up ("failed") before the lease
+        would have expired, so another worker can pick the job up immediately
+        instead of waiting out the timeout.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL, "
+                "gpu_queued_at = now() "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (str(job_id), owner),
+            )
+            return cur.rowcount > 0
+
+    def lease_held_by(self, job_id, owner: str) -> bool:
+        """Whether ``owner`` currently holds ``job_id``'s lease and it is live.
+
+        Every worker write goes through this. Two separate conditions, and both
+        matter: the owner must match (a stale worker must not write) and the
+        lease must not have expired (a worker that vanished and came back must
+        not write either). Checking only the owner would let a worker that slept
+        through its lease resume writing over its successor's output.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM mse.jobs WHERE job_id = %s AND lease_owner = %s "
+                "AND lease_expires_at > now()",
+                (str(job_id), owner),
+            )
+            return cur.fetchone() is not None
 
     def queue_position(self, job_id) -> int | None:
         """1-based place in the queue, or None once the job is no longer queued."""
@@ -257,6 +476,8 @@ def _job_row(row) -> dict:
         "k8s_job_name": row[9],
         "peak_rss_mb": row[10],
         "finished_at": _iso(row[11]),
+        "target": row[12],
+        "est_tets": row[13],
     }
 
 

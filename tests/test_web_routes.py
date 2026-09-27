@@ -49,13 +49,15 @@ class FakeDb:
         self.launched: list[tuple] = []
 
     # writes
-    def create_job(self, job_id, filename, units, n_index, n_modes):
+    def create_job(self, job_id, filename, units, n_index, n_modes,
+                   target=DB.CLUSTER, est_tets=None):
         self.jobs[str(job_id)] = {
             "job_id": str(job_id), "created_at": "2026-09-26T00:00:00+00:00",
             "original_filename": filename, "units": units, "n_index": n_index,
             "n_modes": n_modes, "status": DB.QUEUED, "stage": DB.QUEUED,
             "message": None, "k8s_job_name": None, "peak_rss_mb": None,
             "finished_at": None,
+            "target": target, "est_tets": est_tets,
         }
 
     def mark_running(self, job_id, name):

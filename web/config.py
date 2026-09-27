@@ -35,6 +35,12 @@ UNIT_CHOICES = ("mm", "cm", "m", "in")
 DEFAULT_UNITS = "mm"
 DEFAULT_N_MODES = 20
 
+#: how many modes the owner may ask for. A picklist, not a free field: the mode
+#: count is the single biggest lever on both the mesh size and the solve time
+#: (it sets the target edge length, and the element count goes like h^-3), so an
+#: accidental extra zero here is a much bigger mistake than a typo elsewhere.
+MODE_CHOICES = (10, 20, 40)
+
 #: settings for the solver Job (see the task-2 amendment)
 JOB_CPU = "4"
 JOB_MEMORY = "14Gi"
@@ -43,6 +49,40 @@ JOB_TTL_SECONDS_AFTER_FINISHED = 30
 
 #: how often the background tick looks for queued uploads, in seconds
 TICK_SECONDS = float(os.environ.get("MSE_TICK_SECONDS", "5"))
+
+# --------------------------------------------------------------------------
+# Routing: which machine an upload goes to (dispatch 2/3)
+# --------------------------------------------------------------------------
+
+#: coefficient of the upload-time tet estimate, ``est_tets = C * V / h^3``.
+#: Fitted on 13 measured meshes (the lead's runs); C = 14 is the CONSERVATIVE
+#: fit, chosen so the estimate is at or above the measured count on nearly
+#: every point. Under-estimating sends a big job to the CPU where it dies;
+#: over-estimating costs a small job about a second on the GPU. The asymmetry
+#: is the whole reason for the constant.
+EST_TETS_C = 14.0
+
+#: at or above this estimate the job is queued for the Jetson GPU instead of the
+#: cluster. This is the cluster's *routing* boundary, not its capability limit;
+#: the solver re-decides on the exact count (MSE_CPU_MAX_TETS).
+DEFAULT_GPU_MIN_TETS = 15_000
+
+#: the largest mesh either machine can solve (the lead's measured largest
+#: success in single precision). The solver enforces it on the exact count.
+DEFAULT_MAX_TETS = 600_000
+
+#: an upload is refused outright only above TWICE that, because the estimate can
+#: be up to 2x high (worst over-estimate measured) and refusing at 1x would turn
+#: away jobs that fit.
+UPLOAD_REFUSE_FACTOR = 2
+
+#: how long a GPU job may sit unclaimed before the app gives up and puts it back
+#: on the cluster queue, in seconds.
+DEFAULT_GPU_WAIT_SECONDS = 600
+
+#: how long a worker's lease is valid; a worker renews it on every progress
+#: call, so an expired lease means the worker died, not that the job is slow.
+DEFAULT_LEASE_SECONDS = 300
 
 #: set MSE_DRY_RUN=1 to log what would be launched instead of launching it.
 #: Used by the tests; never set in the cluster.
@@ -81,6 +121,67 @@ def bucket() -> str:
 
 def minio_endpoint() -> str:
     return os.environ.get("MINIO_ENDPOINT") or DEFAULT_MINIO_ENDPOINT
+
+
+def _positive_int(env: str, default: int) -> int:
+    """An int from the environment, falling back on anything unusable.
+
+    A typo in a threshold must not take the app down at import: the defaults are
+    the values the lead calibrated, and a bad override is a misconfiguration
+    worth ignoring rather than a reason to refuse every upload.
+    """
+    try:
+        value = int(os.environ.get(env, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def est_tets_c() -> float:
+    """Coefficient of the upload-time estimate. See :data:`EST_TETS_C`."""
+    try:
+        value = float(os.environ.get("MSE_EST_TETS_C", EST_TETS_C))
+    except (TypeError, ValueError):
+        return EST_TETS_C
+    return value if value > 0 else EST_TETS_C
+
+
+def gpu_min_tets() -> int:
+    """Estimate at or above which a job is queued for the Jetson."""
+    return _positive_int("MSE_GPU_MIN_TETS", DEFAULT_GPU_MIN_TETS)
+
+
+def max_tets() -> int:
+    """The absolute element cap, mirrored from the solver's own limit."""
+    return _positive_int("MSE_MAX_TETS", DEFAULT_MAX_TETS)
+
+
+def upload_refuse_tets() -> int:
+    """Estimate above which an upload is refused before it is ever queued.
+
+    Twice the real cap, because the estimate can be up to 2x high: refusing at
+    1x would turn away jobs that fit. Refusing here is the only guard that
+    costs the owner nothing -- nothing has been meshed yet.
+    """
+    return UPLOAD_REFUSE_FACTOR * max_tets()
+
+
+def gpu_wait_seconds() -> float:
+    """How long an unclaimed GPU job waits before falling back to the cluster."""
+    try:
+        return max(1.0, float(os.environ.get("MSE_GPU_WAIT_S",
+                                             DEFAULT_GPU_WAIT_SECONDS)))
+    except (TypeError, ValueError):
+        return float(DEFAULT_GPU_WAIT_SECONDS)
+
+
+def lease_seconds() -> float:
+    """Validity of a worker lease, in seconds."""
+    try:
+        return max(1.0, float(os.environ.get("MSE_LEASE_S",
+                                             DEFAULT_LEASE_SECONDS)))
+    except (TypeError, ValueError):
+        return float(DEFAULT_LEASE_SECONDS)
 
 
 def max_running_jobs() -> int:

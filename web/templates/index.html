@@ -21,10 +21,30 @@
       <label>Refractive index
         <input type="number" name="n_index" value="1.0" min="1" step="0.001" required>
       </label>
+      <label>Modes
+        <select name="n_modes">
+          {% for count in mode_choices %}
+            <option value="{{ count }}" {% if count == default_n_modes %}selected{% endif %}>{{ count }}</option>
+          {% endfor %}
+        </select>
+      </label>
     </div>
     <p class="muted small">
       The refractive index is the medium filling your object: 1.0 for air or vacuum,
-      about 1.5 for glass.
+      about 1.5 for glass. More modes means a finer mesh and a longer solve; the
+      mesh grows in proportion to this number.
+    </p>
+    <label>Smallest feature (mm) &mdash; optional
+      <input type="text" name="detail" value="auto" placeholder="auto"
+             pattern="auto|([0-9]*\.?[0-9]+)">
+    </label>
+    <p class="muted small">
+      Leave this on <strong>auto</strong> for the default resolution, which is set by
+      the physics of the modes you asked for. If your object has fine detail the modes
+      depend on &mdash; a thin wall, a narrow gap &mdash; enter its size in millimetres
+      here and the mesh will be refined to resolve it. Setting it larger than the
+      automatic value has no effect: the mesh is never made coarser than the detail
+      you name.
     </p>
     <button type="submit">Compute modes</button>
   </form>

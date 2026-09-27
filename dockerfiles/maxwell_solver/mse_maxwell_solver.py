@@ -45,6 +45,46 @@ import mse_storage as STORE  # noqa: E402
 #: container limit; the lead calibrates the real figure on the Jetson.
 DEFAULT_MAX_TETS = 80_000
 
+#: elements above which the CLUSTER cannot solve a job, but the GPU still can.
+#: The upload-time estimate decides the route, but an estimate can be wrong in
+#: either direction; this is the exact count re-deciding, at the first point the
+#: exact count exists. Deliberately lower than DEFAULT_MAX_TETS: it is a
+#: routing boundary, not a capability limit.
+DEFAULT_CPU_MAX_TETS = 150_000
+
+#: what a ``TooBigForProcessor`` writes into its termination message. The app
+#: reads this string back out of the pod's last state to tell "this job is on
+#: the wrong machine" from "this job is broken" -- see the class docstring.
+REROUTE_TOKEN = "MSE_REROUTE"
+
+
+class TooBigForProcessor(Exception):
+    """This job is fine but this machine is not -- re-route it, do not fail it.
+
+    Distinct from :class:`mse_meshing.MeshingError` on purpose. A job over the
+    *cluster's* limit has a home on the GPU, so the app re-queues it there; a
+    job over the absolute limit has no home and is failed with a message the
+    owner can act on. Collapsing the two would either fail a runnable job or
+    re-queue an impossible one forever.
+
+    **How the app hears about it.** A non-zero exit code is invisible to the
+    app: every failure in the solver is exit 1, and Kubernetes reports a Job as
+    ``BackoffLimitExceeded``/``Error`` either way. The only channel that carries
+    a *reason* out of a dead container is its termination message, so this
+    exception writes :data:`REROUTE_TOKEN` into
+    ``/dev/termination-log`` (see :func:`main`) and the app greps for it. The
+    token is a phrase, not the message text, because the text is for a human and
+    would otherwise be load-bearing.
+    """
+
+
+def cpu_max_tets() -> int:
+    """Element count above which a CPU solve is refused as mis-routed."""
+    try:
+        return max(1, int(os.environ.get("MSE_CPU_MAX_TETS", DEFAULT_CPU_MAX_TETS)))
+    except ValueError:
+        return DEFAULT_CPU_MAX_TETS
+
 #: samples along the longest bounding-box axis for mode_XX.bin
 DEFAULT_GRID = FLD.DEFAULT_GRID
 
@@ -90,8 +130,15 @@ def make_store(local_root: str | None, job_id: str) -> STORE.ObjectStore:
 def solve(job_id: str, units: str, n_index: float, n_modes: int,
           store_in: STORE.ObjectStore, store_out: STORE.ObjectStore,
           max_tets: int, grid: int, verbose: bool = True,
-          db: "mse_db.JobStore | None" = None):
+          db: "mse_db.JobStore | None" = None,
+          backend: str | None = None):
     """Run the pipeline and write every result. Returns a summary dict.
+
+    ``backend`` selects the solver backend (``cpu``/``gpu``); ``None`` reads
+    ``MSE_SOLVER_BACKEND``. It is resolved once, here, and then passed explicitly
+    to :func:`mse_eigen.solve_modes`, so the mesh-count guard below and the
+    factorisation cannot disagree about which machine is running -- reading the
+    env twice would let a test set it after the guard had already decided.
 
     Raises on failure after recording the stage that failed; the caller turns
     that into a ``failed`` status and a non-zero exit.
@@ -100,6 +147,8 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
         raise ValueError("The refractive index must be greater than zero.")
     if n_modes < 1:
         raise ValueError("At least one mode must be requested.")
+
+    backend = backend or EIG.BACKEND.selected_backend()
 
     timings: dict[str, float] = {}
     t_start = time.time()
@@ -120,6 +169,40 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
         max_tets=max_tets, verbose=verbose,
     )
     timings["meshing"] = time.time() - t0
+
+    # -- is this machine the right one? ------------------------------------
+    #
+    # The upload-time estimate chose which queue this job went on, and an
+    # estimate is exactly what it says: the mesh's own count is the first point
+    # where the truth is known, and it is known *here*, before assembly, which
+    # is where the expensive part starts. So this is the cheap moment to admit
+    # the route was wrong.
+    #
+    # Two different mistakes, and they must not be conflated:
+    #
+    #   too big for THIS processor (cpu, over MSE_CPU_MAX_TETS)
+    #       The job is fine; the machine is wrong. Raise TooBigForProcessor so
+    #       the app can re-route it to the Jetson queue. Failing here would
+    #       throw away work that is about to run perfectly well elsewhere.
+    #
+    #   too big for ANY processor (over MSE_MAX_TETS)
+    #       No backend can do it. Raise MeshingError, which the owner sees as a
+    #       plain "too detailed" message -- there is no point re-routing.
+    #
+    # Without this the estimate is load-bearing on its own, and a job that
+    # under-estimated its way onto the CPU would be killed by the memory limit
+    # with a message that says nothing about why.
+    n_tets_actual = int(tets.shape[0])
+    if str(backend).lower() == "cpu" and n_tets_actual > cpu_max_tets():
+        raise TooBigForProcessor(
+            f"this model needs {n_tets_actual:,} elements, over the "
+            f"{cpu_max_tets():,} the cluster can solve; re-route to the GPU"
+        )
+    if n_tets_actual > max_tets:
+        raise MESH.MeshingError(
+            f"This model is too detailed: it needs {n_tets_actual:,} elements "
+            f"and the limit is {max_tets:,}. Please simplify the model."
+        )
 
     # -- assembling -------------------------------------------------------
     stage("assembling")
@@ -146,6 +229,7 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
         A_free, B_free, n_modes, points_m,
         edges=edges, tets=tets, tet_edges=tet_edges,
         free_edges=free_edges, constrained=constrained, verbose=verbose,
+        backend=backend,
     )
     residual_note = (
         f", worst refined residual {EIG.LAST_WORST_RESIDUAL:.2e}"
@@ -291,6 +375,38 @@ def write_results(job_id, store_out, surface, points_m, tets, edges, tet_edges,
     return modes_json
 
 
+def termination_message(exc: BaseException, limit: int = 4096) -> str | None:
+    """The text to leave in ``/dev/termination-log``, or ``None`` for no signal.
+
+    Only the re-routable outcome is worth a channel that outlives the container:
+    every other failure is already named for the owner by ``mse.jobs.message``,
+    which the solver writes to the database itself. This one is different -- the
+    app has to *act* on it (move the job to another queue), and the app is not
+    watching the database for it.
+
+    Truncated to ``limit`` because Kubernetes caps the field at 4 KiB and
+    silently truncates over it; truncating here means the token is never the
+    part that gets cut.
+    """
+    if not isinstance(exc, TooBigForProcessor):
+        return None
+    return f"{REROUTE_TOKEN}: {exc}"[:limit]
+
+
+def _write_termination_log(text: str, path: str = "/dev/termination-log") -> bool:
+    """Best-effort write of the pod's termination message. Never raises.
+
+    Absent when running locally (no such path) or under ``--local-in``, which is
+    not a failure: the local paths do not consume the signal.
+    """
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return True
+    except OSError:
+        return False
+
+
 def owner_message(exc: BaseException) -> str:
     """Plain-English text for the job page.
 
@@ -301,6 +417,15 @@ def owner_message(exc: BaseException) -> str:
     """
     if isinstance(exc, (MESH.MeshingError, FLD.SamplingError)):
         return str(exc)
+    if isinstance(exc, TooBigForProcessor):
+        # Reached only when nothing re-routed it. The owner cannot act on a
+        # routing failure, so they get the same plain "too detailed" answer they
+        # would have got from the cap -- naming the scheduler's problem to them
+        # would be noise, and the log carries the real reason.
+        return (
+            "This model is too large to solve with the processors available "
+            "right now. Please try again later, or upload a simpler model."
+        )
     if isinstance(exc, ValueError):
         return str(exc)
     if isinstance(exc, EIG.EigenError):
@@ -351,6 +476,19 @@ def main(argv=None) -> int:
         print(f"[mse] peak RSS {rss:.0f} MB", flush=True)
         if db is not None:
             db.fail(job_id, owner_message(exc), peak_rss_mb=rss)
+        # Leave the re-route signal where the app can read it after this process
+        # is gone. Done LAST and only on this exception: the termination message
+        # is read from the dead container, so anything written here supersedes
+        # nothing, and a crash before this line still leaves the database row
+        # (written above) naming the failure for the owner.
+        signal = termination_message(exc)
+        if signal is not None:
+            if _write_termination_log(signal):
+                print(f"[mse] wrote {REROUTE_TOKEN} to the termination log",
+                      flush=True)
+            else:
+                print(f"[mse] {REROUTE_TOKEN}: could not write the termination "
+                      f"log; the app will see a plain failure", flush=True)
         return 1
     finally:
         if db is not None:

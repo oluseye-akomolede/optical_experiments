@@ -8,6 +8,22 @@
     {{ job.n_modes }} modes requested
   </p>
 
+  {# Where this job runs. Shown from the ROUTING DECISION the app made at upload,
+     not inferred from the status: "queued for the GPU" and "running on the GPU"
+     are different things to wait for, and the owner should be able to tell a job
+     that is waiting for a machine from one that is using it. #}
+  {% if job.target == 'jetson' %}
+    <p class="muted small" id="target-line">
+      This job is queued for the graphics processor, which solves the larger
+      meshes. If it is not picked up within a few minutes it will be moved back
+      to the cluster queue automatically.
+    </p>
+  {% else %}
+    <p class="muted small" id="target-line">
+      This job runs on the cluster.
+    </p>
+  {% endif %}
+
   <div id="progress">
     <p><strong id="status-text">{{ job.status }}</strong>
       <span class="muted" id="stage-text">{{ job.stage or '' }}</span></p>

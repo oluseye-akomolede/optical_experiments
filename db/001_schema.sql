@@ -90,3 +90,68 @@ CREATE TABLE IF NOT EXISTS mse.modes (
 
 CREATE INDEX IF NOT EXISTS jobs_status_idx ON mse.jobs (status);
 CREATE INDEX IF NOT EXISTS jobs_created_idx ON mse.jobs (created_at DESC);
+
+-- --------------------------------------------------------------------------
+-- Routing and the GPU worker (dispatch 2/3)
+--
+-- Additive only: existing rows keep working, and every column is nullable or
+-- defaulted so a Job launched before this change is unaffected. The web app's
+-- initContainer re-applies this file on every deploy, so each addition is
+-- guarded the same way the earlier ones are.
+-- --------------------------------------------------------------------------
+DO $$
+BEGIN
+    -- Which machine this job is for: 'cluster' (a k8s Job, as before) or
+    -- 'jetson' (waiting for a GPU worker to claim it). Existing rows default
+    -- to 'cluster', which is what they actually did.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'target'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN target text NOT NULL DEFAULT 'cluster';
+    END IF;
+
+    -- The upload-time tet estimate that chose `target`. Kept because it is the
+    -- number the routing decision was made on, and a wrong route is diagnosed
+    -- by comparing it with the count the solver actually reported.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'est_tets'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN est_tets bigint;
+    END IF;
+
+    -- Lease: which worker holds this job and until when. A lease that has
+    -- expired is how a dead worker is detected -- there is no other signal,
+    -- because the worker's whole contract is to renew it.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'lease_owner'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN lease_owner text;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'lease_expires_at'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN lease_expires_at timestamptz;
+    END IF;
+
+    -- When this job first became claimable on the jetson queue, so the
+    -- fallback can tell "nobody has picked this up for MSE_GPU_WAIT_S" from
+    -- "it is simply new".
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'gpu_queued_at'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN gpu_queued_at timestamptz;
+    END IF;
+END $$;
+
+-- The claim query scans for the oldest unleased jetson job, so it wants an
+-- index on exactly that. Partial, because leased and cluster rows are never
+-- candidates and the jetson queue stays small next to the archive.
+CREATE INDEX IF NOT EXISTS jobs_jetson_claim_idx
+    ON mse.jobs (created_at)
+    WHERE target = 'jetson' AND status = 'queued' AND lease_owner IS NULL;
