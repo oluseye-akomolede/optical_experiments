@@ -195,25 +195,21 @@ BEGIN
         ALTER TABLE mse.jobs ADD COLUMN min_feature_unit text;
     END IF;
 
-    -- DROP the superseded single column. Without this the "fresh and upgraded
-    -- end up identical" promise above is false for any database that ran the
-    -- intermediate version: `min_feature_mm` would survive as a dead column
-    -- that the code no longer reads or writes, and the two schema shapes would
-    -- differ. Adding and never dropping is how a schema accumulates columns
-    -- nobody can account for.
+    -- NO DROP for the superseded `min_feature_mm`, deliberately. An earlier
+    -- version of this file dropped it, to make fresh and upgraded databases
+    -- match for any DB that had run the intermediate commit -- and that was the
+    -- wrong trade. PRODUCTION never had the column: it runs 8e27869, which
+    -- predates the commit that introduced it (verified with
+    -- ``git merge-base --is-ancestor 8e27869 25ad6d8``; 8e27869 has no
+    -- ``min_feature`` or ``scale`` column at all). So the DROP would never fire
+    -- in production, and its only effect there would be a destructive statement
+    -- running on every app start in exchange for tidying databases that are
+    -- thrown away. A schema script that DROPs on every boot to fix dev
+    -- leftovers is a worse thing to own than a dead column in a scratch DB.
     --
-    -- There is no data to migrate: `min_feature_mm` was a bare number in the
-    -- OBJECT's units, and the column it would map to (`min_feature_value`) has
-    -- no meaning without a `min_feature_unit` that the old row does not carry.
-    -- A backfill would have to guess, and a guessed unit is a wrong length --
-    -- the exact class of defect this change exists to remove. The old value is
-    -- not recoverable as a physical length, so it is not preserved.
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'min_feature_mm'
-    ) THEN
-        ALTER TABLE mse.jobs DROP COLUMN min_feature_mm;
-    END IF;
+    -- The upgrade that matters is from 8e27869, and it is additive: the three
+    -- columns below plus `scale`. That path is what A2c in tests/pg_race_check.py
+    -- builds and checks.
 
     -- NOT NULL DEFAULT 1: an old row is an unscaled upload by definition, so
     -- backfilling 1 is the true value, not a placeholder that has to be

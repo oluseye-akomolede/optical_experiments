@@ -218,56 +218,114 @@ def check_feature_triplet_roundtrip(conn, r: Result, JobStore):
             f"unit={got.get('min_feature_unit')!r} (want 2e-04 / 0.2 / 'nm')")
 
 
-def check_upgrade_matches_a_fresh_schema(conn, r: Result, JobStore, db_module):
-    """A2c: an upgraded database has the SAME columns as a fresh one.
+#: The image tag production runs, and therefore the schema the next upgrade
+#: starts from. Named here so the leg says which deployment it is testing; a
+#: stale value would make the leg check an upgrade nobody will perform.
+DEPLOYED_TAG = "8e27869"
 
-    ``db/001_schema.sql`` states this promise in a comment, and states it for a
-    reason: a column that exists in one shape and not the other is read by nobody
-    on one deployment and by everybody on the other, so the same code works on
-    one machine and fails on the next. It is claimed in prose and was FALSE --
-    ``min_feature_mm`` survived the upgrade as a dead column, because the file
-    added columns and never dropped a superseded one. Measured before the fix:
-    fresh and upgraded column sets differed by exactly that column.
 
-    A double cannot check this: the property is about two REAL schema shapes.
-    Run in a transaction that is rolled back, so the legs after this one see the
-    schema they expect.
+def _deployed_schema_sql() -> str | None:
+    """``db/001_schema.sql`` as it was at the deployed tag, or None.
+
+    Read out of git rather than retyped: the point of the leg is that the
+    upgrade starts from the real deployed shape, and a transcription of it here
+    would be a second copy that can drift from the file that actually shipped.
+    None (rather than a raise) when git cannot answer, so the leg can report
+    "could not ask" instead of passing on an untested upgrade.
     """
+    import subprocess  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1]
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{DEPLOYED_TAG}:db/001_schema.sql"],
+            cwd=root, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 and result.stdout else None
+
+
+def _job_columns(cur) -> list[str]:
+    """The column names of ``mse.jobs``, ordered, as the DB currently has them."""
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs'
+        ORDER BY column_name
+    """)
+    return [row[0] for row in cur.fetchall()]
+
+
+def check_upgrade_matches_a_fresh_schema(conn, r: Result, JobStore, db_module):
+    """A2c: upgrading the DEPLOYED schema gives the same columns as a fresh one.
+
+    The upgrade that has to work is the one production will actually run, and
+    production is at image tag 8e27869 -- a schema with no ``min_feature*``
+    column and no ``scale`` column. (An earlier version of this leg recreated an
+    intermediate commit's shape instead, which proved a property production
+    never exercises and motivated a DROP that would never have fired there. The
+    leg now models the real starting point.)
+
+    What this proves: the additive path from 8e27869 lands on exactly the fresh
+    shape, so the same code reads the same columns on a new deploy and an
+    upgraded one. A double cannot check it -- the property is about two REAL
+    schema shapes -- and it is worth checking because a column present in one
+    shape and absent in the other works on one machine and fails on the next.
+
+    Run inside a transaction that is ROLLED BACK, so the legs after this one see
+    the schema they expect.
+    """
+    # The 8e27869 DDL is not retyped here or approximated by dropping columns:
+    # the checkout carries it, and applying the real file is the only way to be
+    # sure the "before" shape is what production actually runs. Only four
+    # columns were dropped by the hand-reduction this replaced, which would have
+    # missed k8s_job_name/target/gpu_queued_at and quietly made the leg easier
+    # than the upgrade it claims to test.
+    deployed_ddl = _deployed_schema_sql()
+    if deployed_ddl is None:
+        return r.check("A2c the deployed (8e27869) schema is available to test "
+                       "the upgrade from", False,
+                       "git could not read db/001_schema.sql at 8e27869 -- the "
+                       "leg cannot reproduce the real starting shape")
+    with open(db_module._schema_path(), encoding="utf-8") as handle:
+        current_ddl = handle.read()
+
     with conn.cursor() as cur:
+        # The FRESH shape, captured before anything is torn down: this is what
+        # ``apply_schema`` produces on an empty database, and it is the target
+        # the upgrade must land on.
+        fresh = _job_columns(cur)
+    if not fresh:
+        return r.check("A2c the current schema produces mse.jobs", False, "[]")
+
+    with conn.cursor() as cur:
+        # Everything happens inside one transaction that is ROLLED BACK: the
+        # legs after this one must see the schema they expect, and this leg
+        # rebuilds tables.
         cur.execute("BEGIN")
-        cur.execute("""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_schema = 'mse' AND table_name = 'jobs'
-            ORDER BY column_name
-        """)
-        fresh = [row[0] for row in cur.fetchall()]
-        # Reconstruct a pre-rename shape: drop the three new columns and restore
-        # the one they replaced, then run the project's own upgrade path.
-        cur.execute("ALTER TABLE mse.jobs DROP COLUMN IF EXISTS min_feature_value")
-        cur.execute("ALTER TABLE mse.jobs DROP COLUMN IF EXISTS min_feature_unit")
-        cur.execute("ALTER TABLE mse.jobs DROP COLUMN IF EXISTS min_feature_m")
-        cur.execute("ALTER TABLE mse.jobs ADD COLUMN IF NOT EXISTS "
-                    "min_feature_mm double precision")
-        # The PROJECT's own DDL file, read through the SAME resolver
-        # ``apply_schema`` uses -- so this leg upgrades with the real SQL, not a
-        # retyped fragment that could agree with itself while disagreeing with
-        # the file. psycopg2 runs a multi-statement string as one implicit
-        # transaction, which is how the file's DO blocks are written.
-        with open(db_module._schema_path(), encoding="utf-8") as handle:
-            cur.execute(handle.read())
-        cur.execute("""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_schema = 'mse' AND table_name = 'jobs'
-            ORDER BY column_name
-        """)
-        upgraded = [row[0] for row in cur.fetchall()]
+        # The "before" state is production's, produced by applying the DEPLOYED
+        # file rather than by dropping a few columns off the current one. The
+        # hand-reduction this replaced would have missed k8s_job_name, target and
+        # gpu_queued_at, making the leg quietly easier than the upgrade it claims
+        # to test.
+        cur.execute("DROP TABLE IF EXISTS mse.modes")
+        cur.execute("DROP TABLE IF EXISTS mse.jobs")
+        cur.execute(deployed_ddl)
+        before = _job_columns(cur)
+        # ...then the CURRENT file, exactly as the deployed initContainer runs it.
+        cur.execute(current_ddl)
+        after = _job_columns(cur)
         cur.execute("ROLLBACK")
 
-    r.check("A2c an upgraded schema has exactly the columns a fresh one has "
-            "(an ADD-only migration leaves dead columns behind)",
-            fresh == upgraded,
-            f"fresh-only={sorted(set(fresh) - set(upgraded))} "
-            f"upgrade-only={sorted(set(upgraded) - set(fresh))}")
+    if not before:
+        return r.check("A2c applying the deployed schema produces mse.jobs",
+                       False, "8e27869's DDL created no columns -- bad starting "
+                              "state, the upgrade was not tested")
+    r.check("A2c upgrading the DEPLOYED (8e27869) schema lands on exactly the "
+            "fresh set of columns",
+            after == fresh,
+            f"upgrade-only={sorted(set(after) - set(fresh))} "
+            f"missing-after-upgrade={sorted(set(fresh) - set(after))} "
+            f"(before the upgrade: {len(before)} columns, after: {len(after)})")
 
 
 def _race(conn, dsn, r: Result, col: str, bound: int, rounds: int = 60,
