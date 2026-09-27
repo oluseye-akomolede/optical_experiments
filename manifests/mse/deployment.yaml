@@ -30,7 +30,7 @@ spec:
         - name: mse-harbor-pull
       initContainers:
         - name: schema
-          image: harbor.arcadia-ecs.local/mode-search-engine/mse-web:8e27869
+          image: harbor.arcadia-ecs.local/mode-search-engine/mse-web:c836bb6
           command: ["python", "-c"]
           args:
             - |
@@ -42,7 +42,7 @@ spec:
                 name: mse-db
       containers:
         - name: web
-          image: harbor.arcadia-ecs.local/mode-search-engine/mse-web:8e27869
+          image: harbor.arcadia-ecs.local/mode-search-engine/mse-web:c836bb6
           # gunicorn, not the Flask dev server. EXACTLY ONE worker: the tick
           # thread that launches solver Jobs runs in-process, and two workers
           # would race for the namespace's single Job slot. --threads gives the
@@ -54,7 +54,7 @@ spec:
               containerPort: 5000
           env:
             - name: MSE_SOLVER_IMAGE
-              value: harbor.arcadia-ecs.local/mode-search-engine/mse-maxwell-solver:8e27869
+              value: harbor.arcadia-ecs.local/mode-search-engine/mse-maxwell-solver:c836bb6
             - name: MSE_PULL_SECRET
               value: mse-harbor-pull
             - name: MSE_BUCKET
