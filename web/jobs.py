@@ -218,9 +218,9 @@ class K8sJobLauncher:
         states: dict[str, str] = {}
         for job in jobs.items:
             job_status = getattr(job, "status", None)
-            # A Job whose own condition already names the failure needs no pods,
-            # so skip the extra list call for the common DeadlineExceeded case.
-            if _job_condition_reason(job_status) is not None:
+            if _names_the_failure_itself(_job_condition_reason(job_status)):
+                # The Job's own reason is the whole answer and no pod can improve
+                # on it, so skip the extra list call.
                 reason = _failed_reason(job)
             else:
                 reason = _failed_reason(job, self._job_pods(job))
@@ -250,10 +250,12 @@ class K8sJobLauncher:
             # still says *that* it failed, so the caller keeps that reason rather
             # than losing the failure to a failed lookup.
             return []
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             # Nothing about naming an OOMKilled container is worth failing a
             # scheduler tick for. If the core API is unreachable for any reason
-            # at all, fall back to the reason we already have.
+            # at all, fall back to the reason we already have -- but say so, so
+            # a swallowed lookup cannot pass for "this Job has no pods".
+            print(f"[mse-web] could not list pods for {name}: {exc}", flush=True)
             return []
 
     def _core(self):
@@ -317,6 +319,25 @@ def _job_condition_reason(status) -> str | None:
     return None
 
 
+def _names_the_failure_itself(reason: str | None) -> bool:
+    """Whether a Job condition reason is the best answer we will get.
+
+    Only ``DeadlineExceeded`` qualifies. It says the solver overran its own
+    budget, and no pod can sharpen that.
+
+    Every other failure under ``backoffLimit: 0`` arrives as
+    ``BackoffLimitExceeded`` -- including the OOM this app most needs to name.
+    Treating *any* condition as the whole answer is what hid ``OOMKilled``:
+    the condition appears within seconds and then persists, so the pod list was
+    skipped for exactly the steady state an owner would be looking at, and the
+    container's ``OOMKilled`` was only ever visible in the brief window before
+    the condition landed. So an unhelpful condition must fall through to the
+    pods, which is why this is a check on the *reason* and not on
+    ``reason is not None``.
+    """
+    return reason == "DeadlineExceeded"
+
+
 def _failed_reason(job, pods=None) -> str | None:
     """A short reason string if the Job has FAILED, else ``None``.
 
@@ -336,15 +357,21 @@ def _failed_reason(job, pods=None) -> str | None:
         return None
 
     own = _job_condition_reason(status)
-    if own is not None:
+    if _names_the_failure_itself(own):
+        return own
+    if own is not None and not pods:
+        # The Job says it failed and says nothing useful; without the pods there
+        # is nothing better to report, so report what we have.
         return own
 
-    # The Job condition is not always set promptly, but an OOMKilled container
-    # is the case the owner most needs named, so look at the pods.
+    # A specific container reason beats an unhelpful condition: ``BackoffLimitExceeded``
+    # is what every failure under ``backoffLimit: 0`` gets, while ``OOMKilled``
+    # tells the owner what to actually change. This is the case the owner most
+    # needs named, which is why it is allowed to overwrite the condition.
     for reason in ("OOMKilled", "Error"):
         if _pods_have_reason(pods or [], reason):
             return reason
-    return None
+    return own if own is not None else None
 
 
 def _pods_have_reason(pods, reason: str) -> bool:

@@ -363,6 +363,88 @@ def test_job_states_asks_for_the_pods_of_each_failed_job():
     assert api.pod_calls == 1, "the pods of a failed Job must be listed"
 
 
+def _oom_pod():
+    from kubernetes import client as k8s
+
+    return k8s.V1Pod(
+        metadata=k8s.V1ObjectMeta(name="mse-solver-a-x"),
+        status=k8s.V1PodStatus(container_statuses=[
+            k8s.V1ContainerStatus(
+                name="solver", ready=False, restart_count=0,
+                image="img", image_id="",
+                state=k8s.V1ContainerState(terminated=k8s.V1ContainerStateTerminated(
+                    exit_code=137, reason="OOMKilled"))),
+        ]))
+
+
+def test_a_job_that_has_already_been_condemned_still_names_its_oomkilled_pod():
+    """The steady state: condition AND an OOMKilled pod, at the same time.
+
+    An owner looks at a failed Job seconds or minutes after it died, by which
+    time Kubernetes has published ``BackoffLimitExceeded`` -- and with
+    ``backoffLimit: 0`` that is what *every* failure gets, the OOM included.
+    Skipping the pods whenever a Failed condition exists therefore skipped them
+    for exactly the state the owner sees, and ``OOMKilled`` was only nameable in
+    the brief window before the condition landed.
+
+    The reason must be the specific one, not ``BackoffLimitExceeded``: the owner
+    can act on "ran out of memory" and cannot act on the backoff limit.
+    """
+    from kubernetes import client as k8s
+
+    job = _real_job(k8s.V1JobStatus(
+        failed=1,
+        conditions=[k8s.V1JobCondition(
+            type="Failed", status="True", reason="BackoffLimitExceeded")]))
+    launcher, api = _launcher_with(jobs=[job], pods=[_oom_pod()])
+
+    assert launcher.job_states() == {"mse-solver-a": "OOMKilled"}
+    assert api.pod_calls == 1, "an unhelpful condition must still cost a pod list"
+
+
+def test_a_deadline_exceeded_job_does_not_pay_for_a_pod_list():
+    """The one condition that *is* the answer, so the pods are skipped.
+
+    The Job's ``DeadlineExceeded`` already says the solver overran its budget and
+    no pod can sharpen that, so the extra list call is pure cost. This is the
+    other half of the test above: narrowing the skip must not have removed it.
+    """
+    from kubernetes import client as k8s
+
+    job = _real_job(k8s.V1JobStatus(
+        failed=1,
+        conditions=[k8s.V1JobCondition(
+            type="Failed", status="True", reason="DeadlineExceeded")]))
+    launcher, api = _launcher_with(jobs=[job], pods=[_oom_pod()])
+
+    assert launcher.job_states() == {"mse-solver-a": "DeadlineExceeded"}
+    assert api.pod_calls == 0, "DeadlineExceeded needs no pod lookup"
+
+
+def test_a_failed_pod_list_is_reported_rather_than_looking_like_no_pods(capsys):
+    """A swallowed lookup must leave a trace.
+
+    ``_job_pods`` returns ``[]`` on any error so a flaky core API cannot sink the
+    tick. That is the right trade, but an empty list is otherwise identical to
+    "this Job has no pods" -- the signature defect, where a failure to ask is
+    indistinguishable from an answer of nothing. One line in the log is enough
+    to tell them apart.
+    """
+    from kubernetes import client as k8s
+
+    job = _real_job(k8s.V1JobStatus(
+        failed=1,
+        conditions=[k8s.V1JobCondition(
+            type="Failed", status="True", reason="BackoffLimitExceeded")]))
+    launcher, _api = _launcher_with(
+        jobs=[job], pods_exc=RuntimeError("core API unreachable"))
+
+    assert launcher.job_states() == {"mse-solver-a": "BackoffLimitExceeded"}
+    logged = capsys.readouterr().out
+    assert "mse-solver-a" in logged, "the log must name the Job it could not ask about"
+    assert "core API unreachable" in logged, "and say why"
+
+
 # ---------------------------------------------------------------------------
 # Upload validation
 # ---------------------------------------------------------------------------
