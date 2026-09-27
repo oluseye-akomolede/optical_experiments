@@ -88,6 +88,32 @@ def magnitude(field: np.ndarray) -> np.ndarray:
     return np.linalg.norm(field, axis=-1).astype(np.float32)
 
 
+def _array_axis(axis: str) -> int:
+    """Position of a named axis in the field's array shape ``(nz, ny, nx)``.
+
+    The two orderings in this file are different and both are needed, so they
+    are named once here rather than derived at each call site -- deriving them
+    twice is how the slices came out at the wrong physical coordinate.
+
+    The solver's ``sample_grid`` builds ``shape`` and ``origin``/``spacing`` in
+    **(x, y, z)** order, while the field array it fills is ``(nz, ny, nx, 3)``
+    -- the array axes are the *reverse* of the metadata order. So "z" is array
+    axis 0 but metadata index 2, and conflating the two silently reads z's
+    count against x's origin.
+    """
+    return ("z", "y", "x").index(axis)
+
+
+def _meta_axis(axis: str) -> int:
+    """Position of a named axis in ``grid["origin"]``/``grid["spacing"]``.
+
+    The solver writes those in **(x, y, z)** order (see ``sample_grid``:
+    ``xs = linspace(lo[0], hi[0], nx)``, and ``lo`` is
+    ``[x, y, z]``). This is the other half of :func:`_array_axis`.
+    """
+    return ("x", "y", "z").index(axis)
+
+
 def slice_axes(grid: dict) -> list[dict]:
     """Descriptions of the three orthogonal slice families.
 
@@ -101,13 +127,13 @@ def slice_axes(grid: dict) -> list[dict]:
     return [
         {
             "name": axis,
-            "axis": i,                       # index into the (nz, ny, nx) shape
+            "axis": _array_axis(axis),       # index into the (nz, ny, nx) shape
             "count": counts[axis],
-            "origin_m": origin[i],
-            "spacing_m": spacing[i],
+            "origin_m": origin[_meta_axis(axis)],
+            "spacing_m": spacing[_meta_axis(axis)],
             "label": f"{axis} = {{v}} m",
         }
-        for i, axis in enumerate(("z", "y", "x"))
+        for axis in ("z", "y", "x")
     ]
 
 
@@ -115,13 +141,24 @@ def _index_for(grid: dict, axis: str, position_m: float) -> int:
     """Nearest array index along one named axis for a physical position."""
     nz, ny, nx = shape_of(grid)
     counts = {"x": nx, "y": ny, "z": nz}
-    i = ("z", "y", "x").index(axis)
-    origin = float(grid["origin"][i])
-    spacing = float(grid["spacing"][i])
+    origin = float(grid["origin"][_meta_axis(axis)])
+    spacing = float(grid["spacing"][_meta_axis(axis)])
     if spacing == 0:
         return 0
     idx = int(round((position_m - origin) / spacing))
     return max(0, min(counts[axis] - 1, idx))
+
+
+def _round(values):
+    """JSON-safe list: non-finite to ``None``, everything else rounded.
+
+    The one place that decides how a float reaches the browser. The solver marks
+    outside-the-object as ``NaN``, and ``NaN``/``Infinity`` are not JSON -- a
+    single bare token makes ``JSON.parse`` reject the whole payload, which is
+    how the 3-D view broke for the owner. ``None`` becomes ``null``, which the
+    canvas reads as "nothing here".
+    """
+    return [None if not math.isfinite(v) else round(float(v), 6) for v in values]
 
 
 def slice_payload(field: np.ndarray, grid: dict, axis: str,
@@ -148,21 +185,20 @@ def slice_payload(field: np.ndarray, grid: dict, axis: str,
         # array (ny, nx) -> v=y, u=x
         plane, u_axis, v_axis, u_n, v_n = field[idx, :, :, :], "x", "y", nx, ny
 
-    u_m = float(grid["origin"][("z", "y", "x").index(u_axis)])
-    u_d = float(grid["spacing"][("z", "y", "x").index(u_axis)])
-    v_m = float(grid["origin"][("z", "y", "x").index(v_axis)])
-    v_d = float(grid["spacing"][("z", "y", "x").index(v_axis)])
+    u_m = float(grid["origin"][_meta_axis(u_axis)])
+    u_d = float(grid["spacing"][_meta_axis(u_axis)])
+    v_m = float(grid["origin"][_meta_axis(v_axis)])
+    v_d = float(grid["spacing"][_meta_axis(v_axis)])
 
     mag = np.linalg.norm(plane, axis=-1)
 
-    def _round(values):
-        return [None if not math.isfinite(v) else round(float(v), 6) for v in values]
+    normal_m = float(grid["origin"][_meta_axis(axis)])
+    normal_d = float(grid["spacing"][_meta_axis(axis)])
 
     return {
         "axis": axis,
         "plane_index": idx,
-        "plane_position_m": round(float(grid["origin"][("z", "y", "x").index(axis)])
-                                  + idx * float(grid["spacing"][("z", "y", "x").index(axis)]), 9),
+        "plane_position_m": round(normal_m + idx * normal_d, 9),
         "u": {"name": u_axis, "count": int(u_n), "origin_m": u_m, "spacing_m": u_d},
         "v": {"name": v_axis, "count": int(v_n), "origin_m": v_m, "spacing_m": v_d},
         "mag": {"data": _round(mag.ravel()), "min": _finite_min(mag), "max": _finite_max(mag)},
@@ -185,6 +221,15 @@ def downsample(field: np.ndarray, grid: dict, longest: int) -> dict:
 
     The full ``[z][y][x]`` grid loses nothing physical when sampled at a
     coarser stride for display; the arrow slice view keeps full resolution.
+
+    Non-finite samples become ``None``, via the same :func:`_round` the slice
+    path uses. This is not tidiness: the solver marks everything outside the
+    object as ``NaN``, so a real mode is *mostly* NaN, and ``NaN`` is not JSON.
+    ``json.dumps`` writes the bare token ``NaN`` by default, and the browser's
+    ``JSON.parse`` rejects it -- one bad token and the viewer loses the entire
+    payload, which is exactly how the 3-D view broke for the owner on
+    2026-09-27. ``None`` serialises as ``null``, which is what "no value here"
+    means to the canvas.
     """
     nz, ny, nx = shape_of(grid)
     step = max(1, int(round(max(nz, ny, nx) / max(longest, 1))))
@@ -192,8 +237,8 @@ def downsample(field: np.ndarray, grid: dict, longest: int) -> dict:
     return {
         "stride": step,
         "shape": list(blunt.shape[:3]),
-        "mag": magnitude(blunt).ravel().tolist(),
-        "vec": blunt.reshape(-1, 3).ravel().tolist(),
+        "mag": _round(magnitude(blunt).ravel()),
+        "vec": _round(blunt.reshape(-1, 3).ravel()),
     }
 
 
@@ -205,12 +250,16 @@ def ui_scale(grid: dict) -> dict:
     """
     origin = [float(v) for v in grid["origin"]]
     spacing = [float(v) for v in grid["spacing"]]
-    lo = origin
-    hi = [origin[i] + spacing[i] * (shape_of(grid)[2 - i] - 1) for i in range(3)]
+    # Everything here is metadata order (x, y, z); the sample count for each
+    # comes from the array shape, which is the reverse -- hence _array_axis.
+    hi = [
+        origin[i] + spacing[i] * (shape_of(grid)[_array_axis(("x", "y", "z")[i])] - 1)
+        for i in range(3)
+    ]
     return {
-        "origin_m": lo,
+        "origin_m": origin,
         "corner_m": hi,
-        "extent_m": [hi[i] - lo[i] for i in range(3)],
+        "extent_m": [hi[i] - origin[i] for i in range(3)],
     }
 
 

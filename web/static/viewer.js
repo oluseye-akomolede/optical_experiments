@@ -148,7 +148,13 @@ function loadFieldData(jobId, statusData, dom) {
       addSurface(jobId, bounds);
       buildSliders(data.grid);
       selectModeRef = selectMode;
-      selectMode(0);
+      // Default to mode 1, by the server's own numbering rather than by
+      // position -- they coincide today (the solver numbers from 1 and lists in
+      // order), but selecting "the mode called 1" is what the owner asked for
+      // and stays right if the list ever omits one. Falls back to the first
+      // row so an unexpected numbering still shows something.
+      const first = modes.findIndex((m) => Number(m.index) === 1);
+      selectMode(first === -1 ? 0 : first);
       resize();
       renderLoop();
     })
@@ -531,7 +537,21 @@ function buildModeTable(list) {
       tr.classList.add('unavailable');
       tr.title = 'This mode’s field data is not available.';
     } else {
-      tr.addEventListener('click', () => selectModeRef?.(i));
+      // The owner asked for modes to be selectable from the list. A click is
+      // the obvious affordance; the keyboard path is what makes it usable
+      // without a mouse, so the row is focusable and Enter/Space select it.
+      // `selectModeRef` is null until the first payload lands, so guarding the
+      // call keeps a stray keypress from throwing before the viewer is ready.
+      const select = () => selectModeRef?.(i);
+      tr.tabIndex = 0;
+      tr.setAttribute('role', 'button');
+      tr.addEventListener('click', select);
+      tr.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();   // Space would otherwise scroll the page
+          select();
+        }
+      });
     }
     body.appendChild(tr);
   });

@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 
 from flask import (Flask, abort, flash, jsonify, redirect, render_template,
                    request, send_file, url_for)
+from flask.json.provider import DefaultJSONProvider
 
 import config as CFG
 import db as DB
@@ -42,9 +43,33 @@ CLOUD_SAMPLES = 24
 FIELD_NAME = "mode_{:02d}.bin"
 
 
+class StrictJSON(DefaultJSONProvider):
+    """A JSON provider that refuses to write ``NaN``/``Infinity``.
+
+    ``json.dumps`` emits the bare tokens ``NaN`` and ``Infinity`` by default.
+    They are not JSON, and the browser's ``JSON.parse`` rejects the whole
+    document over one of them -- so the failure surfaces as "the results could
+    not be loaded" in a viewer, on a payload the server thought it had sent
+    successfully, with nothing in the logs. That is how the owner's 3-D view
+    broke on 2026-09-27.
+
+    ``allow_nan=False`` turns that into a ``ValueError`` raised inside the
+    request: a 500 in tests and in production, naming the route, instead of a
+    silent browser failure. The viewer path converts non-finite samples to
+    ``null`` (see ``fields._round``), so this never fires for correct data --
+    it is the tripwire for a future field that forgets, which is precisely the
+    bug that shipped.
+    """
+
+    def dumps(self, obj, **kwargs):
+        kwargs.setdefault("allow_nan", False)
+        return super().dumps(obj, **kwargs)
+
+
 def create_app(config: dict | None = None) -> Flask:
     """Build the app. Tests pass overrides here instead of touching env."""
     app = Flask(__name__)
+    app.json = StrictJSON(app)
     app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32)
     app.config.update(
         MAX_CONTENT_LENGTH=CFG.MAX_UPLOAD_BYTES,

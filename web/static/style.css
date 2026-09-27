@@ -70,6 +70,11 @@ a { color: var(--accent); }
 .sliders input[type=range] { flex: 1; }
 .modes tbody tr { cursor: pointer; }
 .modes tbody tr.active { background: #10283c; }
+/* The active row also gets a leading accent so it is findable at a glance in a
+   20-row list, not only by a subtle background shift. */
+.modes tbody tr.active td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.modes tbody tr:hover:not(.unavailable) { background: #16202b; }
+.modes tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .modes tbody tr.unavailable { cursor: default; opacity: .45; }
 @media (max-width: 520px) {
   main { padding: .6rem; }

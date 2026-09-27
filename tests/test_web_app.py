@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import sys
 import types
 import uuid
@@ -568,6 +569,110 @@ def test_slice_payload_marks_true_nan_as_null_not_as_a_dark_colour():
     assert payload["mag"]["data"][0] is None
 
 
+#: A grid whose three axes are distinguishable in EVERY field -- counts, origin
+#: and spacing all differ. The shared ``_grid`` helper uses origin [0,0,0] and
+#: spacing [1,1,1], so a swapped axis there reads a value that is equal anyway
+#: and the bug is invisible. That is not a hypothetical: it is how the axis
+#: reversal survived review, and why the middle axis in particular proves
+#: nothing (swapping z and x looks like a clean reversal, and y is the median
+#: either way).
+def _skewed_grid():
+    return {
+        "nx": 64, "ny": 45, "nz": 32,
+        "origin": [-0.0052, -0.00364, -0.0026],          # the live job's grid
+        "spacing": [0.000165, 0.000165, 0.000168],
+    }
+
+
+def test_slice_axes_give_each_axis_its_own_origin_not_xs():
+    """The bug: origin/spacing are (x, y, z), the array is (nz, ny, nx).
+
+    Indexing the metadata with the *array* position read z's slice against x's
+    origin -- so the z slider was labelled with a coordinate belonging to x, and
+    the drawn plane sat at the wrong place in the object. The counts were right
+    (they come from the shape), which is what made it look like it worked.
+
+    x and z are asserted, not y: y sits in the middle, so a full reversal leaves
+    its index unchanged and a y-only test passes against the broken code.
+    """
+    axes = {a["name"]: a for a in FLD.slice_axes(_skewed_grid())}
+    # metadata order is (x, y, z) -- origin[0], origin[1], origin[2]
+    assert axes["x"]["origin_m"] == pytest.approx(-0.0052)
+    assert axes["z"]["origin_m"] == pytest.approx(-0.0026)
+    assert axes["x"]["spacing_m"] == pytest.approx(0.000165)
+    assert axes["z"]["spacing_m"] == pytest.approx(0.000168)
+    # counts come from the array shape and were always right; assert them so a
+    # "fix" that swaps the counts instead of the metadata is caught
+    assert axes["x"]["count"] == 64
+    assert axes["z"]["count"] == 32
+    assert axes["x"]["axis"] == 2 and axes["z"]["axis"] == 0
+
+
+def test_slice_axes_on_a_swapped_grid_differ_from_x_tagged_as_z():
+    """A direct statement of the defect, so it cannot return quietly.
+
+    If z's entry carried x's coordinate, the two axes would be indistinguishable
+    in the very field the owner reads off the slider. On this grid they must not
+    be equal, and each must equal its own metadata slot.
+    """
+    grid = _skewed_grid()
+    axes = {a["name"]: a for a in FLD.slice_axes(grid)}
+    assert axes["z"]["origin_m"] != axes["x"]["origin_m"]
+    assert axes["z"]["origin_m"] == grid["origin"][2]
+    assert axes["x"]["origin_m"] == grid["origin"][0]
+
+
+def test_a_slice_plane_sits_at_its_own_axis_coordinate():
+    """``plane_position_m`` and the u/v origins follow the same rule.
+
+    A slice's normal coordinate is what the label shows and what the arrows are
+    drawn at; taking it from the wrong metadata slot put the plane at another
+    axis's position. Testing x and z because y cannot distinguish a reversal.
+    """
+    grid = _skewed_grid()
+    field = _field(grid)
+    for axis, meta_i in (("x", 0), ("z", 2)):
+        payload = FLD.slice_payload(field, grid, axis, grid["origin"][meta_i])
+        assert payload["plane_index"] == 0
+        assert payload["plane_position_m"] == pytest.approx(
+            grid["origin"][meta_i])
+
+    # the in-plane axes carry their own origins too: a z slice is a y-x plane,
+    # so u is x and must report x's origin, not z's.
+    z_slice = FLD.slice_payload(field, grid, "z", grid["origin"][2])
+    assert z_slice["u"]["name"] == "x"
+    assert z_slice["u"]["origin_m"] == pytest.approx(grid["origin"][0])
+    assert z_slice["u"]["spacing_m"] == pytest.approx(grid["spacing"][0])
+    assert z_slice["v"]["name"] == "y"
+    assert z_slice["v"]["origin_m"] == pytest.approx(grid["origin"][1])
+
+
+def test_a_slice_of_a_field_that_varies_only_in_x_reads_back_the_x_values():
+    """The end-to-end shape of the claim, with the data carrying the answer.
+
+    The field is a ramp along x and constant along y and z, so a y-z plane
+    through any x holds real structure and a plane normal to x is uniform. If
+    the axes were crossed, the slice the viewer calls "z" would show the ramp.
+    Sizes differ per axis (64/45/32), so a swap also changes the array length --
+    a second, independent way for this to fail.
+    """
+    grid = _skewed_grid()
+    nz, ny, nx = grid["nz"], grid["ny"], grid["nx"]
+    field = np.zeros((nz, ny, nx, 3), dtype="<f4")
+    # value depends on the x index only: array axis 2
+    field[..., 0] = np.arange(nx, dtype="<f4")[None, None, :]
+
+    x_slice = FLD.slice_payload(field, grid, "x", grid["origin"][0])
+    z_slice = FLD.slice_payload(field, grid, "z", grid["origin"][2])
+
+    # an x-normal plane (a y-z plane) is uniform in this field
+    assert x_slice["u"]["name"] == "y" and x_slice["v"]["name"] == "z"
+    assert len(set(x_slice["mag"]["data"])) == 1, "y-z plane is flat in this field"
+    # a z-normal plane (an x-y plane) carries the ramp along its u axis (x)
+    assert z_slice["u"]["name"] == "x"
+    assert z_slice["mag"]["max"] > z_slice["mag"]["min"]
+
+
 def test_slice_positions_stay_inside_the_grid():
     grid = _grid(nx=5, ny=4, nz=3)
     for entry in FLD.slice_axes(grid):
@@ -598,6 +703,46 @@ def test_downsample_shrinks_the_volume_without_changing_the_peak():
     assert cloud["stride"] > 1
     assert len(cloud["mag"]) == int(np.prod(cloud["shape"]))
     assert len(cloud["vec"]) == len(cloud["mag"]) * 3
+
+
+def test_downsample_marks_true_nan_as_null_like_the_slice_path():
+    """The symmetric test the slice path already had, and the 3-D view did not.
+
+    ``slice_payload`` mapped non-finite samples to ``None`` from the start; the
+    point cloud did not, and the difference is the owner's broken 3-D view: the
+    solver marks everything outside the object ``NaN``, ``json.dumps`` writes
+    the bare token ``NaN``, and the browser's ``JSON.parse`` rejects the whole
+    payload over it. A test for one path and not the other is how that shipped.
+    """
+    grid = _grid()
+    field = _field(grid)
+    field[0, 0, 0, :] = np.nan
+    cloud = FLD.downsample(field, grid, longest=8)   # stride 1, nothing dropped
+    assert None in cloud["mag"], "NaN in the cloud must serialise as null"
+    assert None in cloud["vec"]
+    assert not any(v is not None and not math.isfinite(v)
+                   for v in cloud["mag"] + cloud["vec"])
+
+
+def test_downsample_output_is_parseable_by_a_strict_json_parser():
+    """``json.loads`` accepting it is NOT the property that matters.
+
+    Python's ``json`` reads the bare token ``NaN`` happily, so a
+    ``json.loads`` round-trip passes on the payload that breaks every browser.
+    ``parse_constant`` is the only hook that fires on those tokens, so raising
+    from it is what makes this test mean "a browser can read it". This is the
+    instrument gap that let the bug reach production.
+    """
+    grid = _grid(nx=8, ny=6, nz=4)
+    field = _field(grid, seed=2)
+    field[0, 0, 0, :] = np.nan
+    field[1, 1, 1, :] = np.inf
+    cloud = FLD.downsample(field, grid, longest=8)
+
+    def reject(token):
+        raise AssertionError(f"non-finite token {token!r} would break JSON.parse")
+
+    json.loads(json.dumps(cloud), parse_constant=reject)
 
 
 def test_magnitude_returns_float32():

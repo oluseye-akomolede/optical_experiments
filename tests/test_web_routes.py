@@ -752,6 +752,94 @@ def test_an_unreachable_store_is_an_error_not_a_page_of_missing_modes(tmp_path):
         f"/jobs/{job['job_id']}/slices/1.json").status_code == 200
 
 
+def test_a_real_route_response_with_nan_is_readable_by_a_browser_parser(tmp_path):
+    """The whole path, parsed the way the browser parses it.
+
+    Everything below the route was already asserted in pieces, and the payload
+    still broke in production: the solver writes ``NaN`` outside the object,
+    ``json.dumps`` emits the bare token by default, and ``JSON.parse`` rejects
+    the entire document over one of them. The viewer shows "the results could
+    not be loaded" and the mode list never binds.
+
+    So this test does not ask whether Python can read the bytes -- it can, which
+    is exactly why nothing caught this. It asks whether a *strict* parser can:
+    ``parse_constant`` is the only hook that fires on ``NaN``/``Infinity``, so
+    raising from it is what makes the assertion mean "a browser can load this".
+    It also pins the app's own tripwire: ``allow_nan=False`` on the JSON
+    provider, which turns a future leak into a 500 instead of a silent failure.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=2)
+
+    # Rewrite one mode's field so most of it is outside the object, exactly as
+    # the solver marks "not inside the mesh".
+    key = STORE.job_key(job["job_id"], "mode_01.bin")
+    field = np.full((2, 3, 4, 3), np.nan, dtype="<f4")
+    field[0, 0, 0] = [1.0, 2.0, 3.0]
+    store.write(key, field.tobytes())
+
+    response = app.test_client().get(f"/jobs/{job['job_id']}/slices/1.json")
+    assert response.status_code == 200
+    text = response.get_data(as_text=True)
+
+    def reject(token):
+        raise AssertionError(
+            f"the route wrote the bare token {token!r}; JSON.parse would reject "
+            "the whole payload and the viewer would show an error instead")
+
+    payload = json.loads(text, parse_constant=reject)
+    assert payload["cloud"]["mag"], "the cloud must be present"
+    assert None in payload["cloud"]["mag"], "outside-the-object samples are null"
+    # and the slice data, which goes through a different code path
+    assert None in payload["slices"][0]["mag"]["data"]
+
+
+def test_a_mode_payload_from_a_real_route_is_written_for_the_node_test(tmp_path):
+    """Write the fixture the node test parses with the browser's own parser.
+
+    The server-side assertions above all pass on a payload Python can read; the
+    only instrument that sees what the browser sees is ``JSON.parse``, and it
+    lives in node. Rather than hand-write a fixture (which would be a double
+    that models what we *think* we send), this writes the bytes a live route
+    actually returns, so the node test is parsing the real thing.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=1)
+
+    key = STORE.job_key(job["job_id"], "mode_01.bin")
+    field = np.full((2, 3, 4, 3), np.nan, dtype="<f4")
+    field[0, 0, 0] = [1.0, 2.0, 3.0]
+    store.write(key, field.tobytes())
+
+    response = app.test_client().get(f"/jobs/{job['job_id']}/slices/1.json")
+    assert response.status_code == 200
+
+    fixtures = Path(__file__).resolve().parent / "js" / "fixtures"
+    fixtures.mkdir(parents=True, exist_ok=True)
+    (fixtures / "mode_payload.json").write_bytes(response.get_data())
+
+
+def test_the_json_provider_refuses_to_write_a_non_finite_number(tmp_path):
+    """The tripwire, tested directly rather than only through a route.
+
+    A future field that forgets ``_round`` should fail loudly in tests. Without
+    ``allow_nan=False`` the failure is silent, reaches the browser, and surfaces
+    as a message about the network -- which is what happened to the owner.
+    """
+    app, _store, _db, _launcher = make_app(tmp_path)
+    with app.test_request_context():
+        from flask import jsonify
+        # jsonify serialises eagerly, so the ValueError lands here rather than
+        # at response time -- either way it is a 500 in the request, not a
+        # payload the browser cannot parse.
+        with pytest.raises(ValueError):
+            jsonify({"bad": float("nan")})
+
+
 def test_slices_json_is_empty_before_the_job_finishes(tmp_path):
     app, _store, db, _launcher = make_app(tmp_path)
     upload(app.test_client())
