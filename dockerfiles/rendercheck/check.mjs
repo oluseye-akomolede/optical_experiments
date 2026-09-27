@@ -194,16 +194,25 @@ try {
   // stall rather than racing it.
   //
   // Failing closed: if #scene is not on the page this check must not go on to
-  // photograph nothing and report green. Mutation-tested by pointing the
-  // selector at a missing element: the run fails, exiting 1 via the catch below.
+  // photograph nothing.
   //
-  // Be precise about which line does that, because it is not this one.
-  // boundingBox() on a missing element does not return null -- it times out
-  // after 30 s and throws (measured). So the guard below is a second line of
-  // defence for the case where the element exists but has no box, not the
-  // mechanism that catches a vanished canvas. It is kept because that case
-  // would otherwise pass `clip: undefined` through, which screenshots the whole
-  // page and reports a green run having measured nothing.
+  // Two different cases, and only one of them is this guard's:
+  //
+  //   #scene missing entirely   -> boundingBox() does not return null, it times
+  //     out after 30 s and throws (measured). That, not this guard, is what
+  //     catches a vanished canvas.
+  //   #scene present, no box    -> boundingBox() returns null (measured:
+  //     display:none gives null; a zero-size box still gives an object, so the
+  //     guard is not about zero size). This is the case below.
+  //
+  // What the guard buys, stated exactly because the obvious version of this
+  // sentence is false: with it removed, `clip: undefined` does screenshot the
+  // whole page and every predicate really does run and pass -- but the run does
+  // NOT then report green. The drag below reads `box.x`, so it dies with
+  // "TypeError: Cannot read properties of undefined (reading 'x')" about 190
+  // lines later. The guard's value is failing EARLY and with a diagnostic,
+  // instead of a cryptic TypeError after four whole-page screenshots have been
+  // written to OUT_DIR as if they were canvas crops.
   const box = await canvas.boundingBox();
   if (!box) {
     fail('#scene has no bounding box -- the canvas is on the page but has no ' +
