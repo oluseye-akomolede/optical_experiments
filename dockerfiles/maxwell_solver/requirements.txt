@@ -6,10 +6,16 @@
 # pyvista is required even though the solver is headless: tetgen's `.grid`
 # property returns a pyvista.UnstructuredGrid, and that is how the mesh is read
 # back. It pulls in VTK, which is the heaviest dependency by far.
-numpy>=2.0
-scipy>=1.14
-trimesh>=4.0
-tetgen>=0.6
-pyvista>=0.44
-boto3>=1.34
-psycopg2-binary>=2.9
+#
+# Pinned with `==` to the versions the built image actually contains (read with
+# `pip freeze` inside it), so a rebuild is the same image rather than whatever
+# the index published today. Only the direct requirements are listed; pip still
+# resolves their transitive dependencies, so this file stays readable and the
+# transitive set is not frozen into a shape that breaks on a platform change.
+numpy==2.5.3
+scipy==1.18.1
+trimesh==5.1.0
+tetgen==0.8.4
+pyvista==0.49.0
+boto3==1.43.103
+psycopg2-binary==2.9.13

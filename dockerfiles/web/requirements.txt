@@ -3,9 +3,15 @@
 # Everything must install with plain pip on aarch64 (no apt). trimesh is used
 # only to validate the upload before it is queued -- the solver re-checks it and
 # is the authority.
-flask>=3.0
-boto3>=1.34
-trimesh>=4.0
-kubernetes>=29.0
-psycopg2-binary>=2.9
-gunicorn>=22.0
+#
+# Pinned with `==` to the versions the built image actually contains (read with
+# `pip freeze` inside it), so a rebuild is the same image rather than whatever
+# the index published today. Only the direct requirements are listed; pip still
+# resolves their transitive dependencies, so this file stays readable and the
+# transitive set is not frozen into a shape that breaks on a platform change.
+flask==3.1.3
+boto3==1.43.103
+trimesh==5.1.0
+kubernetes==36.0.3
+psycopg2-binary==2.9.13
+gunicorn==26.2.0
