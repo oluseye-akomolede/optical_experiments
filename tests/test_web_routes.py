@@ -110,6 +110,18 @@ class FakeDb:
     def count_running(self):
         return sum(1 for j in self.jobs.values() if j["status"] == DB.RUNNING)
 
+    def reclaim_expired_leases(self):
+        """The healthy case: with no leases in play, nothing was expired.
+
+        The tick calls this on every pass, and "the double has no such method"
+        is an AttributeError, which the tick's middle ``except`` correctly reads
+        as a BROKEN STATEMENT -- degrading the scheduler over an omission in a
+        test double. A double that does not model a method the real store has
+        would make ``/healthz`` report degraded for a reason that cannot happen
+        in production, so the double has to answer it.
+        """
+        return []
+
     # set a job up as finished, with a mode table and field files on disk
     def finish(self, job_id, store, n_modes=2):
         grid = {"nx": 4, "ny": 3, "nz": 2, "origin": [0.0, 0.0, 0.0],
@@ -379,8 +391,17 @@ def test_a_split_answer_the_other_way_round_also_fails_nothing(tmp_path):
 # Pages
 # ---------------------------------------------------------------------------
 def test_healthz(tmp_path):
+    """Liveness is ``status``; ``degraded`` is the scheduler's separate health.
+
+    The two are deliberately different fields: a failing reclaim does not make
+    the process down (pages still serve, the cluster fallback still runs), but
+    it must not be invisible either -- the tick's return value is ``[]`` whether
+    nothing expired or the statement is broken, so ``/healthz`` has to carry it.
+    """
     app, *_ = make_app(tmp_path)
-    assert app.test_client().get("/healthz").get_json() == {"status": "ok"}
+    assert app.test_client().get("/healthz").get_json() == {
+        "status": "ok", "degraded": False,
+    }
 
 
 def test_index_lists_nothing_initially(tmp_path):

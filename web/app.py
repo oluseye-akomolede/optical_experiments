@@ -25,6 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import psycopg2
 from flask import (Flask, abort, flash, jsonify, make_response, redirect,
                    render_template, request, send_file, url_for)
 from flask.json.provider import DefaultJSONProvider
@@ -43,6 +44,22 @@ from meshing import (UploadError, effective_edge_mm, estimate_tets,
 #: (which reads the bytes) go through this, so they cannot drift apart and leave
 #: the list promising a mode the fetcher cannot serve.
 FIELD_NAME = "mode_{:02d}.bin"
+
+#: Non-empty when the scheduler has hit a failure that is NOT transient -- a
+#: statement that will raise on every tick, as opposed to a database that is
+#: briefly unreachable. Module state, read by ``/healthz``, because the whole
+#: point is that a failing tick must leave a trace somewhere other than a log
+#: line nobody reads: the tick's own return value is ``[]`` either way, and
+#: "nothing expired" and "the reclaim is broken" must not look the same.
+#:
+#: It is a LIST, not an exception slot: the first failure is the one worth
+#: reading, and appending keeps it while later ones accumulate behind it.
+SCHEDULER_DEGRADED: list[str] = []
+
+#: How many reclaims have failed in a row, so ``/healthz`` can distinguish a
+#: one-off from a statement that fails every tick -- the difference between a
+#: blip someone should look at and a broken deploy someone must fix.
+_reclaim_failures = 0
 
 
 class StrictJSON(DefaultJSONProvider):
@@ -96,7 +113,19 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
     # -- pages -------------------------------------------------------------
     @app.route("/healthz")
     def healthz():
-        return jsonify({"status": "ok"})
+        """Liveness, plus whether the scheduler is still able to do its job.
+
+        ``status: ok`` means the process is up. ``degraded`` is the separate
+        question, and it is reported rather than folded into the status code:
+        a scheduler that cannot run its reclaim is still serving pages and
+        still has the cluster fallback, so it is not DOWN -- but it is not
+        healthy either, and a monitor that only reads the status code would
+        never learn that the GPU queue stopped bounding its crash loops.
+        """
+        body = {"status": "ok", "degraded": bool(SCHEDULER_DEGRADED)}
+        if SCHEDULER_DEGRADED:
+            body["degraded_reason"] = SCHEDULER_DEGRADED[0]
+        return jsonify(body)
 
     @app.route("/", methods=["GET", "POST"])
     def index():
@@ -329,11 +358,46 @@ def _reclaim_expired_leases(jobs_db, log=print) -> list[str]:
     goes back in the claimable pool; the wait-window fallback below is what
     ultimately moves it to the cluster if no worker comes back for it.
     """
+    # Declared once, at the top: Python requires the ``global`` statement to
+    # appear before any use of the name in the function, and using it inside the
+    # ``except`` below while declaring it in the success path is a SyntaxError.
+    global _reclaim_failures
+
     try:
         ids = jobs_db.reclaim_expired_leases()
-    except Exception as exc:  # noqa: BLE001 - never let a tick crash the loop
-        log(f"[mse-web] could not reclaim expired GPU leases: {exc}")
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+        # Transport trouble: the database is down, restarting, or the
+        # connection died. The next tick will try again and the cluster queue
+        # still works, so this is a log line and a shrug. NOT degraded: raising
+        # an alarm for a blip trains whoever reads it to ignore the alarm.
+        log(f"[mse-web] could not reach the database to reclaim expired GPU "
+            f"leases: {exc}")
         return []
+    except Exception as exc:  # noqa: BLE001
+        # Everything else is a BROKEN STATEMENT, not a broken connection: a
+        # type-adaptation error, a bad column, a constraint. It will fail
+        # identically on every tick, so it is not transient and the next tick
+        # will not fix it. This is the path that bounds a crash-looping worker,
+        # so a silent failure here makes the bound unreachable exactly when it
+        # is needed -- and returning [] would look identical to "nothing
+        # expired". Log it at ERROR and record it where /healthz can report it,
+        # so a swallowed exception is never the only trace.
+        _reclaim_failures += 1
+        note = (f"{type(exc).__name__}: {exc}"
+                f" (last seen {datetime.now(timezone.utc).isoformat()}"
+                f", {_reclaim_failures} in a row)")
+        SCHEDULER_DEGRADED.clear()
+        SCHEDULER_DEGRADED.append(note)
+        log(f"[mse-web] ERROR: reclaiming expired GPU leases failed and will "
+            f"keep failing: {note}")
+        return []
+    # A tick that got through clears the flag. It tracks the CURRENT state, not
+    # "something once went wrong": a statement that has been fixed (a deploy, a
+    # migration) must stop reporting degraded without needing a restart, and a
+    # permanent latch would make the signal useless the first time someone read
+    # it and did not act immediately.
+    SCHEDULER_DEGRADED.clear()
+    _reclaim_failures = 0
     for job_id in ids:
         log(f"[mse-web] job {job_id}: its GPU worker's lease expired; "
             f"the job is claimable again")

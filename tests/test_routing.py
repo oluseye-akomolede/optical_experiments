@@ -399,7 +399,8 @@ class RoutingDb(FakeDb):
             if int(job.get("release_count", 0)) >= DB.MAX_RELEASES:
                 job.update(status=DB.FAILED, stage=DB.FAILED,
                            message="the GPU worker stopped responding and the "
-                                   "job was retried too many times; try again later",
+                                   f"job was retried up to {DB.MAX_RELEASES} "
+                                   "times; try again later",
                            lease_owner=None, lease_expires_at=None)
                 continue
             job.update(lease_owner=None, lease_expires_at=None,
@@ -488,6 +489,82 @@ def test_an_expired_lease_is_reclaimed_and_reported(tmp_path):
 
     assert result["reclaimed"] == ["job-1"]
     assert db.jobs["job-1"]["lease_owner"] is None
+
+
+# ---------------------------------------------------------------------------
+# A broken reclaim must leave a trace (not just "return []")
+#
+# The tick's answer is [] both when nothing expired and when the statement that
+# reclaims is broken. That is the could-not-ask shape: the two are identical on
+# the only surface a monitor reads, and this is the ONLY path that bounds a
+# crash-looping GPU worker, so a silently broken reclaim makes the bound
+# unreachable exactly when it is needed. The remedy is a health signal, and the
+# tests below are what stop it being decoration.
+# ---------------------------------------------------------------------------
+class _BrokenReclaim(RoutingDb):
+    """Reclaims raise, to stand in for a statement that fails every tick."""
+
+    def __init__(self, exc):
+        super().__init__()
+        self._exc = exc
+
+    def reclaim_expired_leases(self):
+        raise self._exc
+
+
+def test_a_transport_failure_reclaiming_is_logged_and_not_degraded(tmp_path):
+    """A database that is briefly unreachable is not a degraded scheduler.
+
+    Transport errors are the transient case: the next tick retries and the
+    cluster fallback still runs. Raising a health alarm for a blip would train
+    whoever reads it to ignore the alarm.
+    """
+    import psycopg2
+
+    db = _BrokenReclaim(psycopg2.OperationalError("server closed the connection"))
+    app, store, _d, launcher = _make(tmp_path, db=db)
+    APP.SCHEDULER_DEGRADED.clear()
+
+    messages = []
+    result = APP.run_tick(store, db, launcher, log=messages.append)
+
+    assert result["reclaimed"] == []
+    assert APP.SCHEDULER_DEGRADED == [], (
+        "a transport blip must not mark the scheduler degraded"
+    )
+    assert any("could not reach the database" in m for m in messages), (
+        "the tick must still say what it could not do"
+    )
+
+
+def test_a_broken_statement_reclaiming_degrades_the_scheduler(tmp_path):
+    """A statement error will fail every tick, so it must be visible.
+
+    This is the 3/3 defect itself: ``ANY(%s)`` over ``list[str]`` against a
+    ``uuid`` column raises ``ProgrammingError``, which the tick swallowed into
+    ``[]``. Only a health signal distinguishes it from "nothing expired".
+    """
+    import psycopg2
+
+    db = _BrokenReclaim(psycopg2.ProgrammingError(
+        "operator does not exist: uuid = text"))
+    app, store, _d, launcher = _make(tmp_path, db=db)
+    APP.SCHEDULER_DEGRADED.clear()
+
+    messages = []
+    APP.run_tick(store, db, launcher, log=messages.append)
+
+    assert APP.SCHEDULER_DEGRADED, "a broken statement must set the flag"
+    assert "ProgrammingError" in APP.SCHEDULER_DEGRADED[0]
+    assert any("ERROR" in m for m in messages), "and must be logged at ERROR"
+
+    # and /healthz reports it, which is the whole point of the flag
+    app.test_client().get("/")
+    body = app.test_client().get("/healthz").get_json()
+    assert body["degraded"] is True
+    assert "ProgrammingError" in body["degraded_reason"]
+
+    APP.SCHEDULER_DEGRADED.clear()
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,21 @@ Run against a THROWAWAY Postgres, never production:
     DSN="postgresql://postgres:pw@127.0.0.1:55432/msecheck"
     .venv-mse/bin/python tests/pg_race_check.py --dsn "$DSN"
 
+Run it against a FRESH database, and do not trust a second run on a dirty one.
+This check does not clean up after itself, and three of its legs depend on being
+handed the row they inserted -- while ``claim_jetson`` returns the OLDEST
+claimable row. Against a database left over from an earlier run this check
+reports failures that are not defects. That is a real limitation, and the
+opposite of the rule this file exists to enforce: an instrument that cannot say
+"could not ask" must never say "nothing there". So it now says so loudly --
+``_claim_row`` raises rather than returning None when the row is unreachable --
+and this note is the honest label on the remaining gap. Recreate the container
+between runs:
+
+    docker rm -f mse-pgcheck && docker run -d --rm --name mse-pgcheck \\
+      -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=msecheck -p 55432:5432 \\
+      postgres:16-alpine
+
 Why this file exists
 --------------------
 The rest of the suite runs against a Python double (tests set ``MSE_DB_MOCK``),
@@ -193,7 +208,8 @@ def _race(conn, dsn, r: Result, col: str, bound: int, rounds: int = 60,
     return worst
 
 
-def check_release_bound(conn, r: Result, bound: int, dsn: str, JobStore):
+def check_release_bound(conn, r: Result, bound: int, dsn: str, JobStore,
+                        db_module):
     """B2: the bound must be enforced INSIDE the UPDATE, not by the caller.
 
     Two sessions race to release one row; the counter must never pass `bound`.
@@ -233,16 +249,28 @@ def check_release_bound(conn, r: Result, bound: int, dsn: str, JobStore):
             f"releases", good <= bound, f"worst {col}={good} over 60 rounds")
 
     check_release_is_terminal(conn, r, bound, JobStore)
-    check_release_not_in_the_gate(r, JobStore)
+    check_release_not_in_the_gate(r, db_module)
     check_release_refuses_a_non_holder(conn, r, JobStore)
 
 
 def check_release_is_terminal(conn, r: Result, bound: int, JobStore):
     """B1/B2 on the REAL release path: releasing `bound` times must end FAILED.
 
-    Calls web/db.py, not a copy of its SQL. Before the counter exists this
-    reports how many releases it took to stop, which is the number the fix must
-    turn into `bound` -- useful even while it fails.
+    Calls web/db.py, not a copy of its SQL.
+
+    What a "release" IS, pinned explicitly, because the earlier form of this leg
+    counted calls instead of looking and so could not tell the two apart. A
+    release that matters is one web/db.py records -- ``release_count`` moves and
+    the job goes back to ``queued``. The release that discovers the bound
+    already reached records nothing and is the terminal one. Counting CALLS
+    makes a correct implementation report bound+1 (the extra call is the one
+    that ends it) and go red against its own bound.
+
+    Read the counter from the row rather than assuming a call moved it. The
+    other reason the call count is wrong here: ``claim_jetson`` takes the OLDEST
+    claimable row, so this loop's claim can return a FOREIGN row, and
+    ``lease_held_by(jid)`` then breaks out while a release against the job it
+    actually claimed has landed on that other job's counter.
     """
     store = JobStore(dsn=DSN_OF[0])
     if not hasattr(store, "release_jetson"):
@@ -251,28 +279,55 @@ def check_release_is_terminal(conn, r: Result, bound: int, JobStore):
     insert_job(conn, jid)                     # queued, unclaimed, no lease yet
     status_after, message = None, ""
     releases = 0
+    # Claim ONCE, before the loop, and use that lease in the first iteration.
+    # The claim is a state CHANGE, not a question: it takes the lease and moves
+    # the row to ``running``, so a second claim for the same row correctly finds
+    # nothing claimable and returns None. An earlier form claimed here "to check
+    # the row is reachable" and then claimed again inside the loop, which read
+    # its own first claim as "the job has terminated" and reported a crash loop
+    # that had not run. Probing a row by claiming it consumes the thing the
+    # probe was meant to establish; check it with a SELECT instead.
+    claimed = _claim_row(store, jid, owner="w-race")   # ITS OWN row, not oldest
     for _ in range(bound + 5):
-        # Take the lease through the real claim path, the way the worker tick
-        # does, so lease_expires_at is a real timestamp -- a hand-seeded
-        # lease_owner has no expiry and lease_held_by (which requires
-        # lease_expires_at > now()) reads it as not held.
-        if store.claim_jetson("w-race", lease_seconds=300) is None:
-            break
-        if not store.lease_held_by(jid, "w-race"):
-            break
-        store.release_jetson(jid, "w-race")   # what /release does
-        releases += 1
+        if claimed is None:
+            break                             # not claimable: it terminated
         with conn.cursor() as cur:
-            cur.execute("SELECT status, COALESCE(message,'') FROM mse.jobs "
-                        "WHERE job_id = %s", (jid,))
-            status_after, message = cur.fetchone()
-    r.check(f"B1 a deterministic failure reaches FAILED within {bound} releases "
-            f"(it took {releases})",
-            status_after == "failed" and releases <= bound,
-            f"status={status_after!r} after {releases} releases")
+            cur.execute("SELECT release_count FROM mse.jobs WHERE job_id = %s",
+                        (jid,))
+            before = cur.fetchone()[0]
+        # The lease came from the real claim path, the way the worker tick does,
+        # so lease_expires_at is a real timestamp -- a hand-seeded lease_owner
+        # has no expiry and lease_held_by (which requires lease_expires_at >
+        # now()) reads it as not held.
+        released = store.release_jetson(jid, "w-race")   # what /release does
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, COALESCE(message,''), release_count "
+                        "FROM mse.jobs WHERE job_id = %s", (jid,))
+            got = cur.fetchone()
+        if got is None:
+            raise AssertionError(
+                f"row {jid} vanished: claim returned {claimed['job_id']}, "
+                f"release_jetson returned {released!r}, and the next SELECT "
+                f"found no row. Something DELETED it -- this leg only reads "
+                f"and updates, so the instrument is wrong about the table."
+            )
+        status_after, message, after = got
+        if after > before:
+            releases += 1                     # a release this store RECORDED
+        else:
+            break                             # the terminal call: recorded none
+        # The next round needs a fresh lease, and by now the row is back to
+        # ``queued`` with no owner -- so this claim is the one that either hands
+        # it back or reports that the bound has taken it out of the pool.
+        claimed = _claim_row(store, jid, owner="w-race")
+    r.check(f"B1 a deterministic failure reaches FAILED at {bound} recorded "
+            f"releases (counter stopped at {releases})",
+            status_after == "failed" and releases == bound,
+            f"status={status_after!r} after {releases} recorded releases "
+            f"(message {message!r})")
 
 
-def check_release_not_in_the_gate(r: Result, JobStore):
+def check_release_not_in_the_gate(r: Result, db_module):
     """The hollow-PASS trap, as a test rather than a note.
 
     If `releases_are_terminal` were written as `if releases <= bound` while
@@ -280,19 +335,29 @@ def check_release_not_in_the_gate(r: Result, JobStore):
     off-by-one), it would return True immediately and the bound would be
     decorative. The test is a tripwire: it must make the guard say False, so a
     guard that cannot say False anywhere fails here.
+
+    The decided contract puts it at MODULE level. Either location is accepted --
+    the check is that the bound can be stated and interrogated as a predicate at
+    all, and where the implementation chose to hang it is not this check's
+    business.
     """
-    gate = getattr(JobStore, "releases_are_terminal", None)
+    gate = getattr(db_module, "releases_are_terminal", None)
+    where = "module"
+    if gate is None:
+        gate = getattr(db_module.JobStore, "releases_are_terminal", None)
+        where = "JobStore"
     if gate is None:
         return r.check("B1 the bound is expressed as a testable predicate",
                        False,
-                       "no releases_are_terminal(...) on JobStore -- the bound "
-                       "cannot be checked except by running the whole loop, so a "
-                       "hollow guard could pass unnoticed")
+                       "no releases_are_terminal(...) on the module or on "
+                       "JobStore -- the bound cannot be checked except by "
+                       "running the whole loop, so a hollow guard could pass "
+                       "unnoticed")
     ok = bool(gate(0, 3)) is False and bool(gate(2, 3)) is False \
         and bool(gate(3, 3)) is True
     r.check("B1 releases_are_terminal refuses 0 and 2, allows 3 "
             "(a guard that only ever returns True fails here)", ok,
-            "checked (0,3)->False, (2,3)->False, (3,3)->True")
+            f"checked (0,3)->False, (2,3)->False, (3,3)->True on {where}")
 
 
 def check_release_refuses_a_non_holder(conn, r: Result, JobStore):
@@ -304,9 +369,15 @@ def check_release_refuses_a_non_holder(conn, r: Result, JobStore):
     with conn.cursor() as cur:
         cur.execute("SELECT lease_owner FROM mse.jobs WHERE job_id = %s", (jid,))
         owner = cur.fetchone()[0]
+    # ``None`` is the decided refusal value for "this worker does not hold the
+    # lease" -- the same value the route turns into a 409, and a different event
+    # from "released" or "failed". ``False`` is accepted too: both mean refused,
+    # and pinning one spelling would fail a correct implementation that picked
+    # the other.
     r.check("E releasing a lease you do not hold is refused and changes nothing",
-            got is False and owner == "w-holder",
-            f"release_jetson returned {got!r}, lease_owner now {owner!r}")
+            (got is None or got is False) and owner == "w-holder",
+            f"release_jetson returned {got!r} (want None or False), "
+            f"lease_owner now {owner!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +471,13 @@ def _claim_row(store, jid, owner="w-leg", lease_seconds=300):
     exist to detect -- the instrument must not manufacture the defect it looks
     for. The release is bounded by the same counter as everything else, so
     ``DRAIN`` is kept well under ``bound``.
+
+    ``None`` means ONE thing here. An earlier version returned it both for "no
+    claimable row at all" and for "claimed ``DRAIN`` foreign rows and never
+    reached yours", and the second case is silent data loss for the caller: the
+    B1 leg read ``None`` as "the job has terminated" and stopped, reporting a
+    crash loop that had not run. Whenever two different conditions collapse onto
+    one return value, the callers eventually believe the wrong one.
     """
     for _ in range(DRAIN):
         job = store.claim_jetson(owner, lease_seconds=lease_seconds)
@@ -408,7 +486,12 @@ def _claim_row(store, jid, owner="w-leg", lease_seconds=300):
         if job["job_id"] == jid:
             return job
         store.release_jetson(job["job_id"], owner, "not the row under test")
-    return None
+    raise AssertionError(
+        f"{jid} was still claimable when the leg started but not among the "
+        f"first {DRAIN} rows claim_jetson handed back; the store is not empty "
+        f"and this leg cannot see the row it is about. Run this check against a "
+        f"clean database (it does not clean up between runs)."
+    )
 
 
 def check_expiry_bound_is_terminal(conn, r: Result, JobStore, bound: int):
@@ -463,7 +546,7 @@ def main() -> int:
 
     import psycopg2  # noqa: PLC0415
     from psycopg2.extensions import parse_dsn  # noqa: PLC0415
-    from mse_db_shim import load_jobstore  # noqa: PLC0415
+    from mse_db_shim import load_db_module  # noqa: PLC0415
 
     # JobStore takes a parsed dsn dict (web/db.py:99 -> _connect reads
     # dsn["host"] etc), so parse the URL rather than passing the string. Parse it
@@ -481,11 +564,19 @@ def main() -> int:
     r = Result()
     conn = psycopg2.connect(args.dsn)
     try:
-        JobStore = load_jobstore()
+        db_module = load_db_module()
+        JobStore = db_module.JobStore
+        # Print the code's OWN bound rather than assuming it equals --bound. The
+        # legs assert against the bound they exercise; if the constant drifts
+        # from the default this line is how the reader sees it, and every leg
+        # that reads web/db.py's constant would go red instead of being tuned by
+        # a flag that the code never reads.
+        print(f"      (web/db.py MAX_RELEASES = {db_module.MAX_RELEASES}; "
+              f"--bound {args.bound} is what the legs assert)")
         JobStore(dsn=dsn).apply_schema()   # the PROJECT's own path
         print("schema applied via web/db.py:JobStore.apply_schema()")
         check_claim_columns(conn, r, JobStore)
-        check_release_bound(conn, r, args.bound, args.dsn, JobStore)
+        check_release_bound(conn, r, args.bound, args.dsn, JobStore, db_module)
         # The expiry path is its own route (a worker that DIES never calls
         # /release), so it gets its own legs rather than reusing the release
         # ones with a different caller.

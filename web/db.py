@@ -257,62 +257,80 @@ class JobStore:
         incremented the counter, a crash-looping worker would requeue through
         lease timeouts forever and never reach the bound. Past the bound the job
         is failed here instead, which is the only way a crash loop terminates.
+        This is the ONLY path that bounds a crash-looping worker, so the bound
+        must be reachable exactly when it is needed.
 
-        One statement per job, with the bound in the WHERE, for the same reason
-        as ``release_jetson``: a racer that checks the count first can requeue a
-        job that should have failed.
+        ONE STATEMENT per branch, with the bound in the WHERE, for the same
+        reason as ``release_jetson``: a racer that checks the count first can
+        requeue a job that should have failed.
+
+        **Two statements, deliberately, and the order is the fix.** The requeue
+        carries no list parameter, so nothing in it can hit a type-adaptation
+        error; the terminal update names its jobs with ``= ANY(%s::uuid[])``.
+        An earlier version did the terminal update with a plain ``ANY(%s)`` over
+        a ``list[str]``, which psycopg2 adapts as ``text[]`` -- there is no
+        ``uuid = text`` operator, so the statement raised, and the job whose
+        lease expired AT the bound stayed ``running`` with an expired lease
+        forever. Both safety nets (``reroute_to_cluster`` and
+        ``_reroute_abandoned_gpu_jobs``) require ``status = 'queued'``, so
+        neither could fire, and the bound became unreachable precisely when it
+        was needed. The cast is the fix; the SPLIT is what keeps a failure in
+        one branch from masking the other, since ``autocommit`` is on and each
+        statement stands alone.
+
+        The split is also a REPORTING fix, and that is the mechanism to hold on
+        to: because each statement commits on its own, a raise in the terminal
+        update never rolled back a requeue -- but it did make this method raise
+        out to a caller that swallowed it, so rows that HAD moved were reported
+        as none. The defect is the tick under-reporting its own work, not lost
+        data. A caller that returns ``[]`` while rows moved is
+        *could-not-ask looking like nothing-there*.
         """
         with self._connect() as conn, conn.cursor() as cur:
+            # (a) Requeue everything under the bound. No list parameter here, so
+            # this branch cannot fail on type adaptation.
             cur.execute(
-                "SELECT job_id, release_count FROM mse.jobs "
-                "WHERE lease_owner IS NOT NULL AND lease_expires_at < now()",
+                "UPDATE mse.jobs SET lease_owner = NULL, "
+                "lease_expires_at = NULL, status = %s, stage = %s, "
+                "gpu_queued_at = now(), "
+                "release_count = release_count + 1 "
+                "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
+                "AND release_count < %s "
+                "RETURNING job_id",
+                (QUEUED, "queued", MAX_RELEASES),
             )
-            rows = [(str(r[0]), int(r[1])) for r in cur.fetchall()]
-            over = []
-            if rows:
-                # Claimable again, and counted -- but only while under the bound.
-                #
-                # ``status`` goes back to ``queued``, and that is NOT cosmetic:
-                # ``claim_jetson`` requires ``status = 'queued' AND lease_owner
-                # IS NULL``. Clearing the lease alone leaves the row ``running``,
-                # which NO worker can claim -- the job is stranded, not looping.
-                # That was a real defect here (the reviewer measured it on
-                # Postgres), and it is the failure mode with no symptom at all:
-                # no error, no loop, just a job that never moves again.
+            requeued = [str(r[0]) for r in cur.fetchall()]
+
+            # (b) Fail whatever is still expired and AT the bound. ``::uuid[]``
+            # is required: the column is ``uuid`` and psycopg2 adapts a
+            # ``list[str]`` as ``text[]``, which has no ``= uuid`` operator.
+            cur.execute(
+                "SELECT job_id FROM mse.jobs "
+                "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
+                "AND release_count >= %s",
+                (MAX_RELEASES,),
+            )
+            over = [str(r[0]) for r in cur.fetchall()]
+            if over:
                 cur.execute(
-                    "UPDATE mse.jobs SET lease_owner = NULL, "
-                    "lease_expires_at = NULL, status = %s, stage = %s, "
-                    "gpu_queued_at = now(), "
-                    "release_count = release_count + 1 "
-                    "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
-                    "AND release_count < %s",
-                    (QUEUED, "queued", MAX_RELEASES),
+                    "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
+                    "finished_at = now(), lease_owner = NULL, "
+                    "lease_expires_at = NULL "
+                    "WHERE job_id = ANY(%s::uuid[]) AND lease_owner IS NOT NULL "
+                    "AND lease_expires_at < now()",
+                    (FAILED, FAILED,
+                     "the GPU worker stopped responding and the job was "
+                     f"retried up to {MAX_RELEASES} times; try again later",
+                     over),
                 )
-                # Past the bound: terminal, and named for why.
-                cur.execute(
-                    "SELECT job_id FROM mse.jobs "
-                    "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
-                    "AND release_count >= %s",
-                    (MAX_RELEASES,),
-                )
-                over = [str(r[0]) for r in cur.fetchall()]
-                if over:
-                    cur.execute(
-                        "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
-                        "finished_at = now(), lease_owner = NULL, "
-                        "lease_expires_at = NULL "
-                        "WHERE job_id = ANY(%s) AND lease_owner IS NOT NULL "
-                        "AND lease_expires_at < now()",
-                        (FAILED, FAILED,
-                         "the GPU worker stopped responding and the job was "
-                         "retried too many times; try again later",
-                         over),
-                    )
-        # Reclaimed-and-requeued only: a job that was just failed is terminal,
-        # and reporting it here would tell the caller to go looking for a worker
-        # that does not exist. A uniform "all expired ids" return is the
-        # instrument lying about which rows moved.
-        return [job_id for job_id, _count in rows if job_id not in set(over)]
+
+        # What actually moved, read back from the requeue's own RETURNING rather
+        # than reconstructed from the pre-read. The pre-read and the UPDATE are
+        # separate statements under autocommit, so a row that another tick
+        # reclaimed in between would be reported as ours. A job that was just
+        # FAILED is terminal and deliberately not reported: telling the caller to
+        # go looking for a worker would send it after one that does not exist.
+        return requeued
 
     def set_k8s_job_name(self, job_id, k8s_job_name: str) -> None:
         """Record the Job name even if the Job could not be created."""
