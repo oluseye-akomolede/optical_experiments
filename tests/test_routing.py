@@ -403,6 +403,8 @@ class RoutingDb(FakeDb):
                            lease_owner=None, lease_expires_at=None)
                 continue
             job.update(lease_owner=None, lease_expires_at=None,
+                       status=DB.QUEUED, stage="queued",
+                       gpu_queued_at="2026-09-26T00:00:00+00:00",
                        release_count=int(job.get("release_count", 0)) + 1)
             requeued.append(job["job_id"])
         self.reclaimed.extend(requeued)
@@ -1130,14 +1132,17 @@ def test_the_bound_is_reachable_from_the_expiry_path_too(tmp_path, monkeypatch):
         db.jobs["job-1"].update(lease_owner=owner, status=DB.RUNNING,
                                 lease_expired=True)
         requeued = db.reclaim_expired_leases()
-        # The real ``reclaim_expired_leases`` clears the LEASE and deliberately
-        # leaves the row ``running``: the job genuinely is mid-flight on the GPU
-        # queue, and re-running it is cheaper than rerouting it. Claimability is
-        # what the cleared lease buys, so that is what is asserted -- not a
-        # status the real code never writes.
+        # Claimable again is the whole property, and ``claim_jetson`` requires
+        # ``status == 'queued' AND lease_owner IS NULL``. Clearing the lease
+        # without resetting the status leaves a ``running`` row that NO worker
+        # can take -- stranded, not looping, and with no symptom at all. That
+        # was a real defect in web/db.py; this asserts against it.
         assert "job-1" in requeued, f"expiry {n} did not reclaim the job"
         db.jobs["job-1"]["lease_expired"] = False
         assert db.jobs["job-1"]["lease_owner"] is None
+        assert db.jobs["job-1"]["status"] == DB.QUEUED, (
+            "the expiry left the row running, so claim_jetson will never "
+            "take it: the job is stranded")
         assert db.jobs["job-1"]["release_count"] == n + 1, (
             "the expiry path did not count the requeue")
 
@@ -1149,6 +1154,52 @@ def test_the_bound_is_reachable_from_the_expiry_path_too(tmp_path, monkeypatch):
         "must apply here too")
     assert "job-1" not in requeued, (
         "the bounded-out row was still reported as requeued")
+
+
+def test_a_released_job_is_claimable_by_the_same_and_by_another_worker(
+        tmp_path, worker):
+    """The lead's state machine, first half: released -> claimable again.
+
+    ``claim_jetson`` requires ``status = 'queued' AND lease_owner IS NULL``, so
+    a release that only nulls the lease produces a row that is permanently
+    unclaimable. Both directions are checked -- the SAME worker and a DIFFERENT
+    one -- because "the releasing worker can take it back" and "anyone can"
+    are different claims and only the second is what a requeue means.
+    """
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    first = WORKER.owner_id("tok-abc-123")
+    db.jobs["job-1"]["lease_owner"] = first
+    db.jobs["job-1"]["status"] = DB.RUNNING
+
+    assert client.post("/worker/jobs/job-1/release", headers=_auth(),
+                       json={"message": "restarting"}).status_code == 200
+    assert db.jobs["job-1"]["status"] == DB.QUEUED
+
+    # another worker, through the real claim path
+    other = WORKER.owner_id("a-different-token")
+    claimed = db.claim_jetson(other, 300)
+    assert claimed is not None, (
+        "the released job is not claimable: claim_jetson needs status='queued'")
+    assert claimed["job_id"] == "job-1"
+    assert db.jobs["job-1"]["lease_owner"] == other
+
+
+def test_a_terminally_failed_job_is_never_claimable(tmp_path, worker):
+    """The state machine, second half: FAILED means never again.
+
+    The counterpart to the release: a terminal failure must leave a row no
+    worker can pick up, however many times it asks.
+    """
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    db.jobs["job-1"]["lease_owner"] = WORKER.owner_id("tok-abc-123")
+    client.post("/worker/jobs/job-1/failed", headers=_auth(),
+                json={"message": "too detailed"})
+
+    assert db.jobs["job-1"]["status"] == DB.FAILED
+    assert db.claim_jetson(WORKER.owner_id("a-different-token"), 300) is None, (
+        "a terminally failed job was handed out again")
 
 
 def test_a_stale_worker_cannot_mark_a_job_done(tmp_path, worker):

@@ -43,6 +43,26 @@ TARGETS = (CLUSTER, JETSON)
 MAX_RELEASES = 3
 
 
+def releases_are_terminal(count: int, bound: int = MAX_RELEASES) -> bool:
+    """Whether ``count`` releases have used up the allowance and the job is done.
+
+    The bound as a PREDICATE rather than a comparison repeated at each of the
+    three sites that enforce it (``release_jetson``, ``reclaim_expired_leases``
+    and the SQL's own ``WHERE ... < %s``). It exists so the bound can be checked
+    without driving a whole claim/release loop: a check that can only reach the
+    bound by running the loop cannot tell a working bound from one that is
+    decorative, because a guard that always returns False never fires and a test
+    that never observes it firing still passes.
+
+    ``count`` is the number of releases ALREADY recorded, so ``MAX_RELEASES``
+    releases are permitted and the next one is over: ``releases_are_terminal(3,
+    3)`` is True, ``(2, 3)`` is False. This is the same comparison the SQL makes
+    -- ``release_count < bound`` allows the write, so a row AT the bound takes
+    the failure branch.
+    """
+    return int(count) >= int(bound)
+
+
 def dsn_from_env() -> dict:
     """Connection parameters from the environment (never from a file)."""
     return {
@@ -218,15 +238,18 @@ class JobStore:
 
         An expired lease means the worker died: it renews on every progress
         call, so a lease that ran out with no renewal has no live owner. The
-        lease fields are cleared, which puts the row back in the claim query --
-        another worker may take it, and if none does the ``MSE_GPU_WAIT_S``
-        fallback reroutes it to the cluster.
+        lease is cleared AND the row is put back to ``queued``, which is what
+        makes it claimable again -- another worker takes it, and if none does
+        the ``MSE_GPU_WAIT_S`` fallback reroutes it to the cluster.
 
-        Only ``lease_owner``/``lease_expires_at`` are touched; the row stays
-        ``jetson`` and ``running``. That is deliberate: the job genuinely is
-        mid-flight on the GPU queue, and a worker picking it up again is the
-        cheapest correct outcome -- re-running from the start costs one solve,
-        while rerouting to the cluster costs a solve *and* the slower machine.
+        The status reset is load-bearing and was missing. ``claim_jetson``
+        requires ``status = 'queued' AND lease_owner IS NULL``, so clearing the
+        lease alone leaves the row ``running`` and NO worker can claim it. The
+        job is then stranded rather than looping: nothing errors, nothing
+        retries, it simply never moves again. A comment here used to call
+        leaving it ``running`` deliberate ("the job genuinely is mid-flight");
+        that was wrong, because the row is mid-flight only while somebody holds
+        it, and an expired lease means nobody does.
 
         THIS COUNTS AS A RELEASE, and that is the whole reason the count is not
         confined to the ``/release`` route. A worker that crashes mid-job every
@@ -248,12 +271,22 @@ class JobStore:
             over = []
             if rows:
                 # Claimable again, and counted -- but only while under the bound.
+                #
+                # ``status`` goes back to ``queued``, and that is NOT cosmetic:
+                # ``claim_jetson`` requires ``status = 'queued' AND lease_owner
+                # IS NULL``. Clearing the lease alone leaves the row ``running``,
+                # which NO worker can claim -- the job is stranded, not looping.
+                # That was a real defect here (the reviewer measured it on
+                # Postgres), and it is the failure mode with no symptom at all:
+                # no error, no loop, just a job that never moves again.
                 cur.execute(
                     "UPDATE mse.jobs SET lease_owner = NULL, "
-                    "lease_expires_at = NULL, release_count = release_count + 1 "
+                    "lease_expires_at = NULL, status = %s, stage = %s, "
+                    "gpu_queued_at = now(), "
+                    "release_count = release_count + 1 "
                     "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
                     "AND release_count < %s",
-                    (MAX_RELEASES,),
+                    (QUEUED, "queued", MAX_RELEASES),
                 )
                 # Past the bound: terminal, and named for why.
                 cur.execute(
@@ -537,6 +570,16 @@ class JobStore:
             # The message is written from THIS attempt -- the failure the owner
             # should see is the one that finally ended it, not the first one,
             # which would name an earlier cause than the run that gave up.
+            #
+            # The branch is guarded on the same predicate the SQL uses, so the
+            # two cannot drift: a row that reaches here with ``row[0]`` under the
+            # bound means the UPDATE above matched nothing for some OTHER reason,
+            # and failing the job on that would be the instrument deciding the
+            # verdict. It cannot happen at READ COMMITTED (the row lock makes the
+            # second statement see the first's result), so it is a guard rather
+            # than a path -- but a guard that cannot refuse is not a guard.
+            if not releases_are_terminal(row[0]):
+                return None
             cur.execute(
                 "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
                 "finished_at = now(), lease_owner = NULL, lease_expires_at = NULL "
