@@ -630,6 +630,83 @@ def test_slices_json_is_empty_before_the_job_finishes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Static assets must revalidate, or a deploy serves the old viewer
+# ---------------------------------------------------------------------------
+def test_static_assets_must_revalidate_rather_than_expire_on_a_timer(tmp_path):
+    """A cached viewer.js must never outlive the API it was written against.
+
+    The endpoints changed shape: ``/slices.json`` used to carry every mode's
+    field and is now an index. A browser holding the old ``viewer.js`` would ask
+    for the new shape, find no ``slices`` key, and render blank slices -- with no
+    error anywhere, which is what makes it worth a test rather than a comment.
+
+    This passes today because Flask's ``send_from_directory`` sends
+    ``Cache-Control: no-cache`` plus an ETag: the browser caches, but must
+    revalidate, and revalidation fails the moment the file changes.
+    ``no-cache`` is not ``no-store`` -- it is exactly the behaviour we want.
+
+    What must NOT appear is an expiry without revalidation. ``max-age`` (or
+    ``S-F``-style freshness) lets a browser reuse the file with no question
+    asked, for as long as it says. That is the regression this test exists for,
+    and it is the only test here that a version query-string on the script tag
+    would not satisfy -- deliberately, because a query-string is a workaround for
+    a missing revalidation guarantee, not the guarantee itself.
+
+    The behavioural half mutates a **copy** of ``web/static``, not the tracked
+    files, and points ``app.static_folder`` at it. Mutating the real one would
+    work, but a kill between the write and the cleanup, or a concurrent run,
+    would leave the source modified -- the same shape as the revert-tool damage
+    that needed a lock. Working on a copy removes the window rather than
+    tidying up after it.
+    """
+    import shutil
+
+    app, _store, _db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+
+    for asset in ("viewer.js", "modecache.js", "style.css"):
+        response = client.get(f"/static/{asset}")
+        assert response.status_code == 200, asset
+        cache_control = (response.headers.get("Cache-Control") or "").lower()
+        assert "max-age" not in cache_control, (
+            f"/static/{asset} sends Cache-Control {cache_control!r}, which lets a "
+            "browser reuse it without revalidating -- a deploy would then keep "
+            "serving the old viewer against the new API"
+        )
+        # Revalidation is only meaningful if there is something to compare.
+        assert response.headers.get("ETag") or \
+            response.headers.get("Last-Modified"), asset
+
+    # From here on the app serves a copy, so this test cannot touch the checkout.
+    staged = tmp_path / "static-copy"
+    shutil.copytree(app.static_folder, staged)
+    real_viewer = Path(app.static_folder) / "viewer.js"
+    original = real_viewer.read_bytes()
+    app.static_folder = str(staged)
+
+    # And the guarantee must be real, not just declarable: change the file and
+    # the stale copy must be refused. Without this the assertions above could
+    # pass on a server that ignores validators entirely.
+    first = client.get("/static/viewer.js")
+    unchanged = client.get("/static/viewer.js", headers={
+        "If-None-Match": first.headers["ETag"]})
+    assert unchanged.status_code == 304, "an unchanged asset should be reused"
+
+    (staged / "viewer.js").write_text(
+        (staged / "viewer.js").read_text() + "\n// deployed change\n")
+    revalidated = client.get("/static/viewer.js", headers={
+        "If-None-Match": first.headers["ETag"]})
+    assert revalidated.status_code == 200, (
+        "a changed asset was served as 304: the browser would keep the old "
+        "viewer with no way to notice"
+    )
+    assert real_viewer.read_bytes() == original, (
+        "this test modified the tracked web/static/viewer.js; it must only ever "
+        "mutate its own copy"
+    )
+
+
+# ---------------------------------------------------------------------------
 # The scheduler: exactly one Job, a quota 403 is a wait, and a finished Job is
 # deleted so the next upload can start.
 # ---------------------------------------------------------------------------
