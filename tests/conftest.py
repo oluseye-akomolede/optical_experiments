@@ -54,6 +54,14 @@ def pytest_collect_file(parent, file_path):
     collected when someone remembers to run node by hand -- and a test nobody
     runs is a test that is already failing. Skips (rather than errors) where
     node is absent, so a checkout without node is not a broken build.
+
+    Running the JS tests by hand: use ``node --test tests/js/*.mjs``. The
+    directory form, ``node --test tests/js/``, discovers ZERO tests, prints
+    ``pass 0`` and exits 0 -- green-looking and empty. Node 20's default
+    test-file patterns do not match the ``test_<name>.mjs`` filenames used here,
+    so the explicit glob is required. When running node directly, read the test
+    COUNT rather than the exit code. (Through pytest this hook runs one
+    ``node --test <file>`` per file, which is unaffected.)
     """
     if file_path.suffix == ".mjs" and file_path.parent.name == "js":
         return NodeTestFile.from_parent(parent, path=file_path)

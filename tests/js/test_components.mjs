@@ -1,5 +1,12 @@
 // Tests for the vector-to-scalar transform in components.js. Run with:
-//   node --test tests/js/
+//   node --test tests/js/*.mjs        <-- the glob matters; see below
+//
+// DO NOT run `node --test tests/js/`. That directory form discovers ZERO tests,
+// prints "pass 0", and EXITS 0 -- so it looks green while having checked
+// nothing. Read the test COUNT, not the exit code. (Node 20's default test-file
+// patterns do not match these `test_<name>.mjs` filenames, which is why the
+// explicit glob is required.) `pytest tests/` from the repo root also runs all
+// of these, via the hook in tests/conftest.py.
 //
 // The cases are fields whose answer can be written down by hand, because the
 // two ways this can be wrong are both silent: reading a grid position off the

@@ -151,6 +151,124 @@ test('the raymarch step is a fraction of the box, not a physical length', () => 
     'depend on the grid rather than on the field');
 });
 
+test('a sample at the box face fetches the last texel, not one past it', () => {
+  // The NaN fallback is `texelFetch(clamp(ivec3(floor(uvw * n)), 0, n-1))`.
+  // At uvw == 1.0 the raw index would be n, one past the last texel, and an
+  // out-of-range texelFetch is undefined in WebGL2.
+  //
+  // What this test is NOT for, and used to claim wrongly: it does not close an
+  // observable defect. The raymarch reads sample i at offset (i + jitter) * dt
+  // with i <= steps-1 and jitter < 1, so the largest offset read is strictly
+  // less than span and uvw never reaches 1.0 -- measured, the live grid's
+  // maximum is 0.999999994. A sweep that drives sampleField at uvw == 1.0
+  // directly reports a large out-of-range count and means nothing, because the
+  // march never produces that coordinate; that mistake was made here, reported
+  // as 481201 samples, and retracted once the march was replayed instead of
+  // swept. See the comment in viewer.js beside the clamp.
+  //
+  // It is still worth a guard: the clamp's bound must stay "the last texel". A
+  // future edit could replace n - 1 with a constant that happens to suit one
+  // grid, or drop the clamp, and nothing on screen would fail on a driver that
+  // zeroes out-of-range fetches.
+  // Match from `return sampleTexel(` to the terminating `);` on its own, with a
+  // greedy run -- a lazy or paren-excluding pattern stops inside the nested
+  // ivec3(...) and captures a truncated expression, which is how this guard
+  // first failed against the very clamp it exists to check.
+  const body = source.slice(source.indexOf('if (bad || isNan(v000)'),
+                            source.indexOf('float x00'));
+  const fallback = /return sampleTexel\((.*)\);/s.exec(body);
+  assert.ok(fallback && /clamp\(/.test(fallback[1]),
+    'the NaN fallback texelFetch is no longer clamped: at uvw == 1.0 ' +
+    'floor(uvw * n) is n, one past the last texel, and an out-of-range ' +
+    'texelFetch is undefined in WebGL2');
+
+  // The upper bound is read OUT OF THE SHADER, not re-typed here. This is the
+  // difference between a guard and a re-implementation: an earlier version of
+  // this test hard-coded the expected bound, and mutation testing showed it let
+  // both `clamp(c, ivec3(0), ivec3(63))` and `clamp(c, ivec3(0), n - ivec3(2))`
+  // through -- the test was checking its own arithmetic, not the shader's. So
+  // the bound expression is extracted from the source and evaluated against the
+  // real grid, and the assertion is that it equals n-1 exactly. A bound that is
+  // a constant, or off by one in either direction, now fails.
+  // The upper bound is the clamp's THIRD argument, split by balancing parens
+  // rather than by regex: the bound itself contains parens (`ivec3(1)`), and
+  // every regex shape tried here captured it one character short -- the outer
+  // `clamp(` and the inner `ivec3(` close in the same place, so counting parens
+  // is the only thing that gets it right.
+  function splitArgs(expr) {
+    const out = [];
+    let depth = 0;
+    let cur = '';
+    for (const ch of expr) {
+      if (ch === '(') depth += 1;
+      if (ch === ')') depth -= 1;
+      if (ch === ',' && depth === 0) { out.push(cur.trim()); cur = ''; continue; }
+      cur += ch;
+    }
+    if (cur.trim()) out.push(cur.trim());
+    return out;
+  }
+  const clampCall = fallback[1].slice(fallback[1].indexOf('(') + 1,
+                                      fallback[1].lastIndexOf(')'));
+  const callArgs = splitArgs(clampCall);
+  assert.equal(callArgs.length, 3,
+    `the fallback clamp has ${callArgs.length} arguments, not 3 -- this guard ` +
+    'needs rewriting against the new shape');
+  const boundText = callArgs[2];
+  // Only the forms the shader can legitimately use are allowed through; a bound
+  // that is a hard-coded integer is rejected by name rather than evaluated, so
+  // `ivec3(63)` cannot pass on a grid whose last texel happens to be 63.
+  if (!/\bn\b/.test(boundText)) {
+    throw new Error(`the clamp's upper bound "${boundText}" does not use the ` +
+      'texture size n, so it is right for one grid and wrong for the next');
+  }
+  // Evaluate the shader's own bound expression. Only the spellings the shader
+  // can legitimately use are recognised; anything else THROWS rather than
+  // evaluating to something that happens to compare equal, so a bound this
+  // guard does not understand is a loud failure, not a silent pass. In
+  // particular `ivec3(63)` has no `n` and was already rejected above, but it is
+  // also simply not one of the shapes below.
+  const VEC = (a) => [a, a, a];
+  const SUB = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const upper = (n) => {
+    const t = boundText.replace(/\s+/g, '');
+    if (t === 'n') return n.slice();
+    if (t === 'n-ivec3(1)') return SUB(n, VEC(1));
+    if (t === 'ivec3(n)-ivec3(1)') return SUB(VEC(n), VEC(1));
+    throw new Error(`the fallback clamp's upper bound is "${boundText}", which ` +
+      'this guard does not recognise as "the last texel" -- if it is a new ' +
+      'legitimate spelling, teach the guard; if it is a constant or an ' +
+      'off-by-one, it is the bug this test exists for');
+  };
+
+  const n = [64, 45, 32];               // the live job's grid
+  assert.deepEqual(upper(n), [63, 44, 31],
+    `the fallback clamp's upper bound evaluates to ${JSON.stringify(upper(n))} ` +
+    `for grid ${JSON.stringify(n)}, not the last texel ${JSON.stringify(n.map((v) => v - 1))}`);
+
+  const clamped = (uvw) => [0, 1, 2].map((a) =>
+    Math.min(Math.max(Math.floor(uvw[a] * n[a]), 0), upper(n)[a]));
+
+  for (const uvw of [[1, 1, 1], [1, 0.5, 0.5], [0.5, 1, 0.5], [0.5, 0.5, 1],
+                     [0, 0, 0], [0.5, 0.5, 0.5]]) {
+    const c = clamped(uvw);
+    for (let a = 0; a < 3; a += 1) {
+      assert.ok(c[a] >= 0 && c[a] < n[a],
+        `a fallback sample at uvw=${JSON.stringify(uvw)} fetches texel ` +
+        `index ${c[a]} on axis ${a}, outside 0..${n[a] - 1} -- the clamp is ` +
+        'not holding, and an out-of-range texelFetch is undefined');
+    }
+  }
+
+  // The two faces specifically: the high face must land ON the last texel (not
+  // short of it -- a clamp that clamps too much samples the wrong voxel) and
+  // the low face on the first.
+  assert.deepEqual(clamped([1, 1, 1]), [63, 44, 31],
+    'uvw == 1.0 must fetch the last texel of each axis, not n and not n-2');
+  assert.deepEqual(clamped([0, 0, 0]), [0, 0, 0],
+    'uvw == 0.0 must fetch the first texel');
+});
+
 test('the faint-component caption is driven by the measured share, not the name', () => {
   // The render check asserts the caption's *text* against a live page; this
   // asserts the wiring that produces it, which is the part a live page cannot

@@ -1,5 +1,6 @@
 // Tests for the lazy-load rule in modecache.js. Run with:
-//   node --test tests/js/
+//   node --test tests/js/*.mjs     (the glob matters -- `node --test tests/js/`
+//   finds zero tests and exits 0, so it looks green having checked nothing)
 //
 // These exist because the viewer's data flow changed from "one response holds
 // every mode" to "an index plus a fetch per mode", and none of that logic had

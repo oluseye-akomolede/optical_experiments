@@ -307,7 +307,29 @@ float sampleField(vec3 uvw) {
 
   if (bad || isNan(v000) || isNan(v100) || isNan(v010) || isNan(v110) ||
       isNan(v001) || isNan(v101) || isNan(v011) || isNan(v111)) {
-    return sampleTexel(ivec3(floor(uvw * vec3(n))));   // inside the box here
+    // Nearest texel, clamped into the texture.
+    //
+    // The clamp is defensive, and the reason it is not load-bearing is worth
+    // writing down, because the obvious reading of this line is wrong. At the
+    // box's own high face uvw == 1.0, floor(uvw * n) is exactly n -- one past
+    // the last texel -- and an out-of-range texelFetch is undefined in WebGL2.
+    // But the raymarch cannot put uvw there: it reads sample i at offset
+    // (i + jitter) * dt with i <= steps-1 and jitter < 1, so the largest offset
+    // read is strictly less than steps * dt = span, and the largest uvw the
+    // march reads on the live grid is 0.999999994 -- index 31 of 0..31, in
+    // range. The overshoot to 1.0056 does happen, but at the p += rd * dt
+    // advance after the final read, whose position is never sampled; the guard
+    // is at the top of the loop and the advance is at the bottom, and that
+    // ordering is what bounds it.
+    //
+    // So nothing observable turns on this clamp, and it is not a fix for the
+    // cloud's flat face -- that is the object's own silhouette (a 10x7x5mm box,
+    // constant x- and y-extent across every z-slice of the finite mask). It is
+    // kept because it makes the fallback provably in-range on every driver for
+    // two tokens, and because a bound that holds by reasoning about a caller
+    // elsewhere in the file is worth pinning where the fetch happens.
+    ivec3 c = ivec3(floor(uvw * vec3(n)));
+    return sampleTexel(clamp(c, ivec3(0), n - ivec3(1)));
   }
 
   float x00 = mix(v000, v100, f.x);
