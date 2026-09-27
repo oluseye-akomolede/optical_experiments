@@ -145,6 +145,14 @@ class K8sJobLauncher:
 
         A Job counts against ``count/jobs.batch`` from creation until deletion,
         including while it is finished, so "occupying" means "exists".
+
+        Raises on 403 rather than returning ``[]``. An empty list is a *claim*
+        that nothing is there, and both of this method's callers act on that
+        claim: the tick launches, and ``_fail_dead_jobs`` fails every running
+        row. Swallowing a 403 into ``[]`` therefore starts a Job against a quota
+        we could not read, or -- worse -- fails a live solve whose only problem
+        was that we were not allowed to look at it. Letting the exception out
+        makes each caller see "could not ask", which they already handle.
         """
         if self.dry_run:
             return []
@@ -157,8 +165,9 @@ class K8sJobLauncher:
             )
         except client.ApiException as exc:
             if exc.status == 403:
-                # quota/RBAC confusion: treat as "cannot start anything now"
-                return []
+                raise CannotAskCluster(
+                    "not allowed to list solver jobs"
+                ) from exc
             raise
         return [j.metadata.name for j in jobs.items]
 
@@ -185,6 +194,10 @@ class K8sJobLauncher:
         Job's own condition, or a container's ``OOMKilled``/``Error`` -- and may
         be ``""`` when Kubernetes does not say. Callers must not depend on it
         being one of a fixed set.
+
+        Raises on 403, for the same reason ``active_job_names`` does: an empty
+        dict is indistinguishable from "every Job is healthy", and callers act
+        on it.
         """
         if self.dry_run:
             return {}
@@ -197,7 +210,9 @@ class K8sJobLauncher:
             )
         except client.ApiException as exc:
             if exc.status == 403:
-                return {}
+                raise CannotAskCluster(
+                    "not allowed to list solver jobs"
+                ) from exc
             raise
 
         states: dict[str, str] = {}
@@ -321,6 +336,18 @@ def failure_message(reason: str | None) -> str:
 
 class JobLaunchError(Exception):
     """The cluster refused the Job for a reason worth telling the owner."""
+
+
+class CannotAskCluster(Exception):
+    """We could not read cluster state -- distinct from reading it and finding nothing.
+
+    Raised when Kubernetes answers 403 to a list call. The two are not the same
+    thing and callers must not treat them as one an empty result would: an empty
+    list of Jobs means "there is nothing there", which is a licence to launch and
+    to fail every running row; "we were not allowed to look" is a licence for
+    neither. This used to be swallowed into an empty result, and the tick then
+    failed live solves whose only fault was being invisible to us.
+    """
 
 
 def _as_launch_error(exc: Exception) -> Exception:

@@ -351,8 +351,50 @@ CASES.append(Case(
     test_file=SOLVER_TEST_FILE,
 ))
 
+JOBS_MODULE = ROOT / "web" / "jobs.py"
+
+# The 403 that the reviewer found: swallowing an unreadable cluster into an empty
+# result, so "_fail_dead_jobs" cannot tell "not allowed to look" from "nothing is
+# there" and fails a live solve -- then deletes it on a later tick.
+#
+# One expected failure, and it took measuring to learn that. The two 403 tests
+# that drive doubles pass with the swallow restored, and no expected set can fix
+# that: the callers were repaired separately, by a placeholder that turns "could
+# not ask" into a shut gate, so a double that answers empty leaves the tick doing
+# the same correct thing either way. The launcher's own raise -- the part that
+# stops the empty answer arising at all -- is reachable only by reading the
+# source, which is what ``test_the_launcher_raises_on_a_403_instead_of_answering_
+# empty`` does. So the reversion is caught by exactly that one probe.
 CASES.append(Case(
-    name="no-schema-path-env",
+    name="403-swallowed-as-empty",
+    why="an unreadable cluster must not look like an empty one",
+    edits=[
+        # the two raise sites, back to the e5b2e3e behaviour
+        (
+            JOBS_MODULE,
+            "            if exc.status == 403:\n"
+            "                raise CannotAskCluster(\n"
+            "                    \"not allowed to list solver jobs\"\n"
+            "                ) from exc",
+            "            if exc.status == 403:\n"
+            "                return []",
+        ),
+        # and the sentence that says it raises, which the probe reads
+        (
+            JOBS_MODULE,
+            "        Raises on 403 rather than returning ``[]``. An empty list is a *claim*",
+            "        Returns ``[]`` when the list call is forbidden. An empty list is a claim",
+        ),
+    ],
+    expect_failing={
+        "test_the_launcher_raises_on_a_403_instead_of_answering_empty",
+    },
+    test_file=WEB_TEST_FILE,
+))
+
+CASES.append(
+        Case(
+            name="no-schema-path-env",
     why="without MSE_SCHEMA_PATH the DDL path is a relative climb again",
     edits=[(WEB_DOCKERFILE, "ENV MSE_SCHEMA_PATH=/opt/mse/001_schema.sql\n",
             "")],

@@ -245,6 +245,14 @@ def _fail_dead_jobs(launcher, jobs_db, log=print) -> int:
         log(f"[mse-web] could not read job states: {exc}")
         return 0
 
+    # There is deliberately no "present is empty, so fail nothing" guard here.
+    # It looks safer and is not: a Job that was deleted by hand (or lost with its
+    # node) leaves an empty list too, and that is precisely the case BUG B exists
+    # to fail -- the guard would have restored the permanent spinner the fix
+    # removed. The 403 that motivated it is handled at the source instead: both
+    # list calls now raise ``CannotAskCluster``, so "we were not allowed to look"
+    # arrives at the handler above and never reaches this loop as an empty list.
+
     # In dry-run there is no cluster, so `present` is empty and every running
     # row would look dead. The in-memory launcher's own state is the only view
     # available, and it reports nothing as failed -- so do nothing.
@@ -296,13 +304,24 @@ def _finished_job_names(launcher, jobs_db) -> list[str]:
 
 
 def _active_jobs(launcher) -> list[str]:
+    """Jobs occupying a slot, or ``["<unknown>"]`` when the cluster cannot be asked.
+
+    Those two must not collapse into one answer. An empty list means "nothing is
+    running"; "we could not ask" is not that, and neither is it a licence to
+    launch. The launcher raises ``CannotAskCluster`` on a 403 instead of
+    returning empty; catching it here and handing back a placeholder keeps every
+    caller's truthiness test correct -- the concurrency gate stays shut, and
+    nothing downstream mistakes the placeholder for a Job it may delete or report
+    on. A caller that needs to know *why* it cannot ask should call the launcher
+    directly, as ``_fail_dead_jobs`` does, and let the exception through.
+    """
     if launcher is None:
         return []
     try:
         return launcher.active_job_names()
     except Exception as exc:  # noqa: BLE001 - never let a tick crash the loop
         print(f"[mse-web] could not list solver jobs: {exc}", flush=True)
-        return []
+        return ["<unknown>"]
 
 
 def _handle_upload(app, store, jobs_db):

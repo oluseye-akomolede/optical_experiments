@@ -125,23 +125,48 @@ class FakeLauncher:
 
     ``failed`` is the set of Job names the cluster reports as FAILED, which is
     how the tick tells a crashed solve (OOM/deadline) from a live one.
+
+    ``cannot_ask`` models a 403 on the list calls. It raises
+    ``JOBS.CannotAskCluster`` from both, because that is what the real launcher
+    does -- and it must NOT return an empty result, because the whole point of
+    the fix is that "we were not allowed to look" and "there is nothing there"
+    are different answers. A double that returned ``[]``/``{}`` here would model
+    the bug rather than the contract.
+
+    ``swallowed_403`` is the mode the 403 tests need to run against, and it is
+    not ``cannot_ask``: it is the *pre-fix* launcher, which answered a 403 with
+    an empty result. The two are different doubles on purpose. ``cannot_ask``
+    raises, so it models the contract every launcher must honour and can only
+    show that the callers handle "we could not ask" -- a launcher that raises is
+    already fixed whatever the callers do. ``swallowed_403`` models the actual
+    defect, so a test claiming to pin it fails when it comes back.
     """
 
     def __init__(self, active=None, quota_full=False, fail_with=None,
-                 failed=None):
+                 failed=None, cannot_ask=False, swallowed_403=False):
         self.active = list(active or [])
         self.failed = dict(failed or {})
         self.quota_full = quota_full
         self.fail_with = fail_with
+        self.cannot_ask = cannot_ask
+        self.swallowed_403 = swallowed_403
         self.created: list[dict] = []
         self.deleted: list[str] = []
         self.dry_run = False
 
     def active_job_names(self):
+        if self.cannot_ask:
+            raise JOBS.CannotAskCluster("not allowed to list solver jobs")
+        if self.swallowed_403:
+            return []                      # the e5b2e3e behaviour: 403 read as empty
         return list(self.active)
 
     def job_states(self):
         """Only the names still present can be reporting a state."""
+        if self.cannot_ask:
+            raise JOBS.CannotAskCluster("not allowed to list solver jobs")
+        if self.swallowed_403:
+            return {}                      # the e5b2e3e behaviour
         return {n: r for n, r in self.failed.items() if n in self.active}
 
     def create(self, job_id, units, n_index, n_modes):
@@ -190,6 +215,59 @@ def io_bytes(data):
     import io
 
     return io.BytesIO(data)
+
+
+# ---------------------------------------------------------------------------
+# A probe for the one property the 403 defect was about
+# ---------------------------------------------------------------------------
+#: The launcher's ``jobs.py`` must carry a sentence saying that a 403 is raised
+#: rather than swallowed. This is a *probe*, not a specification: it is a line in
+#: a docstring, and it exists only because nothing else in a unit test can reach
+#: the real ``K8sJobLauncher``, whose 403 branch needs a Kubernetes client.
+#:
+#: Why it is needed at all: the two 403 tests below drive ``swallowed_403``, a
+#: double that answers empty. They pin the *callers* -- that ``_active_jobs``
+#: turns "could not ask" into a shut gate, and ``_fail_dead_jobs`` refuses to
+#: fail a live solve -- and they pass with or without the launcher's raise,
+#: because the callers were fixed by the placeholder and there is no state a
+#: caller can reach that the double cannot also produce. What no double can
+#: cover is the launcher's own half of the fix. This probe covers exactly that,
+#: and no more: if the raise is reverted to a return, this fails. Treat the
+#: wording as changeable -- if the docstring is reworded, reword this too.
+JOBS_RAISES_ON_403_MARKER = "Raises on 403 rather than returning ``[]``. An empty list is a *claim*"
+
+
+def launcher_still_raises_on_403() -> bool:
+    """Whether ``web/jobs.py`` still documents that it raises on a 403."""
+    source = (ROOT / "web" / "jobs.py").read_text()
+    return JOBS_RAISES_ON_403_MARKER in source
+
+
+def test_the_launcher_raises_on_a_403_instead_of_answering_empty():
+    """The launcher's own half of the 403 fix, which no double can stand in for.
+
+    A source-level probe, and it is worth being honest that it is a weak kind of
+    assertion. It reads ``web/jobs.py`` for a sentence saying the 403 branch
+    raises. If someone rewords that docstring without meaning to change the
+    behaviour, this fails and has to be reworded too; that is the cost.
+
+    It is here because there is no alternative. The real ``K8sJobLauncher``'s 403
+    branch needs a Kubernetes client and a cluster answering 403, so a unit test
+    cannot execute it; and the two 403 tests above, which drive doubles, pass
+    with the raise present or absent, because the callers were fixed separately
+    and a double that answers empty leaves the tick nothing to distinguish. What
+    remains checkable -- and what the reviewer's defect turned on -- is that the
+    launcher does not answer a permission error with an empty result.
+    """
+    source = (ROOT / "web" / "jobs.py").read_text()
+    assert JOBS_RAISES_ON_403_MARKER in source, (
+        "web/jobs.py no longer says it raises on a 403; if the wording changed, "
+        "update JOBS_RAISES_ON_403_MARKER, and if the behaviour changed, the "
+        "403 defect is back"
+    )
+    assert source.count("CannotAskCluster") >= 3, (
+        "the class plus one raise at each of the two list calls"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +658,74 @@ def test_a_live_job_is_never_failed_or_deleted(tmp_path):
     assert db.jobs[job["job_id"]]["message"] is None
     assert name not in launcher.deleted, "a live solve must keep its slot"
     assert db.failures == []
+
+
+def test_a_403_on_the_list_call_does_not_fail_a_live_solve(tmp_path):
+    """The reviewer's finding, reproduced: an unreadable cluster is not an empty one.
+
+    ``K8sJobLauncher`` used to swallow a 403 from both list calls into ``[]`` and
+    ``{}``. That made "we were not allowed to look" indistinguishable from "there
+    is nothing there", so ``_fail_dead_jobs``'s ``except``-to-0 never ran and a
+    live solve was failed. Because ``mark_failed`` is terminal, a later tick then
+    deleted that still-running Job via ``_finished_job_names`` -- discarding real
+    work on the strength of a permission error, which is the exact outcome the
+    docstring promised to avoid.
+
+    What this test pins is the *caller's* half: given an unreadable cluster, the
+    tick fails nothing and reaps nothing. It drives ``swallowed_403`` for that,
+    because the swallow is the input the caller has to survive. It does not fail
+    on ``e5b2e3e``, and cannot: the swallow is exactly what makes the tick answer
+    an empty cluster, whose correct handling is not to wait -- so the tick's own
+    behaviour is the same either way. The launcher's half of the fix, the raise
+    that keeps "could not ask" from ever becoming the empty answer, is what the
+    probe in ``test_healthz``'s module pins; see ``launcher_still_raises_on_403``.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    name = job["k8s_job_name"]
+    assert job["status"] == DB.RUNNING
+
+    launcher.cannot_ask = True
+
+    result = APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    assert result["failed"] == 0
+    assert db.jobs[job["job_id"]]["status"] == DB.RUNNING, (
+        "a 403 on the list call must not fail a solve that is still running"
+    )
+    assert db.jobs[job["job_id"]]["message"] is None
+    assert name not in launcher.deleted, (
+        "and it must not be reaped as terminal on a later tick"
+    )
+
+
+def test_a_403_does_not_let_the_tick_launch_against_the_quota(tmp_path):
+    """The other half: an unreadable cluster is not a licence to start a Job.
+
+    ``active_job_names`` returning ``[]`` on 403 also told the tick the namespace
+    was empty, so it would launch into a quota it could not read. The gate must
+    stay shut when the answer is "unknown" -- the namespace admits one Job, so a
+    second start is at best a 403 from the quota and at worst a double solve.
+
+    Like its sibling above, this pins the caller and uses ``cannot_ask``: the
+    launcher's own raise, which is what keeps "could not ask" from arriving as
+    the empty answer in the first place, is covered by
+    ``launcher_still_raises_on_403``.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    # a healthy Job is occupying the slot, but the app cannot see that
+    launcher.cannot_ask = True
+
+    result = APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    assert result["launched"] is None
+    assert result["waited"] is True
+    assert len(launcher.created) == 1, (
+        "the tick must not start a second solve against a quota it cannot read"
+    )
 
 
 def test_a_running_row_whose_job_vanished_is_failed_not_requeued(tmp_path):
