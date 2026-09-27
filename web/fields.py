@@ -69,17 +69,18 @@ def decode_mode(data: bytes, grid: dict) -> np.ndarray:
     return field.reshape(shape_of(grid) + (3,))
 
 
-def field_is_readable(grid: dict, data: bytes | None) -> bool:
-    """Could ``decode_mode`` read this blob, without decoding it?
+def field_is_readable(grid: dict, size_bytes: int | None) -> bool:
+    """Could ``decode_mode`` read a blob of this length, without fetching it?
 
-    The index route needs this answer for every mode, and decoding twenty
-    multi-megabyte arrays to ask would defeat the point of the split. The only
-    thing that makes a field unreadable is its size, so the check is arithmetic.
-    ``None`` means the solver's mode table has no blob for it.
+    The index route needs this answer for every mode, and reading twenty
+    multi-megabyte blobs to ask would be most of the cost the payload split
+    exists to avoid. The only thing that makes a field unreadable is its length,
+    so the check is arithmetic against a size the caller got cheaply (a HEAD, or
+    a stat). ``None`` means the file is not there at all.
     """
-    if data is None:
+    if size_bytes is None:
         return False
-    return len(data) == n_samples(grid) * 3 * 4
+    return size_bytes == n_samples(grid) * 3 * 4
 
 
 def magnitude(field: np.ndarray) -> np.ndarray:

@@ -64,6 +64,20 @@ class S3Store:
         except Exception:  # noqa: BLE001
             return False
 
+    def size(self, key: str) -> int | None:
+        """The object's length in bytes, or ``None`` if it is not there.
+
+        A HEAD, not a GET: the caller wants to *check* a file, and downloading
+        it to measure it would be the very cost this exists to avoid.
+        """
+        try:
+            return int(self._client.head_object(
+                Bucket=self.bucket, Key=key)["ContentLength"])
+        except Exception as exc:  # noqa: BLE001
+            if _is_missing(exc):
+                return None
+            raise StorageError(f"could not check {key} in storage") from exc
+
 
 def _is_missing(exc: Exception) -> bool:
     response = getattr(exc, "response", None) or {}
@@ -101,6 +115,13 @@ class LocalStore:
 
     def exists(self, key: str) -> bool:
         return self._path(key).is_file()
+
+    def size(self, key: str) -> int | None:
+        """The file's length in bytes, or ``None`` if it is not there."""
+        path = self._path(key)
+        if not path.is_file():
+            return None
+        return path.stat().st_size
 
 
 def job_key(job_id, name: str) -> str:

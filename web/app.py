@@ -35,6 +35,12 @@ from meshing import UploadError, validate_upload
 #: how many slices of the field volume to send for the 3-D point cloud
 CLOUD_SAMPLES = 24
 
+#: where the solver puts one mode's field, and the ONE place that decides it.
+#: Both the index (which reads a size to decide `available`) and the fetch route
+#: (which reads the bytes) go through this, so they cannot drift apart and leave
+#: the list promising a mode the fetcher cannot serve.
+FIELD_NAME = "mode_{:02d}.bin"
+
 
 def create_app(config: dict | None = None) -> Flask:
     """Build the app. Tests pass overrides here instead of touching env."""
@@ -136,7 +142,7 @@ def create_app(config: dict | None = None) -> Flask:
             abort(404)
         try:
             field = FLD.decode_mode(
-                store.read(STORE.job_key(job_id, f"mode_{number:02d}.bin")),
+                store.read(STORE.job_key(job_id, FIELD_NAME.format(number))),
                 manifest["grid"])
         except (FileNotFoundError, FLD.FieldError):
             # The mode is in the table but its field file is gone or unusable.
@@ -445,34 +451,31 @@ def _mode_index(manifest: dict, store, job_id: str) -> dict:
 
     ``available`` is honest rather than decorative: a mode whose field file is
     missing or the wrong size cannot be fetched, so the viewer greys it out
-    instead of requesting it and showing a failure. Finding that out costs one
-    read of the blob against the size the grid demands -- not a decode of a
-    multi-megabyte array, which would defeat the point of the split. The read is
-    the storage layer's, so this stays correct if the results are remote.
+    instead of requesting it and showing a failure. Finding that out costs a
+    HEAD (or a stat) against the size the grid demands -- not a read of a
+    multi-megabyte blob, which would be most of the cost the split exists to
+    avoid, and not a decode of one, which would be all of it.
+
+    The filename is the one the fetch route uses, from the one place that names
+    it (``FIELD_NAME``). An index that promised a mode the fetcher could not
+    deliver would be the same defect in a different costume: the list says the
+    mode is there, and the truth arrives only after a doomed request.
     """
     modes = []
     for mode in manifest.get("modes", []):
         index = int(mode["index"])
         try:
-            blob = store.read(STORE.job_key(job_id, _mode_blob(manifest, index)))
-        except (FileNotFoundError, STORE.StorageError):
-            blob = None
+            size = store.size(STORE.job_key(job_id, FIELD_NAME.format(index)))
+        except STORE.StorageError:
+            size = None
         modes.append({
             "index": index,
             "freq_hz": mode.get("freq_hz"),
             "vacuum_wavelength_m": mode.get("vacuum_wavelength_m"),
-            "available": FLD.field_is_readable(manifest["grid"], blob),
+            "available": FLD.field_is_readable(manifest["grid"], size),
         })
     return {"grid": manifest["grid"], "units": manifest.get("units"),
             "n_index": manifest.get("n_index"), "modes": modes}
-
-
-def _mode_blob(manifest: dict, index: int) -> str:
-    """``modes.json`` may name the field file; fall back to the convention."""
-    for mode in manifest.get("modes", []):
-        if int(mode["index"]) == index and mode.get("field_file"):
-            return str(mode["field_file"])
-    return f"mode_{index:02d}.bin"
 
 
 def _slice_positions(grid: dict):

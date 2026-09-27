@@ -630,6 +630,80 @@ def test_a_truncated_field_file_is_unavailable_rather_than_half_drawn(tmp_path):
         f"/jobs/{job['job_id']}/slices/1.json").status_code == 404
 
 
+def test_the_index_and_the_fetch_agree_on_which_modes_exist(tmp_path):
+    """``available: true`` must mean the fetch will actually serve the mode.
+
+    The reviewer found the shape of this bug: the index resolved a mode's
+    filename one way and the fetch route resolved it another, so the list could
+    promise a mode the fetcher 404ed -- a could-not-ask wearing the other mask,
+    discovered only after a doomed request. Today there is one resolver
+    (``FIELD_NAME``); this test exists to catch a *second* one appearing.
+
+    Its most important fixture is the **named** file. The original bug was only
+    reachable when ``modes.json`` named a field file, and the ``db.finish``
+    helper never writes that key -- so a test built on the default manifest
+    would pass against a re-introduced second resolver, exactly as the first
+    version of this test did. A mode is renamed here and the manifest is made to
+    name it, so any code path that honours ``field_file`` is exercised rather
+    than skipped.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=4)
+
+    prefix = STORE.job_key(job["job_id"], "")
+    key = lambda name: STORE.job_key(job["job_id"], name)   # noqa: E731
+
+    # mode 1: moved to a name the convention would not guess, and declared.
+    store.write(key("mode_01_moved.bin"), store.read(key("mode_01.bin")))
+    (Path(store.root) / key("mode_01.bin")).unlink()
+
+    # mode 2: gone entirely, still declared.
+    (Path(store.root) / key("mode_02.bin")).unlink()
+
+    # mode 3: present under the convention but the wrong size.
+    blob = Path(store.root) / key("mode_03.bin")
+    blob.write_bytes(blob.read_bytes()[:64])
+
+    # mode 4: untouched.
+
+    manifest = json.loads(store.read(key("modes.json")))
+    declared = {1: "mode_01_moved.bin", 2: "mode_02.bin"}
+    for mode in manifest["modes"]:
+        if int(mode["index"]) in declared:
+            mode["field_file"] = declared[int(mode["index"])]
+    store.write(key("modes.json"), json.dumps(manifest).encode())
+    assert prefix  # the key layout is the job's, not a bare name
+
+    client = app.test_client()
+    index = client.get(f"/jobs/{job['job_id']}/slices.json").get_json()
+
+    for mode in index["modes"]:
+        served = client.get(
+            f"/jobs/{job['job_id']}/slices/{mode['index']}.json")
+        if mode["available"]:
+            assert served.status_code == 200, (
+                f"the index promised mode {mode['index']} and the fetch refused "
+                f"it ({served.status_code}) -- the two routes disagree about "
+                "which file holds this mode"
+            )
+        else:
+            assert served.status_code == 404, (
+                f"the index hid mode {mode['index']} but the fetch served it: "
+                "the list is hiding something the server would have given"
+            )
+
+    # mode 1 is present in the store, but under a name only the manifest knows,
+    # so the single resolver does not find it and the index says so. That is the
+    # point: with one resolver, `available` is answerable and correct. A second
+    # resolver that honours `field_file` would report it available, the fetch
+    # would still 404, and the loop above fails -- which is how this catches the
+    # reviewer's bug coming back.
+    assert {m["index"]: m["available"] for m in index["modes"]} == {
+        1: False, 2: False, 3: False, 4: True}
+
+
 def test_slices_json_is_empty_before_the_job_finishes(tmp_path):
     app, _store, db, _launcher = make_app(tmp_path)
     upload(app.test_client())
