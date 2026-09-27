@@ -37,7 +37,7 @@ import jobs as JOBS
 import storage as STORE
 import worker_api as WORKER
 from meshing import (UploadError, effective_edge_mm, estimate_tets,
-                      load_surface, validate_upload)
+                      load_surface, unit_scale_m, validate_upload)
 
 #: where the solver puts one mode's field, and the ONE place that decides it.
 #: Both the index (which reads a size to decide `available`) and the fetch route
@@ -133,6 +133,8 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
             return _handle_upload(app, store, jobs_db)
         return render_template("index.html", jobs=jobs_db.list_jobs(25),
                               units=CFG.UNIT_CHOICES, default_units=CFG.DEFAULT_UNITS,
+                              feature_unit_choices=CFG.FEATURE_UNIT_CHOICES,
+                              default_feature_unit=CFG.DEFAULT_FEATURE_UNIT,
                               mode_choices=CFG.MODE_CHOICES,
                               default_n_modes=CFG.DEFAULT_N_MODES,
                               max_mb=CFG.MAX_UPLOAD_BYTES // (1024 * 1024))
@@ -142,6 +144,7 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
         job = _require_job(jobs_db, job_id)
         return render_template("job.html", job=job,
                               effective_size=_effective_size(job),
+                              resolution=_resolution_caption(job),
                               queue_position=jobs_db.queue_position(job_id))
 
     # -- JSON the page polls ----------------------------------------------
@@ -331,7 +334,7 @@ def run_tick(store, jobs_db, launcher, log=print) -> dict:
     try:
         name = launcher.create(job["job_id"], job["units"], job["n_index"],
                                job["n_modes"],
-                               min_feature_mm=job.get("min_feature_mm"),
+                               min_feature_m=job.get("min_feature_m"),
                                scale=job.get("scale", 1.0) or 1.0)
     except JOBS.QuotaExceeded:
         # The quota counts finished Jobs, so a 403 here is "wait", not "fail".
@@ -633,18 +636,34 @@ def _handle_upload(app, store, jobs_db):
 
     # The optional minimum-feature-size control. Blank means "auto": the solver's
     # own physics-determined edge length, unchanged.
+    #
+    # The number and its unit arrive separately, and the unit is the owner's
+    # choose from FEATURE_UNIT_CHOICES -- NOT the object's units. It is converted
+    # to metres HERE, once, and everything downstream carries metres. That is the
+    # fix for the length-space bug: the value used to be a bare number named
+    # `min_feature_mm` that every reader had to interpret, and the label, the
+    # flashes and the name disagreed about which unit it was.
     detail = (request.form.get("detail") or "").strip()
-    min_feature_mm = None
+    feature_unit = (request.form.get("feature_unit")
+                    or CFG.DEFAULT_FEATURE_UNIT).strip()
+    min_feature_value = None
+    min_feature_m = None
     if detail and detail != "auto":
+        if feature_unit not in CFG.FEATURE_UNIT_CHOICES:
+            flash("Please choose one of the offered units for the smallest "
+                  "feature.")
+            return redirect(url_for("index"))
         try:
-            min_feature_mm = float(detail)
+            min_feature_value = float(detail)
         except ValueError:
-            flash("The smallest feature must be a number in millimetres, or "
-                  "left on automatic.")
+            flash("The smallest feature must be a number, or left on "
+                  "automatic.")
             return redirect(url_for("index"))
-        if not (min_feature_mm > 0) or min_feature_mm != min_feature_mm:
-            flash("The smallest feature must be greater than zero millimetres.")
+        if not (min_feature_value > 0) or min_feature_value != min_feature_value:
+            flash(f"The smallest feature must be greater than zero "
+                  f"{feature_unit}.")
             return redirect(url_for("index"))
+        min_feature_m = min_feature_value * unit_scale_m(feature_unit)
 
     # The free scale factor: the object is multiplied by this before anything
     # measures it. Blank or 1 means "as uploaded", which is also what every job
@@ -676,7 +695,7 @@ def _handle_upload(app, store, jobs_db):
     # failure mode this rig keeps finding where a non-answer is read as one.
     surface = load_surface(data)
     est_tets = estimate_tets(surface, n_modes, units, c=CFG.est_tets_c(),
-                             min_feature_mm=min_feature_mm, scale=scale)
+                             min_feature_m=min_feature_m, scale=scale)
 
     if est_tets > CFG.upload_refuse_tets():
         flash(
@@ -698,7 +717,11 @@ def _handle_upload(app, store, jobs_db):
 
     jobs_db.create_job(job_id, uploaded.filename, units, n_index,
                        n_modes, target=target, est_tets=est_tets,
-                       min_feature_mm=min_feature_mm, scale=scale)
+                       min_feature_m=min_feature_m,
+                       min_feature_value=min_feature_value,
+                       min_feature_unit=(feature_unit if min_feature_value
+                                         is not None else None),
+                       scale=scale)
 
     # Try to start it right away; if the slot is busy it simply stays queued and
     # the tick will pick it up.
@@ -758,6 +781,38 @@ def _effective_size(job: dict) -> str | None:
             return f"{equivalent_mm / 1000.0:,.4g} m of model per unit of file"
         return f"{equivalent_mm:,.4g} mm of model per unit of file"
     except Exception:  # noqa: BLE001 - a caption must never break the page
+        return None
+
+
+def _resolution_caption(job: dict) -> dict | None:
+    """The REQUESTED mesh resolution, in the unit the owner typed it in.
+
+    One number, LABELLED with its unit, because the feature's unit is its own
+    and is not the object's -- a bare "0.2" beside a "0.27" is a pair the reader
+    has to guess at, and a number the page cannot explain reads as a defect.
+
+    "requested" is the length the mesh was ASKED to resolve: the smaller of the
+    physics edge and the owner's declared feature. The ACHIEVED median edge is
+    deliberately not shown, because the solver measures it internally and does
+    not report it, so the page has no number to show -- an earlier draft of this
+    caption and the template both claimed it was displayed, which is the sort of
+    promise that reads as satisfied until someone looks. Showing it would need a
+    new field on the manifest and a column to carry it; that is its own piece of
+    work, not part of stating the requested resolution correctly.
+
+    Returns ``None`` when there is no feature to report (auto), so the page can
+    say nothing rather than invent a number.
+    """
+    value = job.get("min_feature_value")
+    unit = job.get("min_feature_unit")
+    if value is None or not unit:
+        return None
+    try:
+        return {
+            "requested": f"{float(value):g} {unit}",
+            "requested_m": job.get("min_feature_m"),
+        }
+    except (TypeError, ValueError):
         return None
 
 

@@ -144,28 +144,52 @@ def target_edge_length_mm(surface, n_modes: int, units: str) -> float:
     return float(MESH.target_edge_length(surface, n_modes, units=units))
 
 
-def effective_edge_mm(surface, n_modes: int, units: str,
-                      min_feature_mm: float | None = None) -> float:
-    """The edge length the solver will actually mesh to, in the user's units.
+def unit_scale_m(units: str) -> float:
+    """Metres per unit, from the solver's own table.
 
-    The physics edge resolves the top mode; a declared minimum feature resolves
-    the object. Whichever is SMALLER wins, matching
-    ``mse_meshing.tetrahedralize`` exactly. The solver is asked to do it this way
-    somewhere down the call chain; this function exists so the estimate and the
-    mesh cannot disagree about which number was used, which is what would make
-    routing wrong for precisely the detailed jobs the GPU is for.
+    Re-exported so the upload form converts a feature to metres with the SAME
+    table the mesher uses. A second copy of ``{"mm": 1e-3, ...}`` here would be a
+    place for the two to disagree, and a disagreement is a length-space bug.
     """
-    edge = target_edge_length_mm(surface, n_modes, units)
-    if min_feature_mm is None:
-        return edge
-    feature = float(min_feature_mm)
-    if not (feature > 0) or feature != feature:
-        return edge
-    return min(edge, feature)
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    import mse_meshing as MESH  # noqa: PLC0415 - deliberately late
+
+    return float(MESH.unit_scale(units))
+
+
+def effective_edge_mm(surface, n_modes: int, units: str,
+                      min_feature_m: float | None = None) -> float:
+    """The edge length the solver will mesh to, in the user's units.
+
+    A thin conversion over ``mse_meshing.effective_edge_m``, which owns the
+    physics-edge/feature comparison. Kept for callers that want user units (the
+    page shows the owner the unit they chose), so the comparison itself lives in
+    exactly ONE place and cannot drift between the estimate and the mesh.
+
+    ``surface`` is expected to be SCALED already -- the metre result is measured
+    on the scaled object, so converting an unscaled one back to user units would
+    describe a different object.
+    """
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    import mse_meshing as MESH  # noqa: PLC0415 - deliberately late
+
+    return float(MESH.effective_edge_m(
+        surface, n_modes=n_modes, units=units, min_feature_m=min_feature_m,
+    )) / MESH.unit_scale(units)
 
 
 def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
-                  min_feature_mm: float | None = None,
+                  min_feature_m: float | None = None,
                   scale: float = 1.0) -> int:
     """Predicted element count for meshing ``surface`` at ``n_modes``.
 
@@ -174,11 +198,19 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
     the reason a job is sent to the slower machine. See the class of defect this
     rig calls *could-not-ask must not look like nothing-there*.
 
-    ``min_feature_mm`` and ``scale`` are the same two numbers the solver gets,
-    and they matter here for the same reason: the element count goes like
-    ``V / h^3``, so a scaled object and a finer target edge both move the count
-    hard -- a feature-driven refinement of 2x is 8x the elements, which is
-    exactly the difference between the cluster and the GPU queue.
+    ``min_feature_m`` is METRES (converted once at the upload form) and
+    ``scale`` is the owner's free scale factor. They matter here for the same
+    reason they matter to the solver: the element count goes like ``V / h^3``,
+    so a scaled object and a finer target edge both move the count hard -- a
+    feature-driven refinement of 2x is 8x the elements, which is exactly the
+    difference between the cluster and the GPU queue.
+
+    The edge comes from ``mse_meshing.effective_edge_m``, in METRES, on the
+    SCALED surface -- one length space, one comparison, shared with the solver.
+    An earlier version took it from ``effective_edge_mm``, which converted the
+    metre edge back to *user units of an already-scaled surface*; multiplying
+    that by ``unit_scale`` applied the scale a second time, so the estimate and
+    the mesh disagreed by ``scale^3`` -- and the estimate is what routes the job.
     """
     if surface is None:
         return 0
@@ -195,9 +227,9 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
 
         surface = MESH.apply_scale(surface, scale)
         volume_m3 = MESH.enclosure_volume_m3(surface, units)
-        edge = effective_edge_mm(surface, n_modes, units, min_feature_mm)
-        scale_m = MESH.unit_scale(units)
-        edge_m = edge * scale_m
+        edge_m = MESH.effective_edge_m(
+            surface, n_modes=n_modes, units=units, min_feature_m=min_feature_m,
+        )
     except Exception:  # noqa: BLE001 - an estimate must not break an upload
         return 0
 

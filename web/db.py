@@ -161,7 +161,9 @@ class JobStore:
     def create_job(self, job_id, original_filename: str, units: str,
                    n_index: float, n_modes: int, target: str = CLUSTER,
                    est_tets: int | None = None,
-                   min_feature_mm: float | None = None,
+                   min_feature_m: float | None = None,
+                   min_feature_value: float | None = None,
+                   min_feature_unit: str | None = None,
                    scale: float = 1.0) -> None:
         """Create the upload row. Status starts ``queued``, not ``running``.
 
@@ -171,23 +173,35 @@ class JobStore:
         reports. A job queued for the Jetson also gets ``gpu_queued_at``, which
         is what the fallback timer counts from.
 
-        ``min_feature_mm`` and ``scale`` are recorded because they are *inputs*
-        to the mesh, not derivable from what is stored: the same .obj at scale
-        1000 and units mm is a different object, and a job whose frequency looks
-        wrong by 1000x is diagnosed by reading this row, not by re-reading the
-        upload.
+        The three feature columns are recorded because they are *inputs* to the
+        mesh, not derivable from what is stored -- the same .obj at scale 1000 is
+        a different object, and a job whose frequency looks wrong by 1000x is
+        diagnosed by reading this row, not by re-reading the upload.
+
+        All three are stored, not just the canonical one, because the number the
+        owner typed is not recoverable from its metre value once the unit is
+        gone: 0.2 mm and 2e-4 m are the same length, and a row that kept only
+        ``min_feature_m`` could not say which the owner meant to type. The
+        four-ways-of-stating-the-units ambiguity that caused this bug is closed
+        by the row carrying value, unit AND metres explicitly.
+
+        ``min_feature_m`` is the only one the solver sees; the other two exist
+        so the page can show the owner their own input back.
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO mse.jobs "
                 "(job_id, original_filename, units, n_index, n_modes, status, stage, "
-                " target, est_tets, min_feature_mm, scale, gpu_queued_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                " target, est_tets, min_feature_m, min_feature_value, "
+                " min_feature_unit, scale, gpu_queued_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
                 "        CASE WHEN %s = 'jetson' THEN now() END)",
                 (str(job_id), original_filename, units, float(n_index),
                  int(n_modes), QUEUED, QUEUED, target,
                  None if est_tets is None else int(est_tets),
-                 None if min_feature_mm is None else float(min_feature_mm),
+                 None if min_feature_m is None else float(min_feature_m),
+                 None if min_feature_value is None else float(min_feature_value),
+                 min_feature_unit,
                  float(1.0 if scale is None else scale),
                  target),
             )
@@ -346,7 +360,8 @@ class JobStore:
             cur.execute(
                 "SELECT job_id, created_at, original_filename, units, n_index, "
                 "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
-                "finished_at, target, est_tets, min_feature_mm, scale "
+                "finished_at, target, est_tets, min_feature_m, scale, "
+                "min_feature_value, min_feature_unit "
                 "FROM mse.jobs WHERE job_id = %s",
                 (str(job_id),),
             )
@@ -358,7 +373,8 @@ class JobStore:
             cur.execute(
                 "SELECT job_id, created_at, original_filename, units, n_index, "
                 "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
-                "finished_at, target, est_tets, min_feature_mm, scale "
+                "finished_at, target, est_tets, min_feature_m, scale, "
+                "min_feature_value, min_feature_unit "
                 "FROM mse.jobs ORDER BY created_at DESC LIMIT %s",
                 (int(limit),),
             )
@@ -439,7 +455,7 @@ class JobStore:
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT job_id, units, n_index, n_modes, min_feature_mm, scale "
+                "SELECT job_id, units, n_index, n_modes, min_feature_m, scale "
                 "FROM mse.jobs "
                 "WHERE target = %s AND status = %s AND lease_owner IS NULL "
                 "ORDER BY created_at "
@@ -458,7 +474,7 @@ class JobStore:
                 (RUNNING, "queued", owner, float(lease_seconds), job_id),
             )
         return {"job_id": job_id, "units": row[1], "n_index": row[2],
-                "n_modes": row[3], "min_feature_mm": row[4], "scale": row[5],
+                "n_modes": row[3], "min_feature_m": row[4], "scale": row[5],
                 "lease_owner": owner}
 
     def renew_lease(self, job_id, owner: str, lease_seconds: float) -> bool:
@@ -672,8 +688,10 @@ def _job_row(row) -> dict:
         "finished_at": _iso(row[11]),
         "target": row[12],
         "est_tets": row[13],
-        "min_feature_mm": row[14],
+        "min_feature_m": row[14],
         "scale": row[15],
+        "min_feature_value": row[16],
+        "min_feature_unit": row[17],
     }
 
 

@@ -4,7 +4,7 @@ Both are properties of the *upload*, not of the machine, and both move the
 element count by more than a routing threshold -- which is why they are tested
 together and why the estimate is tested against them rather than only the mesh.
 
-The specific defect this file exists to prevent: ``min_feature_mm`` was accepted
+The specific defect this file exists to prevent: ``min_feature_m`` was accepted
 by the upload form, validated, and then dropped on the floor. The route was
 therefore computed from the *physics* edge for a job that would be meshed at a
 much finer *feature* edge, so the detailed uploads -- exactly the ones the GPU
@@ -72,7 +72,162 @@ def test_the_web_unit_menu_offers_exactly_what_the_solver_supports():
 
 
 # ---------------------------------------------------------------------------
-# min_feature_mm: smaller than the physics edge, or no effect at all
+# The feature has its OWN unit, independent of the object's
+# ---------------------------------------------------------------------------
+
+def test_the_feature_unit_menu_is_exactly_nm_um_mm():
+    """A value test, so a later "obvious" widening has to argue with a test.
+
+    The decision was narrow on purpose: nm/um/mm are the optical scales the
+    owner actually types. Adding cm or m here would be a silent widening of what
+    the feature control can express -- fine if decided, but it should fail a
+    test on the way in rather than appear in a diff nobody reads.
+    """
+    import config as CFG
+
+    assert tuple(CFG.FEATURE_UNIT_CHOICES) == ("nm", "um", "mm")
+    assert CFG.DEFAULT_FEATURE_UNIT == "mm"
+    # Every offered unit must be one the solver's table knows, or the app
+    # converts with a unit the mesher cannot interpret.
+    assert set(CFG.FEATURE_UNIT_CHOICES) <= set(MESH.UNIT_SCALE)
+
+
+def test_the_feature_unit_is_independent_of_the_objects_units():
+    """The ambiguity that took four separate places to close.
+
+    Before this round the number was documented as object units in one place,
+    millimetres in another and named ``_mm`` in a third. The decided meaning:
+    the feature's unit is its own, so the SAME physical feature beats the
+    physics edge whatever the .obj is spelled in -- and 0.2 m is a different
+    physical feature from 0.2 mm, which is what makes the first half a real
+    claim rather than a tautology.
+    """
+    feature = 0.2 * MESH.unit_scale("mm")          # 2e-4 m, the decided value
+    surfaces = {
+        "mm object x1000": MESH.apply_scale(_box_surface(), 1000.0),
+        "m object x1": MESH.apply_scale(_box_surface(), 1.0),
+    }
+
+    edges = {name: MESH.effective_edge_m(surface, 20, "mm",
+                                         min_feature_m=feature)
+             for name, surface in surfaces.items()}
+    assert len(set(edges.values())) == 1, (
+        f"the same physical feature gave different edges per spelling: {edges}"
+    )
+
+    # The control: a feature 1000x larger is a different physical feature, and
+    # must NOT give the same edge. Without this the assertion above would pass
+    # for a function that ignored its argument entirely.
+    bigger = MESH.effective_edge_m(
+        next(iter(surfaces.values())), 20, "mm",
+        min_feature_m=0.2 * MESH.unit_scale("m"))
+    assert bigger != next(iter(edges.values()))
+
+
+def test_one_object_spelled_three_ways_meshes_and_estimates_the_same():
+    """INVARIANCE -- the row's first requirement.
+
+    ONE physical object and ONE physical feature, written three ways:
+    ``(mm, x1000)``, ``(m, x1)`` and ``(um, x1e6)``. Every one of them must give
+    the same feature in metres, the same effective edge, the same allowed edge
+    and the same element estimate -- because they are the same object and the
+    same question.
+
+    The feature sits at half the physics edge so the ``min`` CHOICE is exercised:
+    a feature far below the physics edge wins in every spelling, so the test
+    would pass against the broken code. The reviewer measured exactly that --
+    three far-below spellings all estimated 6.1e14.
+    """
+    file_nums = [0.01, 0.007, 0.005]         # metres, under the (m, x1) reading
+    feature_m = 0.2 * MESH.unit_scale("mm")  # 2e-4 m
+
+    rows = []
+    for units, scale in (("m", 1.0), ("mm", 1000.0), ("um", 1e6)):
+        surface = trimesh.creation.box(extents=file_nums)
+        scaled = MESH.apply_scale(surface, scale)
+
+        # Every spelling describes the same object in metres.
+        assert MESH.enclosure_volume_m3(scaled, units) == \
+            pytest.approx(0.01 * 0.007 * 0.005, rel=1e-9)
+
+        edge_m = MESH.effective_edge_m(scaled, 20, units,
+                                       min_feature_m=feature_m)
+        allowed_m = MESH.MAX_EDGE_OVERSHOOT * edge_m
+        est = WEB.estimate_tets(surface, 20, units, c=14.0,
+                                min_feature_m=feature_m, scale=scale)
+        rows.append((units, edge_m, allowed_m, est))
+
+    # The feature is genuinely the winner here, or this proves nothing.
+    assert rows[0][1] == pytest.approx(feature_m), (
+        "the feature did not beat the physics edge, so the min choice was never "
+        "exercised and this invariance test would pass against the old bug"
+    )
+    assert len({r[1] for r in rows}) == 1, f"edges differ: {rows}"
+    assert len({r[2] for r in rows}) == 1, f"allowed edges differ: {rows}"
+    # An element count is an int, so an exact match is the right demand: the
+    # only spread seen is float noise in trimesh's volume, 2 ulp at 3.5e-7.
+    counts = {r[3] for r in rows}
+    assert max(counts) - min(counts) <= 1, f"estimates differ: {rows}"
+
+
+def test_the_physics_edge_wins_when_the_feature_is_named_coarse():
+    """The other side of the ``min``: a coarse feature must not coarsen the mesh.
+
+    Run across the same three spellings, because the bug this round fixes was
+    precisely that WHICH SIDE WINS depended on the spelling.
+    """
+    file_nums = [0.01, 0.007, 0.005]
+    edges = set()
+    for units, scale in (("m", 1.0), ("mm", 1000.0), ("um", 1e6)):
+        surface = MESH.apply_scale(trimesh.creation.box(extents=file_nums),
+                                   scale)
+        physics_m = MESH.effective_edge_m(surface, 20, units)
+        # Twice the physics edge: comfortably the loser of the min.
+        edge_m = MESH.effective_edge_m(surface, 20, units,
+                                       min_feature_m=2.0 * physics_m)
+        assert edge_m == pytest.approx(physics_m, rel=1e-9)
+        edges.add(edge_m)
+    assert len(edges) >= 1  # the assertion above is the real one, per spelling
+
+
+def test_a_nanometre_object_with_a_nanometre_feature_meshes_sensibly():
+    """The plasmonics case: 50 nm across with a 5 nm feature.
+
+    Nothing before this round exercised nm end to end, and both a unit error and
+    the length-space mix-up are invisible at mm scale but fatal here -- a factor
+    of 1e6 is the difference between a solvable mesh and an estimate of zero or
+    1e18.
+    """
+    surface = trimesh.creation.box(extents=[50.0, 30.0, 20.0])   # nm
+    scaled = MESH.apply_scale(surface, 1.0)
+
+    # Physics first, unasked: a 50 nm box at 4 modes wants a 4.73 nm edge. That
+    # number is the yardstick for the two cases below -- and it is worth stating,
+    # because "a 5 nm feature is finer than the physics edge" is FALSE here and a
+    # test that assumed it would fail for a reason that has nothing to do with
+    # units.
+    physics_m = MESH.effective_edge_m(scaled, 4, "nm")
+    assert physics_m == pytest.approx(4.73e-9, rel=0.02)
+
+    # A 5 nm feature is coarser than that: physics wins, exactly.
+    assert MESH.effective_edge_m(scaled, 4, "nm",
+                                 min_feature_m=5.0 * MESH.unit_scale("nm")) \
+        == pytest.approx(physics_m)
+
+    # A 2 nm feature is finer: the feature wins, exactly. Both are metres, so
+    # the comparison is the same one the mm tests make.
+    feature_m = 2.0 * MESH.unit_scale("nm")                      # 2e-9 m
+    edge_m = MESH.effective_edge_m(scaled, 4, "nm", min_feature_m=feature_m)
+    assert edge_m == pytest.approx(feature_m)
+    assert 0 < edge_m < 1e-6
+
+    est = WEB.estimate_tets(surface, 4, "nm", c=14.0,
+                            min_feature_m=feature_m, scale=1.0)
+    assert est > 0, "the nm estimate came back 0, which routes as could-not-ask"
+
+
+# ---------------------------------------------------------------------------
+# min_feature_m: smaller than the physics edge, or no effect at all
 # ---------------------------------------------------------------------------
 
 def _box_surface(extent_mm: float = 10.0):
@@ -81,14 +236,20 @@ def _box_surface(extent_mm: float = 10.0):
 
 
 def test_a_feature_smaller_than_the_physics_edge_lowers_the_target_edge():
-    """The whole point of the control: the mesh must actually get finer."""
-    surface = _box_surface()
-    physics = WEB.target_edge_length_mm(surface, 20, "mm")
-    feature = physics / 4.0
+    """The whole point of the control: the mesh must actually get finer.
 
-    effective = WEB.effective_edge_mm(surface, 20, "mm", feature)
-    assert effective == pytest.approx(feature)
-    assert effective < physics
+    The feature is METRES, so a feature "four times finer than the physics edge"
+    is computed from the physics edge in metres -- the two are the same length
+    space, which is the contract. The surface is SCALED, as the solver sees it.
+    """
+    surface = MESH.apply_scale(_box_surface(), 1.0)
+    physics_mm = WEB.target_edge_length_mm(surface, 20, "mm")
+    physics_m = physics_mm * MESH.unit_scale("mm")
+    feature_m = physics_m / 4.0
+
+    effective = WEB.effective_edge_mm(surface, 20, "mm", feature_m)
+    assert effective == pytest.approx(feature_m / MESH.unit_scale("mm"))
+    assert effective < physics_mm
 
 
 def test_a_feature_larger_than_the_physics_edge_changes_nothing():
@@ -98,11 +259,13 @@ def test_a_feature_larger_than_the_physics_edge_changes_nothing():
     not a licence to under-resolve the modes -- so the answer is the physics
     edge, exactly.
     """
-    surface = _box_surface()
-    physics = WEB.target_edge_length_mm(surface, 20, "mm")
+    surface = MESH.apply_scale(_box_surface(), 1.0)
+    physics_mm = WEB.target_edge_length_mm(surface, 20, "mm")
+    physics_m = physics_mm * MESH.unit_scale("mm")
 
-    assert WEB.effective_edge_mm(surface, 20, "mm", physics * 10.0) == physics
-    assert WEB.effective_edge_mm(surface, 20, "mm", None) == physics
+    assert WEB.effective_edge_mm(surface, 20, "mm", physics_m * 10.0) \
+        == physics_mm
+    assert WEB.effective_edge_mm(surface, 20, "mm", None) == physics_mm
 
 
 def test_auto_is_byte_identical_to_the_previous_behaviour():
@@ -115,7 +278,7 @@ def test_auto_is_byte_identical_to_the_previous_behaviour():
     surface = _box_surface()
     without = WEB.estimate_tets(surface, 20, "mm", c=14.0)
     with_auto = WEB.estimate_tets(surface, 20, "mm", c=14.0,
-                                  min_feature_mm=None, scale=1.0)
+                                  min_feature_m=None, scale=1.0)
 
     assert without == with_auto
     assert WEB.effective_edge_mm(surface, 20, "mm") == \
@@ -131,10 +294,11 @@ def test_a_smaller_feature_raises_the_estimate_not_just_the_edge():
     the GPU.
     """
     surface = _box_surface()
-    physics = WEB.target_edge_length_mm(surface, 20, "mm")
+    physics_m = (WEB.target_edge_length_mm(surface, 20, "mm")
+                 * MESH.unit_scale("mm"))
     auto = WEB.estimate_tets(surface, 20, "mm", c=14.0)
     fine = WEB.estimate_tets(surface, 20, "mm", c=14.0,
-                             min_feature_mm=physics / 4.0)
+                             min_feature_m=physics_m / 4.0)
 
     assert fine > auto
     # 4^3 = 64 within the rounding of an int estimate
@@ -281,8 +445,13 @@ def test_the_solver_uses_the_feature_edge_it_is_given(monkeypatch):
     """
     fake = _fake_mesher(monkeypatch, target_edges=(0.5,))
 
+    # The scripted physics edge is 0.5 in the surface's OWN units (mm here), so
+    # the feature that beats it is 0.5/4 mm -- stated in METRES, which is what
+    # ``tetrahedralize`` takes now. Passing the bare 0.125 would be 0.125
+    # METRES, i.e. 125 mm: a quarter of the object, and a feature that loses to
+    # the physics edge instead of beating it.
     surface = trimesh.creation.box(extents=[10.0, 7.0, 5.0])
-    with_feature = _mesh_volume(fake, surface, min_feature_mm=0.125)
+    with_feature = _mesh_volume(fake, surface, min_feature_m=0.125 * 1e-3)
     without = _mesh_volume(fake, surface)
 
     assert with_feature < without
@@ -297,7 +466,7 @@ def test_the_feature_never_coarsens_the_mesher_target(monkeypatch):
     fake = _fake_mesher(monkeypatch, target_edges=(0.5,))
 
     surface = trimesh.creation.box(extents=[10.0, 7.0, 5.0])
-    coarse_feature = _mesh_volume(fake, surface, min_feature_mm=5.0)
+    coarse_feature = _mesh_volume(fake, surface, min_feature_m=5.0)
     plain = _mesh_volume(fake, surface)
 
     assert coarse_feature == pytest.approx(plain), (
@@ -377,7 +546,7 @@ def test_the_scale_cannot_move_the_estimate_and_that_is_correct():
 
     The consequence, stated plainly because it is the kind of thing that gets
     mistaken for a defect later: a scale factor can never move a job between the
-    cluster and the GPU queue. What DOES move it is ``min_feature_mm``, which
+    cluster and the GPU queue. What DOES move it is ``min_feature_m``, which
     breaks the similarity by naming an absolute length -- see
     ``test_a_smaller_feature_raises_the_estimate_not_just_the_edge``.
     """
@@ -396,14 +565,17 @@ def test_the_feature_size_is_what_moves_the_estimate():
     """The contrast: an ABSOLUTE length does move it, and hard.
 
     Naming a feature breaks the similarity that makes the estimate scale-free,
-    which is why `min_feature_mm` -- not `scale` -- is the input the routing
+    which is why `min_feature_m` -- not `scale` -- is the input the routing
     decision is sensitive to.
     """
     surface = trimesh.creation.box(extents=[10.0, 7.0, 5.0])
-    physics = WEB.target_edge_length_mm(surface, 20, "mm")
+    # In METRES: ``target_edge_length_mm`` answers in the surface's own units,
+    # while the feature the app passes down is metres.
+    physics_m = (WEB.target_edge_length_mm(surface, 20, "mm")
+                 * MESH.unit_scale("mm"))
     auto = WEB.estimate_tets(surface, 20, "mm", c=14.0)
     fine = WEB.estimate_tets(surface, 20, "mm", c=14.0,
-                             min_feature_mm=physics / 4.0)
+                             min_feature_m=physics_m / 4.0)
 
     assert fine == pytest.approx(64 * auto, rel=0.05), (
         "an absolute feature edge 4x below the physics one is 4^3 = 64x the "
@@ -491,7 +663,7 @@ def test_the_mesh_cap_is_a_limit_not_a_target(monkeypatch):
         CapFlat.flat_copies = copies
         return MESH.tetrahedralize(FakeSurface(extent=10.0), "mm", n_modes=4,
                                    n_index=1.5, max_tets=max_tets, verbose=False,
-                                   min_feature_mm=None, scale=1.0)
+                                   min_feature_m=None, scale=1.0)
 
     # 1. The cap is a LIMIT: a mesh that fits it is returned as-is, and one
     #    attempt is all it takes. The fake's default law reports 6 elements
@@ -613,7 +785,7 @@ def test_the_scale_cannot_move_the_estimate_and_that_is_correct():
 
     The consequence, stated plainly because it is the kind of thing that gets
     mistaken for a defect later: a scale factor can never move a job between the
-    cluster and the GPU queue. What DOES move it is ``min_feature_mm``, which
+    cluster and the GPU queue. What DOES move it is ``min_feature_m``, which
     breaks the similarity by naming an absolute length -- see
     ``test_a_smaller_feature_raises_the_estimate_not_just_the_edge``.
     """
@@ -632,14 +804,17 @@ def test_the_feature_size_is_what_moves_the_estimate():
     """The contrast: an ABSOLUTE length does move it, and hard.
 
     Naming a feature breaks the similarity that makes the estimate scale-free,
-    which is why `min_feature_mm` -- not `scale` -- is the input the routing
+    which is why `min_feature_m` -- not `scale` -- is the input the routing
     decision is sensitive to.
     """
     surface = trimesh.creation.box(extents=[10.0, 7.0, 5.0])
-    physics = WEB.target_edge_length_mm(surface, 20, "mm")
+    # In METRES: ``target_edge_length_mm`` answers in the surface's own units,
+    # while the feature the app passes down is metres.
+    physics_m = (WEB.target_edge_length_mm(surface, 20, "mm")
+                 * MESH.unit_scale("mm"))
     auto = WEB.estimate_tets(surface, 20, "mm", c=14.0)
     fine = WEB.estimate_tets(surface, 20, "mm", c=14.0,
-                             min_feature_mm=physics / 4.0)
+                             min_feature_m=physics_m / 4.0)
 
     assert fine == pytest.approx(64 * auto, rel=0.05), (
         "an absolute feature edge 4x below the physics one is 4^3 = 64x the "
@@ -727,7 +902,7 @@ def test_the_mesh_cap_is_a_limit_not_a_target(monkeypatch):
         CapFlat.flat_copies = copies
         return MESH.tetrahedralize(FakeSurface(extent=10.0), "mm", n_modes=4,
                                    n_index=1.5, max_tets=max_tets, verbose=False,
-                                   min_feature_mm=None, scale=1.0)
+                                   min_feature_m=None, scale=1.0)
 
     # 1. The cap is a LIMIT: a mesh that fits it is returned as-is, and one
     #    attempt is all it takes. The fake's default law reports 6 elements

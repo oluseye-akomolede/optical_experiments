@@ -198,7 +198,7 @@ def _register_routes():
             "n_modes": int(job["n_modes"]),
             # Swapped from the job row by SQL, one for one: a NULL integer is
             # not a value, so it stays JSON null.
-            "min_feature_mm": job.get("min_feature_mm"),
+            "min_feature_m": job.get("min_feature_m"),
             "scale": float(job.get("scale") or 1.0),
             # The element caps travel with the job. They are properties of the
             # MACHINES, not of this upload, but a worker that knows only the

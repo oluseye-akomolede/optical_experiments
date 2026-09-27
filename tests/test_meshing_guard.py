@@ -209,6 +209,56 @@ def test_a_resolvable_mesh_is_accepted(monkeypatch):
     assert points.shape[1] == 3
 
 
+def test_the_guard_measures_in_one_space_at_scale_1000(monkeypatch):
+    """The leg that was broken, and the one no existing test covered.
+
+    Every guard test above runs at the default scale, where the old bug's two
+    length spaces differed by exactly the scale factor -- 1.0 -- so the error
+    cancelled and the suite stayed green over it. Here the scale is 1000, which
+    is where ``allowed_edge`` used to come out in metres of the UNSCALED object
+    while ``achieved`` was metres of the scaled one.
+
+    The mesh is the shared fake cube, one copy, so its achieved edge is 1.0 in
+    the SCALED surface's units. The scripted physics edge is the same 1.0, so
+    the allowed edge in metres is ``1.0 * unit_scale('mm') * 1.6 = 1.6e-3``,
+    while achieved is ``1.0 * 1e-3 = 1e-3`` -- just inside, and the mesh is
+    accepted. Under the broken arithmetic the allowed edge was computed against
+    the unscaled object and came out 1000x too small, so this same mesh was
+    REFUSED. Both directions are asserted, because a guard that never fires is
+    as wrong as one that always does.
+    """
+
+    class OneTetGen(FakeTetGen):
+        """One copy of the cube: achieved edge 1.0 in scaled units."""
+
+        def _copies_for(self, maxvolume):
+            return 1
+
+    _install(monkeypatch, OneTetGen)
+    monkeypatch.setattr(MESH, "target_edge_length", lambda *a, **k: 1.0)
+    scale = 1000.0
+
+    class ScaledSurface(FakeSurface):
+        """``apply_scale`` copies at a non-unit scale; the stub must too."""
+
+        def copy(self):
+            return ScaledSurface(extent=self.bounds[1][0])
+
+    # Accepted: achieved 1e-3 m is under the 1.6e-3 m allowed.
+    points, tets = MESH.tetrahedralize(ScaledSurface(extent=scale), "mm",
+                                       n_modes=20, max_tets=10_000,
+                                       verbose=False, scale=scale)
+    assert points.shape[1] == 3
+
+    # And the guard is genuinely armed at this scale: a feature edge 4x finer
+    # than the achieved mesh must be refused, so the pass above is not a guard
+    # that stopped working.
+    with pytest.raises(MESH.MeshingError):
+        MESH.tetrahedralize(ScaledSurface(extent=scale), "mm", n_modes=20,
+                            max_tets=10_000, verbose=False, scale=scale,
+                            min_feature_m=0.25 * MESH.unit_scale("mm"))
+
+
 def test_allow_coarse_path_still_solves(monkeypatch):
     """The bench's deliberate ``enforce_resolution=False`` escape hatch stays."""
 

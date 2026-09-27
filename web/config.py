@@ -35,6 +35,15 @@ UNIT_CHOICES = ("mm", "cm", "m", "um", "nm", "in")
 DEFAULT_UNITS = "mm"
 DEFAULT_N_MODES = 20
 
+#: The smallest-feature control's OWN units, deliberately shorter than
+#: ``UNIT_CHOICES`` and INDEPENDENT of the object's units. The feature is a
+#: physical length: the owner says "0.2 mm" and means 2e-4 m whatever the object
+#: was uploaded in. Sharing the object's widget invited the coupling that caused
+#: the length-space bug this replaces, so the two lists are separate on purpose
+#: and a test asserts this one is exactly these three.
+FEATURE_UNIT_CHOICES = ("nm", "um", "mm")
+DEFAULT_FEATURE_UNIT = "mm"
+
 #: bounds on the free scale factor. Not a technical limit -- a sanity rail, so a
 #: mistyped \"1e12\" is refused at upload rather than meshed into oblivion. The
 #: upper bound is generous because a metre-scale object in nm units is a real

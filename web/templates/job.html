@@ -7,8 +7,21 @@
     Units {{ job.units }} &middot; refractive index {{ job.n_index }} &middot;
     {{ job.n_modes }} modes requested
     {%- if job.scale and job.scale != 1.0 %} &middot; scaled &times;{{ '%g'|format(job.scale) }}{% endif %}
-    {%- if job.min_feature_mm %} &middot; resolving {{ '%g'|format(job.min_feature_mm) }} {{ job.units }} features{% endif %}
+    {%- if resolution %} &middot; <span id="resolution">requested mesh resolution
+    {{ resolution.requested }}</span>{% endif %}
   </p>
+  {# The requested resolution, in the unit the OWNER typed it in -- which is the
+     feature's own unit and deliberately not the object's. Labelled, because a
+     bare "0.2" beside a "0.27" is a pair the reader has to guess at, and a
+     number the page cannot explain reads as a defect. #}
+  {% if resolution %}
+    <p class="muted small" id="resolution-detail">
+      You asked the mesh to resolve a smallest feature of
+      <strong>{{ resolution.requested }}</strong>. The elements it builds are
+      sized around that length, within a small allowance either way. This is the
+      size you asked for; it is not a measurement of the mesh that was built.
+    </p>
+  {% endif %}
   {# The EFFECTIVE size, stated in plain numbers. With a scale factor and um/nm
      units in play, "units" alone no longer says how big the object is, and the
      frequencies are only right if the size is. #}

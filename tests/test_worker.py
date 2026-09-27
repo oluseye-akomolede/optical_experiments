@@ -124,7 +124,7 @@ def queued_job(jobs_db, job_id="11111111-2222-3333-4444-555555555555", **extra):
     job = {
         "job_id": job_id, "units": "mm", "n_index": 1.5, "n_modes": 10,
         "est_tets": 20000, "target": DB.JETSON, "status": DB.QUEUED,
-        "min_feature_mm": None, "scale": 1.0,
+        "min_feature_m": None, "scale": 1.0,
     }
     job.update(extra)
     jobs_db.jobs[job_id] = job

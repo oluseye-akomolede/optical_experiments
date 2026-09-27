@@ -126,6 +126,54 @@ def apply_scale(surface, scale: float):
     return scaled
 
 
+def effective_edge_m(
+    scaled_surface,
+    n_modes: int,
+    units: str,
+    min_feature_m: float | None = None,
+    n_index: float = 1.0,
+) -> float:
+    """The edge length the mesh is built to, in METRES on the scaled surface.
+
+    This is the ONE place the physics edge and the owner's declared smallest
+    feature are compared. Both callers -- ``tetrahedralize`` and the web app's
+    ``estimate_tets`` -- call it and neither re-derives the comparison, because
+    the whole class of bug this replaces was two call sites combining the same
+    two numbers in two different length spaces.
+
+    The arguments are already in the one space that matters:
+
+    * ``scaled_surface`` has been through :func:`apply_scale`, so every length
+      measured on it is the object the solver was actually asked to solve.
+    * ``min_feature_m`` is METRES, converted once at the edge of the system
+      (the upload form, from its own unit selector) and carried in metres from
+      there. It is NOT converted here -- that is deliberate. The parameter used
+      to be called ``min_feature_mm`` and arrived as a bare number in the
+      object's units, which meant every reader had to know *which* unit it was
+      and every one of them could get it wrong. A value that is already metres
+      cannot be converted wrongly.
+
+    ``target_edge_length`` returns the user's units, so it is converted here --
+    ``physics_m`` is the only length in this function that needs a factor, and
+    it needs exactly one.
+    """
+    physics_m = target_edge_length(
+        scaled_surface, n_modes=n_modes, units=units, n_index=n_index
+    ) * unit_scale(units)
+
+    if min_feature_m is None:
+        return physics_m
+    feature_m = float(min_feature_m)
+    if not np.isfinite(feature_m) or feature_m <= 0:
+        # A nonsense feature is ignored rather than divided by. Same rule as
+        # the app's validation, applied here too because this function is
+        # reachable from the solver's own CLI.
+        return physics_m
+    # Whichever is SMALLER wins: a feature left unresolved and a top mode left
+    # unresolved both give frequencies that are confidently wrong.
+    return min(physics_m, feature_m)
+
+
 def load_surface(obj_bytes_or_path, units: str = "mm"):
     """Load and clean an .obj surface, returning ``(trimesh.Trimesh, metres_per_unit)``.
 
@@ -458,7 +506,7 @@ def tetrahedralize(
     max_tets: int = 150_000,
     verbose: bool = True,
     enforce_resolution: bool = True,
-    min_feature_mm: float | None = None,
+    min_feature_m: float | None = None,
     scale: float = 1.0,
 ):
     """Tetrahedralize a cleaned surface and return ``(points_m, tets)`` in metres.
@@ -476,11 +524,22 @@ def tetrahedralize(
     boundary vertices exactly as the user's .obj supplied them -- TetGen does
     not move vertices, so the geometry is preserved.
 
-    ``min_feature_mm`` is the owner's declared smallest feature, in the same
-    units as the upload; it lowers the target edge and never raises it.
+    ``min_feature_m`` is the owner's declared smallest feature in METRES --
+    converted once at the upload form from its own nm/um/mm selector, never
+    from the object's units. It lowers the target edge and never raises it.
     ``scale`` multiplies every vertex before anything is measured, so the
     volume, the surface edge and the target edge all describe the object the
     solver was actually asked to solve.
+
+    Every length below is METRES measured on the SCALED surface. An earlier
+    version mixed spaces right here -- ``edge_length`` was user units of the
+    scaled object while ``min_feature_mm`` was a raw number of the unscaled
+    one, and a local ``scale = unit_scale(units)`` rebound this function's
+    ``scale`` parameter, so ``allowed_edge`` came out in metres of the
+    UNSCALED object against an ``achieved`` in metres of the scaled one. At
+    scale 1 the two factors cancel, which is why the guard tests passed and hid
+    it. The rename of that local to ``unit_scale_m`` is the fix's own guard:
+    the shadowing cannot come back if the names cannot collide.
 
     ``points_m`` is ``(n_points, 3)`` float64 in metres, ``tets`` is
     ``(n_tets, 4)`` indices into it. Raises :class:`MeshingError` when the
@@ -490,43 +549,51 @@ def tetrahedralize(
 
     surface = apply_scale(surface, scale)
 
-    edge_length = target_edge_length(
-        surface, n_modes=n_modes, units=units, n_index=n_index
-    )
+    # Metres per user unit, from here down. Named ``unit_scale_m`` and not
+    # ``scale``: the parameter above is the owner's free scale factor, and an
+    # earlier version rebound the name here, which is how the two length spaces
+    # got mixed two lines later.
+    unit_scale_m = unit_scale(units)
 
-    # The owner may name the smallest feature the modes depend on. The physics
-    # edge is what resolves the top mode; the feature edge is what resolves the
-    # object. Whichever is SMALLER wins, because either one left unresolved
-    # gives frequencies that are confidently wrong. Setting a feature larger
-    # than the physics edge therefore has no effect at all -- there is no path
-    # here that makes the mesh coarser than the physics alone.
-    if min_feature_mm is not None:
-        feature_edge = float(min_feature_mm)
-        if np.isfinite(feature_edge) and feature_edge > 0 and feature_edge < edge_length:
-            if verbose:
-                print(
-                    f"[mse] resolving the {feature_edge:g} {units} feature: target "
-                    f"edge {edge_length:.4g} {units} -> {feature_edge:g} {units}",
-                    flush=True,
-                )
-            edge_length = feature_edge
+    # The one comparison of physics edge against declared feature, in metres.
+    # ``edge_m`` is what the mesh is built to; ``edge_units`` is the same length
+    # in the scaled surface's own units, which is the space TetGen's maxvolume
+    # and the decimation speak. Derived from ``edge_m`` rather than recomputed,
+    # so the two cannot drift.
+    edge_m = effective_edge_m(
+        surface, n_modes=n_modes, units=units,
+        min_feature_m=min_feature_m, n_index=n_index,
+    )
+    edge_units = edge_m / unit_scale_m
+    physics_m = target_edge_length(
+        surface, n_modes=n_modes, units=units, n_index=n_index
+    ) * unit_scale_m
+    if verbose and min_feature_m is not None and edge_m < physics_m:
+        print(
+            f"[mse] resolving the {edge_m:g} m feature: target edge "
+            f"{physics_m:.4g} m -> {edge_m:g} m",
+            flush=True,
+        )
 
     # An over-fine surface floors the interior element size no matter what
     # maxvolume asks for, which is how an ordinary CAD or scan upload gets
     # refused as "too large". Coarsen it toward the target edge first.
     surface, decimation_note = decimate_to_edge_length(
-        surface, edge_length, verbose=verbose
+        surface, edge_units, verbose=verbose
     )
     if verbose and decimation_note:
         print(f"[mse] {decimation_note}", flush=True)
 
-    maxvolume = target_maxvolume(surface, edge_length)
+    maxvolume = target_maxvolume(surface, edge_units)
 
     vertices = np.asarray(surface.vertices, dtype=float)
     faces = np.asarray(surface.faces, dtype=np.int32)
 
-    scale = unit_scale(units)
-    allowed_edge = MAX_EDGE_OVERSHOOT * edge_length * scale
+    # Both sides in metres of the SCALED object: ``achieved`` below is measured
+    # on ``points * unit_scale_m``, so the allowance must be too. The old
+    # ``edge_length * scale`` multiplied a user-units edge by a metres-per-unit
+    # factor, giving metres of an object this function never meshed.
+    allowed_edge = MAX_EDGE_OVERSHOOT * edge_m
 
     n_tets, tets, points = 0, None, None
     achieved = 0.0
@@ -547,7 +614,7 @@ def tetrahedralize(
         if n_tets == 0:
             raise MeshingError("tetrahedralization produced no elements")
 
-        achieved = achieved_edge_length(points * scale, tets)
+        achieved = achieved_edge_length(points * unit_scale_m, tets)
         over_cap = n_tets > max_tets
         too_coarse = achieved > allowed_edge
 
@@ -562,9 +629,10 @@ def tetrahedralize(
                 print(
                     f"[mse] WARNING: mesh is {achieved / allowed_edge:.1f}x "
                     f"coarser than the resolution rule allows "
-                    f"(achieved median edge {achieved / scale:.4g} {units}, "
-                    f"limit {allowed_edge / scale:.4g} {units}); solving anyway "
-                    "because enforce_resolution was disabled",
+                    f"(achieved median edge {achieved / unit_scale_m:.4g} "
+                    f"{units}, limit {allowed_edge / unit_scale_m:.4g} "
+                    f"{units}); solving anyway because enforce_resolution was "
+                    "disabled",
                     flush=True,
                 )
             break
@@ -575,7 +643,7 @@ def tetrahedralize(
             # worse, so there is no path to a correct answer. Refuse, rather
             # than report frequencies we know are wrong.
             raise MeshingError(
-                _coarse_message(n_modes, achieved / scale, edge_length, units)
+                _coarse_message(n_modes, achieved, edge_m, units)
             )
 
         if too_coarse:
@@ -584,7 +652,7 @@ def tetrahedralize(
             # wrong frequencies shown with confidence are worse than no answer.
             if attempt == MAX_MESH_ATTEMPTS - 1:
                 raise MeshingError(
-                    _coarse_message(n_modes, achieved / scale, edge_length, units)
+                    _coarse_message(n_modes, achieved, edge_m, units)
                 )
             # tets ~ 1/maxvolume, so scale by the third power of the edge ratio
             ratio = achieved / allowed_edge
@@ -630,13 +698,13 @@ def tetrahedralize(
                 flush=True,
             )
 
-    points_m = points * scale
+    points_m = points * unit_scale_m
 
     if verbose:
         print(
             f"[mse] mesh: {n_tets:,} tets, {points_m.shape[0]:,} points "
-            f"(surface {len(vertices):,}), target edge {edge_length:.4g} {units}, "
-            f"achieved median edge {achieved / scale:.4g} {units}",
+            f"(surface {len(vertices):,}), target edge {edge_units:.4g} {units}, "
+            f"achieved median edge {achieved / unit_scale_m:.4g} {units}",
             flush=True,
         )
 

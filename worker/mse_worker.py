@@ -996,7 +996,7 @@ def real_solve(job: dict, store_in, store_out, stage: StageReporter | None = Non
         max_tets=int(job["max_tets"]),
         grid=int(job.get("grid") or 64),
         verbose=True, backend="gpu", db=stage,
-        min_feature_mm=job.get("min_feature_mm"),
+        min_feature_m=job.get("min_feature_m"),
         scale=float(job.get("scale") or 1.0),
     )
 

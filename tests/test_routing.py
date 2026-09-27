@@ -356,10 +356,10 @@ class RoutingDb(FakeDb):
 
     def create_job(self, job_id, filename, units, n_index, n_modes,
                    target=DB.CLUSTER, est_tets=None,
-                   min_feature_mm=None, scale=1.0):
+                   min_feature_m=None, scale=1.0):
         super().create_job(job_id, filename, units, n_index, n_modes,
                            target=target, est_tets=est_tets,
-                           min_feature_mm=min_feature_mm, scale=scale)
+                           min_feature_m=min_feature_m, scale=scale)
         self.jobs[str(job_id)].update(target=target, est_tets=est_tets,
                                       gpu_queued_at="2026-09-26T00:00:00+00:00"
                                       if target == DB.JETSON else None,
@@ -580,7 +580,7 @@ class LeaseDb(RoutingDb):
 
     What that means for what is proved: the column list, the row indices and the
     returned dict in ``web/db.py:claim_jetson`` were read by hand and agree
-    (SELECT lists ``min_feature_mm, scale`` as columns 5 and 6; the return reads
+    (SELECT lists ``min_feature_m, scale`` as columns 5 and 6; the return reads
     ``row[4]`` and ``row[5]``). That is a manual check, not a test, and the
     reviewer should treat it as one. Reaching the real SQL needs Postgres, which
     is tier 2 -- so the honest position is that this leg is verified by reading
@@ -596,12 +596,12 @@ class LeaseDb(RoutingDb):
     #: The columns the real ``claim_jetson`` SELECTs, named here so the double
     #: cannot be more generous than the query it stands in for. Returning
     #: ``dict(job)`` was the earlier version and it hid a real defect class: the
-    #: SQL could stop selecting ``min_feature_mm``/``scale`` and every test would
+    #: SQL could stop selecting ``min_feature_m``/``scale`` and every test would
     #: still pass, because the double happened to hand back whatever the row
     #: held. A double that returns MORE than the query would is a double that
     #: cannot fail for the reason the query can.
     CLAIM_COLUMNS = ("job_id", "units", "n_index", "n_modes",
-                     "min_feature_mm", "scale")
+                     "min_feature_m", "scale")
 
     def claim_jetson(self, owner, lease_seconds):
         for job in self.jobs.values():
@@ -713,7 +713,7 @@ def test_a_claimed_job_carries_the_mesh_inputs(tmp_path, monkeypatch):
     monkeypatch.setenv("MSE_WORKER_TOKEN", "tok-abc-123")
     db = LeaseDb()
     db.create_job("job-1", "u.obj", "um", 1.5, 20, target=DB.JETSON,
-                  est_tets=40_000, min_feature_mm=0.25, scale=1000.0)
+                  est_tets=40_000, min_feature_m=0.25, scale=1000.0)
     app, _s, _d, _l = _make(tmp_path, db=db)
 
     resp = app.test_client().post("/worker/claim", headers=_auth())
@@ -721,7 +721,7 @@ def test_a_claimed_job_carries_the_mesh_inputs(tmp_path, monkeypatch):
     body = resp.get_json()
 
     assert body["units"] == "um"
-    assert body["min_feature_mm"] == 0.25
+    assert body["min_feature_m"] == 0.25
     assert body["scale"] == 1000.0
 
 
@@ -741,7 +741,7 @@ def test_a_claim_of_an_unscaled_featureless_job_says_so_plainly(tmp_path, monkey
     body = app.test_client().post("/worker/claim",
                                   headers=_auth()).get_json()
 
-    assert "min_feature_mm" in body and body["min_feature_mm"] is None
+    assert "min_feature_m" in body and body["min_feature_m"] is None
     assert "scale" in body and body["scale"] == 1.0
 
 

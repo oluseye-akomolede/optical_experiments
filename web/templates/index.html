@@ -42,9 +42,14 @@
       mesh grows in proportion to this number.
     </p>
     <div class="row">
-      <label>Smallest feature ({{ default_units }}) &mdash; optional
+      <label>Smallest feature &mdash; optional
         <input type="text" name="detail" value="auto" placeholder="auto"
                pattern="auto|([0-9]*\.?[0-9]+)">
+        <select name="feature_unit" aria-label="Smallest feature units">
+          {% for unit in feature_unit_choices %}
+          <option value="{{ unit }}"{% if unit == default_feature_unit %} selected{% endif %}>{{ unit }}</option>
+          {% endfor %}
+        </select>
       </label>
       <label>Scale factor &mdash; optional
         <input type="text" name="scale" value="" placeholder="1"
@@ -54,10 +59,12 @@
     <p class="muted small">
       Leave the feature size on <strong>auto</strong> for the default resolution, which
       is set by the physics of the modes you asked for. If your object has fine detail
-      the modes depend on &mdash; a thin wall, a narrow gap &mdash; enter its size in the
-      units above and the mesh will be refined to resolve it. Setting it larger than the
-      automatic value has no effect: the mesh is never made coarser than the detail you
-      name.
+      the modes depend on &mdash; a thin wall, a narrow gap &mdash; enter its size and
+      pick its unit from the menu beside it. The feature's unit is its own and is
+      <strong>independent of the units you uploaded your object in</strong>: <code>0.2
+      mm</code> means two hundred microns whether your .obj is in metres or in
+      millimetres. Setting it larger than the automatic value has no effect: the mesh is
+      never made coarser than the detail you name.
     </p>
     <p class="muted small">
       The <strong>scale factor</strong> multiplies the model before anything else looks

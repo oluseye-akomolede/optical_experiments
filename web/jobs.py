@@ -37,7 +37,7 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
                        ttl_seconds_after_finished: int = 30,
                        max_tets: int | None = None,
                        cpu_max_tets: int | None = None,
-                       min_feature_mm: float | None = None,
+                       min_feature_m: float | None = None,
                        scale: float = 1.0):
     """Return the ``batch/v1`` Job manifest that solves one upload.
 
@@ -80,12 +80,14 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
         # routed on is what makes that second decision agree with the first
         # instead of inventing a different one.
         env.append({"name": "MSE_CPU_MAX_TETS", "value": str(int(cpu_max_tets))})
-    if min_feature_mm is not None:
-        # The owner's declared smallest feature. Passed as a flag rather than an
-        # env var because it is a property of THIS upload, not of the machine --
-        # two jobs on one node have different feature sizes, and an env var is
-        # the wrong shape for a per-job value.
-        args += ["--min-feature", repr(float(min_feature_mm))]
+    if min_feature_m is not None:
+        # The owner's declared smallest feature, in METRES -- converted once at
+        # the upload form from its own nm/um/mm selector, never from the
+        # object's units. Passed as a flag rather than an env var because it is a
+        # property of THIS upload, not of the machine -- two jobs on one node
+        # have different feature sizes, and an env var is the wrong shape for a
+        # per-job value.
+        args += ["--min-feature", repr(float(min_feature_m))]
     if scale is not None and float(scale) != 1.0:
         # Omitted when 1.0 so a job with no scaling is byte-identical to what
         # this function produced before the argument existed -- which is what
@@ -173,7 +175,7 @@ class K8sJobLauncher:
         return self._client
 
     def manifest(self, job_id, units: str, n_index: float, n_modes: int,
-                 min_feature_mm: float | None = None,
+                 min_feature_m: float | None = None,
                  scale: float = 1.0) -> dict:
         return build_job_manifest(
             job_id, units, n_index, n_modes, self.image, self.pull_secret,
@@ -182,7 +184,7 @@ class K8sJobLauncher:
             ttl_seconds_after_finished=self.ttl_seconds_after_finished,
             max_tets=self.max_tets,
             cpu_max_tets=self.cpu_max_tets,
-            min_feature_mm=min_feature_mm, scale=scale,
+            min_feature_m=min_feature_m, scale=scale,
         )
 
     # -- cluster state -----------------------------------------------------
@@ -325,10 +327,10 @@ class K8sJobLauncher:
 
     # -- mutation ----------------------------------------------------------
     def create(self, job_id, units: str, n_index: float, n_modes: int,
-               min_feature_mm: float | None = None, scale: float = 1.0) -> str:
+               min_feature_m: float | None = None, scale: float = 1.0) -> str:
         """Create the Job and return its name."""
         manifest = self.manifest(job_id, units, n_index, n_modes,
-                                 min_feature_mm=min_feature_mm, scale=scale)
+                                 min_feature_m=min_feature_m, scale=scale)
         if self.dry_run:
             return manifest["metadata"]["name"]
         from kubernetes import client

@@ -86,7 +86,7 @@ def set_max_tets(limit: int | None) -> None:
 
     ``None`` restores the environment/default behaviour. Module state rather
     than a parameter threaded through every caller because the cap is a
-    property of the machine, not of a job -- unlike ``min_feature_mm``, which
+    property of the machine, not of a job -- unlike ``min_feature_m``, which
     is a property of the upload and travels as an argument.
 
     **A latch, not a job-scoped setting.** The override outlives the call that
@@ -167,9 +167,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epw", type=float, default=None,
                         help="edges per wavelength for mesh resolution (bench use)")
     parser.add_argument("--min-feature", type=float, default=None,
-                        metavar="SIZE",
-                        help="smallest feature to resolve, in --units (default: "
-                             "the physics edge alone)")
+                        metavar="METRES",
+                        help="smallest feature to resolve, in METRES -- not "
+                             "--units (default: the physics edge alone)")
     parser.add_argument("--scale", type=float, default=1.0,
                         help="multiply every vertex by this before any "
                              "measurement (default: 1.0)")
@@ -188,7 +188,7 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
           max_tets: int, grid: int, verbose: bool = True,
           db: "mse_db.JobStore | None" = None,
           backend: str | None = None,
-          min_feature_mm: float | None = None,
+          min_feature_m: float | None = None,
           scale: float = 1.0):
     """Run the pipeline and write every result. Returns a summary dict.
 
@@ -198,10 +198,14 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
     factorisation cannot disagree about which machine is running -- reading the
     env twice would let a test set it after the guard had already decided.
 
-    ``min_feature_mm`` and ``scale`` reach the mesh only, and they are the same
-    two numbers the app used for its ``est_tets``; if they were applied in one
-    place and not the other, routing would be wrong for exactly the detailed
-    jobs the GPU exists for.
+    ``min_feature_m`` (METRES, converted once at the upload form from its own
+    nm/um/mm selector -- never from ``units``) and ``scale`` reach the mesh only,
+    and they are the same two numbers the app used for its ``est_tets``; if they
+    were applied in one place and not the other, routing would be wrong for
+    exactly the detailed jobs the GPU exists for. That "same two numbers" is
+    only meaningful with one length space: when the feature arrived in the
+    object's units and the app and the mesher disagreed about which, the two
+    estimates differed by a factor of the scale.
 
     Raises on failure after recording the stage that failed; the caller turns
     that into a ``failed`` status and a non-zero exit.
@@ -230,7 +234,7 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
     points_m, tets = MESH.tetrahedralize(
         surface, units, n_modes=n_modes, n_index=n_index,
         max_tets=max_tets, verbose=verbose,
-        min_feature_mm=min_feature_mm, scale=scale,
+        min_feature_m=min_feature_m, scale=scale,
     )
     timings["meshing"] = time.time() - t0
 
@@ -322,7 +326,7 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
         job_id, store_out, surface, points_m, tets, edges, tet_edges, signs,
         eigenvectors, k, k0, freq_hz, wavelength_m, units, n_index, grid,
         free_edges=free_edges, n_edges=n_edges, verbose=verbose,
-        min_feature_mm=min_feature_mm, scale=scale,
+        min_feature_m=min_feature_m, scale=scale,
     )
     timings["writing"] = time.time() - t0
     timings["total"] = time.time() - t_start
@@ -356,7 +360,7 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
 def write_results(job_id, store_out, surface, points_m, tets, edges, tet_edges,
                   signs, eigenvectors, k, k0, freq_hz, wavelength_m,
                   units, n_index, grid, free_edges=None, n_edges=None,
-                  verbose=True, min_feature_mm=None, scale=1.0):
+                  verbose=True, min_feature_m=None, scale=1.0):
     """Write surface.glb, modes.json, mode_XX.bin and mode_XX.vtu.
 
     ``eigenvectors`` are the PEC-reduced vectors; ``free_edges``/``n_edges`` let
@@ -431,7 +435,7 @@ def write_results(job_id, store_out, surface, points_m, tets, edges, tet_edges,
         # and the next reader all need to know which object produced these
         # frequencies without re-reading the Job.
         "scale": float(scale),
-        "min_feature": None if min_feature_mm is None else float(min_feature_mm),
+        "min_feature": None if min_feature_m is None else float(min_feature_m),
         "grid": {
             "nx": int(nx), "ny": int(ny), "nz": int(nz),
             "origin": [float(v) for v in origin],
@@ -553,7 +557,7 @@ def main(argv=None) -> int:
             job_id, args.units, args.n_index, args.n_modes,
             store_in, store_out, effective_max_tets, args.grid,
             verbose=verbose, db=db,
-            min_feature_mm=args.min_feature, scale=args.scale,
+            min_feature_m=args.min_feature, scale=args.scale,
         )
     except BaseException as exc:  # noqa: BLE001 - record, then re-raise as exit code
         print(f"[mse] FAILED: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)

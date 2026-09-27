@@ -21,6 +21,17 @@ between runs:
       -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=msecheck -p 55432:5432 \\
       postgres:16-alpine
 
+-- and TEAR IT DOWN when you are done, ending with ``docker ps -a``:
+
+    docker rm -f mse-pgcheck && docker ps -a
+
+(``DOCKER_CONFIG=~/.docker-mse`` for both, and for every docker command in this
+rig.) The trailing ``docker ps -a`` is not ceremony: a check leaves a container
+behind every time it is run, and a leftover holds the port so the NEXT run
+connects to the old one -- whose schema is the previous commit's. That is a
+check silently reading a stale world, which is the failure this file exists to
+prevent, committed by the file itself.
+
 Why this file exists
 --------------------
 The rest of the suite runs against a Python double (tests set ``MSE_DB_MOCK``),
@@ -29,7 +40,7 @@ real ``web/db.py`` query is wrong*. Two things were therefore verified by READIN
 and never by RUNNING:
 
   1. ``claim_jetson``'s SELECT column list and the row indices it returns -- the
-     SELECT lists ``min_feature_mm, scale`` and the return reads ``row[4]``,
+     SELECT lists ``min_feature_m, scale`` and the return reads ``row[4]``,
      ``row[5]``. Change the SELECT to ``NULL, NULL`` and the whole suite stays
      green.
   2. Any bound on repeated releases. A race needs two concurrent transactions in
@@ -131,25 +142,69 @@ def insert_job(conn, job_id, **cols):
 def check_claim_columns(conn, r: Result, JobStore):
     """A2: claim_jetson's SELECT and its return indices must agree.
 
-    Insert DISTINCT values for min_feature_mm and scale. Identical values would
+    Insert DISTINCT values for min_feature_m and scale. Identical values would
     pass a query that selected the right columns in the wrong order, or a return
     that read the wrong indices -- the check would then be blind to exactly the
     defect it exists for.
     """
     jid = str(uuid.uuid4())
-    insert_job(conn, jid, **{"min_feature_mm": 0.37, "scale": 1234.5})
+    insert_job(conn, jid, **{"min_feature_m": 0.37, "scale": 1234.5})
     # Call the REAL method, so a wrong column list or a wrong row index in
     # web/db.py fails here. Re-stating its SQL would test my transcription.
     got = JobStore(dsn=DSN_OF[0]).claim_jetson("w-race", lease_seconds=300)
     if got is None:
         return r.check("A2 claim_jetson returns the seeded row", False,
                        "no row came back")
-    r.check("A2 claim_jetson returns min_feature_mm/scale under the right keys "
+    r.check("A2 claim_jetson returns min_feature_m/scale under the right keys "
             "(a wrong SELECT column or index fails here)",
-            got.get("min_feature_mm") == 0.37 and got.get("scale") == 1234.5,
-            f"min_feature_mm={got.get('min_feature_mm')!r} "
+            got.get("min_feature_m") == 0.37 and got.get("scale") == 1234.5,
+            f"min_feature_m={got.get('min_feature_m')!r} "
             f"scale={got.get('scale')!r} (want 0.37 / 1234.5; distinct so a swap "
             f"or a NULL-pair SELECT is visible)")
+
+
+def check_feature_triplet_roundtrip(conn, r: Result, JobStore):
+    """A2b: the three feature columns survive a write/read cycle, distinctly.
+
+    The row keeps the feature THREE ways -- the number typed, the unit chosen,
+    and the canonical metres -- and all three share one SELECT list and one set
+    of row indices in ``web/db.py``. A swap between ``min_feature_value`` and
+    ``min_feature_m`` (two floats, adjacent in the list) is invisible unless the
+    values are distinct, and it is the exact defect this file exists for: the
+    store would hand back a number that looks right and means something else.
+
+    Read through the REAL ``get_job``, not through re-stated SQL, so a wrong
+    column list or row index in the store fails here rather than in production.
+
+    The inserted row is DELETED before returning. This leg only reads, so it
+    never claims the row, which would leave it ``queued`` and claimable -- and
+    the next leg to claim would be handed THIS row instead of its own, failing
+    with an ordering error that has nothing to do with what it tests. Measured:
+    without this delete, ``check_release_bound``'s ``_claim_row`` drained its
+    ``DRAIN`` allowance on this row and raised. A read-only leg must not leave
+    claimable state behind, for the same reason ``_claim_row`` releases what it
+    touches.
+    """
+    jid = str(uuid.uuid4())
+    # Distinct in EVERY position, including the unit: 0.2 / 2e-4 / 'nm' cannot
+    # be mistaken for one another, whereas 2.0 / 2.0 would hide a swap.
+    insert_job(conn, jid, **{"min_feature_m": 2e-4, "min_feature_value": 0.2,
+                             "min_feature_unit": "nm"})
+    try:
+        got = JobStore(dsn=DSN_OF[0]).get_job(jid)
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM mse.jobs WHERE job_id = %s", (jid,))
+        conn.commit()
+    if got is None:
+        return r.check("A2b get_job returns the seeded row", False, "no row")
+    r.check("A2b the min_feature_* triplet round-trips through the real store "
+            "(a value<->metres swap or an off-by-one index fails here)",
+            got.get("min_feature_m") == 2e-4
+            and got.get("min_feature_value") == 0.2
+            and got.get("min_feature_unit") == "nm",
+            f"m={got.get('min_feature_m')!r} value={got.get('min_feature_value')!r} "
+            f"unit={got.get('min_feature_unit')!r} (want 2e-04 / 0.2 / 'nm')")
 
 
 def _race(conn, dsn, r: Result, col: str, bound: int, rounds: int = 60,
@@ -576,6 +631,7 @@ def main() -> int:
         JobStore(dsn=dsn).apply_schema()   # the PROJECT's own path
         print("schema applied via web/db.py:JobStore.apply_schema()")
         check_claim_columns(conn, r, JobStore)
+        check_feature_triplet_roundtrip(conn, r, JobStore)
         check_release_bound(conn, r, args.bound, args.dsn, JobStore, db_module)
         # The expiry path is its own route (a worker that DIES never calls
         # /release), so it gets its own legs rather than reusing the release

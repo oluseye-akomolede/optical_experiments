@@ -59,7 +59,13 @@ class FakeDb:
     # writes
     def create_job(self, job_id, filename, units, n_index, n_modes,
                    target=DB.CLUSTER, est_tets=None,
-                   min_feature_mm=None, scale=1.0):
+                   min_feature_m=None, min_feature_value=None,
+                   min_feature_unit=None, scale=1.0):
+        # All THREE feature columns, because the real store has all three: the
+        # number the owner typed, the unit they chose, and the canonical metres
+        # the solver gets. A double that kept only the metres would pass a test
+        # in which the app wrote a value the database silently drops -- and the
+        # two typed fields are what the job page shows back to the owner.
         self.jobs[str(job_id)] = {
             "job_id": str(job_id), "created_at": "2026-09-26T00:00:00+00:00",
             "original_filename": filename, "units": units, "n_index": n_index,
@@ -67,7 +73,10 @@ class FakeDb:
             "message": None, "k8s_job_name": None, "peak_rss_mb": None,
             "finished_at": None,
             "target": target, "est_tets": est_tets,
-            "min_feature_mm": min_feature_mm, "scale": scale,
+            "min_feature_m": min_feature_m,
+            "min_feature_value": min_feature_value,
+            "min_feature_unit": min_feature_unit,
+            "scale": scale,
         }
 
     def mark_running(self, job_id, name):
@@ -208,7 +217,7 @@ class FakeLauncher:
         return {n: r for n, r in self.failed.items() if n in self.active}
 
     def create(self, job_id, units, n_index, n_modes,
-               min_feature_mm=None, scale=1.0):
+               min_feature_m=None, scale=1.0):
         if self.quota_full:
             raise JOBS.QuotaExceeded("exceeded quota: count/jobs.batch")
         if self.fail_with is not None:
@@ -216,14 +225,14 @@ class FakeLauncher:
         name = JOBS.job_name(job_id)
         self.created.append({"job_id": str(job_id), "units": units,
                              "n_index": n_index, "n_modes": n_modes,
-                             "min_feature_mm": min_feature_mm, "scale": scale,
+                             "min_feature_m": min_feature_m, "scale": scale,
                              # recorded so a test can assert the OPTIONAL flag is
                              # absent, not merely falsy -- the real manifest omits
                              # --min-feature rather than passing a zero, and that
                              # distinction is what keeps 'auto' meaning 'no opinion'
                              "args": list(JOBS.build_job_manifest(
                                  job_id, units, n_index, n_modes, "img", "sec",
-                                 "ns", min_feature_mm=min_feature_mm,
+                                 "ns", min_feature_m=min_feature_m,
                                  scale=scale)["spec"]["template"]["spec"]
                                  ["containers"][0]["args"]),
                              "name": name})
@@ -438,23 +447,64 @@ def test_the_upload_form_options_reach_the_job(tmp_path):
 def test_the_detail_option_reaches_the_solver_not_just_the_form(tmp_path):
     """The field the whole row exists for: it must not stop at the row.
 
-    ``min_feature_mm`` was accepted and validated and then dropped, so the mesh
-    was built at the physics edge while the route was computed as if it were
-    not. This asserts the full path the lead asked for -- the row AND the Job
-    the solver gets handed -- because passing one and not the other is exactly
-    the half-wired state that produced the bug.
+    The feature was accepted and validated and then dropped, so the mesh was
+    built at the physics edge while the route was computed as if it were not.
+    This asserts the full path the lead asked for -- the row AND the Job the
+    solver gets handed -- because passing one and not the other is exactly the
+    half-wired state that produced the bug.
+
+    The units are the point of the round: ``0.2`` typed with the default unit
+    (mm) is stored as ``2e-4`` METRES for the solver, and the typed pair is
+    kept beside it so the page can say it back in the owner's own words.
     """
     app, _store, db, launcher = make_app(tmp_path)
     # 0.2 mm on the test's box is below the physics edge but still inside the
     # cap. Worth knowing: a feature fine enough to blow the cap is REFUSED at
     # upload rather than queued, which is the conservative-estimate behaviour
     # doing its job -- 0.05 mm on this box estimates 39.2M elements.
-    upload(app.test_client(), detail="0.2")
+    upload(app.test_client(), detail="0.2", feature_unit="mm")
     (job,) = db.jobs.values()
 
-    assert job["min_feature_mm"] == 0.2
-    assert launcher.created[0]["min_feature_mm"] == 0.2
+    assert job["min_feature_m"] == pytest.approx(2e-4)
+    assert job["min_feature_value"] == 0.2
+    assert job["min_feature_unit"] == "mm"
+    assert launcher.created[0]["min_feature_m"] == pytest.approx(2e-4)
     assert "--min-feature" in launcher.created[0]["args"]
+
+
+def test_the_job_page_shows_the_feature_in_the_unit_the_owner_typed(tmp_path):
+    """The page is where the owner checks what they asked for.
+
+    The feature's unit is its own, so the page must print the TYPED unit and
+    never the object's -- a page that re-spelled 25 nm as "2.5e-05 mm" would be
+    arithmetically true and useless to read. This is also the render check the
+    rig insists on: an HTTP 200 is not evidence that an element is present, so
+    the response body is parsed for the element and its text.
+    """
+    for value, unit, want_m, want_text in (
+        ("0.2", "mm", 2e-4, "0.2 mm"),
+        ("25", "nm", 2.5e-8, "25 nm"),
+        ("0.025", "um", 2.5e-8, "0.025 um"),
+    ):
+        app, _store, db, _launcher = make_app(tmp_path / f"{value}{unit}")
+        client = app.test_client()
+        nm_box = trimesh.creation.box(extents=[200.0, 120.0, 80.0])
+        upload(client, data=nm_box.export(file_type="obj").encode(),
+               units="nm", detail=value, feature_unit=unit)
+        (job,) = db.jobs.values()
+
+        assert job["min_feature_m"] == pytest.approx(want_m), (
+            f"{value} {unit} stored the wrong length; and note 25 nm and "
+            f"0.025 um are the SAME physical length, which is why they share an "
+            f"expectation"
+        )
+        assert job["min_feature_unit"] == unit
+
+        body = client.get(f"/jobs/{job['job_id']}").get_data(as_text=True)
+        found = re.search(r'<span id="resolution">(.*?)</span>', body, re.S)
+        assert found is not None, "the resolution element is absent from the page"
+        assert " ".join(found.group(1).split()) == \
+            f"requested mesh resolution {want_text}"
 
 
 def test_auto_leaves_the_feature_unset_rather_than_zero(tmp_path):
@@ -468,8 +518,8 @@ def test_auto_leaves_the_feature_unset_rather_than_zero(tmp_path):
     upload(app.test_client(), detail="auto")
     (job,) = db.jobs.values()
 
-    assert job["min_feature_mm"] is None
-    assert launcher.created[0]["min_feature_mm"] is None
+    assert job["min_feature_m"] is None
+    assert launcher.created[0]["min_feature_m"] is None
     # and the job the solver is handed must not carry the flag at all
     assert "--min-feature" not in launcher.created[0].get("args", [])
 

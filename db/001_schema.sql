@@ -52,9 +52,18 @@ CREATE TABLE IF NOT EXISTS mse.jobs (
     peak_rss_mb       double precision,
     finished_at       timestamptz,
     -- The mesh inputs the owner may set. Present here as well as in the upgrade
-    -- block below so a fresh database and an upgraded one end up identical;
-    -- `min_feature_mm` NULL means "the physics edge alone".
-    min_feature_mm    double precision,
+    -- block below so a fresh database and an upgraded one end up identical.
+    --
+    -- The smallest feature is a PHYSICAL length: the owner types a number and
+    -- picks nm/um/mm, INDEPENDENT of the object's `units`. `min_feature_m` is
+    -- the canonical metres value the solver uses; `min_feature_value` and
+    -- `min_feature_unit` are the input as typed, kept so the page can show the
+    -- owner their own number back. All three NULL means "the physics edge
+    -- alone". Three columns rather than one because a length whose unit is
+    -- implicit is exactly what the bug this replaces was made of.
+    min_feature_m     double precision,
+    min_feature_value double precision,
+    min_feature_unit  text,
     scale             double precision NOT NULL DEFAULT 1.0,
     -- How many times a GPU worker has handed this job back with no verdict
     -- (POST /worker/jobs/<id>/release). It exists so that a job which can never
@@ -159,16 +168,31 @@ BEGIN
     END IF;
 
     -- The two mesh inputs the owner can set. Both are recorded rather than
-    -- derived: min_feature_mm is the smallest feature the modes must resolve
-    -- (NULL = the physics edge alone), and scale multiplies every vertex before
+    -- derived: the min_feature_* triplet is the smallest feature the modes must
+    -- resolve (NULL = the physics edge alone; see the CREATE TABLE above for
+    -- why it is three columns), and scale multiplies every vertex before
     -- anything measures it. Without these a job's frequencies cannot be
     -- explained from its row alone -- the same .obj at scale 1000 is a
     -- different object, and the row would not say so.
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'min_feature_mm'
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'min_feature_m'
     ) THEN
-        ALTER TABLE mse.jobs ADD COLUMN min_feature_mm double precision;
+        ALTER TABLE mse.jobs ADD COLUMN min_feature_m double precision;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'min_feature_value'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN min_feature_value double precision;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'min_feature_unit'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN min_feature_unit text;
     END IF;
 
     -- NOT NULL DEFAULT 1: an old row is an unscaled upload by definition, so
