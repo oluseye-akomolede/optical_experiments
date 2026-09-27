@@ -238,20 +238,37 @@ def _fail_dead_jobs(launcher, jobs_db, log=print) -> int:
         # A launcher that cannot report Job conditions cannot tell a dead solve
         # from a live one; leave the rows for a launcher that can.
         return 0
+
+    # Each call is made on its own, and each can fail alone. "Could not ask" and
+    # "there is nothing there" are different answers, so a raise from either one
+    # ends the reconcile for this tick -- failing a live solve on an answer we
+    # never got is much worse than a spinner that lasts one more tick.
+    #
+    # Both calls must succeed, not just one. They are separate requests to the
+    # cluster and either can fail first; a launcher that raised from
+    # ``active_job_names`` while ``job_states`` answered an empty dict is a shape
+    # that a placeholder cannot rescue, because an empty dict reads as "no Job
+    # here has failed" and every running row then falls through to the ''else''.
+    # That shape used to be unreachable by luck -- both calls hitting the same
+    # 403 -- and this makes it unreachable by construction.
     try:
-        present = set(_active_jobs(launcher))
+        names = launcher.active_job_names()
+    except Exception as exc:  # noqa: BLE001 - never let a tick crash the loop
+        log(f"[mse-web] could not list solver jobs: {exc}")
+        return 0
+    try:
         states = launcher.job_states()
     except Exception as exc:  # noqa: BLE001 - never let a tick crash the loop
         log(f"[mse-web] could not read job states: {exc}")
         return 0
+    present = set(names)
 
     # There is deliberately no "present is empty, so fail nothing" guard here.
     # It looks safer and is not: a Job that was deleted by hand (or lost with its
     # node) leaves an empty list too, and that is precisely the case BUG B exists
     # to fail -- the guard would have restored the permanent spinner the fix
-    # removed. The 403 that motivated it is handled at the source instead: both
-    # list calls now raise ``CannotAskCluster``, so "we were not allowed to look"
-    # arrives at the handler above and never reaches this loop as an empty list.
+    # removed. Both list calls raise on an unreadable cluster, so an empty list
+    # here can only mean a successful look that found nothing.
 
     # In dry-run there is no cluster, so `present` is empty and every running
     # row would look dead. The in-memory launcher's own state is the only view

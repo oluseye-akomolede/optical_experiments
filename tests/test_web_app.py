@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import types
 import uuid
 from pathlib import Path
 
@@ -160,6 +161,92 @@ def test_a_plain_403_is_not_a_quota_wait():
 
     launcher = JOBS.K8sJobLauncher("ns", "img", "secret", dry_run=True)
     assert launcher.is_quota_exceeded(FakeApiError()) is False
+
+
+# ---------------------------------------------------------------------------
+# The launcher's list calls, reached without a cluster
+# ---------------------------------------------------------------------------
+# ``_batch()`` returns ``self._client`` when it is already set, so assigning a
+# fake here short-circuits the lazy kubernetes import: no kube config, no
+# cluster, and the branch under test is the real production one. The 403 fix was
+# briefly pinned only by reading the source on the assumption that the client
+# was unreachable in a unit test. It is reachable.
+class _FakeApi:
+    def __init__(self, exc=None, jobs=()):
+        self._exc = exc
+        self._jobs = list(jobs)
+        self.calls = 0
+
+    def list_namespaced_job(self, namespace, label_selector=None):
+        self.calls += 1
+        if self._exc is not None:
+            raise self._exc
+        return types.SimpleNamespace(items=self._jobs)
+
+
+def _launcher_with(exc=None, jobs=()):
+    launcher = JOBS.K8sJobLauncher("ns", "img", "secret")
+    api = _FakeApi(exc=exc, jobs=jobs)
+    launcher._client = api                    # short-circuits _batch()
+    return launcher, api
+
+
+def _api_exception(status):
+    """A real kubernetes ``ApiException`` when importable, else a stand-in.
+
+    The production code catches ``kubernetes.client.ApiException`` and reads
+    ``.status``. Importing kubernetes keeps this honest about the type the real
+    call raises; the fallback keeps the suite runnable without it.
+    """
+    try:
+        from kubernetes import client
+        return client.ApiException(status=status, reason="Forbidden")
+    except Exception:  # noqa: BLE001 - kubernetes not installed
+        exc = Exception("Forbidden")
+        exc.status = status
+        return exc
+
+
+def test_active_job_names_raises_on_a_403_instead_of_returning_empty():
+    """The reviewer's defect as behaviour, not as source text.
+
+    An empty list is a *claim* that nothing is there, and both callers act on
+    that claim: the tick launches, and ``_fail_dead_jobs`` fails every running
+    row. Answering a permission error with that claim is what failed live solves.
+    """
+    launcher, _api = _launcher_with(exc=_api_exception(403))
+    with pytest.raises(JOBS.CannotAskCluster):
+        launcher.active_job_names()
+
+
+def test_job_states_raises_on_a_403_instead_of_returning_empty():
+    launcher, _api = _launcher_with(exc=_api_exception(403))
+    with pytest.raises(JOBS.CannotAskCluster):
+        launcher.job_states()
+
+
+def test_a_non_403_api_error_is_not_relabelled_as_a_refusal():
+    """A 500 or a timeout must reach the caller as itself.
+
+    ``CannotAskCluster`` means "we were not allowed to look". Anything else is a
+    different failure and must not be dressed as one. Both are errors rather
+    than empty answers, which is the property that matters here.
+    """
+    launcher, _api = _launcher_with(exc=_api_exception(500))
+    for call in (launcher.active_job_names, launcher.job_states):
+        with pytest.raises(Exception) as excinfo:
+            call()
+        assert not isinstance(excinfo.value, JOBS.CannotAskCluster)
+
+
+def test_a_good_list_returns_the_names_and_the_failure_states():
+    """The happy path, so the raise is not hiding a broken success path."""
+    job = types.SimpleNamespace(metadata=types.SimpleNamespace(name="mse-solver-a"),
+                                status=types.SimpleNamespace(conditions=[]))
+    launcher, api = _launcher_with(jobs=[job])
+    assert launcher.active_job_names() == ["mse-solver-a"]
+    assert launcher.job_states() == {}
+    assert api.calls == 2, "one list call per method"
 
 
 # ---------------------------------------------------------------------------

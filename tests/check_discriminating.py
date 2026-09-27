@@ -266,6 +266,8 @@ CASES.append(Case(
 
 WEB_APP = ROOT / "web" / "app.py"
 WEB_TEST_FILE = "tests/test_web_routes.py"
+#: the launcher's own tests, where the real 403 branch is driven through a fake _client
+LAUNCHER_TEST_FILE = "tests/test_web_app.py"
 
 # BUG B: a dead Job's row staying `running` forever. Two reversions, because the
 # fix has two halves and they fail in opposite directions -- dropping the failure
@@ -383,15 +385,62 @@ CASES.append(Case(
             "            if exc.status == 403:\n"
             "                return []",
         ),
-        # and the sentence that says it raises, which the probe reads
+        # the sentence that says it raises, so the source stays coherent with
+        # the reverted behaviour rather than a docstring contradicted by code
         (
             JOBS_MODULE,
             "        Raises on 403 rather than returning ``[]``. An empty list is a *claim*",
             "        Returns ``[]`` when the list call is forbidden. An empty list is a claim",
         ),
     ],
+    # Two, and they are the *behavioural* tests in test_web_app.py: the reversion
+    # is caught by driving the real 403 branch through a fake `_client`, which is
+    # what the lead pointed out was possible all along. This case used to expect a
+    # source probe instead; that probe is gone.
     expect_failing={
-        "test_the_launcher_raises_on_a_403_instead_of_answering_empty",
+        "test_active_job_names_raises_on_a_403_instead_of_returning_empty",
+        "test_job_states_raises_on_a_403_instead_of_returning_empty",
+    },
+    test_file=LAUNCHER_TEST_FILE,
+))
+
+# The split answer: one list call raising while the other answers. This is the
+# shape that shows the placeholder is not what protects `_fail_dead_jobs` -- an
+# empty dict from `job_states` reads as "nothing failed", and the running row is
+# failed. Fixing it required `_fail_dead_jobs` to require BOTH calls to succeed,
+# so this reversion is the guard's own test.
+CASES.append(Case(
+    name="reconcile-on-a-partial-answer",
+    why="failing rows off a list call that never answered",
+    edits=[(
+        WEB_APP,
+        "    try:\n"
+        "        names = launcher.active_job_names()\n"
+        "    except Exception as exc:  # noqa: BLE001 - never let a tick crash the loop\n"
+        "        log(f\"[mse-web] could not list solver jobs: {exc}\")\n"
+        "        return 0\n"
+        "    try:\n"
+        "        states = launcher.job_states()\n"
+        "    except Exception as exc:  # noqa: BLE001 - never let a tick crash the loop\n"
+        "        log(f\"[mse-web] could not read job states: {exc}\")\n"
+        "        return 0\n"
+        "    present = set(names)",
+        "    try:\n"
+        "        present = set(_active_jobs(launcher))\n"
+        "        states = launcher.job_states()\n"
+        "    except Exception as exc:  # noqa: BLE001 - never let a tick crash the loop\n"
+        "        log(f\"[mse-web] could not read job states: {exc}\")\n"
+        "        return 0",
+    )],
+    # One, not two, and the reason is worth keeping. Only the first direction
+    # discriminates: it needs `job_states` to *answer*, which the old combined
+    # try/except does not guard. The mirror -- `job_states` raising while
+    # `active_job_names` answers -- is caught by the old code too, because a
+    # raise from either call inside the single try reaches the same handler. So
+    # the mirror pins the behaviour without distinguishing the two shapes, and
+    # saying so is better than leaving a second name here that never fires.
+    expect_failing={
+        "test_one_call_raising_while_the_other_answers_still_fails_nothing",
     },
     test_file=WEB_TEST_FILE,
 ))
@@ -459,6 +508,20 @@ def run_case(case: Case) -> bool:
              "-p", "no:randomly", "--tb=no"],
             cwd=str(ROOT), capture_output=True, text=True,
         )
+        # "Unrunnable" and "passing" must not be the same input. If pytest never
+        # ran -- wrong interpreter, import error, a collection failure -- stdout
+        # holds no FAILED lines and every expected set would compare empty and
+        # report MISMATCH, or worse, a case expecting nothing would report OK.
+        # That is the same class of error as the 403 defect: an empty result
+        # standing in for "we could not ask".
+        if proc.returncode not in (0, 1):
+            print(f"\n=== {case.name} ===")
+            print(f"  COULD NOT RUN: pytest exited {proc.returncode}")
+            tail = (proc.stderr or proc.stdout).strip().splitlines()[-4:]
+            for line in tail:
+                print(f"    {line}")
+            ok = False
+            return ok
         failing = set()
         for line in proc.stdout.splitlines():
             if not line.startswith("FAILED"):
@@ -495,6 +558,19 @@ def main(argv=None) -> int:
     parser.add_argument("case", nargs="?", help="which case to run")
     parser.add_argument("--list", action="store_true", help="list the cases")
     args = parser.parse_args(argv)
+
+    # Fail here rather than reporting 18 clean mismatches. This checker shells
+    # out with sys.executable; run it under an interpreter without pytest and
+    # every subprocess dies on import, stdout holds no FAILED lines, and each
+    # case compares an empty set. On 2026-09-27 that cost a round of redesigning
+    # tests that were never the problem.
+    import importlib.util
+    if importlib.util.find_spec("pytest") is None:
+        raise SystemExit(
+            f"this checker runs pytest as a subprocess of {sys.executable!r}, "
+            "which cannot import it -- use the venv:\n"
+            "  .venv-mse/bin/python tests/check_discriminating.py"
+        )
 
     if args.list:
         for case in CASES:
