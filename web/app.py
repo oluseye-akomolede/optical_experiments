@@ -130,7 +130,13 @@ def create_app(config: dict | None = None) -> Flask:
     def job_slices(job_id):
         """The mode index: what each mode is, without any field data."""
         manifest = _done_manifest(store, jobs_db, job_id)
-        return jsonify(_mode_index(manifest, store, job_id))
+        try:
+            index = _mode_index(manifest, store, job_id)
+        except STORE.StorageError:
+            # We could not check the field files, so we cannot say which modes
+            # are available -- and a 200 here would say all of them are gone.
+            abort(502)
+        return jsonify(index)
 
     @app.route("/jobs/<job_id>/slices/<int:number>.json")
     def job_slices_for_mode(job_id, number):
@@ -460,14 +466,23 @@ def _mode_index(manifest: dict, store, job_id: str) -> dict:
     it (``FIELD_NAME``). An index that promised a mode the fetcher could not
     deliver would be the same defect in a different costume: the list says the
     mode is there, and the truth arrives only after a doomed request.
+
+    **``available`` is only ever set false from a successful check.** The store
+    already draws the line this needs: ``None`` means "looked, and it is not
+    there", while ``StorageError`` means "could not look at all". Collapsing the
+    second into the first is the bug this function has already been fixed for
+    once, and it is the same one the 403 handling was fixed for: a failure to ask
+    rendered as an answer of nothing. So ``StorageError`` is allowed to
+    propagate, and the route turns it into a 502 rather than a 200 full of false
+    flags. A viewer that greys out every mode because the bucket was unreachable
+    has been told something false about the data.
     """
     modes = []
     for mode in manifest.get("modes", []):
         index = int(mode["index"])
-        try:
-            size = store.size(STORE.job_key(job_id, FIELD_NAME.format(index)))
-        except STORE.StorageError:
-            size = None
+        # No except: a store that cannot answer must abort the request, not
+        # quietly report every mode as missing.
+        size = store.size(STORE.job_key(job_id, FIELD_NAME.format(index)))
         modes.append({
             "index": index,
             "freq_hz": mode.get("freq_hz"),

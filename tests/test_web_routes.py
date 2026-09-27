@@ -704,6 +704,54 @@ def test_the_index_and_the_fetch_agree_on_which_modes_exist(tmp_path):
         1: False, 2: False, 3: False, 4: True}
 
 
+def test_an_unreachable_store_is_an_error_not_a_page_of_missing_modes(tmp_path):
+    """A store we cannot ask must not answer "all modes are gone".
+
+    ``available: false`` is a claim about the data. ``StorageError`` means the
+    claim could not be checked at all -- S3 down, credentials lapsed, a network
+    partition -- and rendering it as a 200 full of false flags tells the owner
+    something false: every mode greyed out, and no error anywhere to explain it.
+
+    This is the signature defect in its third costume (403 into an empty list,
+    not-allowed-to-look into nothing-there, and now storage-unreachable into
+    file-missing). The store already draws the line -- ``None`` is "looked and
+    it is not there", an exception is "could not look" -- so the test asserts the
+    route keeps it, and the asymmetry that proves it: the very same store serves
+    a mode the index refused to describe.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=3)
+
+    client = app.test_client()
+    # A positive control first: with a working store the index is a 200 and the
+    # modes are genuinely available. Without this, a route that always 502s
+    # would pass the assertion below for the wrong reason.
+    healthy = client.get(f"/jobs/{job['job_id']}/slices.json")
+    assert healthy.status_code == 200
+    assert {m["available"] for m in healthy.get_json()["modes"]} == {True}
+
+    def unreachable(key):
+        raise STORE.StorageError(f"could not check {key} in storage")
+
+    # The app builds its own store from ``MSE_LOCAL_STORE``; ``make_app``'s
+    # store is a second handle on the same directory, used to lay down fixtures.
+    # Patching the app's handle is the one the routes call.
+    app.extensions["mse"]["store"].size = unreachable
+    response = client.get(f"/jobs/{job['job_id']}/slices.json")
+
+    assert response.status_code == 502, (
+        "an uncheckable store must be an error the viewer can report, not a "
+        "200 claiming every mode is missing"
+    )
+    # And the fetch route, on the same broken store, still serves the mode --
+    # which is the proof that the index's "all false" would have been a lie
+    # about the data rather than a fact about it.
+    assert client.get(
+        f"/jobs/{job['job_id']}/slices/1.json").status_code == 200
+
+
 def test_slices_json_is_empty_before_the_job_finishes(tmp_path):
     app, _store, db, _launcher = make_app(tmp_path)
     upload(app.test_client())
