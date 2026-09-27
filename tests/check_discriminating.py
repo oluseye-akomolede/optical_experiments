@@ -310,15 +310,19 @@ CASES.append(Case(
         "        elif name and name in present:\n"
         "            pass                           # BUG: alive, but failed anyway",
     )],
-    # Three, not the one. The two extra are the slot tests, and they are not
+    # Four, not the one. Two extras are the slot tests, and they are not
     # incidental: a healthy Job failed by this bug is now terminal, so the tick
     # reaps it and the next upload starts, which is precisely the "every upload
     # fails" damage described above. They are the same defect measured on the
-    # queue rather than on the row.
+    # queue rather than on the row. The fourth is the transient-error test,
+    # which came later and pins the same healthy-Job survival from the other
+    # side: its second tick sees a present, unfailed Job, and this reversion
+    # fails it there too.
     expect_failing={
         "test_a_live_job_is_never_failed_or_deleted",
         "test_a_queued_or_running_job_is_never_deleted",
         "test_the_tick_does_nothing_when_the_slot_is_occupied",
+        "test_a_transient_list_error_then_a_good_list_behaves_normally",
     },
     test_file=WEB_TEST_FILE,
 ))

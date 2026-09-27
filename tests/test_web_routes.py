@@ -270,6 +270,48 @@ def test_the_launcher_raises_on_a_403_instead_of_answering_empty():
     )
 
 
+def test_a_transient_list_error_then_a_good_list_behaves_normally(tmp_path):
+    """One failed list must not cost the solve its life.
+
+    A blip -- a timeout, a 403 that clears, a rolling API server -- makes one
+    tick unable to see the cluster. The row must survive that tick untouched, and
+    the next good list must reconcile it normally, because the Job really is
+    still there. This is the reviewer's case in the shape the owner would meet
+    it: nothing failed, nothing was deleted, and the solve ran to completion.
+
+    The failure is injected by flipping ``cannot_ask`` between the two ticks.
+    That means this test passes on ``e5b2e3e`` too, and it is worth saying why
+    rather than finding out later: the swallow makes the *first* tick fail the
+    row, and this test only inspects the row's survival, which is a difference
+    it cannot see -- both a fixed and a broken launcher leave the second tick
+    looking the same. It is a regression test for the reconcile-not-crash path,
+    not a discriminator for the 403 defect. See
+    ``launcher_still_raises_on_403`` for what covers that.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    name = job["k8s_job_name"]
+    assert job["status"] == DB.RUNNING
+
+    launcher.cannot_ask = True
+    first = APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    assert first["failed"] == 0, "a blip must not fail a live solve"
+    assert first["launched"] is None, "and must not launch into an unknown slot"
+    assert db.jobs[job["job_id"]]["status"] == DB.RUNNING
+    assert name not in launcher.deleted
+
+    # the blip clears; the Job is still there and healthy
+    launcher.cannot_ask = False
+    second = APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    assert second["failed"] == 0, "the Job is present and not failed"
+    assert second["deleted"] == []
+    assert db.jobs[job["job_id"]]["status"] == DB.RUNNING
+    assert launcher.active == [name]
+
+
 # ---------------------------------------------------------------------------
 # Pages
 # ---------------------------------------------------------------------------
