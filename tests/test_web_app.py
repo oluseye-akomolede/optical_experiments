@@ -579,7 +579,10 @@ def test_slice_payload_marks_true_nan_as_null_not_as_a_dark_colour():
 def _skewed_grid():
     return {
         "nx": 64, "ny": 45, "nz": 32,
-        "origin": [-0.0052, -0.00364, -0.0026],          # the live job's grid
+        # Counts and origins are the live job's, taken from modes.json. The
+        # spacings are those values rounded to 6 digits; the rounding keeps x
+        # and z distinct, which is what lets a swap be seen at all.
+        "origin": [-0.0052, -0.00364, -0.0026],
         "spacing": [0.000165, 0.000165, 0.000168],
     }
 
