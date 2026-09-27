@@ -88,10 +88,15 @@ Nice=10
 # SIGTERM stop (the operator restarting the service) must stay stopped.
 Restart=on-failure
 RestartSec=5
-# A bounded window to report the in-flight job failed-and-requeue and release
-# the bench lock before SIGKILL. The worker checks for the stop signal right
-# after solve() returns; a solve that runs longer than this is SIGKILLed, and
-# the lease then expires on its own, which the app already handles.
+# A bounded window to release the bench lock and hand the in-flight job back
+# before SIGKILL. The worker checks for the stop signal right AFTER solve()
+# returns, so this window only covers a stop that lands between operations; a
+# stop that lands DURING a solve cannot interrupt it (the solve runs in compiled
+# BLAS/cuDSS, and a Python signal handler runs only between bytecodes). A solve
+# longer than this window is SIGKILLed (Result=timeout, status=9), no release is
+# sent, and the lease expires on its own -- the app's reclaim then requeues the
+# job and counts the release against MAX_RELEASES. Safe, but the work in flight
+# is lost. worker/README.md, "Stopping the worker", has the full sequence.
 TimeoutStopSec=120
 
 [Install]

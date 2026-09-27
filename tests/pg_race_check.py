@@ -376,6 +376,23 @@ def _race(conn, dsn, r: Result, col: str, bound: int, rounds: int = 60,
     for _ in range(rounds):
         jid = str(uuid.uuid4())
         insert_job(conn, jid, **{"lease_owner": "w-race"})
+        # This row exists only to carry the counter through the race, and it is
+        # retired the moment the round's count is read. Round N leaves round
+        # N-1 behind as ``status='queued' AND lease_owner IS NULL`` -- exactly
+        # the shape a later leg's claim takes -- and there are 100 of them
+        # (40 control rounds + 60), more than any drain allowance. Measured:
+        # without this, check_release_is_terminal's ``_claim_row`` was handed
+        # these rows instead of its own and raised.
+        #
+        # ``status='failed'`` is what makes it terminal: it satisfies
+        # ``claim_jetson``'s ``lease_owner IS NULL`` gate while failing its
+        # ``status = 'queued'`` gate, so the row is invisible to every later
+        # claim while still holding the column shape this check needs to read
+        # back. The counter itself is left alone -- this check's subject.
+        #
+        # (The gate is ``status AND lease_owner`` TOGETHER. A future reader who
+        # "simplifies" this to just clearing the lease reintroduces 100
+        # claimable rows; that is why the status is set, not the owner nulled.)
         a = psycopg2.connect(**dsn)
         b = psycopg2.connect(**dsn)
         a.autocommit = b.autocommit = True
@@ -409,6 +426,9 @@ def _race(conn, dsn, r: Result, col: str, bound: int, rounds: int = 60,
         with conn.cursor() as cur:
             cur.execute(f"SELECT {col} FROM mse.jobs WHERE job_id = %s", (jid,))
             worst = max(worst, cur.fetchone()[0])
+            cur.execute("UPDATE mse.jobs SET status = 'failed' WHERE job_id = %s",
+                        (jid,))
+        conn.commit()
         a.close()
         b.close()
     return worst
@@ -691,6 +711,19 @@ def _claim_row(store, jid, owner="w-leg", lease_seconds=300):
             return None
         if job["job_id"] == jid:
             return job
+        # Hand the foreign row BACK, which is the only correct move: the row is
+        # ``running`` under an owner this leg is not, and marking it failed here
+        # would MANUFACTURE the stranded-row defect these legs exist to detect
+        # (and would strand a real worker still solving it). ``mark_failed`` was
+        # tried and is wrong for exactly that reason.
+        #
+        # The loop still terminates because ``claim_jetson`` gates on
+        # ``status='queued' AND lease_owner IS NULL`` TOGETHER: a released row
+        # returns to ``queued`` with the lease nulled, so it IS handed back once
+        # -- but ``_race`` retires its own rows terminal, so nothing accumulates
+        # more than one or two of these and DRAIN=2 is enough. The measurement
+        # that matters is in ``_race``'s docstring: 100 rows were left claimable
+        # before that retirement, and the drain raised on every leg after it.
         store.release_jetson(job["job_id"], owner, "not the row under test")
     raise AssertionError(
         f"{jid} was still claimable when the leg started but not among the "
@@ -698,6 +731,134 @@ def _claim_row(store, jid, owner="w-leg", lease_seconds=300):
         f"and this leg cannot see the row it is about. Run this check against a "
         f"clean database (it does not clean up between runs)."
     )
+
+
+# ---------------------------------------------------------------------------
+# D. the APP-SIDE terminal path, and the reaper's Jetson blind spot
+#
+# These two legs are the integration the second dispatch deploy was missing.
+# Everything above exercises the WORKER's routes (/release, /failed, expiry).
+# Neither of the bugs below lives there: one is the app failing a row on its own
+# initiative, and the other is the tick mis-reading a lease-owned row as dead.
+# Both were invisible to every unit test because those drive a DOUBLE that
+# models the contract, not the real SQL.
+# ---------------------------------------------------------------------------
+
+def _insert_jetson_job(conn, job_id):
+    """A row queued for the GPU, as the routing decision leaves it."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO mse.jobs (job_id, original_filename, units, n_index, "
+            "n_modes, status, stage, target) "
+            "VALUES (%s, 'box.obj', 'mm', 1.0, 20, 'queued', 'queued', 'jetson')",
+            (job_id,))
+    conn.commit()
+
+
+def check_mark_failed_clears_the_lease(conn, r: Result, JobStore):
+    """D1: the app failing a CLAIMED row must clear its lease.
+
+    The bug: ``mark_failed`` set the terminal status and left ``lease_owner``
+    set. A Jetson worker renews its lease on every ``/progress``, and the
+    heartbeat treats a 409 as "the lease is gone, stop solving" -- so while the
+    lease survived the failure, the worker had no way to learn the job was over.
+    On the second dispatch deploy it kept solving a failed job of 487,953
+    elements for minutes and only found out when its upload was refused.
+
+    The assertion is the WORKER's observation, not the column: a claim, then a
+    mark_failed, then the real ``renew_lease`` -- which must now return False,
+    because False is what becomes the 409 that stops it.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    _insert_jetson_job(conn, jid)
+
+    claimed = _claim_row(store, jid, owner="w-d1")
+    if claimed is None:
+        return r.check("D1 the seeding claim works", False,
+                       f"claim_jetson never returned {jid}")
+
+    store.mark_failed(jid, "the app failed this job while a worker held it")
+
+    renewed = store.renew_lease(jid, "w-d1", lease_seconds=300)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, lease_owner FROM mse.jobs WHERE job_id = %s",
+                    (jid,))
+        status, owner = cur.fetchone()
+
+    r.check("D1 the app failing a claimed row clears the lease, so the worker's "
+            "next heartbeat 409s and it stops solving (a lease left set means it "
+            "keeps solving a dead job)",
+            renewed is False,
+            f"after mark_failed status={status!r} lease_owner={owner!r} but "
+            f"renew_lease returned {renewed!r} -- want False (the 409)")
+
+
+def check_a_claimed_jetson_job_is_not_reaped_by_the_tick(conn, r: Result,
+                                                         JobStore, app_module):
+    """D2: the tick's dead-job reaper must not fail a claimed JETSON row.
+
+    THE DISPATCH ROLLBACK. ``_fail_dead_jobs`` asks the cluster which Jobs are
+    present; a Jetson job is never there, because the GPU worker is a systemd
+    unit the owner runs rather than a Job this app launches. So "absent" -- the
+    reaper's word for dead -- was every Jetson row's permanent state, and every
+    GPU job died at the first tick after its claim:
+
+        [mse-web] job bdaa3fbd... failed: its Job <unnamed> is gone
+
+    Driven on the REAL store and the REAL ``_fail_dead_jobs``, with a launcher
+    that reports an EMPTY cluster: not a fault, just what a Jetson-only fleet
+    looks like. A Jetson row's liveness is its lease, which is D1's subject.
+
+    This is the leg the row asks for by name, and it is red when the
+    ``target == 'jetson'`` skip is removed from the reaper.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    _insert_jetson_job(conn, jid)
+
+    claimed = _claim_row(store, jid, owner="w-d2")
+    if claimed is None:
+        return r.check("D2 the seeding claim works", False,
+                       f"claim_jetson never returned {jid}")
+
+    class EmptyCluster:
+        """A launcher that can see the cluster and finds no Jobs on it.
+
+        Deliberately NOT ``cannot_ask``: an unreadable cluster is already
+        covered, and it returns 0 for a different reason ("we do not know").
+        This models the true Jetson state -- a successful look that finds
+        nothing, which is the input that failed every GPU job.
+        """
+        dry_run = False
+
+        def active_job_names(self):
+            return []
+
+        def job_states(self):
+            return {}
+
+    before = store.renew_lease(jid, "w-d2", lease_seconds=300)
+    if not before:
+        return r.check("D2 the pre-tick heartbeat works", False,
+                       "renew_lease refused before the tick even ran")
+
+    app_module._fail_dead_jobs(EmptyCluster(), store, log=lambda *a: None)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, lease_owner FROM mse.jobs WHERE job_id = %s",
+                    (jid,))
+        status, owner = cur.fetchone()
+    after = store.renew_lease(jid, "w-d2", lease_seconds=300)
+
+    r.check("D2 a claimed Jetson job SURVIVES a tick that sees an empty cluster "
+            "(the reaper must only judge cluster jobs; a Jetson row's liveness is "
+            "its lease)",
+            status == "running" and owner == "w-d2" and after is True,
+            f"after the tick status={status!r} lease_owner={owner!r}, heartbeat "
+            f"renews={after!r} -- want running/claimed/True. This is the "
+            f"dispatch rollback: 'its Job <unnamed> is gone'")
 
 
 def check_expiry_bound_is_terminal(conn, r: Result, JobStore, bound: int):
@@ -756,7 +917,7 @@ def main() -> int:
 
     import psycopg2  # noqa: PLC0415
     from psycopg2.extensions import parse_dsn  # noqa: PLC0415
-    from mse_db_shim import load_db_module  # noqa: PLC0415
+    from mse_db_shim import load_app_module, load_db_module  # noqa: PLC0415
 
     # The connection is assembled from the ENVIRONMENT so no password ever
     # appears on argv, where any seat's `ps` can read it. Building the dict
@@ -810,6 +971,17 @@ def main() -> int:
         # ones with a different caller.
         check_expiry_requeues_the_job(conn, r, JobStore)
         check_expiry_bound_is_terminal(conn, r, JobStore, args.bound)
+        # The APP-side paths, which no leg above touches: the app failing a row
+        # on its own initiative, and the tick judging a lease-owned Jetson row.
+        # The dispatch rollback lived here and every unit test was green.
+        check_mark_failed_clears_the_lease(conn, r, JobStore)
+        # D2 is invoked on its own line so a traceback names IT rather than the
+        # call site. The module-level handler prints only ``type: message``, and
+        # an AssertionError raised inside a helper reads as "the check did not
+        # execute" with no line -- which is exactly how a D2 that never ran was
+        # first read as a D2 that failed.
+        check_a_claimed_jetson_job_is_not_reaped_by_the_tick(conn, r, JobStore,
+                                                             load_app_module())
     finally:
         conn.close()
     print("RESULT:", "PASS" if r.ok else "FAIL")

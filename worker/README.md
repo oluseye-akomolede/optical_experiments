@@ -162,6 +162,43 @@ message, so even a worker that flaps forever cannot loop. The bound is enforced
 as one atomic `UPDATE` with the count in the `WHERE` clause, because a
 read-count-then-decide form lets two concurrent releases both requeue.
 
+## Stopping the worker: what a stop can and cannot interrupt
+
+`systemctl --user stop mse-worker` sets a flag the worker checks **after
+`solve()` returns**. That is a real limitation and it is worth stating plainly
+rather than implying a stop is always graceful:
+
+**A stop that lands while the worker is between operations** (fetching input,
+uploading, idle, waiting on the bench lock) takes effect immediately: the job is
+released through the transient path, the lease is cleared, the bench lock is
+dropped, and the job is claimable again at once.
+
+**A stop that lands in the middle of a long C-level eigensolve cannot interrupt
+it.** The spectral solve runs inside a compiled BLAS/cuDSS call; Python's signal
+handler runs only between bytecodes, so the flag is set and then nothing happens
+until the solve itself returns. In practice:
+
+1. `systemctl stop` sends SIGTERM and waits.
+2. The solve keeps running. After `TimeoutStopSec=120` the unit is **SIGKILLed**
+   (`Result=timeout`, `status=9`) — this is what the owner observed.
+3. No `release` and no `failed` is sent, so the lease is simply left to expire.
+4. The app's tick reclaims the expired lease, which requeues the job and
+   **counts the release**, bounded by `MAX_RELEASES` (3). Past the bound the app
+   fails it with a plain message rather than looping.
+
+So a stop mid-solve is **safe but slow**: the work in flight is lost, the job
+comes back to the queue (or fails at the bound after repeated stops), and
+nothing is stranded. The steps in 3 and 4 are the paths `tests/pg_race_check.py`
+C1/C2 exercise on real Postgres, and the SIGKILL leaves no lock behind because
+the bench lock is an `flock` the kernel drops with the process.
+
+**What is NOT yet true.** A stop cannot make the worker report promptly: there
+is no window where it can say "I am stopping" while a solve is in flight. The
+design that would fix that — running each solve in a CHILD process the worker
+can terminate on SIGTERM, then `/release` immediately — is proposed and NOT
+built. It would also isolate solver crashes and GPU memory from the worker
+process, which are separate wins.
+
 **Every path back to claimable counts, not just `/release`.** A worker that dies
 mid-job never calls anything — the row returns through lease **expiry**. That
 path increments the same counter and hits the same bound, or a crash-looping
@@ -206,8 +243,10 @@ tier-1, against a real HTTP server on a real socket through the real routes):
   release is counted, and the retry succeeds
 - **three releases plus one** end the job: the app fails it at the bound, so a
   flapping worker cannot loop
-- SIGTERM mid-job **releases** the job (not fails it) and leaves no dangling
-  lease — a service restart must not destroy a good job
+- SIGTERM mid-job, **arriving while the worker is between operations**,
+  **releases** the job (not fails it) and leaves no dangling lease — a service
+  restart must not destroy a good job. (What happens when it arrives DURING a
+  solve is a different and weaker guarantee — see "Stopping the worker" below.)
 - an **upload** failure reports `failed`, never `done`
 - the worker makes no claim at all while the bench lock is held (asserted on the
   server's request log — "did not ask" and "asked and got nothing" look

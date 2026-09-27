@@ -89,9 +89,45 @@ class FakeDb:
         self.jobs[str(job_id)]["k8s_job_name"] = name
 
     def mark_failed(self, job_id, message):
+        # The REAL store clears the lease here (see DB.JobStore.mark_failed) so a
+        # worker holding the row learns it is over from its next heartbeat. The
+        # double has to model that, or a test asserting the worker is stopped
+        # would pass against a double that never stopped it.
         self.jobs[str(job_id)].update(status=DB.FAILED, stage=DB.FAILED,
-                                      message=message)
+                                      message=message, lease_owner=None,
+                                      lease_expires_at=None)
         self.failures.append((str(job_id), message))
+
+    # -- the Jetson lease, modelled on the real store ----------------------
+    #
+    # These exist so a test can put a row in the state a real GPU worker leaves
+    # it in -- CLAIMED, running, holding a lease, with NO k8s Job. That state is
+    # the one the second dispatch deploy died on and the one nothing in this
+    # suite could previously produce, because a FakeDb with no claim path can
+    # only ever hold cluster rows.
+    def claim_jetson(self, owner, lease_seconds):
+        """Claim the oldest claimable jetson row, as the real store does."""
+        for job in self.jobs.values():
+            if (job["target"] == DB.JETSON and job["status"] == DB.QUEUED
+                    and not job.get("lease_owner")):
+                job["lease_owner"] = owner
+                job["lease_expires_at"] = "2099-01-01T00:00:00+00:00"
+                job["status"] = DB.RUNNING
+                job["stage"] = "claimed"
+                return dict(job)
+        return None
+
+    def renew_lease(self, job_id, owner, lease_seconds):
+        """Renew iff ``owner`` holds it -- False is the 409 the worker stops on."""
+        job = self.jobs.get(str(job_id))
+        if not job or job.get("lease_owner") != owner:
+            return False
+        job["lease_expires_at"] = "2099-01-01T00:00:00+00:00"
+        return True
+
+    def lease_held_by(self, job_id, owner):
+        job = self.jobs.get(str(job_id))
+        return bool(job and job.get("lease_owner") == owner)
 
     # reads
     def get_job(self, job_id):
@@ -283,6 +319,27 @@ def upload(client, filename="box.obj", data=None, units="mm", n_index="1.0",
     }
     fields.update(extra)
     return client.post("/", data=fields, content_type="multipart/form-data")
+
+
+def upload_to_the_cluster(client, monkeypatch, **extra):
+    """Upload a row that the routing decision sends to the CLUSTER.
+
+    WHY THIS EXISTS. ``closed_box_bytes()`` estimates at ~19.8k tets, which is
+    over ``MSE_GPU_MIN_TETS`` (15k), so the plain ``upload()`` helper routes to
+    the **Jetson** -- by design. Tests about cluster-Job behaviour (a
+    ``DeadlineExceeded`` condition, an OOMKilled container, a Job lost with its
+    node) were therefore running their assertions against a *jetson* row. They
+    passed only because ``FakeDb.next_queued`` ignored the target and handed the
+    jetson row to the cluster launcher, a state the real app cannot produce.
+
+    That is the unfaithful-double half of the dispatch rollback: with a jetson
+    row carrying a ``k8s_job_name``, the reaper's ``target == 'jetson'`` skip
+    never fired in these tests. Raising the GPU threshold makes the routing
+    decision pick the cluster for the same fixture, which is what the test
+    actually means to exercise.
+    """
+    monkeypatch.setenv("MSE_GPU_MIN_TETS", str(10 ** 9))
+    return upload(client, **extra)
 
 
 def io_bytes(data):
@@ -1574,7 +1631,7 @@ def test_a_queued_or_running_job_is_never_deleted(tmp_path):
 
 
 def test_a_job_reporting_deadline_exceeded_fails_the_row_with_that_reason(
-        tmp_path):
+        tmp_path, monkeypatch):
     """A Job killed by activeDeadlineSeconds must name the deadline, not "gone".
 
     The owner needs to know whether the solver ran out of time or out of memory
@@ -1583,7 +1640,7 @@ def test_a_job_reporting_deadline_exceeded_fails_the_row_with_that_reason(
     it through ``JOBS.failure_message``.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     name = job["k8s_job_name"]
 
@@ -1596,14 +1653,15 @@ def test_a_job_reporting_deadline_exceeded_fails_the_row_with_that_reason(
         JOBS.FAILURE_MESSAGES["DeadlineExceeded"]
 
 
-def test_a_job_reporting_oomkilled_fails_the_row_with_that_reason(tmp_path):
+def test_a_job_reporting_oomkilled_fails_the_row_with_that_reason(tmp_path,
+                                                               monkeypatch):
     """The original incident's cause: the container was OOM-killed.
 
     This is the case that actually happened -- the writing stage hit its 14 Gi
     limit -- so the message the owner sees must say memory, not "unexpectedly".
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     launcher.failed[job["k8s_job_name"]] = "OOMKilled"
 
@@ -1614,14 +1672,14 @@ def test_a_job_reporting_oomkilled_fails_the_row_with_that_reason(tmp_path):
 
 
 def test_a_job_failed_for_an_unknown_reason_does_not_leak_the_kubernetes_token(
-        tmp_path):
+        tmp_path, monkeypatch):
     """An unmapped reason must fall back, never reach the owner verbatim.
 
     Kubernetes reasons are token-like strings ('BackoffLimitExceeded'); putting
     one in front of the owner is worse than saying nothing specific.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     launcher.failed[job["k8s_job_name"]] = "BackoffLimitExceeded"
 
@@ -1653,6 +1711,97 @@ def test_a_live_job_is_never_failed_or_deleted(tmp_path):
     assert db.jobs[job["job_id"]]["message"] is None
     assert name not in launcher.deleted, "a live solve must keep its slot"
     assert db.failures == []
+
+
+def test_a_claimed_jetson_job_survives_a_tick(tmp_path):
+    """THE INTEGRATION TEST: a real tick must not kill a real Jetson claim.
+
+    This is the test whose absence let the second dispatch deploy through five
+    green gates. Every existing test drove ``_fail_dead_jobs`` against a
+    ``FakeDb`` that could only ever hold CLUSTER rows -- a row with a
+    ``k8s_job_name`` the fake launcher reported. A Jetson job is not launched by
+    the app at all: it is a systemd unit the owner runs, so it has NO
+    ``k8s_job_name`` and is absent from ``active_job_names`` by construction.
+
+    ``_fail_dead_jobs`` read that absence as death, so the first tick after a
+    claim failed every GPU job in the cluster:
+
+        [mse-web] worker w-b55c... claimed bdaa3fbd...
+        [mse-web] job bdaa3fbd... failed: its Job <unnamed> is gone
+
+    The test drives the REAL tick (``run_tick`` -> ``_fail_dead_jobs``) against a
+    REAL claim path (``claim_jetson``), with a launcher reporting an EMPTY
+    cluster -- which is not a fault here, it is what a Jetson-only fleet always
+    looks like. A Jetson row's liveness is its LEASE; the cluster has nothing to
+    say about it.
+
+    Mutation that must turn this red: delete the ``target == DB.JETSON`` skip in
+    ``_fail_dead_jobs``.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    # A row queued for the GPU the way the routing decision leaves it, then
+    # CLAIMED the way a real worker does. Neither step leaves a k8s Job behind,
+    # which is the whole point.
+    _make_jetson_row(db)
+    claimed = db.claim_jetson("w-integration", 300.0)
+    assert claimed is not None, "the claim path must produce a row to test"
+    assert claimed["k8s_job_name"] is None, (
+        "a Jetson job genuinely has no k8s Job -- that is the premise")
+    assert launcher.active == [], (
+        "and therefore the cluster reports nothing for it")
+
+    result = APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    row = db.jobs[str(claimed["job_id"])]
+    assert row["status"] == DB.RUNNING, (
+        "a tick failed a claimed Jetson job -- its Job <unnamed> is gone is what "
+        "the reaper said, and it must not say that about a lease-owned row"
+    )
+    assert row["lease_owner"] == "w-integration", "the lease is its liveness"
+    assert db.failures == [], f"nothing may be failed: {db.failures}"
+    assert result["failed"] == 0
+
+
+def test_a_failed_jetson_row_is_not_cleared_by_a_later_tick(tmp_path):
+    """The other direction, so the skip is a SKIP and not a blind spot.
+
+    A guard that excludes Jetson rows must not also exclude them from every
+    OTHER mechanism. This pins that the reaper's exclusion is narrow: it stops
+    this function from judging them, and nothing more.
+
+    SCOPE, stated because it is easy to over-read: this runs against ``FakeDb``,
+    so it checks the TICK's behaviour (it does not re-fail an already-terminal
+    row) and NOT the real store's SQL. ``FakeDb.mark_failed`` clears the lease
+    to mirror the real store, but a double agreeing with the code it doubles
+    proves nothing about the code -- verified by mutation: reverting the real
+    ``mark_failed`` leaves this test GREEN. The real lease-clear is pinned on
+    real Postgres by ``pg_race_check.py`` D1, which is the leg that goes red.
+    """
+
+    app, _store, db, launcher = make_app(tmp_path)
+    row = _make_jetson_row(db)
+    db.claim_jetson("w-integration", 300.0)
+
+    # The APP fails it (a launch error, a reaper verdict elsewhere, an operator).
+    db.mark_failed(row["job_id"], "the GPU worker was stopped by an operator")
+
+    result = APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    after = db.jobs[str(row["job_id"])]
+    assert after["status"] == DB.FAILED
+    assert after["lease_owner"] is None, (
+        "mark_failed must clear the lease, or the worker keeps renewing against "
+        "a dead row and never learns to stop"
+    )
+    assert result["failed"] == 0, "it was already terminal; the tick did not re-fail it"
+
+
+def _make_jetson_row(db):
+    """Put a row in ``db`` queued for the GPU, as the routing decision does."""
+    import uuid as _uuid
+    job_id = str(_uuid.uuid4())
+    db.create_job(job_id, "box.obj", "mm", 1.0, 20, target=DB.JETSON)
+    return db.jobs[job_id]
 
 
 def test_a_403_on_the_list_call_does_not_fail_a_live_solve(tmp_path):
@@ -1722,7 +1871,8 @@ def test_a_403_does_not_let_the_tick_launch_against_the_quota(tmp_path):
     )
 
 
-def test_a_running_row_whose_job_vanished_is_failed_not_requeued(tmp_path):
+def test_a_running_row_whose_job_vanished_is_failed_not_requeued(tmp_path,
+                                                                 monkeypatch):
     """The deploy-blocker-3 fix: a dead solve is FAILED, never silently retried.
 
     This test replaces one that asserted the old behaviour (re-queue), which was
@@ -1732,7 +1882,7 @@ def test_a_running_row_whose_job_vanished_is_failed_not_requeued(tmp_path):
     message the owner can read.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
 
     # the DB says running, but the cluster has nothing (lost with its node)
@@ -1753,7 +1903,7 @@ def test_the_tick_does_nothing_when_the_slot_is_occupied(tmp_path):
     assert len(launcher.created) == 1
 
 
-def test_a_dead_job_frees_the_slot_for_the_next_upload(tmp_path):
+def test_a_dead_job_frees_the_slot_for_the_next_upload(tmp_path, monkeypatch):
     """Failing the dead row must not wedge the queue behind it.
 
     The old behaviour re-queued the dead job, which kept the single Job slot
@@ -1762,8 +1912,8 @@ def test_a_dead_job_frees_the_slot_for_the_next_upload(tmp_path):
     spinner for a permanently stuck queue.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     first, second = list(db.jobs.values())
     assert first["status"] == DB.RUNNING
 

@@ -485,6 +485,21 @@ def _fail_dead_jobs(launcher, jobs_db, log=print) -> int:
     A launcher that cannot report (no cluster, dry run, a failed list call)
     makes this return 0 rather than guess: failing a live solve on a transient
     API error would be much worse than a spinner that lasts one more tick.
+
+    ONLY CLUSTER JOBS ARE CONSIDERED, and that exclusion is the whole point of
+    the ``target`` check below. A JETSON row never has a ``k8s_job_name`` and
+    never will: the GPU worker is a systemd unit the owner runs, not a Job this
+    app launches, so it is absent from ``active_job_names`` by construction. To a
+    reaper that asks only "is this row's Job gone?", every Jetson job answered
+    YES from the moment it was claimed, and it was failed at the first tick after
+    the claim -- the second dispatch deploy died exactly this way, with
+    ``job <id> failed: its Job <unnamed> is gone`` for every GPU job.
+
+    A Jetson row's liveness is its LEASE, not a Job: the worker renews on every
+    heartbeat, and a worker that dies leaves the lease to expire, which
+    ``reclaim_expired_leases`` already handles (requeue, and fail past the
+    bound). Two mechanisms for one question is how they dissagree; each machine
+    gets the one that can actually see it.
     """
     if launcher is None or not hasattr(launcher, "job_states"):
         # A launcher that cannot report Job conditions cannot tell a dead solve
@@ -532,6 +547,15 @@ def _fail_dead_jobs(launcher, jobs_db, log=print) -> int:
     for job in jobs_db.list_jobs(50):
         if job["status"] != DB.RUNNING:
             continue
+        # A Jetson row is not this function's to judge (see the docstring): it
+        # has no Job, so "no Job present" is its NORMAL state rather than
+        # evidence of death. Skip it entirely -- the lease owns it.
+        #
+        # ``target`` is read from the row, never inferred from the missing name:
+        # a CLUSTER row whose launch failed before ``mark_running`` stored a name
+        # also has no name, and THAT one really is dead and must still be failed.
+        if job.get("target") == DB.JETSON:
+            continue  # JETSON-REAPER-SKIP-ANCHOR
         name = job.get("k8s_job_name")
         if name and name in states:
             reason = states[name]

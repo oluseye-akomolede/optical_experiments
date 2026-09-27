@@ -42,7 +42,23 @@ build_and_import() {
     log "importing inside $name"
     # --network none and no env: if the import needs the DB or MinIO it must
     # fail HERE, where we are looking at it, rather than in the cluster.
-    docker run --rm --network none "$tag" python -c "$import_expr"
+    #
+    # --entrypoint python OVERRIDES THE IMAGE'S ENTRYPOINT, and that override is
+    # the whole reason this leg works. Docker APPENDS a `docker run` command to
+    # the image's ENTRYPOINT rather than replacing it, and the solver image's
+    # entrypoint is `python /opt/app/mse_maxwell_solver.py`. So the natural form
+    #
+    #     docker run --rm --network none "$tag" python -c "$import_expr"
+    #
+    # does not import anything: it runs the solver AS A SCRIPT with a bogus
+    # --job-id, and the container exits 2 printing argparse's usage line. The
+    # `usage: mse_maxwell_solver ... --job-id` that comes out of that reads
+    # exactly like an import-time failure inside the module, and it sent this
+    # leg's diagnosis chasing a stale `__pycache__` that was never at fault
+    # (the baked .pyc's top level is `if __name__ == "__main__": sys.exit(main())`,
+    # identical to the source). The web image has no ENTRYPOINT, so the same
+    # form works there -- which is why only the solver leg ever failed.
+    docker run --rm --network none --entrypoint python "$tag" -c "$import_expr"
     log "$name: import OK"
 }
 

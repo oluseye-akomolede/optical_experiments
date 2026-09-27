@@ -9,6 +9,7 @@ Lives in ``tests/`` deliberately: under ``web/`` it would be baked into the
 mse-web image, where nothing imports it.
 """
 import importlib.util
+import sys
 from pathlib import Path
 
 _DB_PY = Path(__file__).resolve().parent.parent / "web" / "db.py"
@@ -29,3 +30,28 @@ def load_db_module():
 
 def load_jobstore():
     return load_db_module().JobStore
+
+
+_APP_PY = Path(__file__).resolve().parent.parent / "web" / "app.py"
+
+
+def load_app_module():
+    """``web/app.py`` as a module, so a leg can drive the REAL tick.
+
+    ``_fail_dead_jobs`` is where the dispatch rollback lived, and a leg that
+    called a copy of it would test the copy. Importing the real module also
+    means the leg fails loudly if ``app`` stops importing at all, which is a
+    separate bug the deploy cares about.
+
+    ``web/`` and the solver directory go on ``sys.path`` first: the app imports
+    its siblings by bare name (``import config``), exactly as it does inside the
+    image where ``/opt/app`` is the working directory.
+    """
+    root = _APP_PY.parent.parent
+    for extra in (root / "web", root / "dockerfiles" / "maxwell_solver"):
+        if str(extra) not in sys.path:
+            sys.path.insert(0, str(extra))
+    spec = importlib.util.spec_from_file_location("mse_app_real", _APP_PY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod

@@ -235,11 +235,29 @@ class JobStore:
             )
 
     def mark_failed(self, job_id, message: str) -> None:
-        """Record an upload that never reached the solver."""
+        """Mark a row FAILED for good. TERMINAL, and it CLEARS THE LEASE.
+
+        The lease clear is not tidiness -- it is what stops a worker solving a
+        dead job. A Jetson worker holds a lease renewed by a heartbeat, and the
+        heartbeat treats a 409 as "the lease is gone, stop". While this statement
+        left ``lease_owner`` set, the worker's ``/progress`` kept renewing against
+        a row the app had already failed, so the worker had no way to learn the
+        job was over: on the second dispatch deploy it kept solving a failed job
+        of 487,953 elements for minutes and only found out when its upload was
+        refused. Clearing the lease here turns the next heartbeat into the 409
+        that stops it, which is the mechanism already built for exactly this.
+
+        EVERY terminal path must do this, not just the worker's own ``/failed``
+        route (``fail_jetson``, which also clears it). The app can end a job on
+        its own initiative -- a launch that failed, a reaper that found the solve
+        dead -- and those rows can still carry a lease from a worker that took
+        the job before the app's verdict landed.
+        """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
-                "finished_at = now() WHERE job_id = %s",
+                "finished_at = now(), lease_owner = NULL, "
+                "lease_expires_at = NULL WHERE job_id = %s",
                 (FAILED, FAILED, message, str(job_id)),
             )
 
