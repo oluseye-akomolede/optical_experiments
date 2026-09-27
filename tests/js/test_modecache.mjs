@@ -47,8 +47,8 @@ test('requests per page are capped so a burst cannot open everything at once', (
 test('the URL uses the mode index the server sent, not the position in the list', () => {
   // The two differ whenever a job's modes do not start at 1, which is why the
   // index is carried through rather than recomputed as position + 1.
-  assert.equal(modeFieldUrl('abc-123', 7), '/jobs/abc-123/slices/7.json');
-  assert.equal(modeFieldUrl('abc-123', 0), '/jobs/abc-123/slices/0.json');
+  assert.equal(modeFieldUrl('abc-123', 7), '/jobs/abc-123/field/7.bin');
+  assert.equal(modeFieldUrl('abc-123', 0), '/jobs/abc-123/field/0.bin');
 });
 
 test('a late arrival lands against its own mode, not the selected one', () => {
@@ -78,34 +78,3 @@ test('a late arrival lands against its own mode, not the selected one', () => {
 // The fixture is written by tests/test_web_routes.py from a live route response
 // (see `_write_viewer_fixture`). If it is missing the test fails loudly rather
 // than skipping: a skip here would recreate the original blindness.
-import { readFileSync, existsSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
-
-const here = dirname(fileURLToPath(import.meta.url));
-const fixturePath = join(here, 'fixtures', 'mode_payload.json');
-
-test('a real mode payload parses in a browser-strict JSON parser', () => {
-  assert.ok(existsSync(fixturePath),
-    `missing fixture ${fixturePath} -- run the pytest suite first, which writes it`);
-  const raw = readFileSync(fixturePath, 'utf8');
-
-  // JSON.parse is the actual instrument the browser uses. If a bare NaN token
-  // were present it would throw here exactly as it did in the owner's browser.
-  let payload;
-  assert.doesNotThrow(() => { payload = JSON.parse(raw); },
-    'the payload must be strict JSON -- JSON.parse rejects bare NaN/Infinity');
-
-  assert.ok(Array.isArray(payload.slices) && payload.slices.length > 0,
-    'a mode payload must carry slices');
-  const mag = payload.slices[0].mag.data;
-  assert.ok(mag.some((v) => v === null),
-    'outside-the-object samples must be null, not omitted or zero');
-  assert.ok(mag.every((v) => v === null || Number.isFinite(v)),
-    'every sample is null or a finite number');
-
-  // and the viewer's own store accepts it
-  const mode = { index: payload.index, available: true };
-  storeFields(mode, payload);
-  assert.equal(mode.fields.index, payload.index);
-});

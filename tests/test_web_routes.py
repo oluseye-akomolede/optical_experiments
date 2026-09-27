@@ -534,7 +534,7 @@ def test_a_missing_file_is_a_404_not_a_500(tmp_path):
 # ---------------------------------------------------------------------------
 # The viewer's data endpoint
 # ---------------------------------------------------------------------------
-def test_slices_index_names_every_mode_and_carries_no_field_data(tmp_path):
+def test_the_index_names_every_mode_and_carries_no_field_data(tmp_path):
     """The index is the list, not the payload.
 
     This is the contract the lazy load exists for: one small response the phone
@@ -548,7 +548,7 @@ def test_slices_index_names_every_mode_and_carries_no_field_data(tmp_path):
     db.finish(job["job_id"], store, n_modes=3)
 
     payload = app.test_client().get(
-        f"/jobs/{job['job_id']}/slices.json").get_json()
+        f"/jobs/{job['job_id']}/index.json").get_json()
     assert [m["index"] for m in payload["modes"]] == [1, 2, 3]
     for mode in payload["modes"]:
         assert "slices" not in mode and "cloud" not in mode
@@ -558,20 +558,45 @@ def test_slices_index_names_every_mode_and_carries_no_field_data(tmp_path):
     assert payload["grid"]["nx"] > 0
 
 
-def test_one_mode_payload_has_all_three_slices_for_that_mode_only(tmp_path):
+def test_one_mode_payload_holds_that_mode_and_only_that_mode(tmp_path):
+    """One mode's whole vector field, as float16, and no other mode's.
+
+    The viewer turns this back into the mode's *scalar* field itself, so the
+    only thing the route has to get right is that the bytes are one mode's, in
+    the grid's shape, and that they are the mode that was asked for. A payload
+    that carried the wrong mode would draw a perfectly plausible picture of the
+    wrong thing.
+    """
+    import gzip
+
     app, store, db, _launcher = make_app(tmp_path)
     upload(app.test_client())
     (job,) = db.jobs.values()
     db.finish(job["job_id"], store, n_modes=3)
 
-    mode = app.test_client().get(
-        f"/jobs/{job['job_id']}/slices/2.json").get_json()
-    assert mode["index"] == 2
-    assert [s["axis"] for s in mode["slices"]] == ["z", "y", "x"]
-    for slice_ in mode["slices"]:
-        assert len(slice_["mag"]["data"]) == \
-            slice_["u"]["count"] * slice_["v"]["count"]
-    assert mode["cloud"]["mag"]
+    grid = {"nx": 4, "ny": 3, "nz": 2}
+    count = grid["nx"] * grid["ny"] * grid["nz"] * 3
+
+    response = app.test_client().get(f"/jobs/{job['job_id']}/field/2.bin")
+    assert response.status_code == 200
+    assert response.headers["X-Field-Dtype"] == "float16-le"
+    # Two bytes a sample, exactly: a longer body would mean the decoder kept a
+    # dtype it was not asked for, and the texture upload would be misaligned.
+    assert response.headers["Content-Encoding"] == "gzip"
+    raw = gzip.decompress(response.data)
+    assert len(raw) == count * 2
+
+    # And it is *that* mode. The fixture gives each mode a different field, so
+    # the comparison is against the solver's own bytes for mode 2.
+    source = np.frombuffer(
+        store.read(STORE.job_key(job["job_id"], "mode_02.bin")), dtype="<f4")
+    half = np.frombuffer(raw, dtype="<f2")
+    mine = app.test_client().get(f"/jobs/{job['job_id']}/field/2.bin")
+    again = np.frombuffer(gzip.decompress(mine.data), dtype="<f2")
+    assert np.array_equal(half, again)
+    finite = ~np.isnan(source)
+    assert np.allclose(half[finite].astype(np.float64), source[finite],
+                       rtol=1e-3, atol=1e-5)
 
 
 def test_a_mode_payload_for_a_mode_the_job_lacks_is_404(tmp_path):
@@ -584,7 +609,7 @@ def test_a_mode_payload_for_a_mode_the_job_lacks_is_404(tmp_path):
     client = app.test_client()
     for bad in ("4", "0"):
         assert client.get(
-            f"/jobs/{job['job_id']}/slices/{bad}.json").status_code == 404
+            f"/jobs/{job['job_id']}/field/{bad}.bin").status_code == 404
 
 
 def test_a_mode_whose_field_file_is_missing_answers_404_not_500(tmp_path):
@@ -604,13 +629,13 @@ def test_a_mode_whose_field_file_is_missing_answers_404_not_500(tmp_path):
     (Path(store.root) / STORE.job_key(job["job_id"], "mode_02.bin")).unlink()
 
     client = app.test_client()
-    index = client.get(f"/jobs/{job['job_id']}/slices.json").get_json()
+    index = client.get(f"/jobs/{job['job_id']}/index.json").get_json()
     flags = {m["index"]: m["available"] for m in index["modes"]}
     assert flags == {1: True, 2: False, 3: True}
     assert client.get(
-        f"/jobs/{job['job_id']}/slices/2.json").status_code == 404
+        f"/jobs/{job['job_id']}/field/2.bin").status_code == 404
     assert client.get(
-        f"/jobs/{job['job_id']}/slices/1.json").status_code == 200
+        f"/jobs/{job['job_id']}/field/1.bin").status_code == 200
 
 
 def test_a_truncated_field_file_is_unavailable_rather_than_half_drawn(tmp_path):
@@ -624,10 +649,10 @@ def test_a_truncated_field_file_is_unavailable_rather_than_half_drawn(tmp_path):
     blob.write_bytes(blob.read_bytes()[:100])
 
     client = app.test_client()
-    index = client.get(f"/jobs/{job['job_id']}/slices.json").get_json()
+    index = client.get(f"/jobs/{job['job_id']}/index.json").get_json()
     assert {m["index"]: m["available"] for m in index["modes"]}[1] is False
     assert client.get(
-        f"/jobs/{job['job_id']}/slices/1.json").status_code == 404
+        f"/jobs/{job['job_id']}/field/1.bin").status_code == 404
 
 
 def test_the_index_and_the_fetch_agree_on_which_modes_exist(tmp_path):
@@ -677,11 +702,11 @@ def test_the_index_and_the_fetch_agree_on_which_modes_exist(tmp_path):
     assert prefix  # the key layout is the job's, not a bare name
 
     client = app.test_client()
-    index = client.get(f"/jobs/{job['job_id']}/slices.json").get_json()
+    index = client.get(f"/jobs/{job['job_id']}/index.json").get_json()
 
     for mode in index["modes"]:
         served = client.get(
-            f"/jobs/{job['job_id']}/slices/{mode['index']}.json")
+            f"/jobs/{job['job_id']}/field/{mode['index']}.bin")
         if mode["available"]:
             assert served.status_code == 200, (
                 f"the index promised mode {mode['index']} and the fetch refused "
@@ -785,7 +810,7 @@ def test_both_field_routes_agree_on_which_modes_exist(tmp_path):
     (Path(store.root) / STORE.job_key(job["job_id"], "mode_02.bin")).unlink()
 
     client = app.test_client()
-    index = client.get(f"/jobs/{job['job_id']}/slices.json").get_json()
+    index = client.get(f"/jobs/{job['job_id']}/index.json").get_json()
     for mode in index["modes"]:
         served = client.get(f"/jobs/{job['job_id']}/field/{mode['index']}.bin")
         if mode["available"]:
@@ -850,7 +875,7 @@ def test_an_unreachable_store_is_an_error_not_a_page_of_missing_modes(tmp_path):
     # A positive control first: with a working store the index is a 200 and the
     # modes are genuinely available. Without this, a route that always 502s
     # would pass the assertion below for the wrong reason.
-    healthy = client.get(f"/jobs/{job['job_id']}/slices.json")
+    healthy = client.get(f"/jobs/{job['job_id']}/index.json")
     assert healthy.status_code == 200
     assert {m["available"] for m in healthy.get_json()["modes"]} == {True}
 
@@ -861,7 +886,7 @@ def test_an_unreachable_store_is_an_error_not_a_page_of_missing_modes(tmp_path):
     # store is a second handle on the same directory, used to lay down fixtures.
     # Patching the app's handle is the one the routes call.
     app.extensions["mse"]["store"].size = unreachable
-    response = client.get(f"/jobs/{job['job_id']}/slices.json")
+    response = client.get(f"/jobs/{job['job_id']}/index.json")
 
     assert response.status_code == 502, (
         "an uncheckable store must be an error the viewer can report, not a "
@@ -871,78 +896,84 @@ def test_an_unreachable_store_is_an_error_not_a_page_of_missing_modes(tmp_path):
     # which is the proof that the index's "all false" would have been a lie
     # about the data rather than a fact about it.
     assert client.get(
-        f"/jobs/{job['job_id']}/slices/1.json").status_code == 200
+        f"/jobs/{job['job_id']}/field/1.bin").status_code == 200
 
 
-def test_a_real_route_response_with_nan_is_readable_by_a_browser_parser(tmp_path):
-    """The whole path, parsed the way the browser parses it.
+def test_the_index_route_is_the_only_json_the_viewer_needs(tmp_path):
+    """The index still has to be strict JSON, and it still has to be small.
 
-    Everything below the route was already asserted in pieces, and the payload
-    still broke in production: the solver writes ``NaN`` outside the object,
-    ``json.dumps`` emits the bare token by default, and ``JSON.parse`` rejects
-    the entire document over one of them. The viewer shows "the results could
-    not be loaded" and the mode list never binds.
-
-    So this test does not ask whether Python can read the bytes -- it can, which
-    is exactly why nothing caught this. It asks whether a *strict* parser can:
-    ``parse_constant`` is the only hook that fires on ``NaN``/``Infinity``, so
-    raising from it is what makes the assertion mean "a browser can load this".
-    It also pins the app's own tripwire: ``allow_nan=False`` on the JSON
-    provider, which turns a future leak into a 500 instead of a silent failure.
+    The NaN lesson lives on in a different place now. The field payload is
+    float16 bytes rather than JSON, so ``json.dumps`` can no longer leak a bare
+    ``NaN`` token into it -- but the *index* is still JSON, and the grid it
+    carries still comes from ``modes.json``, which the solver wrote. So this
+    parses the index the way the browser does, with the hook that only fires on
+    a non-finite token, and separately checks that no mode entry has grown a
+    field-sized array back into it.
     """
     app, store, db, _launcher = make_app(tmp_path)
     upload(app.test_client())
     (job,) = db.jobs.values()
-    db.finish(job["job_id"], store, n_modes=2)
+    db.finish(job["job_id"], store, n_modes=3)
 
-    # Rewrite one mode's field so most of it is outside the object, exactly as
-    # the solver marks "not inside the mesh".
-    key = STORE.job_key(job["job_id"], "mode_01.bin")
-    field = np.full((2, 3, 4, 3), np.nan, dtype="<f4")
-    field[0, 0, 0] = [1.0, 2.0, 3.0]
-    store.write(key, field.tobytes())
-
-    response = app.test_client().get(f"/jobs/{job['job_id']}/slices/1.json")
+    response = app.test_client().get(f"/jobs/{job['job_id']}/index.json")
     assert response.status_code == 200
-    text = response.get_data(as_text=True)
 
     def reject(token):
         raise AssertionError(
-            f"the route wrote the bare token {token!r}; JSON.parse would reject "
+            f"the index wrote the bare token {token!r}; JSON.parse would reject "
             "the whole payload and the viewer would show an error instead")
 
-    payload = json.loads(text, parse_constant=reject)
-    assert payload["cloud"]["mag"], "the cloud must be present"
-    assert None in payload["cloud"]["mag"], "outside-the-object samples are null"
-    # and the slice data, which goes through a different code path
-    assert None in payload["slices"][0]["mag"]["data"]
+    payload = json.loads(response.get_data(as_text=True), parse_constant=reject)
+    assert [m["index"] for m in payload["modes"]] == [1, 2, 3]
+    for mode in payload["modes"]:
+        assert "slices" not in mode and "cloud" not in mode and "field" not in mode
+    # The whole point of the split: this response must stay small enough to
+    # fetch on page load. One mode's float16 field is ~110 kB for this grid, so
+    # a plain ceiling well under that catches a bulk array coming back.
+    assert len(response.data) < 4000, (
+        f"the index is {len(response.data)} bytes; a field-sized array has "
+        "probably come back into it, which is the 11 MB shape it was split from")
 
 
-def test_a_mode_payload_from_a_real_route_is_written_for_the_node_test(tmp_path):
-    """Write the fixture the node test parses with the browser's own parser.
+def test_a_real_field_response_is_written_for_the_node_test(tmp_path):
+    """Write the bytes a live route returns, for the node test to parse.
 
-    The server-side assertions above all pass on a payload Python can read; the
-    only instrument that sees what the browser sees is ``JSON.parse``, and it
-    lives in node. Rather than hand-write a fixture (which would be a double
-    that models what we *think* we send), this writes the bytes a live route
-    actually returns, so the node test is parsing the real thing.
+    The old fixture was JSON and the node test used ``JSON.parse``; the payload
+    is float16 bytes now, so the instrument changes with it. What must not
+    change is the principle: the fixture is produced by a *live route*, not
+    hand-written, so ``test_viewfield.mjs`` is checking the real thing rather
+    than a double that models what we think we send.
     """
+    import gzip
+
     app, store, db, _launcher = make_app(tmp_path)
     upload(app.test_client())
     (job,) = db.jobs.values()
     db.finish(job["job_id"], store, n_modes=1)
 
     key = STORE.job_key(job["job_id"], "mode_01.bin")
-    field = np.full((2, 3, 4, 3), np.nan, dtype="<f4")
-    field[0, 0, 0] = [1.0, 2.0, 3.0]
+    grid = {"nx": 4, "ny": 3, "nz": 2}
+    field = np.full((grid["nz"], grid["ny"], grid["nx"], 3), np.nan, dtype="<f4")
+    field[0, 0, 0] = [1.0, -0.5, 0.25]
+    field[1, 2, 3] = [0.125, 0.0, -1.0]
     store.write(key, field.tobytes())
 
-    response = app.test_client().get(f"/jobs/{job['job_id']}/slices/1.json")
+    response = app.test_client().get(f"/jobs/{job['job_id']}/field/1.bin")
     assert response.status_code == 200
 
     fixtures = Path(__file__).resolve().parent / "js" / "fixtures"
     fixtures.mkdir(parents=True, exist_ok=True)
-    (fixtures / "mode_payload.json").write_bytes(response.get_data())
+    (fixtures / "mode_field.bin").write_bytes(gzip.decompress(response.data))
+    # The grid the node test needs to decode it, alongside the bytes. Written
+    # from the live index rather than from the literal above, so a change to how
+    # the server reports a grid cannot pass unnoticed.
+    index = app.test_client().get(f"/jobs/{job['job_id']}/index.json").get_json()
+    (fixtures / "mode_grid.json").write_text(json.dumps(index["grid"]))
+    # Remove the old JSON fixture: leaving it would let a stale artifact be read
+    # by a test that no longer describes the API.
+    stale = fixtures / "mode_payload.json"
+    if stale.exists():
+        stale.unlink()
 
 
 def test_the_json_provider_refuses_to_write_a_non_finite_number(tmp_path):
@@ -962,14 +993,14 @@ def test_the_json_provider_refuses_to_write_a_non_finite_number(tmp_path):
             jsonify({"bad": float("nan")})
 
 
-def test_slices_json_is_empty_before_the_job_finishes(tmp_path):
+def test_the_index_is_not_served_before_the_job_finishes(tmp_path):
     app, _store, db, _launcher = make_app(tmp_path)
     upload(app.test_client())
     (job,) = db.jobs.values()
     assert app.test_client().get(
-        f"/jobs/{job['job_id']}/slices.json").status_code == 404
+        f"/jobs/{job['job_id']}/index.json").status_code == 404
     assert app.test_client().get(
-        f"/jobs/{job['job_id']}/slices/1.json").status_code == 404
+        f"/jobs/{job['job_id']}/field/1.bin").status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -978,7 +1009,7 @@ def test_slices_json_is_empty_before_the_job_finishes(tmp_path):
 def test_static_assets_must_revalidate_rather_than_expire_on_a_timer(tmp_path):
     """A cached viewer.js must never outlive the API it was written against.
 
-    The endpoints changed shape: ``/slices.json`` used to carry every mode's
+    The endpoints changed shape: ``/index.json`` used to carry every mode's
     field and is now an index. A browser holding the old ``viewer.js`` would ask
     for the new shape, find no ``slices`` key, and render blank slices -- with no
     error anywhere, which is what makes it worth a test rather than a comment.

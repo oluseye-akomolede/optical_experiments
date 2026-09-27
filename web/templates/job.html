@@ -27,20 +27,29 @@
   <div id="viewer" hidden>
     <div class="viewer-wrap">
       <canvas id="scene"></canvas>
-      <div class="legend"><span id="legend-lo">0</span>
-        <div class="legend-bar"></div>
-        <span id="legend-hi">1</span></div>
+      <p class="error" id="viewer-fallback" hidden>
+        This plot needs WebGL 2, which this browser either does not have or has
+        turned off. Try a current Chrome, Firefox, Edge or Safari, or turn on
+        hardware acceleration. The mode list below and the “Download for
+        ParaView” link still work, and open the field in ParaView.
+      </p>
+      <div class="legend"><span id="legend-lo"></span>
+        <div class="legend-bar" id="legend-bar"></div>
+        <span id="legend-hi"></span></div>
+      <p class="muted small" id="legend-note"></p>
     </div>
     <div class="controls">
-      <button id="toggle-animate" type="button">Animate</button>
-      <button id="toggle-arrows" type="button">Show E direction</button>
+      <label class="control-label" for="component-system">Coordinate system</label>
+      <select id="component-system"></select>
+      <label class="control-label" for="component-name">Component</label>
+      <select id="component-name"></select>
       <span class="muted small" id="mode-caption"></span>
+      <a class="muted small" id="download-vtu" hidden download>Download for ParaView (.vtu)</a>
     </div>
-    <div class="sliders">
-      <label>x<input type="range" id="slice-x" min="0" max="0" value="0"></label>
-      <label>y<input type="range" id="slice-y" min="0" max="0" value="0"></label>
-      <label>z<input type="range" id="slice-z" min="0" max="0" value="0"></label>
-    </div>
+    <p class="muted small" id="viewer-hint">
+      Drag to rotate, scroll or pinch to zoom, right-drag or two-finger drag to
+      pan.
+    </p>
   </div>
 </section>
 

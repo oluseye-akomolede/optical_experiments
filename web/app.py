@@ -2,7 +2,7 @@
 
 Owner-facing decisions this implements: .obj upload, a units menu (mm default),
 a refractive index field (default 1.0), the 20 lowest optical modes, and a
-viewer that shows the object with coloured field slices through it. Tailnet
+viewer that shows the object with a rotatable 3-D plot of the field. Tailnet
 only, no login.
 
 Concurrency is one. An upload is recorded as ``queued`` and a background tick
@@ -34,9 +34,6 @@ import jobs as JOBS
 import storage as STORE
 from meshing import UploadError, validate_upload
 
-#: how many slices of the field volume to send for the 3-D point cloud
-CLOUD_SAMPLES = 24
-
 #: where the solver puts one mode's field, and the ONE place that decides it.
 #: Both the index (which reads a size to decide `available`) and the fetch route
 #: (which reads the bytes) go through this, so they cannot drift apart and leave
@@ -67,8 +64,15 @@ class StrictJSON(DefaultJSONProvider):
         return super().dumps(obj, **kwargs)
 
 
-def create_app(config: dict | None = None) -> Flask:
-    """Build the app. Tests pass overrides here instead of touching env."""
+def create_app(config: dict | None = None) -> tuple[Flask, object, object, object]:
+    """Build the app *and its collaborators*, and hand all four back.
+
+    The return is a 4-tuple, not a bare ``Flask``: the store, the jobs database
+    and the launcher are built from the same config, and a caller that wants to
+    test a route against a store it controls needs them. ``build_app`` below is
+    the WSGI entrypoint and drops them, which is where a caller who only wants
+    the app should look.
+    """
     app = Flask(__name__)
     app.json = StrictJSON(app)
     app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32)
@@ -141,19 +145,31 @@ def create_app(config: dict | None = None) -> Flask:
             abort(404)
         except STORE.StorageError:
             abort(502)
+        # A .vtu is the one result file the user takes *away* -- the viewer
+        # renders the field itself, so the only reason to fetch this is to open
+        # it in ParaView, and `as_attachment` is what makes a browser save it
+        # instead of rendering it. The name is made readable rather than left as
+        # the solver's `mode_03.vtu`: on a downloads shelf, twenty files called
+        # `mode_NN.vtu` from twenty jobs are indistinguishable, so the object's
+        # name goes in front.
+        if name.endswith(".vtu"):
+            return send_file(_bytes_io(data), mimetype=_mimetype(name),
+                             as_attachment=True,
+                             download_name=_vtu_download_name(job, name),
+                             conditional=True)
         return send_file(_bytes_io(data), mimetype=_mimetype(name),
                          download_name=name, conditional=True)
 
     # -- derived payloads the viewer needs --------------------------------
     #
     # The payload is split so a phone downloads one mode's field, not twenty.
-    # ``slices.json`` is now the *index*: one entry per mode with its frequency
-    # and its index, no field data. The heavy arrays live in
-    # ``slices/<n>.json`` and are fetched when that mode is first selected. A
-    # job whose modes are all unreadable is still a payload, not an error --
-    # the index is what the mode table renders from.
-    @app.route("/jobs/<job_id>/slices.json")
-    def job_slices(job_id):
+    # ``index.json`` is the *index*: one entry per mode with its frequency and
+    # its index, no field data. The heavy arrays live in
+    # ``field/<n>.bin`` and are fetched when that mode is first selected. A job
+    # whose modes are all unreadable is still a payload, not an error -- the
+    # index is what the mode table renders from.
+    @app.route("/jobs/<job_id>/index.json")
+    def job_index(job_id):
         """The mode index: what each mode is, without any field data."""
         manifest = _done_manifest(store, jobs_db, job_id)
         try:
@@ -175,9 +191,9 @@ def create_app(config: dict | None = None) -> Flask:
         modest (the object fills most of its bounding box, so few samples are
         NaN) but it is still a third off.
 
-        Availability answers exactly as ``slices/<n>.json`` did: 404 for a mode
-        the table does not have or whose file is gone, 502 when storage cannot
-        be reached, so the viewer's existing failure handling still holds.
+        Availability: 404 for a mode the table does not have or whose file is
+        gone, 502 when storage cannot be reached -- a store that cannot answer
+        must never look like a mode that is not there.
         """
         manifest = _done_manifest(store, jobs_db, job_id)
         mode = next((m for m in manifest.get("modes", [])
@@ -200,31 +216,6 @@ def create_app(config: dict | None = None) -> Flask:
         response.headers["Content-Encoding"] = "gzip"
         response.headers["X-Field-Dtype"] = "float16-le"
         return response
-
-    @app.route("/jobs/<job_id>/slices/<int:number>.json")
-    def job_slices_for_mode(job_id, number):
-        """One mode's slices and point cloud, decoded from its own field file."""
-        manifest = _done_manifest(store, jobs_db, job_id)
-        mode = next((m for m in manifest.get("modes", [])
-                     if int(m["index"]) == number), None)
-        if mode is None:
-            abort(404)
-        try:
-            field = FLD.decode_mode(
-                store.read(STORE.job_key(job_id, FIELD_NAME.format(number))),
-                manifest["grid"])
-        except (FileNotFoundError, FLD.FieldError):
-            # The mode is in the table but its field file is gone or unusable.
-            # That is the same shape of failure as an unknown mode number, so it
-            # answers the same way rather than pretending a field exists.
-            abort(404)
-        return jsonify({
-            "grid": manifest["grid"],
-            "index": number,
-            "slices": [FLD.slice_payload(field, manifest["grid"], axis, pos)
-                       for axis, pos in _slice_positions(manifest["grid"])],
-            "cloud": FLD.downsample(field, manifest["grid"], CLOUD_SAMPLES),
-        })
 
     return app, store, jobs_db, launcher
 
@@ -481,11 +472,37 @@ def _require_job(jobs_db, job_id):
 
 
 def _safe_result_name(name: str) -> bool:
-    """Only the filenames the solver actually writes may be proxied."""
+    """Only the filenames the solver actually writes may be proxied.
+
+    A full match against a fixed alternation, not a prefix or a substring test:
+    this string reaches a store lookup, and the only reason a traversing name
+    cannot escape is that nothing shaped like one matches here at all. The
+    backslash and the dot are literals rather than metacharacters, so ``..`` and
+    ``/`` have no way to satisfy the pattern.
+    """
     import re
 
     return bool(re.fullmatch(r"modes\.json|surface\.glb|mode_\d{2}\.bin|"
                              r"mode_\d{2}\.vtu", name))
+
+
+def _vtu_download_name(job: dict, name: str) -> str:
+    """``my-lens/mode_03.vtu`` -> ``my-lens-mode03.vtu``.
+
+    Only the stem is kept: a browser turns a path separator into a directory
+    (or, on some platforms, refuses the name outright), and the download shelf
+    is not the place to reproduce the solver's ``mode_NN`` spelling. Anything
+    that is not a safe filename character is dropped rather than escaped, so the
+    result cannot become a path however the upload was named.
+    """
+    import re
+
+    stem = os.path.basename(job.get("original_filename") or "") or "mode"
+    stem = re.sub(r"\.(obj|stl|glb)$", "", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-.") or "mode"
+    index = re.fullmatch(r"mode_(\d+)\.vtu", name)
+    number = index.group(1) if index else "00"
+    return f"{stem[:60]}-mode{number}.vtu"
 
 
 def _mimetype(name: str) -> str:
@@ -563,16 +580,6 @@ def _mode_index(manifest: dict, store, job_id: str) -> dict:
         })
     return {"grid": manifest["grid"], "units": manifest.get("units"),
             "n_index": manifest.get("n_index"), "modes": modes}
-
-
-def _slice_positions(grid: dict):
-    """One representative slice per family, taken at the object's centre."""
-    out = []
-    for entry in FLD.slice_axes(grid):
-        count = entry["count"]
-        out.append((entry["name"],
-                    entry["origin_m"] + entry["spacing_m"] * (count // 2)))
-    return out
 
 
 def _bytes_io(data: bytes):

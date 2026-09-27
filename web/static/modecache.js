@@ -33,14 +33,16 @@ export function wantsFetch(index, mode, inFlightCount = 0) {
 }
 
 /**
- * The URL for a mode's field payload.
+ * The URL for a mode's field payload: raw float16 bytes, not JSON, because it
+ * goes straight into a 3-D texture. Serving it under a name that says so keeps
+ * a browser (or a reader) from expecting a document it can parse.
  *
  * `index` comes from the server's mode table and is used verbatim, not as
  * `mode.index + 1`: the table's numbering is the solver's, and a job whose
  * modes do not start at 1 must still fetch the right files.
  */
 export function modeFieldUrl(jobId, index) {
-  return `/jobs/${jobId}/slices/${index}.json`;
+  return `/jobs/${jobId}/field/${index}.bin`;
 }
 
 /**

@@ -1,0 +1,16 @@
+OrbitControls.js, from three 0.160.0.
+
+Source: examples/jsm/controls/OrbitControls.js inside
+https://registry.npmjs.org/three/-/three-0.160.0.tgz (the same tarball as
+three.module.min.js, so the same MIT license -- see three.LICENSE).
+
+The one change from upstream is the import specifier on line 12:
+`from 'three'` becomes `from './three.module.min.js'`. This app serves the
+library as a vendored file rather than through a bundler or a CDN, because it
+is only reachable on the tailnet and must work with no network access at all.
+The same rewrite was applied to GLTFLoader.js.
+
+Pinned to the *same release* as the vendored three build on purpose: the class
+reaches into three's internals (Spherical, Quaternion, EventDispatcher) and a
+version skew between the two files is the kind of mismatch that shows up as
+subtle viewport behaviour rather than as an error.

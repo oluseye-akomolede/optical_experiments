@@ -42,6 +42,33 @@ export const SYSTEMS = {
   magnitude: ['E'],
 };
 
+/** Display order of the coordinate systems in the picker. */
+export const SYSTEM_NAMES = ['cartesian', 'cylindrical', 'spherical', 'magnitude'];
+
+/** Human labels. Kept beside the names so the two cannot drift apart. */
+export const SYSTEM_LABELS = {
+  cartesian: 'Cartesian',
+  cylindrical: 'Cylindrical',
+  spherical: 'Spherical',
+  magnitude: 'Magnitude',
+};
+
+export const COMPONENT_LABELS = {
+  Ex: 'Eₓ', Ey: 'Eᵧ', Ez: 'Eᵥ',
+  Erho: 'Eᵨ', Ephi: 'Eᵩ',
+  Er: 'Eᵣ', Etheta: 'Eθ',
+  E: '|E|',
+};
+
+/** The components of one system, as the picker should list them. */
+export function COMPONENT_NAMES(system) {
+  return SYSTEMS[system] ? SYSTEMS[system].slice() : [];
+}
+
+/** What the plot shows before the user touches anything. */
+export const DEFAULT_SYSTEM = 'magnitude';
+export const DEFAULT_COMPONENT = 'E';
+
 /**
  * The scalar value at one sample, for the chosen component.
  *
@@ -138,4 +165,49 @@ export function componentVolume(vec, positions, centre, system, name) {
     out[i] = componentOf(v, p, centre, system, name);
   }
   return out;
+}
+
+// --------------------------------------------------------------------------
+// float32 -> float16 (IEEE 754 binary16), round-to-nearest-even
+// --------------------------------------------------------------------------
+// Written out rather than built on Float16Array, which Safari did not ship
+// until 2025 and which would turn an older-but-fine browser into a page that
+// loads and then shows nothing. NaN maps to a NaN half (the exponent is all
+// ones and the mantissa is non-zero), which is what keeps the solver's
+// outside-the-object samples transparent through the upload.
+export function float32ToHalf(value) {
+  const buffer = new ArrayBuffer(4);
+  const f32 = new Float32Array(buffer);
+  const u32 = new Uint32Array(buffer);
+  f32[0] = value;
+  const x = u32[0];
+  const sign = (x >>> 16) & 0x8000;
+  const exp = (x >>> 23) & 0xff;
+  const mantissa = x & 0x7fffff;
+
+  if (exp === 0xff) {
+    // Infinity or NaN. A non-zero mantissa is what makes a NaN a NaN, so it is
+    // carried over (any non-zero value will do, but keeping it costs nothing).
+    return sign | 0x7c00 | (mantissa ? 0x0200 : 0);
+  }
+  const half = exp - 127 + 15;
+  if (half >= 0x1f) return sign | 0x7c00;              // overflow -> infinity
+  if (half <= 0) {
+    if (half < -10) return sign;                        // underflow -> zero
+    // Subnormal: shift the implicit leading 1 back in and round.
+    const m = mantissa | 0x800000;
+    const shift = 14 - half;
+    const r = m >> shift;
+    const rem = m & ((1 << shift) - 1);
+    const halfway = 1 << (shift - 1);
+    const roundUp = rem > halfway || (rem === halfway && (r & 1) === 1);
+    return sign | (r + (roundUp ? 1 : 0));
+  }
+  let m = mantissa >> 13;
+  const rem = mantissa & 0x1fff;
+  if (rem > 0x1000 || (rem === 0x1000 && (m & 1) === 1)) {
+    m += 1;
+    if (m === 0x400) return sign | ((half + 1) << 10);   // mantissa carried
+  }
+  return sign | (half << 10) | m;
 }

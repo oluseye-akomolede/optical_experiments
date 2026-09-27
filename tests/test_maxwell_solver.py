@@ -454,6 +454,74 @@ def test_sampled_field_reproduces_a_constant_field_on_a_rotated_tet():
 # solver entrypoint: end-to-end on a tiny mesh, and the failure paths
 # --------------------------------------------------------------------------
 
+def test_the_vtu_carries_the_exact_values_and_a_reader_gets_them_back(tmp_path):
+    """The .vtu the owner downloads must be the field the solver computed.
+
+    It was written as ascii with ``%.6g``, which rounds every sample to six
+    significant digits and -- worse -- does so in a format where nothing
+    downstream notices: ParaView opens the file and draws a field that is
+    subtly not the one that was solved. This checks the property that the
+    rounding broke, through the reader the user actually uses, rather than
+    checking that the file exists.
+    """
+    import mse_fields as FLD
+    import pyvista as pv
+
+    shape = (2, 3, 4)
+    f = np.random.default_rng(11).standard_normal((2, 3, 4, 3)).astype("<f4")
+    # A value whose seventh significant digit is non-zero is what the old
+    # writer truncated; 1/7 is the cheapest such number to write down.
+    f[1, 2, 3] = [1.0 / 7.0, -1.0 / 3.0, np.float32(0.1)]
+    origin, spacing = (1.0, 2.0, 3.0), (0.5, 0.25, 0.125)
+
+    out = tmp_path / "mode_01.vtu"
+    FLD.write_vtu(out, f, shape, origin, spacing)
+    read = pv.read(out)
+
+    assert read.n_points == 24 and read.n_cells == 24
+    got = np.asarray(read["E"]).reshape(shape + (3,))
+    # Bit-exact, not close: float32 is the solver's own precision, and the whole
+    # point of the change was to stop losing digits on the way out.
+    assert np.array_equal(got, f), (
+        "the .vtu does not round-trip the field exactly -- the writer is "
+        "still narrowing the values on the way out"
+    )
+    mag = np.asarray(read["E_magnitude"]).reshape(shape)
+    assert np.allclose(mag, np.linalg.norm(f, axis=-1), rtol=1e-6)
+
+    pts = np.asarray(read.points)
+    assert np.allclose(pts[0], origin)
+    assert np.allclose(pts[-1], (origin[0] + 3 * spacing[0],
+                                 origin[1] + 2 * spacing[1],
+                                 origin[2] + 1 * spacing[2]))
+
+
+def test_the_vtu_keeps_the_solvers_nan_outside_the_object(tmp_path):
+    """NaN is "no sample here", and ParaView must be told that, not given a 0.
+
+    A zero would draw the outside of the object as a real part of the field,
+    which is the same failure the plot has a test for -- the two views have to
+    agree about where the object ends, or one of them is lying.
+    """
+    import mse_fields as FLD
+    import pyvista as pv
+
+    shape = (2, 2, 2)
+    f = np.full((2, 2, 2, 3), np.nan, dtype="<f4")
+    f[0, 0, 0] = [0.25, 0.5, 0.75]
+
+    out = tmp_path / "mode_01.vtu"
+    FLD.write_vtu(out, f, shape, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    got = np.asarray(pv.read(out)["E"]).reshape(shape + (3,))
+
+    assert np.array_equal(got[0, 0, 0], f[0, 0, 0])
+    # 8 samples, one of them real, three components each: 21 components are
+    # outside the object. NaN is per-component, so that is what is counted --
+    # a 21 (=7 samples) here would mean a whole sample had been dropped.
+    assert np.isnan(got).sum() == 21, "the outside-the-object NaN was lost"
+    assert not np.isnan(got[0, 0, 0]).any()
+
+
 def _write_box(root, job_id, extents=(10.0, 7.0, 5.0), open_surface=False):
     """Put a box .obj where the solver expects to find it."""
     import trimesh

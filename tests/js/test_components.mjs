@@ -10,7 +10,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { componentOf, componentVolume, boxCentre, SYSTEMS }
+import { componentOf, componentVolume, boxCentre, SYSTEMS, SYSTEM_NAMES,
+         COMPONENT_NAMES, SYSTEM_LABELS, COMPONENT_LABELS,
+         DEFAULT_SYSTEM, DEFAULT_COMPONENT }
   from '../../web/static/components.js';
 
 const C = [0, 0, 0];
@@ -149,4 +151,32 @@ test('the offered component list is complete and has no duplicates', () => {
     assert.equal(new Set(names).size, names.length, `${system} repeats a name`);
     assert.ok(names.length >= 1);
   }
+});
+
+test('the picker lists every system the transform can answer for', () => {
+  // The UI is built from these lists, so a system the transform supports but
+  // the picker omits would be unreachable; one the picker offers but the
+  // transform cannot answer would draw a blank plot. Both are silent.
+  assert.deepEqual(SYSTEM_NAMES.slice().sort(), Object.keys(SYSTEMS).sort());
+  for (const system of SYSTEM_NAMES) {
+    assert.ok(SYSTEM_LABELS[system], `${system} has no label`);
+    const names = COMPONENT_NAMES(system);
+    assert.deepEqual(names, SYSTEMS[system]);
+    for (const name of names) {
+      const got = componentOf([1, 2, 3], [1, 1, 1], [0, 0, 0], system, name);
+      assert.ok(Number.isFinite(got), `${system}.${name} is not answerable`);
+      assert.ok(COMPONENT_LABELS[name], `${name} has no label`);
+    }
+  }
+  // COMPONENT_NAMES must not hand out the module's own array, or a caller
+  // sorting it for display would reorder the transform's table underneath it.
+  const first = COMPONENT_NAMES('cartesian');
+  first.reverse();
+  assert.deepEqual(COMPONENT_NAMES('cartesian'), ['Ex', 'Ey', 'Ez']);
+});
+
+test('the default selection is one the transform can actually answer', () => {
+  assert.ok(SYSTEMS[DEFAULT_SYSTEM], 'default system is not offered');
+  assert.ok(SYSTEMS[DEFAULT_SYSTEM].includes(DEFAULT_COMPONENT),
+            'default component is not in the default system');
 });
