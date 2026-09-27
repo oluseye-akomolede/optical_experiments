@@ -38,6 +38,14 @@ class MemoryStore(STORE.LocalStore):
     def __init__(self, root):
         super().__init__(root)
 
+    def keys_under(self, job_id: str) -> list[str]:
+        """The names stored under ``jobs/<job_id>/``, for tests that assert on
+        WHICH files arrived rather than only that the job finished."""
+        base = Path(self.root) / "jobs" / job_id
+        if not base.is_dir():
+            return []
+        return sorted(p.name for p in base.iterdir() if p.is_file())
+
 
 class FakeDb:
     """The parts of JobStore the routes and the tick actually use."""

@@ -55,7 +55,12 @@ CREATE TABLE IF NOT EXISTS mse.jobs (
     -- block below so a fresh database and an upgraded one end up identical;
     -- `min_feature_mm` NULL means "the physics edge alone".
     min_feature_mm    double precision,
-    scale             double precision NOT NULL DEFAULT 1.0
+    scale             double precision NOT NULL DEFAULT 1.0,
+    -- How many times a GPU worker has handed this job back with no verdict
+    -- (POST /worker/jobs/<id>/release). It exists so that a job which can never
+    -- complete cannot loop forever: releases are legitimate for transient
+    -- reasons, but a bounded number of them. See the cap in web/worker_api.py.
+    release_count     integer NOT NULL DEFAULT 0
 );
 
 -- The solver used to run as a SparkApplication; it is now a plain batch/v1 Job,
@@ -175,6 +180,16 @@ BEGIN
         WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'scale'
     ) THEN
         ALTER TABLE mse.jobs ADD COLUMN scale double precision NOT NULL DEFAULT 1.0;
+    END IF;
+
+    -- How many times a worker has released this job with no verdict. Additive
+    -- and defaulted to 0, so every existing row means "released zero times",
+    -- which is the true value rather than a placeholder.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'release_count'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN release_count integer NOT NULL DEFAULT 0;
     END IF;
 END $$;
 

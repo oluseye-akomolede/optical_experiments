@@ -1,0 +1,76 @@
+# The Jetson GPU worker, as a systemd USER unit.
+#
+# Install (the lead does this -- see worker/README.md for the full sequence):
+#   mkdir -p ~/.config/systemd/user
+#   cp mse-worker.service ~/.config/systemd/user/
+#   cp mse_worker.py ~/mse-worker/          # alongside the solver checkout
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now mse-worker
+#
+# A USER unit, not a system one: the worker needs the desktop user's CUDA
+# environment and the user's ~/.config/mse-worker/env, and it must not run as
+# root on a box the owner also uses interactively. That also means it stops when
+# the user logs out unless lingering is on; `loginctl enable-linger <user>` is
+# the one-time fix, and README.md says so.
+#
+# ---------------------------------------------------------------------------
+# The bench lock
+# ---------------------------------------------------------------------------
+# The worker takes an exclusive `flock` on ~/mse-bench/.gpu.lock for the whole
+# time it is solving, and it does not even CLAIM a job while someone else holds
+# that lock. The lock exists because the GPU is the one resource here that
+# cannot be shared: the lead's own benchmark runs take the same lock, and two
+# things doing a cuDSS factorisation at once on 8 GB of shared memory is how the
+# box runs out of memory and looks broken.
+#
+# flock, not a sentinel file: the kernel drops it when the holder dies, so a
+# SIGKILLed worker or a crashed bench run cannot wedge the GPU permanently.
+# If the worker is idle and the lock is held, that is the normal state while a
+# bench run is in progress -- not a fault.
+
+[Unit]
+Description=MSE GPU worker (claim one Jetson job at a time and solve it)
+Documentation=file:%h/mse-worker/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/mse-worker/mse_worker.py
+EnvironmentFile=%h/.config/mse-worker/env
+
+# --- the Jetson CUDA environment -------------------------------------------
+# Verified working on the Orin (JetPack 6.2 / L4T R36.4.7 / CUDA 12.6); the
+# versions matter and the wrong ones ABORT rather than error -- see
+# scratch/gpu-reference/README.md. cuDSS 0.7.1 (Jetson aarch64 build from
+# NVIDIA's redist), NOT the pip nvidia-cudss-cu12 wheel, which is an SBSA build
+# and aborts in cudss.create(); the same goes for the pip cublas/nvrtc wheels.
+# %h rather than a home path so the unit is not machine-specific.
+Environment=LD_LIBRARY_PATH=%h/cudss-0.7.1/lib:/usr/local/cuda/lib64
+Environment=CUDSS_MT_LIB=%h/cudss-0.7.1/lib/libcudss_mtlayer_gomp.so.0
+Environment=CUDA_PYTHON_DISABLE_MAJOR_VERSION_WARNING=1
+Environment=MSE_SOLVER_BACKEND=gpu
+
+# --- resource limits -------------------------------------------------------
+# MemoryMax is a CGROUP limit and must stay one: ulimit -v (an address-space
+# limit) stops CUDA from initialising at all on this box, which is why the
+# bench runs use `systemd-run --user --scope -p MemoryMax=5G` rather than ulimit.
+# 5G is the measured working set of a solve; the Orin has 8 GB shared with the
+# system, so this is the ceiling that leaves the desktop alive.
+MemoryMax=5G
+# Below the interactive shell and the desktop: when the owner is using the box,
+# the worker should give way rather than make the machine feel broken.
+Nice=10
+
+# Restart on failure with backoff. Restart=on-failure and not `always`: a clean
+# SIGTERM stop (the operator restarting the service) must stay stopped.
+Restart=on-failure
+RestartSec=5
+# A bounded window to report the in-flight job failed-and-requeue and release
+# the bench lock before SIGKILL. The worker checks for the stop signal right
+# after solve() returns; a solve that runs longer than this is SIGKILLed, and
+# the lease then expires on its own, which the app already handles.
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target

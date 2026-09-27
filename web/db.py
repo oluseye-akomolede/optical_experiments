@@ -34,6 +34,14 @@ CLUSTER = "cluster"
 JETSON = "jetson"
 TARGETS = (CLUSTER, JETSON)
 
+#: How many times a jetson job may be handed back with no verdict before it is
+#: failed for good. Releases are legitimate for transient reasons; an unbounded
+#: number of them is an infinite loop, so there is a cap. Three is enough for a
+#: genuine restart or a flapping network to clear without a human, and small
+#: enough that a genuinely broken job reaches a terminal state quickly instead
+#: of cycling through the GPU queue forever.
+MAX_RELEASES = 3
+
 
 def dsn_from_env() -> dict:
     """Connection parameters from the environment (never from a file)."""
@@ -219,19 +227,59 @@ class JobStore:
         mid-flight on the GPU queue, and a worker picking it up again is the
         cheapest correct outcome -- re-running from the start costs one solve,
         while rerouting to the cluster costs a solve *and* the slower machine.
+
+        THIS COUNTS AS A RELEASE, and that is the whole reason the count is not
+        confined to the ``/release`` route. A worker that crashes mid-job every
+        time never calls ``/release`` -- it dies -- so if only that route
+        incremented the counter, a crash-looping worker would requeue through
+        lease timeouts forever and never reach the bound. Past the bound the job
+        is failed here instead, which is the only way a crash loop terminates.
+
+        One statement per job, with the bound in the WHERE, for the same reason
+        as ``release_jetson``: a racer that checks the count first can requeue a
+        job that should have failed.
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT job_id FROM mse.jobs "
+                "SELECT job_id, release_count FROM mse.jobs "
                 "WHERE lease_owner IS NOT NULL AND lease_expires_at < now()",
             )
-            ids = [str(row[0]) for row in cur.fetchall()]
-            if ids:
+            rows = [(str(r[0]), int(r[1])) for r in cur.fetchall()]
+            over = []
+            if rows:
+                # Claimable again, and counted -- but only while under the bound.
                 cur.execute(
-                    "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL "
-                    "WHERE lease_owner IS NOT NULL AND lease_expires_at < now()",
+                    "UPDATE mse.jobs SET lease_owner = NULL, "
+                    "lease_expires_at = NULL, release_count = release_count + 1 "
+                    "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
+                    "AND release_count < %s",
+                    (MAX_RELEASES,),
                 )
-        return ids
+                # Past the bound: terminal, and named for why.
+                cur.execute(
+                    "SELECT job_id FROM mse.jobs "
+                    "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
+                    "AND release_count >= %s",
+                    (MAX_RELEASES,),
+                )
+                over = [str(r[0]) for r in cur.fetchall()]
+                if over:
+                    cur.execute(
+                        "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
+                        "finished_at = now(), lease_owner = NULL, "
+                        "lease_expires_at = NULL "
+                        "WHERE job_id = ANY(%s) AND lease_owner IS NOT NULL "
+                        "AND lease_expires_at < now()",
+                        (FAILED, FAILED,
+                         "the GPU worker stopped responding and the job was "
+                         "retried too many times; try again later",
+                         over),
+                    )
+        # Reclaimed-and-requeued only: a job that was just failed is terminal,
+        # and reporting it here would tell the caller to go looking for a worker
+        # that does not exist. A uniform "all expired ids" return is the
+        # instrument lying about which rows moved.
+        return [job_id for job_id, _count in rows if job_id not in set(over)]
 
     def set_k8s_job_name(self, job_id, k8s_job_name: str) -> None:
         """Record the Job name even if the Job could not be created."""
@@ -413,21 +461,92 @@ class JobStore:
             )
             return cur.rowcount > 0
 
-    def release_jetson(self, job_id, owner: str) -> bool:
-        """Drop ``owner``'s lease, returning the job to the claimable pool.
+    def fail_jetson(self, job_id, owner: str, message: str) -> bool:
+        """Mark a jetson job FAILED for good, if ``owner`` still holds the lease.
 
-        Used when the worker reports it is giving up ("failed") before the lease
-        would have expired, so another worker can pick the job up immediately
-        instead of waiting out the timeout.
+        TERMINAL, and that is the point. The earlier behaviour -- releasing the
+        lease and requeueing -- meant a deterministic failure (a mesh the
+        mesher refuses, a box that is too detailed, a solver exception) came
+        straight back to the same or the next worker, which failed it the same
+        way. Forever. The message was logged and nowhere else, so the owner saw
+        a job that never finished and no reason for it.
+
+        ``finished_at`` is set and the lease cleared in the same statement, so
+        the row is in exactly the state the cluster's own failure path leaves it
+        in: the owner's job page reads it through the same column.
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
+                "finished_at = now(), lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (FAILED, FAILED, message, str(job_id), owner),
+            )
+            return cur.rowcount > 0
+
+    def release_jetson(self, job_id, owner: str, message: str = "") -> str | None:
+        """Hand a job back with no verdict -- or FAIL it if it has been released
+        too many times. One statement, one transaction.
+
+        Returns ``"released"``, ``"failed"`` (the bound was reached and the job
+        is now terminal) or ``None`` (this owner does not hold the lease -- the
+        caller answers 409, never a silent success).
+
+        For TRANSIENT reasons only -- a SIGTERM shutdown mid-job, a CUDA init
+        failure, a lost connection. Not a verdict about the job, so the row goes
+        back to ``queued`` and another worker (or this one, later) can take it.
+
+        WHY ONE STATEMENT. The bound has to hold when two releases race. A
+        read-count-then-decide form lets both callers read ``count = 2``, both
+        conclude they are under the bound, and both requeue -- the job that
+        should have failed at 3 instead goes round again, which is exactly the
+        non-terminating loop this whole mechanism exists to remove. Putting the
+        counter in the ``UPDATE``'s WHERE clause makes the database do the
+        comparison, so a losing racer matches zero rows and takes the failure
+        branch below.
+
+        WHY THE COUNT IS ON EVERY PATH BACK TO CLAIMABLE. ``/release`` is not
+        the only way a jetson row returns to the queue: a lease EXPIRY (a worker
+        that died mid-job) requeues it too. If only ``/release`` incremented the
+        count, a worker that crashed every time would requeue forever through
+        the timeout path and never hit the bound. See ``reclaim_expired_leases``.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            # Try the bounded release first. The WHERE carries the bound, so a
+            # racer that loses sees rowcount 0 and falls through to the failure.
+            cur.execute(
                 "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL, "
-                "gpu_queued_at = now() "
+                "status = %s, stage = %s, gpu_queued_at = now(), "
+                "release_count = release_count + 1 "
+                "WHERE job_id = %s AND lease_owner = %s AND release_count < %s",
+                (QUEUED, "queued", str(job_id), owner, MAX_RELEASES),
+            )
+            if cur.rowcount > 0:
+                return "released"
+            # Zero rows: either the lease is not ours (409) or the bound is
+            # reached. Distinguish them, because they are not the same event.
+            cur.execute(
+                "SELECT release_count FROM mse.jobs "
                 "WHERE job_id = %s AND lease_owner = %s",
                 (str(job_id), owner),
             )
-            return cur.rowcount > 0
+            row = cur.fetchone()
+            if row is None:
+                return None
+            # Over the bound and still ours: fail it, in this same transaction.
+            # The message is written from THIS attempt -- the failure the owner
+            # should see is the one that finally ended it, not the first one,
+            # which would name an earlier cause than the run that gave up.
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
+                "finished_at = now(), lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (FAILED, FAILED,
+                 message or f"the GPU worker could not complete this job after "
+                            f"{row[0]} attempts; try again later",
+                 str(job_id), owner),
+            )
+            return "failed"
 
     def lease_held_by(self, job_id, owner: str) -> bool:
         """Whether ``owner`` currently holds ``job_id``'s lease and it is live.

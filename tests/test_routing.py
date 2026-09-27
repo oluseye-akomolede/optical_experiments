@@ -362,7 +362,15 @@ class RoutingDb(FakeDb):
                            min_feature_mm=min_feature_mm, scale=scale)
         self.jobs[str(job_id)].update(target=target, est_tets=est_tets,
                                       gpu_queued_at="2026-09-26T00:00:00+00:00"
-                                      if target == DB.JETSON else None)
+                                      if target == DB.JETSON else None,
+                                      # The schema's own default, so a row here
+                                      # starts in the state a real one does. A
+                                      # double that omitted it would make
+                                      # ``release_count`` look absent when the
+                                      # real column is NOT NULL DEFAULT 0, and
+                                      # every ``.get(..., 0)`` would paper over
+                                      # the difference.
+                                      release_count=0)
 
     def reroute_to_cluster(self, job_id, reason):
         job = self.jobs.get(str(job_id))
@@ -380,11 +388,25 @@ class RoutingDb(FakeDb):
     def reclaim_expired_leases(self):
         ids = [j["job_id"] for j in self.jobs.values()
                if j.get("lease_expired")]
+        requeued = []
         for job in self.jobs.values():
-            if job.get("lease_expired"):
-                job.update(lease_owner=None, lease_expires_at=None)
-        self.reclaimed.extend(ids)
-        return ids
+            if not job.get("lease_expired"):
+                continue
+            # Counting here matches web/db.py, and it is the path a crash-looping
+            # worker actually takes: it never calls /release, it dies. A double
+            # that requeued on expiry without counting would show the loop
+            # terminating in tests and running forever in production.
+            if int(job.get("release_count", 0)) >= DB.MAX_RELEASES:
+                job.update(status=DB.FAILED, stage=DB.FAILED,
+                           message="the GPU worker stopped responding and the "
+                                   "job was retried too many times; try again later",
+                           lease_owner=None, lease_expires_at=None)
+                continue
+            job.update(lease_owner=None, lease_expires_at=None,
+                       release_count=int(job.get("release_count", 0)) + 1)
+            requeued.append(job["job_id"])
+        self.reclaimed.extend(requeued)
+        return requeued
 
 
 def _jetson_job(db, est_tets, job_id="job-1"):
@@ -489,6 +511,8 @@ class LeaseDb(RoutingDb):
     def __init__(self):
         super().__init__()
         self.claims: list[tuple[str, str]] = []
+        #: every stage the server was told, in order (see set_jetson_stage)
+        self.stages_seen: list[str] = []
 
     #: The columns the real ``claim_jetson`` SELECTs, named here so the double
     #: cannot be more generous than the query it stands in for. Returning
@@ -524,11 +548,45 @@ class LeaseDb(RoutingDb):
         return bool(job and job.get("lease_owner") == owner
                     and not job.get("lease_expired"))
 
-    def release_jetson(self, job_id, owner):
+    def release_jetson(self, job_id, owner, message=""):
+        job = self.jobs.get(str(job_id))
+        if not job or job.get("lease_owner") != owner:
+            return None
+        # ``status`` goes back to queued, matching web/db.py. The first version
+        # of this double cleared only the lease, copying a real bug: claim_jetson
+        # filters on status = queued, so a row released as ``running`` was never
+        # claimable -- the job stranded forever with no worker and no error. A
+        # double that is MORE generous than the query hides exactly that.
+        #
+        # The bound is modelled here for the same reason, and it is the part
+        # most worth modelling: a double that requeued unconditionally would let
+        # a test "prove" the loop terminates when the real SQL would cycle, and
+        # would never exercise the failure branch at all.
+        if int(job.get("release_count", 0)) >= DB.MAX_RELEASES:
+            # The message the owner reads is the one from the run that finally
+            # failed -- here, the reason the caller passed. The earlier form used
+            # a fixed string, which matched neither ``web/db.py`` (which prefers
+            # the caller's message and falls back only when there is none) nor
+            # the lead's item D, and it would have hidden a worker that stopped
+            # sending one.
+            job.update(status=DB.FAILED, stage=DB.FAILED,
+                       message=message or "the GPU worker could not complete "
+                                          "this job after several attempts; "
+                                          "try again later",
+                       lease_owner=None, lease_expires_at=None)
+            return "failed"
+        job.update(lease_owner=None, lease_expires_at=None,
+                   status=DB.QUEUED, stage="queued",
+                   release_count=int(job.get("release_count", 0)) + 1)
+        return "released"
+
+    def fail_jetson(self, job_id, owner, message):
         job = self.jobs.get(str(job_id))
         if not job or job.get("lease_owner") != owner:
             return False
-        job.update(lease_owner=None, lease_expires_at=None)
+        # Terminal: no requeue, and the message is what the owner reads.
+        job.update(status=DB.FAILED, stage=DB.FAILED, message=message,
+                   lease_owner=None, lease_expires_at=None)
         return True
 
     def finish_jetson(self, job_id, owner):
@@ -542,6 +600,9 @@ class LeaseDb(RoutingDb):
         job = self.jobs.get(str(job_id))
         if job:
             job["stage"] = stage
+        # Recorded as well as stored: a test that asserts the heartbeat carries
+        # a REAL stage needs the sequence, and the row only keeps the last one.
+        self.stages_seen.append(stage)
 
 
 @pytest.fixture()
@@ -866,16 +927,228 @@ def test_done_marks_the_job_finished_for_the_lease_holder(tmp_path, worker):
     assert db.jobs["job-1"]["status"] == DB.DONE
 
 
-def test_failed_releases_the_lease_so_another_worker_can_take_it(tmp_path, worker):
-    """A worker giving up must not sit on the lease until it expires: that is
-    the difference between a job that waits a timeout and one that restarts."""
+def test_failed_is_terminal_and_the_message_reaches_the_owner(tmp_path, worker):
+    """A deterministic failure must END the job, not requeue it.
+
+    This is the fix for the fail/requeue/fail loop, and the two halves of it are
+    both asserted here: the lease is cleared (so the row is not stuck) AND the
+    row is FAILED (so it is not offered again), with the worker's message on it
+    where the owner can read it.
+    """
     client, db, _store = worker
     _jetson_job(db, est_tets=20_000)
     db.jobs["job-1"]["lease_owner"] = WORKER.owner_id("tok-abc-123")
     resp = client.post("/worker/jobs/job-1/failed", headers=_auth(),
-                       json={"message": "out of memory"})
+                       json={"message": "this model is too detailed to solve"})
     assert resp.status_code == 200
+    row = db.jobs["job-1"]
+    assert row["lease_owner"] is None, "the lease must be cleared"
+    assert row["status"] == DB.FAILED, (
+        "a deterministic failure was requeued: it comes straight back to a "
+        "worker that fails it the same way, forever")
+    assert row["message"] == "this model is too detailed to solve"
+
+
+def test_the_failure_message_is_visible_on_the_job_status_api(tmp_path, worker):
+    """What the owner actually sees -- through the route the page reads.
+
+    Asserting on the double's dict would prove only that the double stored it.
+    The owner's view is the job status API, so the message has to survive that
+    projection too; a message that exists in the row but not in the payload is
+    a message the owner never reads.
+
+    The id is a real UUID because the route validates one and 404s otherwise --
+    the short ids the other tests use never reach ``get_job`` at all.
+    """
+    client, db, _store = worker
+    job_id = "11111111-1111-1111-1111-111111111111"
+    _jetson_job(db, est_tets=20_000, job_id=job_id)
+    db.jobs[job_id]["lease_owner"] = WORKER.owner_id("tok-abc-123")
+    client.post(f"/worker/jobs/{job_id}/failed", headers=_auth(),
+                json={"message": "this object could not be solved for 20 modes"})
+
+    payload = client.get(f"/jobs/{job_id}/status").get_json()
+    assert payload["status"] == DB.FAILED
+    assert "could not be solved for 20 modes" in (payload.get("message") or "")
+
+
+def test_failed_for_a_lease_this_worker_does_not_hold_is_409(tmp_path, worker):
+    """Never a silent success: the caller must learn it has no lease."""
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    db.jobs["job-1"]["lease_owner"] = "w-someone-else"
+    resp = client.post("/worker/jobs/job-1/failed", headers=_auth(),
+                       json={"message": "nope"})
+    assert resp.status_code == 409
+    assert db.jobs["job-1"]["status"] == DB.QUEUED
+
+
+def test_release_hands_the_job_back_with_no_verdict(tmp_path, worker):
+    """The transient verb: claimable again, counted, and NOT failed."""
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    db.jobs["job-1"]["lease_owner"] = WORKER.owner_id("tok-abc-123")
+    resp = client.post("/worker/jobs/job-1/release", headers=_auth(),
+                       json={"message": "the connection dropped"})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "released": True, "failed": False}
+    row = db.jobs["job-1"]
+    assert row["status"] == DB.QUEUED, "a release must leave it claimable"
+    assert row["lease_owner"] is None
+    assert row["release_count"] == 1, "the release must be counted"
+    assert "the connection dropped" not in (row.get("message") or ""), (
+        "a release is not a verdict; it must not write a failure message")
+
+
+def test_a_release_on_a_lease_this_worker_does_not_hold_is_409(tmp_path,
+                                                               worker):
+    """The lead's item E. A stale worker must not free somebody else's lease."""
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    db.jobs["job-1"]["lease_owner"] = "w-someone-else"
+    resp = client.post("/worker/jobs/job-1/release", headers=_auth(),
+                       json={"message": "dropping out"})
+    assert resp.status_code == 409
+    assert db.jobs["job-1"]["lease_owner"] == "w-someone-else"
+    assert db.jobs["job-1"]["release_count"] == 0
+
+
+def test_three_releases_fail_the_job_and_the_bound_is_the_same_in_both_copies(
+        tmp_path, worker):
+    """The bound, driven through the route until it fires.
+
+    ``MAX_RELEASES`` permits that many releases, so the one AFTER them is the
+    last: three requeues, then the fourth finds the count at the bound and the
+    app fails the job itself with a plain message. An unbounded release would
+    let a flapping worker loop forever, which is the defect this exists for.
+    """
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    owner = WORKER.owner_id("tok-abc-123")
+
+    for n in range(DB.MAX_RELEASES):
+        db.jobs["job-1"]["lease_owner"] = owner
+        resp = client.post("/worker/jobs/job-1/release", headers=_auth(),
+                           json={"message": "still dropping"})
+        assert resp.status_code == 200, f"release {n} refused"
+        assert resp.get_json()["released"] is True, (
+            f"the bound fired on release {n}, one before it should")
+        assert db.jobs["job-1"]["release_count"] == n + 1
+
+    db.jobs["job-1"]["lease_owner"] = owner
+    resp = client.post("/worker/jobs/job-1/release", headers=_auth(),
+                       json={"message": "and again"})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "released": False, "failed": True}
+    row = db.jobs["job-1"]
+    assert db.jobs["job-1"]["status"] == DB.FAILED
     assert db.jobs["job-1"]["lease_owner"] is None
+    # The message is the one from the run that FINALLY failed (item D): the
+    # owner should read the cause that ended it, not an earlier one.
+    assert db.jobs["job-1"]["message"] == "and again", (
+        "the owner was not shown the failure that ended the job")
+
+
+def test_two_interleaved_releases_cannot_both_requeue_past_the_bound(
+        tmp_path, worker):
+    """The lead's item B, at the API level.
+
+    Two releases race on the SAME row with the count already at the bound. A
+    read-count-then-decide form lets both read 3, both decide they are under it,
+    and both requeue -- the job that should be terminal goes round again. The
+    bound lives in the UPDATE's WHERE clause, so a losing racer matches zero
+    rows.
+
+    The loser can land in either of the two legal places, and BOTH are correct:
+    a 409 (the winner already cleared the lease, so the second caller no longer
+    holds it) or a 200 that reports ``failed``. What is forbidden is two
+    requeues, and that is what this asserts -- counting requeues, not statuses.
+    """
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    owner = WORKER.owner_id("tok-abc-123")
+
+    # bring the row to one release BELOW the bound
+    for _ in range(DB.MAX_RELEASES - 1):
+        db.jobs["job-1"]["lease_owner"] = owner
+        client.post("/worker/jobs/job-1/release", headers=_auth(),
+                    json={"message": "dropping"})
+    assert db.jobs["job-1"]["release_count"] == DB.MAX_RELEASES - 1
+
+    db.jobs["job-1"]["lease_owner"] = owner
+    first = client.post("/worker/jobs/job-1/release", headers=_auth(),
+                        json={"message": "racer one"})
+    second = client.post("/worker/jobs/job-1/release", headers=_auth(),
+                         json={"message": "racer two"})
+
+    requeues = 0
+    for resp in (first, second):
+        body = resp.get_json()
+        if resp.status_code == 200 and body and body.get("released"):
+            requeues += 1
+        assert resp.status_code in (200, 409), (
+            f"unexpected status {resp.status_code}: {resp.get_data()!r}")
+    assert requeues <= 1, (
+        f"both racers requeued, so the job escaped the bound: "
+        f"{first.status_code}/{second.status_code}")
+    assert db.jobs["job-1"]["release_count"] <= DB.MAX_RELEASES, (
+        f"the race double-counted the release: "
+        f"{db.jobs['job-1']['release_count']}")
+
+    # THE INVARIANT THAT MATTERS: the job cannot cycle. Either the race failed it
+    # outright, or it is left at the bound and claimable exactly once more --
+    # and that last claim ends it. Prove termination rather than assuming it.
+    taken = db.claim_jetson(owner, 300)
+    if taken is not None:
+        db.jobs["job-1"]["lease_owner"] = owner
+        final = client.post("/worker/jobs/job-1/release", headers=_auth(),
+                            json={"message": "one too many"})
+        assert final.get_json() == {"ok": True, "released": False,
+                                    "failed": True}, (
+            "the job was requeued past the bound: it can loop forever")
+    assert db.jobs["job-1"]["status"] == DB.FAILED, (
+        "a job at the bound is still claimable: it would cycle forever")
+
+
+def test_the_bound_is_reachable_from_the_expiry_path_too(tmp_path, monkeypatch):
+    """The lead's item C: EVERY path back to claimable counts, not just release.
+
+    A worker that dies mid-job never calls /release -- the row comes back
+    through lease EXPIRY. If that path did not increment the same counter, a
+    worker that crashed every time would requeue forever through the timeout
+    and never reach the bound, which is the loop this whole mechanism removes.
+
+    Driven on the REAL ``reclaim_expired_leases`` logic via the double, which
+    models the count-and-bound: the assertion that matters is that repeated
+    expiries converge on FAILED instead of cycling.
+    """
+    db = LeaseDb()
+    _jetson_job(db, est_tets=20_000)
+    owner = "w-crashy"
+
+    for n in range(DB.MAX_RELEASES):
+        db.jobs["job-1"].update(lease_owner=owner, status=DB.RUNNING,
+                                lease_expired=True)
+        requeued = db.reclaim_expired_leases()
+        # The real ``reclaim_expired_leases`` clears the LEASE and deliberately
+        # leaves the row ``running``: the job genuinely is mid-flight on the GPU
+        # queue, and re-running it is cheaper than rerouting it. Claimability is
+        # what the cleared lease buys, so that is what is asserted -- not a
+        # status the real code never writes.
+        assert "job-1" in requeued, f"expiry {n} did not reclaim the job"
+        db.jobs["job-1"]["lease_expired"] = False
+        assert db.jobs["job-1"]["lease_owner"] is None
+        assert db.jobs["job-1"]["release_count"] == n + 1, (
+            "the expiry path did not count the requeue")
+
+    db.jobs["job-1"].update(lease_owner=owner, status=DB.RUNNING,
+                            lease_expired=True)
+    requeued = db.reclaim_expired_leases()
+    assert db.jobs["job-1"]["status"] == DB.FAILED, (
+        "a crash-looping worker can requeue forever through expiry: the bound "
+        "must apply here too")
+    assert "job-1" not in requeued, (
+        "the bounded-out row was still reported as requeued")
 
 
 def test_a_stale_worker_cannot_mark_a_job_done(tmp_path, worker):

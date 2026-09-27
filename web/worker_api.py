@@ -209,6 +209,18 @@ def _register_routes():
             # upload the solver then refused at 80k.
             "max_tets": CFG.max_tets(),
             "cpu_max_tets": CFG.cpu_max_tets(),
+            # WHICH lease this claim took. Sent for the same reason the caps
+            # are: the worker cannot see the row, so a value the app chose and
+            # the worker needs has to travel with the claim.
+            #
+            # The worker does NOT derive its beat from this. Earlier it beat at
+            # ``this / 3``, which for the 300 s default is 100 s -- longer than
+            # many real solves, so the first beat arrived after the work was
+            # done and a long job looked to the app like a dead worker. The beat
+            # interval is now the worker's own ``MSE_BEAT_SECONDS``. This value
+            # stays in the payload because the worker checks its beat against it
+            # and warns when the beat cannot keep the lease alive, which is a
+            # real misconfiguration the worker alone cannot see.
             "lease_seconds": lease_seconds,
         })
 
@@ -280,21 +292,55 @@ def _register_routes():
 
     @bp.post("/worker/jobs/<job_id>/failed")
     def failed(job_id):
-        """The worker is giving the job up. Release the lease promptly.
+        """The worker is giving up on this job for good. TERMINAL.
 
-        Not a permanent failure: dropping the lease puts the row back in the
-        claimable pool, so this is how a worker that hit a transient problem
-        (out of memory on a big mesh, a restart) hands the job back rather than
-        sitting on it until the lease times out.
+        The job is marked FAILED with the worker's message, the lease is
+        cleared, and it is NOT requeued. This is the only honest thing to do
+        with a deterministic failure -- a mesh the mesher refuses, a box that is
+        too detailed, a solver exception -- because requeueing it means it comes
+        straight back to a worker that fails it the same way. Forever, with the
+        reason visible only in a log the owner never reads.
+
+        Transient reasons do NOT belong here: they go to ``/release``, which
+        hands the job back with no verdict. This route used to release-and-
+        requeue, which is why a deterministic failure looped; the fix is to make
+        the two cases two verbs rather than one blurry one.
         """
         owner = _require_worker()
         body = request.get_json(silent=True) or {}
-        if not _deps()["jobs_db"].release_jetson(job_id, owner):
+        message = str(body.get("message", ""))[:2000] or "the GPU worker failed"
+        if not _deps()["jobs_db"].fail_jetson(job_id, owner, message):
             abort(409, description="this worker no longer holds the lease")
-        message = str(body.get("message", ""))[:2000]
-        if message:
-            _deps()["log"](f"[mse-web] worker {owner} released {job_id}: {message}")
+        _deps()["log"](f"[mse-web] worker {owner} failed {job_id}: {message}")
         return jsonify({"ok": True})
+
+    @bp.post("/worker/jobs/<job_id>/release")
+    def release(job_id):
+        """Hand the job back with NO verdict, because the reason was transient.
+
+        Requeues, so another worker (or this one, later) can take it, and the
+        release is COUNTED. The bound is enforced inside ``release_jetson`` as
+        one atomic statement rather than here: a read-count-then-decide form
+        lets two concurrent releases both read 2, both requeue, and the job that
+        should have failed instead goes round again. See that method's docstring.
+
+        The response says which of the three things happened, so a worker (and a
+        test) can tell "requeued" from "this was the last try and it is now
+        terminal".
+        """
+        owner = _require_worker()
+        body = request.get_json(silent=True) or {}
+        reason = str(body.get("message", ""))[:2000]
+        outcome = _deps()["jobs_db"].release_jetson(job_id, owner, reason)
+        if outcome is None:
+            abort(409, description="this worker no longer holds the lease")
+        if outcome == "failed":
+            _deps()["log"](f"[mse-web] {job_id} failed after {DB.MAX_RELEASES} "
+                           f"releases" + (f": {reason}" if reason else ""))
+            return jsonify({"ok": True, "released": False, "failed": True})
+        _deps()["log"](f"[mse-web] worker {owner} released {job_id}"
+                       + (f": {reason}" if reason else ""))
+        return jsonify({"ok": True, "released": True, "failed": False})
 
 
 
