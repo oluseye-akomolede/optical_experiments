@@ -31,7 +31,7 @@ spec:
         - name: mse-harbor-pull
       containers:
         - name: rendercheck
-          image: harbor.arcadia-ecs.local/mode-search-engine/mse-rendercheck:8e27869
+          image: harbor.arcadia-ecs.local/mode-search-engine/mse-rendercheck:4874af7
           env:
             - name: MSE_URL
               value: http://mse-web.mode-search-engine.svc.cluster.local/jobs/08f832dd-26ba-410f-afe5-ad5dfd08a167
