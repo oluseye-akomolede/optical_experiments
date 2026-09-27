@@ -128,7 +128,7 @@ class K8sJobLauncher:
             except Exception:  # noqa: BLE001 - fall back for local/dev use
                 config.load_kube_config()
             self._client = client.BatchV1Api()
-            self._core = client.CoreV1Api()
+            self._core_api = client.CoreV1Api()
         return self._client
 
     def manifest(self, job_id, units: str, n_index: float, n_modes: int) -> dict:
@@ -217,10 +217,58 @@ class K8sJobLauncher:
 
         states: dict[str, str] = {}
         for job in jobs.items:
-            reason = _failed_reason(job)
+            job_status = getattr(job, "status", None)
+            # A Job whose own condition already names the failure needs no pods,
+            # so skip the extra list call for the common DeadlineExceeded case.
+            if _job_condition_reason(job_status) is not None:
+                reason = _failed_reason(job)
+            else:
+                reason = _failed_reason(job, self._job_pods(job))
             if reason is not None:
                 states[job.metadata.name] = reason
         return states
+
+    def _job_pods(self, job) -> list:
+        """The pods belonging to ``job``, or ``[]`` if we cannot list them.
+
+        A pod list is how a container's ``OOMKilled`` becomes visible -- the
+        Job's status holds no pods. Failing to list them must not sink the whole
+        tick: the Job's own condition still says *that* it failed, so the caller
+        falls back to a reason it does have rather than losing the failure.
+        """
+        from kubernetes import client
+
+        name = getattr(getattr(job, "metadata", None), "name", None)
+        if not name:
+            return []
+        try:
+            return list(self._core().list_namespaced_pod(
+                self.namespace, label_selector=f"job-name={name}"
+            ).items)
+        except client.ApiException:
+            # Not allowed, or the pod is already gone. The Job's own condition
+            # still says *that* it failed, so the caller keeps that reason rather
+            # than losing the failure to a failed lookup.
+            return []
+        except Exception:  # noqa: BLE001
+            # Nothing about naming an OOMKilled container is worth failing a
+            # scheduler tick for. If the core API is unreachable for any reason
+            # at all, fall back to the reason we already have.
+            return []
+
+    def _core(self):
+        """The CoreV1 API, built alongside the batch one.
+
+        ``_batch()`` short-circuits when a client is already assigned (the tests
+        do that to run without a cluster), so the core client is built here if
+        that path skipped it.
+        """
+        self._batch()
+        if getattr(self, "_core_api", None) is None:
+            from kubernetes import client
+
+            self._core_api = client.CoreV1Api()
+        return self._core_api
 
     # -- mutation ----------------------------------------------------------
     def create(self, job_id, units: str, n_index: float, n_modes: int) -> str:
@@ -254,53 +302,78 @@ class K8sJobLauncher:
                 raise
 
 
-def _failed_reason(job) -> str | None:
+def _job_condition_reason(status) -> str | None:
+    """The ``Failed`` condition's reason, or ``None`` if it is not set yet.
+
+    Split out so a caller can ask "does the Job itself already say why?" without
+    paying for a pod list. Returns ``""`` (not ``None``) when the condition is
+    set but carries no reason -- that is still a failure, so the caller must not
+    read it as "keep looking".
+    """
+    for cond in (getattr(status, "conditions", None) or []):
+        if getattr(cond, "type", "") == "Failed" and \
+                getattr(cond, "status", "") == "True":
+            return getattr(cond, "reason", "") or ""
+    return None
+
+
+def _failed_reason(job, pods=None) -> str | None:
     """A short reason string if the Job has FAILED, else ``None``.
 
     Kubernetes signals this two ways and we check both: the Job's own
     ``Failed`` condition (``DeadlineExceeded`` when ``activeDeadlineSeconds``
-    ran out, ``BackoffLimitExceeded``), and the pod's container termination
-    reason (``OOMKilled`` when the cgroup killed it). A Job with neither is not
+    ran out, ``BackoffLimitExceeded``), and a container's termination reason
+    (``OOMKilled`` when the cgroup killed it). A Job with neither is not
     treated as failed -- it is either running or finished successfully.
+
+    ``pods`` are the Job's pods, which the caller must list separately: a
+    ``V1JobStatus`` describes the Job, not its pods -- ``status.failed`` is a
+    *count*, not a list. Passing the Job alone therefore cannot name an
+    ``OOMKilled`` container, and asking this function to try was the bug.
     """
     status = getattr(job, "status", None)
     if status is None:
         return None
 
-    for cond in (getattr(status, "conditions", None) or []):
-        if getattr(cond, "type", "") == "Failed" and \
-                getattr(cond, "status", "") == "True":
-            return getattr(cond, "reason", "") or ""
+    own = _job_condition_reason(status)
+    if own is not None:
+        return own
 
     # The Job condition is not always set promptly, but an OOMKilled container
-    # is the case the owner most needs named, so look at the pod too.
+    # is the case the owner most needs named, so look at the pods.
     for reason in ("OOMKilled", "Error"):
-        if _pod_has_reason(status, reason):
+        if _pods_have_reason(pods or [], reason):
             return reason
     return None
 
 
-def _pod_has_reason(status, reason: str) -> bool:
-    """Whether any container of the Job's pod terminated with ``reason``.
+def _pods_have_reason(pods, reason: str) -> bool:
+    """Whether any container of any of these pods terminated with ``reason``.
 
     Reads the shape the Python client returns; a plain dict is accepted too so
-    the fake launcher in tests can pass either.
+    the tests can pass either. The ``state`` of a container is either a dict or
+    an object depending on how it was built, so both are handled once, in
+    ``_attr``, rather than guessed at per call site.
     """
-    def get(obj, name, default=None):
-        if isinstance(obj, dict):
-            return obj.get(name, default)
-        return getattr(obj, name, default)
-
-    for pod in (get(status, "failed", None) or []):
-        pod_status = get(pod, "status", None) or pod
-        for cs in (get(pod_status, "container_statuses", None) or []):
-            term = get(get(cs, "state", None) or {}, "terminated", None)
-            if term is None and not isinstance(get(cs, "state", None), dict):
-                state = get(cs, "state", None)
-                term = get(state, "terminated", None)
-            if get(term, "reason", "") == reason:
+    for pod in pods or []:
+        pod_status = _attr(pod, "status") or pod
+        for cs in (_attr(pod_status, "container_statuses") or []):
+            state = _attr(cs, "state")
+            if state is None:
+                continue
+            terminated = _attr(state, "terminated")
+            if terminated is None and isinstance(state, dict):
+                terminated = state.get("terminated")
+            if _attr(terminated, "reason", "") == reason:
                 return True
     return False
+
+
+def _attr(obj, name, default=None):
+    """``getattr`` that also reads a plain dict, for fakes and real objects."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
 
 
 #: owner-facing text per known failure reason. Kept deliberately plain: this is

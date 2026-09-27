@@ -172,10 +172,13 @@ def test_a_plain_403_is_not_a_quota_wait():
 # briefly pinned only by reading the source on the assumption that the client
 # was unreachable in a unit test. It is reachable.
 class _FakeApi:
-    def __init__(self, exc=None, jobs=()):
+    def __init__(self, exc=None, jobs=(), pods=(), pods_exc=None):
         self._exc = exc
         self._jobs = list(jobs)
+        self._pods = list(pods)
+        self._pods_exc = pods_exc
         self.calls = 0
+        self.pod_calls = 0
 
     def list_namespaced_job(self, namespace, label_selector=None):
         self.calls += 1
@@ -183,11 +186,18 @@ class _FakeApi:
             raise self._exc
         return types.SimpleNamespace(items=self._jobs)
 
+    def list_namespaced_pod(self, namespace, label_selector=None):
+        self.pod_calls += 1
+        if self._pods_exc is not None:
+            raise self._pods_exc
+        return types.SimpleNamespace(items=self._pods)
 
-def _launcher_with(exc=None, jobs=()):
+
+def _launcher_with(exc=None, jobs=(), pods=(), pods_exc=None):
     launcher = JOBS.K8sJobLauncher("ns", "img", "secret")
-    api = _FakeApi(exc=exc, jobs=jobs)
+    api = _FakeApi(exc=exc, jobs=jobs, pods=pods, pods_exc=pods_exc)
     launcher._client = api                    # short-circuits _batch()
+    launcher._core_api = api                  # and the core client too
     return launcher, api
 
 
@@ -247,6 +257,110 @@ def test_a_good_list_returns_the_names_and_the_failure_states():
     assert launcher.active_job_names() == ["mse-solver-a"]
     assert launcher.job_states() == {}
     assert api.calls == 2, "one list call per method"
+
+
+# ---------------------------------------------------------------------------
+# The real client's shape: status.failed is a COUNT, not a pod list
+# ---------------------------------------------------------------------------
+def _real_job(status):
+    """A real ``V1Job`` carrying a real ``V1JobStatus``.
+
+    Built from the actual kubernetes client, not a ``SimpleNamespace`` -- that
+    is the whole point. The bug this pins was invisible precisely because the
+    doubles were hand-shaped.
+    """
+    from kubernetes import client as k8s
+
+    return k8s.V1Job(metadata=k8s.V1ObjectMeta(name="mse-solver-a"),
+                     status=status)
+
+
+def test_a_real_job_status_whose_failure_is_only_a_count_does_not_raise():
+    """The crash: ``status.failed`` is ``1``, and the old code iterated it.
+
+    ``failed=1`` with no ``Failed`` condition is exactly the window the bug
+    lived in -- Kubernetes has counted the failure but not yet published the
+    condition. The old code reached its pod loop, tried to iterate the int, and
+    raised ``TypeError``, which propagated out of ``job_states`` and failed the
+    whole scheduler tick: no dead-Job marking and no launch until the condition
+    landed. Reproduced here against the real client objects.
+    """
+    from kubernetes import client as k8s
+
+    job = _real_job(k8s.V1JobStatus(failed=1))
+    # The precondition this test depends on: iterating it really does raise.
+    with pytest.raises(TypeError):
+        list(job.status.failed)
+
+    assert JOBS._failed_reason(job, []) is None
+    assert JOBS._job_condition_reason(job.status) is None
+
+
+def test_a_real_failed_condition_is_read_before_any_pod_lookup():
+    from kubernetes import client as k8s
+
+    job = _real_job(k8s.V1JobStatus(
+        failed=1,
+        conditions=[k8s.V1JobCondition(
+            type="Failed", status="True", reason="DeadlineExceeded")]))
+    assert JOBS._failed_reason(job, []) == "DeadlineExceeded"
+
+
+def test_oomkilled_is_named_from_the_pods_not_from_the_job_status():
+    """The message that could never fire, now reachable.
+
+    A Job's status holds no pods, so ``OOMKilled`` can only come from a pod
+    list. The old code looked for pods inside the Job status, so this reason was
+    unreachable in production no matter what Kubernetes reported.
+    """
+    from kubernetes import client as k8s
+
+    job = _real_job(k8s.V1JobStatus(failed=1))      # no Failed condition yet
+    pod = k8s.V1Pod(
+        metadata=k8s.V1ObjectMeta(name="mse-solver-a-x"),
+        status=k8s.V1PodStatus(container_statuses=[
+            k8s.V1ContainerStatus(
+                name="solver", ready=False, restart_count=0,
+                image="img", image_id="",
+                state=k8s.V1ContainerState(terminated=k8s.V1ContainerStateTerminated(
+                    exit_code=137, reason="OOMKilled"))),
+        ]))
+
+    assert JOBS._failed_reason(job, [pod]) == "OOMKilled"
+    # and without the pods it is honestly unknown, not silently "no failure"
+    assert JOBS._failed_reason(job, []) is None
+
+
+def test_a_pod_list_that_fails_does_not_lose_the_job_failure():
+    """A failed pod lookup must degrade to the reason we have, not to none.
+
+    ``_job_pods`` returns ``[]`` rather than raising, so the Job's own
+    condition still reports the failure. Losing the whole failure because we
+    could not name its cause would be a worse trade.
+    """
+    from kubernetes import client as k8s
+
+    job = _real_job(k8s.V1JobStatus(
+        failed=1,
+        conditions=[k8s.V1JobCondition(
+            type="Failed", status="True", reason="BackoffLimitExceeded")]))
+    launcher, api = _launcher_with(
+        jobs=[job], pods_exc=_api_exception(403))
+
+    assert launcher.job_states() == {
+        "mse-solver-a": "BackoffLimitExceeded"}
+
+
+def test_job_states_asks_for_the_pods_of_each_failed_job():
+    """The pod list is requested per Job, so OOMKilled has somewhere to come from."""
+    from kubernetes import client as k8s
+
+    job = _real_job(k8s.V1JobStatus(failed=1))
+    launcher, api = _launcher_with(jobs=[job])
+
+    assert launcher.job_states() == {}
+    assert api.calls == 1
+    assert api.pod_calls == 1, "the pods of a failed Job must be listed"
 
 
 # ---------------------------------------------------------------------------

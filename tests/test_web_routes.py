@@ -164,7 +164,18 @@ class FakeLauncher:
         return list(self.active)
 
     def job_states(self):
-        """Only the names still present can be reporting a state."""
+        """Only the names still present can be reporting a state.
+
+        This class doubles the *launcher*, not the Kubernetes client, so it
+        answers ``job_states`` outright and never exercises ``_failed_reason``
+        or the pod list. That is why it did not catch the ``status.failed``
+        TypeError and is not expected to: the double that hid that bug is
+        ``_FakeApi`` in tests/test_web_app.py, which stands in for the client and
+        used to hand back pods from a field the real ``V1JobStatus`` does not
+        have. Tests for the real client shapes belong there, against real
+        ``kubernetes.client`` objects -- see
+        ``test_a_real_job_status_whose_failure_is_only_a_count_does_not_raise``.
+        """
         if self.cannot_ask or self.raise_on == "job_states":
             raise JOBS.CannotAskCluster("not allowed to list solver jobs")
         if self.swallowed_403:
