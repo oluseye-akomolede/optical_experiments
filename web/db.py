@@ -235,23 +235,12 @@ class JobStore:
             cur.execute("SELECT count(*) FROM mse.jobs WHERE status = %s", (RUNNING,))
             return int(cur.fetchone()[0])
 
-    def requeue_stale(self, job_ids) -> int:
-        """Put jobs the cluster no longer knows about back in the queue.
-
-        ``job_ids`` are the ones the tick found neither running nor queued; a
-        Job deleted by hand (or lost with the node) would otherwise leave its
-        row stuck in ``running`` forever.
-        """
-        ids = [str(j) for j in job_ids]
-        if not ids:
-            return 0
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE mse.jobs SET status = %s, stage = %s "
-                "WHERE status = %s AND job_id = ANY(%s)",
-                (QUEUED, QUEUED, RUNNING, ids),
-            )
-            return cur.rowcount
+    # NOTE: there is deliberately no `requeue_stale` here any more. It put rows
+    # whose Job had vanished back into `queued`, which sounds self-healing but
+    # re-runs a solve that has already died -- an object that OOMs would OOM on
+    # every attempt, forever. A row that is `running` with no Job behind it did
+    # not finish, so the tick now fails it (see app._fail_dead_jobs) and the
+    # owner is told, rather than watching a spinner that never ends.
 
 
 def _job_row(row) -> dict:

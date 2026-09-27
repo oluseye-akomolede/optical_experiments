@@ -163,10 +163,49 @@ class K8sJobLauncher:
         return [j.metadata.name for j in jobs.items]
 
     def is_quota_exceeded(self, exc: Exception) -> bool:
-        """A 403 'exceeded quota' means wait, not fail."""
+        """A 403 'exceeded quota' means wait, not fail.
+
+        Distinct from :func:`_as_launch_error`, which turns the same exception
+        into ``QuotaExceeded`` for the launch path; this is the predicate form
+        the tests and any caller holding a bare exception use.
+        """
         status = getattr(exc, "status", None)
         body = str(getattr(exc, "body", "") or str(exc))
         return status == 403 and "exceeded quota" in body.lower()
+
+    def job_states(self) -> dict[str, str]:
+        """``{job name: failure reason}`` for our Jobs that have FAILED.
+
+        Only failures are reported, so a name absent from the result means
+        "exists and has not failed". A caller distinguishes the three cases it
+        cares about by crossing this with ``active_job_names``: running (present
+        in both), dead-and-failed (in this dict), and gone (in neither).
+
+        The reason is a best-effort plain word -- ``DeadlineExceeded`` from the
+        Job's own condition, or a container's ``OOMKilled``/``Error`` -- and may
+        be ``""`` when Kubernetes does not say. Callers must not depend on it
+        being one of a fixed set.
+        """
+        if self.dry_run:
+            return {}
+        from kubernetes import client
+
+        api = self._batch()
+        try:
+            jobs = api.list_namespaced_job(
+                self.namespace, label_selector="app=mse-solver"
+            )
+        except client.ApiException as exc:
+            if exc.status == 403:
+                return {}
+            raise
+
+        states: dict[str, str] = {}
+        for job in jobs.items:
+            reason = _failed_reason(job)
+            if reason is not None:
+                states[job.metadata.name] = reason
+        return states
 
     # -- mutation ----------------------------------------------------------
     def create(self, job_id, units: str, n_index: float, n_modes: int) -> str:
@@ -198,6 +237,86 @@ class K8sJobLauncher:
         except client.ApiException as exc:
             if exc.status != 404:  # already gone is success
                 raise
+
+
+def _failed_reason(job) -> str | None:
+    """A short reason string if the Job has FAILED, else ``None``.
+
+    Kubernetes signals this two ways and we check both: the Job's own
+    ``Failed`` condition (``DeadlineExceeded`` when ``activeDeadlineSeconds``
+    ran out, ``BackoffLimitExceeded``), and the pod's container termination
+    reason (``OOMKilled`` when the cgroup killed it). A Job with neither is not
+    treated as failed -- it is either running or finished successfully.
+    """
+    status = getattr(job, "status", None)
+    if status is None:
+        return None
+
+    for cond in (getattr(status, "conditions", None) or []):
+        if getattr(cond, "type", "") == "Failed" and \
+                getattr(cond, "status", "") == "True":
+            return getattr(cond, "reason", "") or ""
+
+    # The Job condition is not always set promptly, but an OOMKilled container
+    # is the case the owner most needs named, so look at the pod too.
+    for reason in ("OOMKilled", "Error"):
+        if _pod_has_reason(status, reason):
+            return reason
+    return None
+
+
+def _pod_has_reason(status, reason: str) -> bool:
+    """Whether any container of the Job's pod terminated with ``reason``.
+
+    Reads the shape the Python client returns; a plain dict is accepted too so
+    the fake launcher in tests can pass either.
+    """
+    def get(obj, name, default=None):
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+
+    for pod in (get(status, "failed", None) or []):
+        pod_status = get(pod, "status", None) or pod
+        for cs in (get(pod_status, "container_statuses", None) or []):
+            term = get(get(cs, "state", None) or {}, "terminated", None)
+            if term is None and not isinstance(get(cs, "state", None), dict):
+                state = get(cs, "state", None)
+                term = get(state, "terminated", None)
+            if get(term, "reason", "") == reason:
+                return True
+    return False
+
+
+#: owner-facing text per known failure reason. Kept deliberately plain: this is
+#: what appears on the job page, and the owner is not a Kubernetes operator.
+FAILURE_MESSAGES = {
+    "DeadlineExceeded": (
+        "The solver took too long and was stopped. Try a simpler object, or "
+        "ask for fewer modes."
+    ),
+    "OOMKilled": (
+        "The solver ran out of memory. Try a simpler object, or ask for fewer "
+        "modes."
+    ),
+}
+
+#: used when the Job is gone or died without Kubernetes giving a reason
+FAILURE_DEFAULT = (
+    "The solver stopped unexpectedly. Please try a simpler object, or ask for "
+    "fewer modes."
+)
+
+
+def failure_message(reason: str | None) -> str:
+    """Plain English for the owner, from a Kubernetes reason.
+
+    Unknown reasons fall back rather than leaking a Kubernetes token into the
+    UI, and the reason is never interpolated verbatim.
+    """
+    if reason:
+        return FAILURE_MESSAGES.get(reason, FAILURE_DEFAULT)
+    return FAILURE_DEFAULT
 
 
 class JobLaunchError(Exception):

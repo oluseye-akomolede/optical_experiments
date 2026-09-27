@@ -14,3 +14,4 @@ venv/
 # OpenRig seat projections (generated per seat; never commit)
 CLAUDE.md
 .openrig/
+scratch/

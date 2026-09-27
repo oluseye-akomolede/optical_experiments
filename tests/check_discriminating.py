@@ -199,6 +199,158 @@ for _reqs, _label in ((WEB_REQS, "web"), (SOLVER_REQS, "solver")):
         test_file=IMAGE_TEST_FILE,
     ))
 
+FIELDS = ROOT / "dockerfiles" / "maxwell_solver" / "mse_fields.py"
+SAMPLER_TEST_FILE = "tests/test_field_sampler.py"
+
+# BUG A: the (chunk, n_tets, 3) broadcast that OOM-killed the Job. Restoring it
+# leaves the located set identical -- which is exactly why it needs a test that
+# watches the allocation rather than the answer, and why the exactness tests
+# all pass here. An earlier draft of this expectation also listed
+# test_the_candidate_set_is_bounded_by_cell_size_not_tet_count; that was wrong,
+# and the tool said so. candidate_counts re-gathers candidates through
+# _candidate_pairs on its own, so it does not observe the broadcast at all. The
+# set below is what was measured: exactly one test, and it is the one written
+# for this bug.
+CASES.append(Case(
+    name="broadcast-against-every-tet",
+    why="the (chunk, n_tets, 3) difference array that OOM-killed the Job",
+    edits=[(
+        FIELDS,
+        "        owner, cand = _candidate_pairs(chunk, tree, radius)\n"
+        "        if cand.size == 0:\n"
+        "            continue\n"
+        "\n"
+        "        diff = chunk[owner] - v0_all[cand]                # (C, 3)\n"
+        "        b = np.einsum(\"cij,cj->ci\", inv_J[cand], diff)    # (C, 3)",
+        "        # THE ORIGINAL BUG, restored for the discriminating check\n"
+        "        d = chunk[:, None, :] - v0_all[None, :, :]        # (m, n_tets, 3)\n"
+        "        n_tets = tets.shape[0]\n"
+        "        owner = np.repeat(np.arange(chunk.shape[0]), n_tets)\n"
+        "        cand = np.tile(np.arange(n_tets), chunk.shape[0])\n"
+        "        bb1 = np.einsum(\"mtj,tj->mt\", d, inv_J[:, 0, :])\n"
+        "        bb2 = np.einsum(\"mtj,tj->mt\", d, inv_J[:, 1, :])\n"
+        "        bb3 = np.einsum(\"mtj,tj->mt\", d, inv_J[:, 2, :])\n"
+        "        b = np.stack([bb1, bb2, bb3], axis=-1).reshape(-1, 3)",
+    )],
+    expect_failing={
+        "test_the_locator_does_not_broadcast_against_every_tet",
+    },
+    test_file=SAMPLER_TEST_FILE,
+))
+
+# The shape of "reuse" that would still be wrong: locating per mode, inside
+# sample_field, instead of once per job in write_results. Reverting the
+# once-per-job call is a call-site change in the solver, not in this module, so
+# what is checked here is the module-level contract it rests on -- that the
+# located result is a pure function of (points, tets, samples) and carries no
+# eigenvector, so reuse cannot change the field.
+CASES.append(Case(
+    name="locator-depends-on-the-mode",
+    why="if locating were mode-dependent, reusing one result would change the field",
+    edits=[(
+        FIELDS,
+        "    radius = _LOCATE_RADIUS_FACTOR * r_max",
+        "    radius = _LOCATE_RADIUS_FACTOR * r_max * (1.0 + 1e-12)",
+    )],
+    # A deliberately invisible perturbation: it changes no answer, so nothing
+    # should fail. This case exists to record that the "locate once" claim is
+    # NOT proved by a reversion of this shape -- it is proved by
+    # test_locating_once_and_reusing_matches_locating_per_mode being a pure
+    # function of its inputs, and by write_results calling it outside the mode
+    # loop. An empty expected set is a real assertion: it says the reviewer can
+    # restore this and watch the suite stay green, so any future test that
+    # claims to catch mode-dependence by this route is caught lying.
+    expect_failing=set(),
+    test_file=SAMPLER_TEST_FILE,
+))
+
+WEB_APP = ROOT / "web" / "app.py"
+WEB_TEST_FILE = "tests/test_web_routes.py"
+
+# BUG B: a dead Job's row staying `running` forever. Two reversions, because the
+# fix has two halves and they fail in opposite directions -- dropping the failure
+# reconcile leaves dead rows running, and dropping the "is it still alive?" check
+# fails healthy solves. A fix that only passes one of them is not the fix.
+CASES.append(Case(
+    name="never-reconcile-running-rows",
+    why="without the reconcile, a Job that dies leaves its row running forever",
+    edits=[(
+        WEB_APP,
+        "        if name and name in states:\n"
+        "            message = JOBS.failure_message(states[name])\n"
+        "        elif name and name in present:\n"
+        "            continue                       # alive and well; not ours to touch\n"
+        "        else:\n"
+        "            message = JOBS.failure_message(None)",
+        "        continue",
+    )],
+    # Five, not the four the names suggest. The fifth is
+    # test_a_dead_job_frees_the_slot_for_the_next_upload, and it belongs: that
+    # test asserts the queued upload starts once the dead row is failed, so a
+    # reversion that stops failing the row fails it too. Two tests catching one
+    # defect from different ends (the row's state, and the queue moving behind
+    # it) is the intended shape here -- see the comment in that test.
+    expect_failing={
+        "test_a_running_row_whose_job_vanished_is_failed_not_requeued",
+        "test_a_job_reporting_deadline_exceeded_fails_the_row_with_that_reason",
+        "test_a_job_reporting_oomkilled_fails_the_row_with_that_reason",
+        "test_a_job_failed_for_an_unknown_reason_does_not_leak_the_kubernetes_token",
+        "test_a_dead_job_frees_the_slot_for_the_next_upload",
+    },
+    test_file=WEB_TEST_FILE,
+))
+
+CASES.append(Case(
+    name="absent-means-dead",
+    why="treating 'no Failed condition' as 'dead' fails every healthy solve",
+    edits=[(
+        WEB_APP,
+        "        elif name and name in present:\n"
+        "            continue                       # alive and well; not ours to touch",
+        "        elif name and name in present:\n"
+        "            pass                           # BUG: alive, but failed anyway",
+    )],
+    # Three, not the one. The two extra are the slot tests, and they are not
+    # incidental: a healthy Job failed by this bug is now terminal, so the tick
+    # reaps it and the next upload starts, which is precisely the "every upload
+    # fails" damage described above. They are the same defect measured on the
+    # queue rather than on the row.
+    expect_failing={
+        "test_a_live_job_is_never_failed_or_deleted",
+        "test_a_queued_or_running_job_is_never_deleted",
+        "test_the_tick_does_nothing_when_the_slot_is_occupied",
+    },
+    test_file=WEB_TEST_FILE,
+))
+
+BENCH = ROOT / "tests" / "bench_box.py"
+SOLVER_TEST_FILE = "tests/test_maxwell_solver.py"
+
+# The bench's writing stage, un-wired: the exact gap that let the ~15 GB sampler
+# reach the cluster. Reverting the stage to "collect the keys and write nothing"
+# is what a bench that stopped after the solve looked like.
+CASES.append(Case(
+    name="bench-skips-the-writing-stage",
+    why="the bench stopping after the solve is how BUG A reached the cluster",
+    edits=[(
+        BENCH,
+        "    t0 = time.time()\n"
+        "    summary = SOLVER.solve(\n"
+        "        job_id, units, n_index, n_modes, stores, stores,\n"
+        "        max_tets=max_tets, grid=grid, verbose=verbose,\n"
+        "    )\n"
+        "    summary[\"wall_s\"] = time.time() - t0",
+        "    t0 = time.time()\n"
+        "    summary = {\"timings\": {}, \"n_tets\": 0, \"n_modes\": n_modes}\n"
+        "    summary[\"wall_s\"] = time.time() - t0",
+    )],
+    expect_failing={
+        "test_the_bench_writing_stage_drives_the_production_solve",
+        "test_the_bench_reports_the_writing_stage_among_its_timings",
+    },
+    test_file=SOLVER_TEST_FILE,
+))
+
 CASES.append(Case(
     name="no-schema-path-env",
     why="without MSE_SCHEMA_PATH the DDL path is a relative climb again",

@@ -70,14 +70,6 @@ class FakeDb:
                                       message=message)
         self.failures.append((str(job_id), message))
 
-    def requeue_stale(self, job_ids):
-        count = 0
-        for jid in job_ids:
-            if self.jobs.get(str(jid), {}).get("status") == DB.RUNNING:
-                self.jobs[str(jid)].update(status=DB.QUEUED, stage=DB.QUEUED)
-                count += 1
-        return count
-
     # reads
     def get_job(self, job_id):
         return self.jobs.get(str(job_id))
@@ -129,10 +121,16 @@ class FakeDb:
 
 
 class FakeLauncher:
-    """A launcher whose cluster state is a set of names."""
+    """A launcher whose cluster state is a set of names.
 
-    def __init__(self, active=None, quota_full=False, fail_with=None):
+    ``failed`` is the set of Job names the cluster reports as FAILED, which is
+    how the tick tells a crashed solve (OOM/deadline) from a live one.
+    """
+
+    def __init__(self, active=None, quota_full=False, fail_with=None,
+                 failed=None):
         self.active = list(active or [])
+        self.failed = dict(failed or {})
         self.quota_full = quota_full
         self.fail_with = fail_with
         self.created: list[dict] = []
@@ -141,6 +139,10 @@ class FakeLauncher:
 
     def active_job_names(self):
         return list(self.active)
+
+    def job_states(self):
+        """Only the names still present can be reporting a state."""
+        return {n: r for n, r in self.failed.items() if n in self.active}
 
     def create(self, job_id, units, n_index, n_modes):
         if self.quota_full:
@@ -498,20 +500,109 @@ def test_a_queued_or_running_job_is_never_deleted(tmp_path):
     assert launcher.active == [running["k8s_job_name"]]
 
 
-def test_a_stale_running_row_is_requeued_not_deleted(tmp_path):
-    """A row stuck in `running` with no Job behind it is requeued, not reaped."""
+def test_a_job_reporting_deadline_exceeded_fails_the_row_with_that_reason(
+        tmp_path):
+    """A Job killed by activeDeadlineSeconds must name the deadline, not "gone".
+
+    The owner needs to know whether the solver ran out of time or out of memory
+    -- "try fewer modes" is useless advice for the first if it was the second.
+    Kubernetes puts the reason on the Job's Failed condition and the tick maps
+    it through ``JOBS.failure_message``.
+    """
     app, _store, db, launcher = make_app(tmp_path)
     upload(app.test_client())
     (job,) = db.jobs.values()
     name = job["k8s_job_name"]
 
-    # the DB says running, but the cluster has nothing (lost with its node)
-    launcher.active.clear()
+    launcher.failed[name] = "DeadlineExceeded"
+    result = APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    assert result["failed"] == 1
+    assert db.jobs[job["job_id"]]["status"] == DB.FAILED
+    assert db.jobs[job["job_id"]]["message"] == \
+        JOBS.FAILURE_MESSAGES["DeadlineExceeded"]
+
+
+def test_a_job_reporting_oomkilled_fails_the_row_with_that_reason(tmp_path):
+    """The original incident's cause: the container was OOM-killed.
+
+    This is the case that actually happened -- the writing stage hit its 14 Gi
+    limit -- so the message the owner sees must say memory, not "unexpectedly".
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    launcher.failed[job["k8s_job_name"]] = "OOMKilled"
+
     APP.run_tick(None, db, launcher, log=lambda *a: None)
 
-    assert launcher.deleted == []              # there was nothing to delete
+    assert db.jobs[job["job_id"]]["message"] == \
+        JOBS.FAILURE_MESSAGES["OOMKilled"]
+
+
+def test_a_job_failed_for_an_unknown_reason_does_not_leak_the_kubernetes_token(
+        tmp_path):
+    """An unmapped reason must fall back, never reach the owner verbatim.
+
+    Kubernetes reasons are token-like strings ('BackoffLimitExceeded'); putting
+    one in front of the owner is worse than saying nothing specific.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    launcher.failed[job["k8s_job_name"]] = "BackoffLimitExceeded"
+
+    APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    message = db.jobs[job["job_id"]]["message"]
+    assert message == JOBS.FAILURE_DEFAULT
+    assert "BackoffLimitExceeded" not in message
+
+
+def test_a_live_job_is_never_failed_or_deleted(tmp_path):
+    """The case that must NOT be touched: Job present, no Failed condition.
+
+    This is the other half of the fix and the more dangerous half to get wrong.
+    The reconcile step crosses the database against the cluster, so a bug that
+    treats "absent from job_states" as "dead" would fail every healthy solve the
+    moment it started writing -- the owner would see failures on every upload.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    name = job["k8s_job_name"]
+    assert launcher.active == [name]
+
+    result = APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    assert result["failed"] == 0
     assert db.jobs[job["job_id"]]["status"] == DB.RUNNING
-    assert launcher.active == [name]           # relaunched under the same name
+    assert db.jobs[job["job_id"]]["message"] is None
+    assert name not in launcher.deleted, "a live solve must keep its slot"
+    assert db.failures == []
+
+
+def test_a_running_row_whose_job_vanished_is_failed_not_requeued(tmp_path):
+    """The deploy-blocker-3 fix: a dead solve is FAILED, never silently retried.
+
+    This test replaces one that asserted the old behaviour (re-queue), which was
+    the bug: a row whose Job had vanished was put back in the queue, so a solve
+    that had already died -- an OOM, say -- would be re-run forever and the owner
+    would watch a spinner that never ended. The row must end `failed`, with a
+    message the owner can read.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+
+    # the DB says running, but the cluster has nothing (lost with its node)
+    launcher.active.clear()
+    result = APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    assert result["failed"] == 1
+    assert db.jobs[job["job_id"]]["status"] == DB.FAILED
+    assert db.jobs[job["job_id"]]["message"] == JOBS.FAILURE_DEFAULT
+    assert len(launcher.created) == 1, "the dead job must not be relaunched"
 
 
 def test_the_tick_does_nothing_when_the_slot_is_occupied(tmp_path):
@@ -522,17 +613,28 @@ def test_the_tick_does_nothing_when_the_slot_is_occupied(tmp_path):
     assert len(launcher.created) == 1
 
 
-def test_a_running_row_with_no_job_is_requeued(tmp_path):
-    """A Job deleted by hand (or lost with its node) must not wedge the queue."""
+def test_a_dead_job_frees_the_slot_for_the_next_upload(tmp_path):
+    """Failing the dead row must not wedge the queue behind it.
+
+    The old behaviour re-queued the dead job, which kept the single Job slot
+    busy with a solve that could never succeed. Failing it is only correct if
+    the *next* upload then runs -- otherwise the fix just swaps one permanent
+    spinner for a permanently stuck queue.
+    """
     app, _store, db, launcher = make_app(tmp_path)
     upload(app.test_client())
-    (job,) = db.jobs.values()
-    # the Job vanished from the cluster without recording a result
+    upload(app.test_client())
+    first, second = list(db.jobs.values())
+    assert first["status"] == DB.RUNNING
+
+    # the running Job vanished from the cluster without recording a result
     launcher.active.clear()
     APP.run_tick(None, db, launcher, log=lambda *a: None)
-    assert db.jobs[job["job_id"]]["status"] in (DB.QUEUED, DB.RUNNING)
-    # and it must have been launched again rather than left stuck
-    assert len(launcher.created) >= 2
+
+    assert db.jobs[first["job_id"]]["status"] == DB.FAILED
+    assert db.jobs[second["job_id"]]["status"] == DB.RUNNING, (
+        "the queued upload must be picked up once the dead job is failed"
+    )
 
 
 def test_a_launch_failure_is_recorded_against_the_job(tmp_path):
