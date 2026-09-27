@@ -35,6 +35,7 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
                        cpu: str = "4", memory: str = "14Gi",
                        active_deadline_seconds: int = 1800,
                        ttl_seconds_after_finished: int = 30,
+                       max_tets: int | None = None,
                        cpu_max_tets: int | None = None,
                        min_feature_mm: float | None = None,
                        scale: float = 1.0):
@@ -65,6 +66,14 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
         # and the backend is the first thing to check when a run is slow.
         {"name": "MSE_SOLVER_BACKEND", "value": "cpu"},
     ]
+    if max_tets is not None:
+        # The solver's ABSOLUTE cap, sent explicitly. Its own default is the
+        # same number, but the app is the thing that decides which uploads are
+        # allowed through, so the app is the thing that must say what the limit
+        # is. Omitting it was the defect: the app accepted up to 600k while the
+        # solver refused above 80k, and every job in between died on a limit the
+        # owner had never been told about.
+        env.append({"name": "MSE_MAX_TETS", "value": str(int(max_tets))})
     if cpu_max_tets is not None:
         # The solver re-decides the route on the exact tetrahedron count, at the
         # first point that count exists. Handing it the same boundary the app
@@ -135,12 +144,14 @@ class K8sJobLauncher:
                  cpu: str = "4", memory: str = "14Gi",
                  active_deadline_seconds: int = 1800,
                  ttl_seconds_after_finished: int = 30, dry_run: bool = False,
+                 max_tets: int | None = None,
                  cpu_max_tets: int | None = None):
         self.namespace = namespace
         self.image = image
         self.pull_secret = pull_secret
         self.cpu = cpu
         self.memory = memory
+        self.max_tets = max_tets
         self.cpu_max_tets = cpu_max_tets
         self.active_deadline_seconds = active_deadline_seconds
         self.ttl_seconds_after_finished = ttl_seconds_after_finished
@@ -169,6 +180,7 @@ class K8sJobLauncher:
             self.namespace, cpu=self.cpu, memory=self.memory,
             active_deadline_seconds=self.active_deadline_seconds,
             ttl_seconds_after_finished=self.ttl_seconds_after_finished,
+            max_tets=self.max_tets,
             cpu_max_tets=self.cpu_max_tets,
             min_feature_mm=min_feature_mm, scale=scale,
         )

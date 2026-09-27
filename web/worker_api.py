@@ -118,8 +118,15 @@ def owner_id(token: str) -> str:
 #: filenames a worker may upload. A closed set, checked by full match -- so
 #: ``../modes.json``, ``/etc/passwd`` and ``mode_01.bin/../x`` are all refused
 #: without any path sanitising.
+#:
+#: Full match, NOT ``match`` with a ``$`` anchor: Python's ``$`` also matches
+#: just before a trailing newline, so ``"mode_01.bin\n"`` satisfied the anchored
+#: pattern and became a second, distinct storage key for the same mode. The
+#: ``\\Z`` in the pattern is belt-and-braces on top of ``fullmatch`` because this
+#: one string is the whole traversal defence and a future edit that swaps
+#: ``fullmatch`` for ``match`` should still not reopen it.
 _ALLOWED_EXACT = ("modes.json", "surface.glb")
-_ALLOWED_PATTERN = re.compile(r"^mode_\d{2}\.(bin|vtu)$")
+_ALLOWED_PATTERN = re.compile(r"\Amode_\d{2}\.(bin|vtu)\Z")
 
 #: per-file ceiling. The field grid is what makes a .bin big; 64 MiB is well
 #: over the largest the app has ever produced and well under what would let a
@@ -133,12 +140,17 @@ def allowed_name(name: str) -> bool:
     Rejects anything with a path separator outright, before the allow-list is
     consulted, so a traversal attempt is refused even if it somehow matched a
     pattern later.
+
+    ``fullmatch`` rather than ``match``: the pattern is ``\\A...\\Z`` anchored
+    too, and this is the one call where "almost the right name" must never be
+    good enough -- a name that differs from an allowed one by a trailing newline
+    is a different storage key, and the two would then diverge silently.
     """
     if not name or "/" in name or "\\" in name or name in (".", ".."):
         return False
     if name in _ALLOWED_EXACT:
         return True
-    return bool(_ALLOWED_PATTERN.match(name))
+    return bool(_ALLOWED_PATTERN.fullmatch(name))
 
 
 def register(app, jobs_db, store, log=print):
@@ -188,6 +200,15 @@ def _register_routes():
             # not a value, so it stays JSON null.
             "min_feature_mm": job.get("min_feature_mm"),
             "scale": float(job.get("scale") or 1.0),
+            # The element caps travel with the job. They are properties of the
+            # MACHINES, not of this upload, but a worker that knows only the
+            # row cannot learn them: it has no cluster access and no reason to
+            # hold a copy of a constant that must equal the app's. Sending them
+            # per claim is what keeps the solver's cap and the app's ceiling the
+            # same number -- the defect this closes was the app approving an
+            # upload the solver then refused at 80k.
+            "max_tets": CFG.max_tets(),
+            "cpu_max_tets": CFG.cpu_max_tets(),
             "lease_seconds": lease_seconds,
         })
 

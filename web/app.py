@@ -839,6 +839,12 @@ def _launcher(app):
         pull_secret=CFG.pull_secret(), cpu=CFG.JOB_CPU, memory=CFG.JOB_MEMORY,
         active_deadline_seconds=CFG.JOB_ACTIVE_DEADLINE_SECONDS,
         ttl_seconds_after_finished=CFG.JOB_TTL_SECONDS_AFTER_FINISHED,
+        # BOTH caps, from the app's own configuration: the app is what decides
+        # which uploads are allowed through, so the app is what must tell the
+        # solver where the limits are. These used to be left unset, which meant
+        # the solver fell back to its own default and refused jobs the app had
+        # already accepted.
+        max_tets=CFG.max_tets(), cpu_max_tets=CFG.cpu_max_tets(),
         dry_run=app.config.get("DRY_RUN", CFG.DRY_RUN),
     )
 

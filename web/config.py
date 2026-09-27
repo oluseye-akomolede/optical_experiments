@@ -77,7 +77,30 @@ DEFAULT_GPU_MIN_TETS = 15_000
 
 #: the largest mesh either machine can solve (the lead's measured largest
 #: success in single precision). The solver enforces it on the exact count.
-DEFAULT_MAX_TETS = 600_000
+#:
+#: IMPORTED from the solver, not restated. This number existed in two places and
+#: the two disagreed: the app capped uploads at 600_000 while the solver's own
+#: default was 80_000, and nothing ever passed the app's value to the solver, so
+#: every job between the two -- exactly the large jobs the GPU exists for --
+#: failed inside the solver with a limit the app had already approved. One
+#: import makes that impossible rather than merely fixed.
+#:
+#: The import is guarded because ``web/`` is deployed as its own image and the
+#: solver package lives beside the repo, not on the app's path by default. If it
+#: cannot be found the app FAILS TO IMPORT rather than falling back to a
+#: restated number -- a silent fallback is the defect this import removes.
+def _solver_dir() -> str:
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    return str(root)
+
+
+_solver_dir()
+from mse_maxwell_solver import DEFAULT_CPU_MAX_TETS, DEFAULT_MAX_TETS  # noqa: E402
 
 #: an upload is refused outright only above TWICE that, because the estimate can
 #: be up to 2x high (worst over-estimate measured) and refusing at 1x would turn
@@ -162,6 +185,18 @@ def gpu_min_tets() -> int:
 def max_tets() -> int:
     """The absolute element cap, mirrored from the solver's own limit."""
     return _positive_int("MSE_MAX_TETS", DEFAULT_MAX_TETS)
+
+
+def cpu_max_tets() -> int:
+    """Element count above which the CLUSTER cannot solve a job but the GPU can.
+
+    A routing boundary, not a capability limit -- the same distinction the
+    solver makes at ``mse_maxwell_solver.DEFAULT_CPU_MAX_TETS``. The app sends it
+    to every cluster Job so the solver's re-decision on the exact count lands in
+    the same place as the app's upload-time decision, instead of re-deciding with
+    a constant the app never saw. ``MSE_CPU_MAX_TETS`` overrides it.
+    """
+    return _positive_int("MSE_CPU_MAX_TETS", DEFAULT_CPU_MAX_TETS)
 
 
 def upload_refuse_tets() -> int:

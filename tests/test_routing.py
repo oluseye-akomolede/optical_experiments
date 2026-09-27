@@ -736,16 +736,57 @@ def test_only_allow_listed_filenames_are_accepted(name):
     any path sanitising, because it simply is not one of the names.
 
     **An honest note on what this test does and does not pin.** The separator
-    check in ``allowed_name`` is currently redundant: ``re.match`` anchors at
-    the start, and the two patterns both begin with a literal, so no name
-    containing a slash can match either one. Removing the separator check does
-    NOT redden this test, and I verified that by mutation rather than assuming
-    it -- see the commit message. It stays because it is the guard that survives
-    a future pattern like ``.*\\.bin``, and because it is the thing a reader
-    looks for. It is defence in depth, not the load-bearing check, and this test
-    claims only the behaviour (a traversal is refused), not the mechanism.
+    check in ``allowed_name`` is currently redundant: the pattern is anchored at
+    the start with a literal, so no name containing a slash can match it.
+    Removing the separator check does NOT redden this test, and I verified that
+    by mutation rather than assuming it -- see the commit message. It stays
+    because it is the guard that survives a future pattern like ``.*\\.bin``,
+    and because it is the thing a reader looks for. It is defence in depth, not
+    the load-bearing check, and this test claims only the behaviour (a traversal
+    is refused), not the mechanism.
     """
     assert WORKER.allowed_name(name) is False
+
+
+@pytest.mark.parametrize("name", [
+    "mode_01.bin\n", "mode_12.vtu\n", "mode_01.bin\n\n", "mode_01.bin\nx",
+    "modes.json\n", "surface.glb\n", "mode_01.bin\r", "mode_01.bin ",
+])
+def test_a_trailing_newline_is_not_an_allowed_name(name):
+    """The bypass the reviewer found, and the three lookalikes around it.
+
+    Python's ``$`` matches just before a trailing newline, so ``re.match`` with
+    an anchored pattern accepted ``"mode_01.bin\\n"`` and the route stored it as
+    a SECOND key (``jobs/<id>/mode_01.bin\\n``) beside the real one. Two keys
+    for one mode is a silent corruption the viewer never sees, which is why this
+    is a correctness bug and not a tidiness one.
+
+    ``\\r`` and a trailing space were ALREADY refused -- ``$`` does not match
+    before them -- so those two cases are here as *controls*, not as evidence.
+    A test that only contains the newline case would pass against a fix that
+    merely grew the character class, and would not tell a reader that the
+    newline is the only one that was ever reachable. The pair
+    (``mode_01.bin\\r`` false today, and false before) is what makes the newline
+    case mean something.
+    """
+    assert WORKER.allowed_name(name) is False, (
+        f"{name!r} must not be an allowed upload name"
+    )
+
+
+def test_the_allowed_pattern_rejects_the_newline_that_match_accepted():
+    """The mechanism, pinned separately from the behaviour above.
+
+    ``allowed_name`` could be made to refuse the newline in more than one way, so
+    this asserts the specific property that was broken: the pattern itself no
+    longer matches a name with a trailing newline. If someone switches back to
+    ``re.match`` with a ``$`` anchor, this fails even while ``allowed_name``
+    happens to stay correct for another reason.
+    """
+    assert WORKER._ALLOWED_PATTERN.match("mode_01.bin\n") is None, (
+        "the pattern's $/\\Z anchor is what closed the newline bypass"
+    )
+    assert WORKER._ALLOWED_PATTERN.fullmatch("mode_01.bin") is not None
 
 
 def test_the_pattern_is_anchored_so_a_leading_slash_cannot_match():
@@ -894,3 +935,87 @@ def test_the_tick_only_hands_the_job_slot_to_a_cluster_job(tmp_path):
     launcher.create = spy
     APP.run_tick(store, db, launcher)
     assert launched_targets == [DB.CLUSTER]
+
+
+# ---------------------------------------------------------------------------
+# F2: the element cap has ONE definition, and both paths carry it
+# ---------------------------------------------------------------------------
+#
+# The defect these pin: ``web/config.py`` capped uploads at 600_000 while the
+# solver's own ``DEFAULT_MAX_TETS`` was 80_000, and NOTHING passed the app's
+# number to the solver. So the app accepted an upload, told the owner it was
+# fine, routed it to the Jetson, and the solver refused it at 80k -- failing
+# precisely the large jobs the GPU exists for. Two constants that must agree and
+# are never compared is the defect class; there is now one constant, imported.
+
+def test_the_app_and_the_solver_share_one_element_cap():
+    """Not "they happen to match today" -- the app IMPORTS the solver's number.
+
+    Asserting equality would pass against two constants that agree by luck and
+    drift at the next edit, which is exactly how this defect appeared. Asserting
+    identity is the claim that actually holds the property: change the solver's
+    default and the app's ceiling moves with it, with no second edit.
+    """
+    import mse_maxwell_solver as SOLVER
+
+    assert CFG.DEFAULT_MAX_TETS is SOLVER.DEFAULT_MAX_TETS, (
+        "the app's cap must BE the solver's cap, not a copy of its value"
+    )
+    assert CFG.DEFAULT_CPU_MAX_TETS == SOLVER.DEFAULT_CPU_MAX_TETS
+
+
+def test_the_job_env_carries_both_caps():
+    """The cluster Job must be told the limits, not left to its own default.
+
+    Before this the Job env carried only MSE_CPU_MAX_TETS, so the absolute cap
+    was whatever the image's solver defaulted to. The `MSE_MAX_TETS` assertion
+    is the one that would have caught the 80k bug.
+    """
+    manifest = JOBS.build_job_manifest(
+        "11111111-1111-1111-1111-111111111111", "mm", 1.0, 20,
+        "img", "sec", "ns", max_tets=600_000, cpu_max_tets=150_000)
+    container = manifest["spec"]["template"]["spec"]["containers"][0]
+    env = {e["name"]: e["value"] for e in container["env"]}
+    assert env["MSE_MAX_TETS"] == "600000"
+    assert env["MSE_CPU_MAX_TETS"] == "150000"
+
+
+def test_the_app_passes_both_caps_to_the_real_launcher(tmp_path, monkeypatch):
+    """The wiring, not the builder: a builder that takes a cap nobody gives it
+    is still a Job running on a default.
+
+    This is the leg that was actually broken -- ``build_job_manifest`` grew a
+    ``cpu_max_tets`` parameter that no caller ever set, so every assertion about
+    the builder passed while every real Job ran with the solver's default.
+
+    ``_launcher`` is called directly rather than through ``create_app``: the
+    factory honours an injected ``MSE_JOB_LAUNCHER``, and with a test double
+    installed this path is never reached at all. Testing it through the factory
+    is how this test first passed while proving nothing.
+    """
+    monkeypatch.setenv("MSE_SOLVER_IMAGE", "test-image")
+
+    class FakeApp:
+        config: dict = {}
+
+    launcher = APP._launcher(FakeApp())
+    assert launcher.max_tets == CFG.max_tets(), (
+        "the real launcher was built without the app's element cap"
+    )
+    assert launcher.cpu_max_tets == CFG.cpu_max_tets()
+
+
+def test_the_claim_payload_carries_both_caps(tmp_path, worker):
+    """The worker has no cluster access and no business holding a copy of the
+    app's constant, so the caps must arrive with the claim.
+
+    A worker that guessed them would be the same two-sources defect one layer
+    down; a worker that omitted them would fail large jobs on the Jetson instead
+    of in the cluster, which is worse -- the large jobs are what the Jetson is
+    for.
+    """
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    body = client.post("/worker/claim", headers=_auth()).get_json()
+    assert body["max_tets"] == CFG.max_tets()
+    assert body["cpu_max_tets"] == CFG.cpu_max_tets()

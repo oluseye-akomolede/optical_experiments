@@ -65,6 +65,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dockerfiles" / "ma
 
 import mse_eigen as EIG  # noqa: E402
 import mse_fem as F  # noqa: E402
+import mse_maxwell_solver as SOLVER  # noqa: E402
 import mse_meshing as MESH  # noqa: E402
 import mse_storage as STORE  # noqa: E402
 
@@ -156,7 +157,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epw", type=float, default=None,
                         help="edges per wavelength (default: MSE_EDGES_PER_WAVELENGTH)")
     parser.add_argument("--max-tets", type=int,
-                        default=int(os.environ.get("MSE_MAX_TETS", "80000")))
+                        default=int(os.environ.get("MSE_MAX_TETS",
+                                                  SOLVER.DEFAULT_MAX_TETS)))
     parser.add_argument("--tolerance", type=float, default=3.0,
                         help="pass threshold in percent (default: 3.0)")
     parser.add_argument("--allow-coarse", action="store_true",

@@ -43,7 +43,16 @@ import mse_storage as STORE  # noqa: E402
 
 #: default element cap. Chosen so a worst-case solve stays well under the 14Gi
 #: container limit; the lead calibrates the real figure on the Jetson.
-DEFAULT_MAX_TETS = 80_000
+#:
+#: THE ONE SOURCE OF TRUTH for this number. ``web/config.py`` imports it rather
+#: than keeping its own copy, and both the cluster Job env and the worker's
+#: claim payload carry the value this function resolves. It used to be 80_000
+#: here while the app capped uploads at 600_000, with nothing passing the app's
+#: number to the solver: every job the app accepted above 80k tets -- exactly
+#: the large jobs the GPU exists for -- died in the solver on a limit the app
+#: had already told the owner was fine. Two constants that must agree and are
+#: never compared is the whole defect class; there is now one constant.
+DEFAULT_MAX_TETS = 600_000
 
 #: elements above which the CLUSTER cannot solve a job, but the GPU still can.
 #: The upload-time estimate decides the route, but an estimate can be wrong in
@@ -51,6 +60,46 @@ DEFAULT_MAX_TETS = 80_000
 #: exact count exists. Deliberately lower than DEFAULT_MAX_TETS: it is a
 #: routing boundary, not a capability limit.
 DEFAULT_CPU_MAX_TETS = 150_000
+
+#: the cap a *solve* runs with. Settable, because tests assert on the guard at a
+#: tiny count rather than by meshing 600k tetrahedra.
+_MAX_TETS_OVERRIDE: int | None = None
+
+
+def max_tets() -> int:
+    """Element count above which a solve is refused as too large.
+
+    The single accessor for the absolute cap. Every caller that used to read the
+    constant or the CLI default now asks here, so a test can set a small cap and
+    a deploy can set a real one, and neither can disagree with the other.
+    """
+    if _MAX_TETS_OVERRIDE is not None:
+        return _MAX_TETS_OVERRIDE
+    try:
+        return max(1, int(os.environ.get("MSE_MAX_TETS", DEFAULT_MAX_TETS)))
+    except ValueError:
+        return DEFAULT_MAX_TETS
+
+
+def set_max_tets(limit: int | None) -> None:
+    """Force the cap for this process (tests, and the bench's ``--max-tets``).
+
+    ``None`` restores the environment/default behaviour. Module state rather
+    than a parameter threaded through every caller because the cap is a
+    property of the machine, not of a job -- unlike ``min_feature_mm``, which
+    is a property of the upload and travels as an argument.
+
+    **A latch, not a job-scoped setting.** The override outlives the call that
+    set it, so whoever sets it owns restoring it. That is the right shape for
+    the two real callers -- a test asserts at a tiny cap for the whole test, and
+    ``main()`` sets the cap for the whole of one process -- but it is a trap for
+    anyone calling ``main(argv)`` twice in one process, and it did in fact leak:
+    a test running ``main(["--max-tets", "4000"])`` left every later test in the
+    session solving at 4,000 elements. Prefer passing ``max_tets`` to
+    :func:`solve` when the cap belongs to one call.
+    """
+    global _MAX_TETS_OVERRIDE
+    _MAX_TETS_OVERRIDE = None if limit is None else max(1, int(limit))
 
 #: what a ``TooBigForProcessor`` writes into its termination message. The app
 #: reads this string back out of the pod's last state to tell "this job is on
@@ -110,9 +159,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="read jobs/<id>/... from this directory instead of MinIO")
     parser.add_argument("--local-out", metavar="DIR",
                         help="write jobs/<id>/... to this directory instead of MinIO")
-    parser.add_argument("--max-tets", type=int,
-                        default=int(os.environ.get("MSE_MAX_TETS", DEFAULT_MAX_TETS)),
-                        help=f"cap on tetrahedra (default: {DEFAULT_MAX_TETS})")
+    parser.add_argument("--max-tets", type=int, default=None,
+                        help=f"cap on tetrahedra (default: {DEFAULT_MAX_TETS}, or "
+                             f"$MSE_MAX_TETS if set)")
     parser.add_argument("--grid", type=int, default=DEFAULT_GRID,
                         help=f"samples along the longest axis (default: {DEFAULT_GRID})")
     parser.add_argument("--epw", type=float, default=None,
@@ -470,6 +519,20 @@ def main(argv=None) -> int:
     if args.epw is not None:
         os.environ["MSE_EDGES_PER_WAVELENGTH"] = str(args.epw)
 
+    # Resolve the cap ONCE, here, after parsing. The flag defaults to None so
+    # this call is the only place ``max_tets()`` is consulted -- a parser default
+    # would have frozen the value at build_parser() time and a test (or a later
+    # set_max_tets) would silently not apply.
+    effective_max_tets = max_tets() if args.max_tets is None else int(args.max_tets)
+    # Resolved for this run, and handed back in the ``finally`` below.
+    # ``set_max_tets`` writes a module global, so a run that did not restore it
+    # would leave every LATER caller in the process -- including callers that
+    # pass no cap at all -- solving at this run's limit. Threading
+    # ``effective_max_tets`` into ``solve()`` keeps this run's own behaviour
+    # independent of the global, so the restore costs nothing.
+    previous_max_tets = max_tets()
+    set_max_tets(effective_max_tets)
+
     verbose = not args.quiet
     job_id = str(args.job_id)
 
@@ -488,7 +551,7 @@ def main(argv=None) -> int:
             # is exactly the deploy failure that removed this call.
         summary = solve(
             job_id, args.units, args.n_index, args.n_modes,
-            store_in, store_out, args.max_tets, args.grid,
+            store_in, store_out, effective_max_tets, args.grid,
             verbose=verbose, db=db,
             min_feature_mm=args.min_feature, scale=args.scale,
         )
@@ -516,6 +579,9 @@ def main(argv=None) -> int:
     finally:
         if db is not None:
             db.close()
+        # See above. In the ``finally`` so a FAILED run restores it too: the
+        # failure path is exactly when a later run is most likely.
+        set_max_tets(previous_max_tets)
 
     if verbose:
         print(f"[mse] done: {summary['n_modes']} modes, "
