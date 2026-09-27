@@ -280,7 +280,13 @@ def test_the_ddl_has_no_bare_create_schema():
     Postgres checks the privilege before the IF NOT EXISTS short-circuit, so
     that one line crash-looped the initContainer with 'permission denied for
     database mode_search_engine' even though the schema already existed. It must
-    only ever appear inside a DO block guarded on pg_namespace.
+    not appear anywhere in the file -- outside a DO block OR inside one.
+
+    The whole-file scope is deliberate. An earlier version of this test only
+    checked statements outside DO blocks, which made it vacuous: the stripper
+    removes the DO body, so the offending line hid one scope deeper and the test
+    passed against the very reversion that caused the outage. Found by
+    ``tests/check_discriminating.py``, not by reading.
     """
     for statement in _statements_outside_do_blocks(
         SCHEMA_SQL.read_text(encoding="utf-8")
@@ -289,6 +295,19 @@ def test_the_ddl_has_no_bare_create_schema():
         assert not upper.startswith("CREATE SCHEMA"), (
             f"bare CREATE SCHEMA outside a DO block: {statement!r}"
         )
+
+    # The loop above is necessary but NOT sufficient, and this assertion is the
+    # one that actually catches the regression. `_statements_outside_do_blocks`
+    # strips the whole DO body, so a bare `CREATE SCHEMA IF NOT EXISTS` *inside*
+    # the guard is invisible to it -- the exact statement that crash-looped the
+    # deploy. Asserted on the guard's text here so the file cannot pass by
+    # hiding the offending form one scope deeper.
+    sql = SCHEMA_SQL.read_text(encoding="utf-8")
+    guard = sql[sql.index("DO $$"): sql.index("END $$;") + len("END $$;")]
+    assert "CREATE SCHEMA IF NOT EXISTS" not in guard, (
+        "the guard's CREATE SCHEMA must be unqualified; IF NOT EXISTS still "
+        "needs database-level CREATE and fails even when the schema exists"
+    )
 
 
 def test_the_ddl_has_no_other_database_level_statement():

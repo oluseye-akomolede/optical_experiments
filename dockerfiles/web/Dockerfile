@@ -20,7 +20,14 @@ COPY dockerfiles/web/requirements.txt /opt/app/requirements.txt
 RUN pip install --no-cache-dir -r /opt/app/requirements.txt
 
 COPY web/ /opt/app/
-COPY db/ /opt/app/db/
+COPY db/ /opt/mse/
+
+# The DDL lives at a fixed path in the image rather than being found by a
+# relative climb from the module, which is what made the first deploy fragile.
+# DB code reads this from the environment (see web/db.py: MSE_SCHEMA_PATH is the
+# first candidate), so the layout is declared here, once, and the resolver's
+# fallbacks still cover a bare checkout.
+ENV MSE_SCHEMA_PATH=/opt/mse/001_schema.sql
 
 RUN useradd --create-home --uid 10001 mse
 USER 10001

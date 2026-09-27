@@ -39,8 +39,11 @@ WORKDIR /opt/app
 COPY dockerfiles/maxwell_solver/requirements.txt /opt/app/requirements.txt
 RUN pip install --no-cache-dir -r /opt/app/requirements.txt
 
+# No `COPY db/`: the solver does not apply the schema -- the web app's
+# initContainer owns it, and the entrypoint no longer calls apply_schema(). The
+# DDL was dead weight in this image and, worse, its presence invited the
+# assumption that a Job could provision its own schema.
 COPY dockerfiles/maxwell_solver/ /opt/app/
-COPY db/ /opt/app/db/
 
 # Run unprivileged: the solver only reads storage and writes results.
 RUN useradd --create-home --uid 10001 mse
