@@ -160,11 +160,14 @@ test('a sample at the box face fetches the last texel, not one past it', () => {
   // observable defect. The raymarch reads sample i at offset (i + jitter) * dt
   // with i <= steps-1 and jitter < 1, so the largest offset read is strictly
   // less than span and uvw never reaches 1.0 -- measured, the live grid's
-  // maximum is 0.999999994. A sweep that drives sampleField at uvw == 1.0
-  // directly reports a large out-of-range count and means nothing, because the
-  // march never produces that coordinate; that mistake was made here, reported
-  // as 481201 samples, and retracted once the march was replayed instead of
-  // swept. See the comment in viewer.js beside the clamp.
+  // maximum is 0.999999994. The window is zero-width rather than absent --
+  // floor(uvw * n) >= n first fires at uvw == 1.0 EXACTLY -- so a sweep that
+  // drives sampleField at uvw == 1.0 directly DOES report out-of-range hits;
+  // they mean nothing, because the march never produces that coordinate. That
+  // mistake was made here, reported as 481201 samples, and retracted once the
+  // march was replayed instead of swept. Do not state the finding as "it never
+  // fires": say there is no uvw < 1.0 at which it fires. See the comment in
+  // viewer.js beside the clamp.
   //
   // It is still worth a guard: the clamp's bound must stay "the last texel". A
   // future edit could replace n - 1 with a constant that happens to suit one

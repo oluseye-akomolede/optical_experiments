@@ -322,6 +322,14 @@ float sampleField(vec3 uvw) {
     // is at the top of the loop and the advance is at the bottom, and that
     // ordering is what bounds it.
     //
+    // The window is zero-width, not absent, and the difference is worth stating
+    // because it is easy to test this wrongly: floor(uvw * n) >= n first happens
+    // at uvw == 1.0 EXACTLY, so a harness that sweeps uvw and includes 1.0 will
+    // report out-of-range hits and mean nothing by it -- that mistake was made
+    // here once, and reported as 481201 samples before being retracted. The
+    // correct statement is not "it never fires" but "there is no uvw < 1.0 at
+    // which it fires, and the march does not reach 1.0".
+    //
     // So nothing observable turns on this clamp, and it is not a fix for the
     // cloud's flat face -- that is the object's own silhouette (a 10x7x5mm box,
     // constant x- and y-extent across every z-slice of the finite mask). It is
