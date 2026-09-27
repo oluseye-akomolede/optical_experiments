@@ -248,28 +248,7 @@ def downsample(field: np.ndarray, grid: dict, longest: int) -> dict:
     }
 
 
-def ui_scale(grid: dict) -> dict:
-    """Metres-per-unit for display plus a sensible unit label.
-
-    The owner uploads in mm/cm/m/in; the viewer shows the numbers back in the
-    unit they chose, which is what they will compare against their CAD model.
-    """
-    origin = [float(v) for v in grid["origin"]]
-    spacing = [float(v) for v in grid["spacing"]]
-    # Everything here is metadata order (x, y, z); the sample count for each
-    # comes from the array shape, which is the reverse -- hence _array_axis.
-    hi = [
-        origin[i] + spacing[i] * (shape_of(grid)[_array_axis(("x", "y", "z")[i])] - 1)
-        for i in range(3)
-    ]
-    return {
-        "origin_m": origin,
-        "corner_m": hi,
-        "extent_m": [hi[i] - origin[i] for i in range(3)],
-    }
-
-
 __all__ = [
     "FieldError", "load_modes_json", "shape_of", "n_samples", "decode_mode",
-    "magnitude", "slice_axes", "slice_payload", "downsample", "ui_scale",
+    "magnitude", "slice_axes", "slice_payload", "downsample",
 ]
