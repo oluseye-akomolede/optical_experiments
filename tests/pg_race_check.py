@@ -320,6 +320,36 @@ def check_upgrade_matches_a_fresh_schema(conn, r: Result, JobStore, db_module):
         return r.check("A2c applying the deployed schema produces mse.jobs",
                        False, "8e27869's DDL created no columns -- bad starting "
                               "state, the upgrade was not tested")
+
+    # The STARTING shape is asserted on its own, not just used. `after == fresh`
+    # would also hold if this leg accidentally applied the CURRENT schema twice
+    # -- a copy/paste of the wrong DDL, or _deployed_schema_sql() silently
+    # returning the working-tree file -- and it would then pass while testing no
+    # upgrade at all. This is the same could-not-ask shape the rig keeps hitting:
+    # an equality between two things is not evidence about either one.
+    #
+    # 12 is production's count at 8e27869 (measured, not assumed); the four
+    # exclusions are the columns the upgrade is supposed to ADD, so their absence
+    # before is what makes their presence after meaningful.
+    EXPECTED_BEFORE = 12
+    ADDED_BY_THE_UPGRADE = ("min_feature_m", "min_feature_value",
+                            "min_feature_unit", "scale")
+    leaked = [c for c in ADDED_BY_THE_UPGRADE if c in before]
+    starting_shape_ok = (len(before) == EXPECTED_BEFORE and not leaked)
+    r.check("A2c the STARTING shape is really 8e27869's (12 columns, none of "
+            "the upgrade's columns yet)",
+            starting_shape_ok,
+            f"got {len(before)} columns (expected {EXPECTED_BEFORE}); columns "
+            f"the upgrade should be adding but which are already present: "
+            f"{leaked} -- the 'after' comparison below would pass vacuously")
+    if not starting_shape_ok:
+        # The equality cannot be read as evidence if the "before" state was not
+        # the deployed one. Report it as not-run rather than as a pass.
+        return r.check("A2c upgrading the DEPLOYED (8e27869) schema lands on "
+                       "exactly the fresh set of columns", False,
+                       "not evaluated: the starting shape was wrong, so the "
+                       "comparison proves nothing")
+
     r.check("A2c upgrading the DEPLOYED (8e27869) schema lands on exactly the "
             "fresh set of columns",
             after == fresh,
