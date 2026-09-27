@@ -323,6 +323,36 @@ def test_the_schema_creation_is_guarded_on_pg_namespace():
     )
 
 
+def test_the_guard_still_contains_a_real_create_schema():
+    """The guard must still CREATE, not merely raise.
+
+    A role that DOES hold database-level CREATE has to be able to provision the
+    schema in one step. Replacing the inner statement with a RAISE would make
+    the file only ever re-appliable, and would take away the one path that
+    provisions a fresh database.
+
+    (The scoped app role cannot provision -- that is a documented limitation of
+    the role, not of this file.)
+    """
+    sql = SCHEMA_SQL.read_text(encoding="utf-8")
+    guard = sql[sql.index("DO $$"): sql.index("END $$;") + len("END $$;")]
+    assert "CREATE SCHEMA mse;" in guard
+    assert "RAISE EXCEPTION" not in guard
+
+
+def test_the_comment_does_not_claim_the_schema_is_always_creatable():
+    """The wording finding: the old comment read as a general fact.
+
+    An existing schema never reaches the privileged statement, but an ABSENT one
+    does and fails -- with an error byte-identical to the one this fix was for.
+    The comment must say which case it covers, or the next reader re-derives the
+    wrong conclusion from a deploy log.
+    """
+    sql = SCHEMA_SQL.read_text(encoding="utf-8")
+    assert "when the schema already exists" in sql
+    assert "When the schema is ABSENT" in sql
+
+
 def test_the_stripper_sees_a_bare_create_schema():
     """The helper itself must be discriminating, or the tests above are vacuous."""
     fake = "CREATE SCHEMA IF NOT EXISTS mse;\n"
