@@ -70,6 +70,7 @@ a { color: var(--accent); }
 .sliders input[type=range] { flex: 1; }
 .modes tbody tr { cursor: pointer; }
 .modes tbody tr.active { background: #10283c; }
+.modes tbody tr.unavailable { cursor: default; opacity: .45; }
 @media (max-width: 520px) {
   main { padding: .6rem; }
   .card { padding: .75rem; }

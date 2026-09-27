@@ -69,6 +69,19 @@ def decode_mode(data: bytes, grid: dict) -> np.ndarray:
     return field.reshape(shape_of(grid) + (3,))
 
 
+def field_is_readable(grid: dict, data: bytes | None) -> bool:
+    """Could ``decode_mode`` read this blob, without decoding it?
+
+    The index route needs this answer for every mode, and decoding twenty
+    multi-megabyte arrays to ask would defeat the point of the split. The only
+    thing that makes a field unreadable is its size, so the check is arithmetic.
+    ``None`` means the solver's mode table has no blob for it.
+    """
+    if data is None:
+        return False
+    return len(data) == n_samples(grid) * 3 * 4
+
+
 def magnitude(field: np.ndarray) -> np.ndarray:
     """``|E|`` as float32, NaN preserved where the solver marked outside."""
     return np.linalg.norm(field, axis=-1).astype(np.float32)

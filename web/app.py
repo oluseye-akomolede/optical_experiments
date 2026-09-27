@@ -113,38 +113,43 @@ def create_app(config: dict | None = None) -> Flask:
                          download_name=name, conditional=True)
 
     # -- derived payloads the viewer needs --------------------------------
+    #
+    # The payload is split so a phone downloads one mode's field, not twenty.
+    # ``slices.json`` is now the *index*: one entry per mode with its frequency
+    # and its index, no field data. The heavy arrays live in
+    # ``slices/<n>.json`` and are fetched when that mode is first selected. A
+    # job whose modes are all unreadable is still a payload, not an error --
+    # the index is what the mode table renders from.
     @app.route("/jobs/<job_id>/slices.json")
     def job_slices(job_id):
-        """Every slice of every mode, small enough for a phone."""
-        job = _require_job(jobs_db, job_id)
-        if job["status"] != DB.DONE:
+        """The mode index: what each mode is, without any field data."""
+        manifest = _done_manifest(store, jobs_db, job_id)
+        return jsonify(_mode_index(manifest, store, job_id))
+
+    @app.route("/jobs/<job_id>/slices/<int:number>.json")
+    def job_slices_for_mode(job_id, number):
+        """One mode's slices and point cloud, decoded from its own field file."""
+        manifest = _done_manifest(store, jobs_db, job_id)
+        mode = next((m for m in manifest.get("modes", [])
+                     if int(m["index"]) == number), None)
+        if mode is None:
             abort(404)
         try:
-            manifest = FLD.load_modes_json(
-                store.read(STORE.job_key(job_id, "modes.json")))
-        except FLD.FieldError:
-            abort(502)
-        except FileNotFoundError:
+            field = FLD.decode_mode(
+                store.read(STORE.job_key(job_id, f"mode_{number:02d}.bin")),
+                manifest["grid"])
+        except (FileNotFoundError, FLD.FieldError):
+            # The mode is in the table but its field file is gone or unusable.
+            # That is the same shape of failure as an unknown mode number, so it
+            # answers the same way rather than pretending a field exists.
             abort(404)
-
-        modes = []
-        for mode in manifest.get("modes", []):
-            index = int(mode["index"])
-            try:
-                raw = store.read(STORE.job_key(job_id, f"mode_{index:02d}.bin"))
-                field = FLD.decode_mode(raw, manifest["grid"])
-            except (FileNotFoundError, FLD.FieldError):
-                continue
-            modes.append({
-                "index": index,
-                "freq_hz": mode.get("freq_hz"),
-                "vacuum_wavelength_m": mode.get("vacuum_wavelength_m"),
-                "slices": [FLD.slice_payload(field, manifest["grid"], axis, pos)
-                           for axis, pos in _slice_positions(manifest["grid"])],
-                "cloud": FLD.downsample(field, manifest["grid"], CLOUD_SAMPLES),
-            })
-        return jsonify({"grid": manifest["grid"], "units": manifest.get("units"),
-                        "n_index": manifest.get("n_index"), "modes": modes})
+        return jsonify({
+            "grid": manifest["grid"],
+            "index": number,
+            "slices": [FLD.slice_payload(field, manifest["grid"], axis, pos)
+                       for axis, pos in _slice_positions(manifest["grid"])],
+            "cloud": FLD.downsample(field, manifest["grid"], CLOUD_SAMPLES),
+        })
 
     return app, store, jobs_db, launcher
 
@@ -416,6 +421,58 @@ def _mimetype(name: str) -> str:
     if name.endswith(".vtu"):
         return "application/xml"
     return "application/octet-stream"
+
+
+def _done_manifest(store, jobs_db, job_id) -> dict:
+    """The solver's mode table for a finished Job, or the right abort.
+
+    Both payload routes need exactly this preamble, and it fails the same way
+    for both: not found, not finished, or unreadable.
+    """
+    job = _require_job(jobs_db, job_id)
+    if job["status"] != DB.DONE:
+        abort(404)
+    try:
+        return FLD.load_modes_json(store.read(STORE.job_key(job_id, "modes.json")))
+    except FLD.FieldError:
+        abort(502)
+    except FileNotFoundError:
+        abort(404)
+
+
+def _mode_index(manifest: dict, store, job_id: str) -> dict:
+    """What the viewer needs to draw the mode *list*, and nothing heavier.
+
+    ``available`` is honest rather than decorative: a mode whose field file is
+    missing or the wrong size cannot be fetched, so the viewer greys it out
+    instead of requesting it and showing a failure. Finding that out costs one
+    read of the blob against the size the grid demands -- not a decode of a
+    multi-megabyte array, which would defeat the point of the split. The read is
+    the storage layer's, so this stays correct if the results are remote.
+    """
+    modes = []
+    for mode in manifest.get("modes", []):
+        index = int(mode["index"])
+        try:
+            blob = store.read(STORE.job_key(job_id, _mode_blob(manifest, index)))
+        except (FileNotFoundError, STORE.StorageError):
+            blob = None
+        modes.append({
+            "index": index,
+            "freq_hz": mode.get("freq_hz"),
+            "vacuum_wavelength_m": mode.get("vacuum_wavelength_m"),
+            "available": FLD.field_is_readable(manifest["grid"], blob),
+        })
+    return {"grid": manifest["grid"], "units": manifest.get("units"),
+            "n_index": manifest.get("n_index"), "modes": modes}
+
+
+def _mode_blob(manifest: dict, index: int) -> str:
+    """``modes.json`` may name the field file; fall back to the convention."""
+    for mode in manifest.get("modes", []):
+        if int(mode["index"]) == index and mode.get("field_file"):
+            return str(mode["field_file"])
+    return f"mode_{index:02d}.bin"
 
 
 def _slice_positions(grid: dict):

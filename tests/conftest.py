@@ -44,3 +44,55 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "heavy" in item.keywords:
             item.add_marker(skip)
+
+
+def pytest_collect_file(parent, file_path):
+    """Make the JavaScript tests part of ``pytest tests/``.
+
+    ``tests/js/`` holds the viewer's lazy-load rule (``modecache.js``), which is
+    plain ESM and needs node, not a browser. Without this hook it is only
+    collected when someone remembers to run node by hand -- and a test nobody
+    runs is a test that is already failing. Skips (rather than errors) where
+    node is absent, so a checkout without node is not a broken build.
+    """
+    if file_path.suffix == ".mjs" and file_path.parent.name == "js":
+        return NodeTestFile.from_parent(parent, path=file_path)
+    return None
+
+
+class NodeTestFile(pytest.File):
+    def collect(self):
+        import shutil
+
+        runner = shutil.which("node")
+        yield NodeTestItem.from_parent(self, name=self.path.name, runner=runner)
+
+
+class NodeTestItem(pytest.Item):
+    def __init__(self, *, runner, **kwargs):
+        super().__init__(**kwargs)
+        self.runner = runner
+
+    def runtest(self):
+        import subprocess
+
+        if self.runner is None:
+            raise pytest.skip.Exception("node is not installed", _use_item_location=True)
+        proc = subprocess.run(
+            [self.runner, "--test", str(self.path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if proc.returncode != 0:
+            raise NodeTestFailure(proc.stdout + proc.stderr)
+
+    def repr_failure(self, excinfo):
+        if isinstance(excinfo.value, NodeTestFailure):
+            return str(excinfo.value)
+        return super().repr_failure(excinfo)
+
+    def reportinfo(self):
+        return self.path, 0, f"node --test {self.path.name}"
+
+
+class NodeTestFailure(Exception):
+    """node --test reported at least one failing assertion."""

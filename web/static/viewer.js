@@ -1,15 +1,21 @@
 // MSE mode viewer: the object, coloured field slices, and E-direction arrows.
 //
-// Data comes from two endpoints, both same-origin:
-//   /jobs/<id>/status      small poll for progress
-//   /jobs/<id>/slices.json every mode's slices + a coarse point cloud
-//   /jobs/<id>/files/...   proxied results (modes.json, surface.glb)
+// Data comes from three endpoints, all same-origin:
+//   /jobs/<id>/status          small poll for progress
+//   /jobs/<id>/slices.json     the mode index: one entry per mode, no field data
+//   /jobs/<id>/slices/<n>.json one mode's slices + a coarse point cloud
+//   /jobs/<id>/files/...       proxied results (modes.json, surface.glb)
+//
+// The split between the index and the per-mode payload is the point: the index
+// is fetched once and is small, and a mode's field data (which is large) is
+// fetched only when that mode is first shown. See `modeFields` below.
 //
 // three.js is vendored under /static/vendor (pinned 0.160.0, MIT); nothing is
 // fetched from a CDN, because the app is only reachable on the tailnet.
 
 import * as THREE from './vendor/three.module.min.js';
 import { GLTFLoader } from './vendor/GLTFLoader.js';
+import { wantsFetch, modeFieldUrl, storeFields } from './modecache.js';
 
 const root = document.getElementById('job');
 if (root) init(root);
@@ -151,7 +157,6 @@ function loadFieldData(jobId, statusData, dom) {
       document.getElementById('failure-text').textContent =
         'The results could not be loaded. Please refresh the page.';
     });
-
   function boundsOf(grid) {
     const lo = grid.origin.slice();
     const n = [grid.nx, grid.ny, grid.nz];
@@ -239,18 +244,56 @@ function loadFieldData(jobId, statusData, dom) {
       ? `Mode ${mode.index}: ${formatFrequency(mode.freq_hz)} · ` +
         `${formatWavelength(mode.vacuum_wavelength_m)} in vacuum`
       : '';
+    loadMode(current);
     updateSlices();
+  }
+
+  // The field for a mode arrives on demand, once. `mode.fields` is the cache and
+  // `mode.loading` is the in-flight promise, so selecting a mode twice (or
+  // selecting it while it is still downloading) fetches it once. A mode that
+  // arrives after the user has moved on still lands in its own cache slot,
+  // which is why the next visit is instant. The decision itself lives in
+  // modecache.js, where it is tested.
+  let inFlight = 0;
+
+  function loadMode(i) {
+    const mode = modes[i];
+    if (!wantsFetch(i, mode, inFlight)) return;
+    inFlight += 1;
+    mode.loading = fetch(modeFieldUrl(jobId, mode.index), { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
+      .then((payload) => {
+        storeFields(mode, payload);
+        if (modes[current] === mode) updateSlices();
+      })
+      .catch(() => {
+        mode.loading = null;
+        mode.failed = true;
+        paintModeFailure();
+        if (modes[current] === mode) updateSlices();
+      })
+      .then(() => { inFlight -= 1; });
+  }
+
+  function paintModeFailure() {
+    const panel = document.getElementById('failure');
+    const text = document.getElementById('failure-text');
+    if (panel) panel.hidden = false;
+    if (text) text.textContent = 'This mode could not be loaded. Try another.';
   }
 
   function updateSlices() {
     const mode = modes[current];
     if (!mode) return;
+    const fields = mode.fields;
 
     for (const axis of ['x', 'y', 'z']) {
-      const wanted = Number(document.getElementById(`slice-${axis}`).value);
-      const slice = mode.slices.find((s) => s.axis === axis);
       const plane = slicePlanes[axis];
-      if (!slice) { plane.mesh.visible = false; continue; }
+      const slice = fields
+        ? fields.slices.find((s) => s.axis === axis)
+        : null;
+      if (!slice) { plane.mesh.visible = false; clearArrows(); continue; }
+      const wanted = Number(document.getElementById(`slice-${axis}`).value);
       plane.mesh.visible = true;
       plane.slice = slice;
       paint(plane, slice);
@@ -357,8 +400,11 @@ function loadFieldData(jobId, statusData, dom) {
 
   function updateArrows() {
     clearArrows();
+    const mode = modes[current];
+    const fields = mode && mode.fields;
+    if (!fields) return;
     const axis = activeAxis();
-    const slice = modes[current].slices.find((s) => s.axis === axis);
+    const slice = fields.slices.find((s) => s.axis === axis);
     if (!slice) return;
     // The slider value is an INDEX along the normal axis; where that plane sits
     // in metres is `wantedPos`, which is also the third coordinate of every
@@ -478,7 +524,15 @@ function buildModeTable(list) {
     tr.dataset.index = String(mode.index);
     tr.innerHTML = `<td>${mode.index}</td><td>${formatFrequency(mode.freq_hz)}</td>` +
                    `<td>${formatWavelength(mode.vacuum_wavelength_m)}</td>`;
-    tr.addEventListener('click', () => selectModeRef?.(i));
+    // A mode the index says is unreadable has no field to fetch, so it is not
+    // selectable -- clicking it would only produce a failure the user cannot
+    // act on. It stays visible so the numbering matches the physics.
+    if (mode.available === false) {
+      tr.classList.add('unavailable');
+      tr.title = 'This mode’s field data is not available.';
+    } else {
+      tr.addEventListener('click', () => selectModeRef?.(i));
+    }
     body.appendChild(tr);
   });
 }

@@ -523,7 +523,14 @@ def test_a_missing_file_is_a_404_not_a_500(tmp_path):
 # ---------------------------------------------------------------------------
 # The viewer's data endpoint
 # ---------------------------------------------------------------------------
-def test_slices_json_carries_every_mode_with_all_three_slices(tmp_path):
+def test_slices_index_names_every_mode_and_carries_no_field_data(tmp_path):
+    """The index is the list, not the payload.
+
+    This is the contract the lazy load exists for: one small response the phone
+    can fetch immediately, with the multi-megabyte arrays behind a second,
+    per-mode request. If a bulk ``slices`` ever comes back here, the payload has
+    silently regressed to the 11 MB shape it was split to avoid.
+    """
     app, store, db, _launcher = make_app(tmp_path)
     upload(app.test_client())
     (job,) = db.jobs.values()
@@ -533,12 +540,83 @@ def test_slices_json_carries_every_mode_with_all_three_slices(tmp_path):
         f"/jobs/{job['job_id']}/slices.json").get_json()
     assert [m["index"] for m in payload["modes"]] == [1, 2, 3]
     for mode in payload["modes"]:
-        assert [s["axis"] for s in mode["slices"]] == ["z", "y", "x"]
-        for slice_ in mode["slices"]:
-            assert len(slice_["mag"]["data"]) == \
-                slice_["u"]["count"] * slice_["v"]["count"]
-        assert mode["cloud"]["mag"]
+        assert "slices" not in mode and "cloud" not in mode
+        assert mode["available"] is True
+        assert mode["freq_hz"] is not None
     assert payload["units"] == "mm"
+    assert payload["grid"]["nx"] > 0
+
+
+def test_one_mode_payload_has_all_three_slices_for_that_mode_only(tmp_path):
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=3)
+
+    mode = app.test_client().get(
+        f"/jobs/{job['job_id']}/slices/2.json").get_json()
+    assert mode["index"] == 2
+    assert [s["axis"] for s in mode["slices"]] == ["z", "y", "x"]
+    for slice_ in mode["slices"]:
+        assert len(slice_["mag"]["data"]) == \
+            slice_["u"]["count"] * slice_["v"]["count"]
+    assert mode["cloud"]["mag"]
+
+
+def test_a_mode_payload_for_a_mode_the_job_lacks_is_404(tmp_path):
+    """A mode number outside the solver's table, and a non-number, both 404."""
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=3)
+
+    client = app.test_client()
+    for bad in ("4", "0"):
+        assert client.get(
+            f"/jobs/{job['job_id']}/slices/{bad}.json").status_code == 404
+
+
+def test_a_mode_whose_field_file_is_missing_answers_404_not_500(tmp_path):
+    """The mode is in the table but its field is gone: 404, never a crash.
+
+    Worth pinning because the two routes disagree on purpose. The *index* says
+    ``available: false`` and still returns 200 -- the list is still useful. The
+    per-mode route has nothing to send, so it is a 404. A regression here would
+    surface as a 500 in the viewer's fetch, which the browser shows as a generic
+    failure with no hint that only one mode is affected.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=3)
+
+    (Path(store.root) / STORE.job_key(job["job_id"], "mode_02.bin")).unlink()
+
+    client = app.test_client()
+    index = client.get(f"/jobs/{job['job_id']}/slices.json").get_json()
+    flags = {m["index"]: m["available"] for m in index["modes"]}
+    assert flags == {1: True, 2: False, 3: True}
+    assert client.get(
+        f"/jobs/{job['job_id']}/slices/2.json").status_code == 404
+    assert client.get(
+        f"/jobs/{job['job_id']}/slices/1.json").status_code == 200
+
+
+def test_a_truncated_field_file_is_unavailable_rather_than_half_drawn(tmp_path):
+    """Size is checked, so a partial write cannot decode into a wrong shape."""
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store, n_modes=3)
+
+    blob = Path(store.root) / STORE.job_key(job["job_id"], "mode_01.bin")
+    blob.write_bytes(blob.read_bytes()[:100])
+
+    client = app.test_client()
+    index = client.get(f"/jobs/{job['job_id']}/slices.json").get_json()
+    assert {m["index"]: m["available"] for m in index["modes"]}[1] is False
+    assert client.get(
+        f"/jobs/{job['job_id']}/slices/1.json").status_code == 404
 
 
 def test_slices_json_is_empty_before_the_job_finishes(tmp_path):
@@ -547,6 +625,8 @@ def test_slices_json_is_empty_before_the_job_finishes(tmp_path):
     (job,) = db.jobs.values()
     assert app.test_client().get(
         f"/jobs/{job['job_id']}/slices.json").status_code == 404
+    assert app.test_client().get(
+        f"/jobs/{job['job_id']}/slices/1.json").status_code == 404
 
 
 # ---------------------------------------------------------------------------
