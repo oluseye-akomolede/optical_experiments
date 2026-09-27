@@ -23,7 +23,7 @@ import * as THREE from './vendor/three.module.min.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
 import { GLTFLoader } from './vendor/GLTFLoader.js';
 import { wantsFetch, modeFieldUrl, storeFields } from './modecache.js';
-import { boxCentre, componentVolume, float32ToHalf, SYSTEM_NAMES,
+import { boxCentre, componentVolume, float32ToHalf, halfToFloat32, SYSTEM_NAMES,
          SYSTEM_LABELS, COMPONENT_NAMES, COMPONENT_LABELS, DEFAULT_SYSTEM,
          DEFAULT_COMPONENT }
   from './components.js';
@@ -128,10 +128,19 @@ const COLORMAP = [
 // place the box in the scene: a half-size box centred on the origin, scaled by
 // the mesh to the grid's physical extent. Scaling a unit geometry is what keeps
 // local space equal to texture space, whatever the grid's aspect ratio.
+// The box is the unit cube, and `vLocal` is derived from the geometry's own
+// vertex position rather than from `uv`. The two are *not* interchangeable and
+// the difference is the whole bug this comment exists for: `uv` on a
+// BoxGeometry runs 0..1 per face, which is what the raymarch wants, but the
+// position runs -0.5..0.5, so a fragment's `vLocal` would name a point that is
+// not the one the geometry actually occupies. Every ray would then test a slab
+// it is not inside and discard, and the plot would be a blank canvas with no
+// error anywhere. Taking the coordinate from `position` makes geometry and
+// shader agree by construction, whatever size the mesh is scaled to.
 const VERTEX_SHADER = `
 varying vec3 vLocal;
 void main() {
-  vLocal = uv;
+  vLocal = position + 0.5;   // the unit cube's -0.5..0.5 becomes 0..1
   gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
 }
 `;
@@ -150,7 +159,17 @@ vec3 cameraLocal() {
 }
 `;
 
-const FRAGMENT_SHADER = `#version 300 es
+// No `#version` line here, and that is deliberate rather than an omission.
+// `glslVersion: THREE.GLSL3` makes three.js prepend its own `#version 300 es`
+// ahead of a ~55-line block of shared declarations, because a ShaderMaterial
+// is not a raw one. A `#version` written here would therefore land *after*
+// that block, which GLSL forbids -- "'#version' directive must occur before
+// anything else" -- and the fragment shader would fail to compile. three.js
+// logs that to the console and then draws nothing, so the plot is a blank
+// canvas with no exception and no failing unit test; only the render check
+// could see it. The `in`/`out`/`texelFetch` syntax below still needs GLSL3,
+// which is exactly what `glslVersion` is asking for.
+const FRAGMENT_SHADER = `
 precision highp float;
 precision highp sampler3D;
 
@@ -255,8 +274,17 @@ void main() {
   // The whole raymarch runs in local space: the box spans 0..1 there, so the
   // slab test and the texture lookup need no physical units at all. Only the
   // step length depends on the grid's texel counts.
+  //
+  // The direction is the camera *to* the fragment, and the march runs backwards
+  // along it. This is what side: BackSide requires -- the fragment being shaded
+  // is the box's far wall, so the ray has to travel from that far wall back
+  // toward the eye to cross the volume at all. Marching the other way, with the
+  // direction pointing away from the camera, leaves the box on the first step,
+  // so the slab test rejects every fragment and the canvas comes out empty.
+  // That failure is invisible without a render check: the shader compiles,
+  // nothing throws, and a blank plot looks like a mode with no field.
   vec3 ro = vLocal;
-  vec3 rd = normalize(vLocal - cameraLocal());
+  vec3 rd = normalize(cameraLocal() - vLocal);
   vec3 inv = 1.0 / rd;
   vec3 t0 = (vec3(0.0) - ro) * inv;
   vec3 t1 = (vec3(1.0) - ro) * inv;
@@ -342,12 +370,13 @@ function loadFieldData(jobId, statusData) {
 
   let surfaceMesh = null;
 
-  // The box the raymarch runs in: a half-size cube centred on the origin, then
-  // scaled to the grid's physical extent. Half-size because the vertex shader
-  // uses the box's vertex coordinates, which run 0..1 whatever its size -- a
-  // unit mesh scaled non-uniformly to the grid keeps local space equal to
-  // texture space at any aspect ratio, and the mesh's origin stays the centre.
-  const boxGeometry = new THREE.BoxGeometry(0.5, 0.5, 0.5);
+  // The box the raymarch runs in: the unit cube centred on the origin, scaled
+  // to the grid's physical extent and moved to its centre. Local space is
+  // therefore 0..1 across the grid however the box is scaled, which is what
+  // lets the shader work in grid coordinates and never in metres. The vertex
+  // shader recovers that 0..1 from the geometry's own vertices -- see
+  // VERTEX_SHADER, where deriving it from `uv` instead made every ray miss.
+  const boxGeometry = new THREE.BoxGeometry(1, 1, 1);
   // Back faces are rendered on purpose: the camera may sit inside the box, and
   // a front-face-only box would vanish the moment the user zoomed in past the
   // near wall, which reads as the plot having disappeared.
@@ -580,13 +609,21 @@ function loadFieldData(jobId, statusData) {
     const grid = manifest.grid;
     const buffer = mode.fields;
     if (!buffer || !buffer.byteLength) return null;
-    const vec = new Float32Array(buffer);
-    const expected = grid.nx * grid.ny * grid.nz * 3;
-    if (vec.length !== expected) {
-      // A short or long payload means the index and the blob disagree; drawing
-      // whatever fits would show a plausible field built from misaligned
-      // samples, so this is a failure rather than a best effort.
-      throw new Error(`field has ${vec.length} samples, expected ${expected}`);
+    const count = grid.nx * grid.ny * grid.nz;
+    const expected = count * 3 * 2;   // three components, two bytes each
+    if (buffer.byteLength !== expected) {
+      // The route sends little-endian half floats, so the length is what says
+      // the index and the blob agree. Checking the *loaded* length rather than
+      // the decoded one is deliberate: decoding first and comparing afterwards
+      // would let a float32 payload -- twice the bytes -- decode into a
+      // correctly-shaped array of nonsense and draw a plausible wrong picture.
+      throw new Error(
+        `field payload is ${buffer.byteLength} bytes, expected ${expected}`);
+    }
+    const view = new DataView(buffer);
+    const vec = new Float32Array(count * 3);
+    for (let i = 0; i < vec.length; i += 1) {
+      vec[i] = halfToFloat32(view.getUint16(i * 2, true));
     }
     const positions = positionsOf(grid);
     const centre = boxCentre(grid);

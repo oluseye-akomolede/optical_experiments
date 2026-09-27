@@ -10,6 +10,7 @@ failure, and a Job is deleted once its result is recorded.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import types
 import uuid
@@ -529,6 +530,136 @@ def test_a_missing_file_is_a_404_not_a_500(tmp_path):
     path.unlink()
     assert app.test_client().get(
         f"/jobs/{job['job_id']}/files/surface.glb").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# The .vtu download
+# ---------------------------------------------------------------------------
+# The viewer renders the field itself, so the only reason to fetch a .vtu is to
+# carry it away and open it in ParaView. That makes this route's job different
+# from the proxy's: the bytes have to arrive intact *and* be saved rather than
+# displayed, under a name a person can find again on a downloads shelf.
+def _plant_vtu(store, job_id, name="mode_01.vtu", data=b"<VTKFile>...</VTKFile>"):
+    store.write(STORE.job_key(job_id, name), data)
+
+
+def test_a_vtu_is_offered_as_a_download_under_a_name_the_upload_earned(tmp_path):
+    app, store, db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+    upload(client, filename="my lens.obj")
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store)
+    _plant_vtu(store, job["job_id"])
+
+    response = client.get(f"/jobs/{job['job_id']}/files/mode_01.vtu")
+
+    assert response.status_code == 200
+    assert response.data == b"<VTKFile>...</VTKFile>"
+    # as_attachment is the whole point: without it the browser renders the XML.
+    assert "attachment" in response.headers["Content-Disposition"]
+    disposition = response.headers["Content-Disposition"]
+    assert "my-lens-mode01.vtu" in disposition, disposition
+    # Not the solver's name: twenty `mode_01.vtu` from twenty jobs are
+    # indistinguishable once they are all sitting in a downloads folder.
+    assert "mode_01.vtu" not in disposition.replace("my-lens-mode01.vtu", "")
+
+
+@pytest.mark.parametrize("filename", [
+    "lens.obj", "a/b/c.obj", "….obj", "lens..obj",
+    "  spaced name .obj", "-leading.obj", "no-extension-here.obj",
+])
+def test_the_download_name_is_a_plain_filename_whatever_was_uploaded(
+        tmp_path, filename):
+    """A name from the upload reaches Content-Disposition, so it may not be one.
+
+    A path separator in the filename header makes some browsers write a file
+    somewhere other than the downloads folder, and the escaping rules for the
+    header are inconsistent enough that the safe move is to leave nothing in the
+    name that needs escaping. Whatever comes in, what goes out is one path
+    segment of ``[A-Za-z0-9._-]``.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+    upload(client, filename=filename)
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store)
+    _plant_vtu(store, job["job_id"])
+
+    from app import _vtu_download_name
+    name = _vtu_download_name(job, "mode_01.vtu")
+
+    assert "/" not in name and "\\" not in name, name
+    assert name.endswith("-mode01.vtu"), name
+    assert name == Path(name).name, f"{name!r} is not a single path segment"
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", name), name
+
+
+def test_a_vtu_the_job_does_not_have_is_a_404(tmp_path):
+    """A missing .vtu is a missing file, not an empty download.
+
+    ``send_file`` with no data would be a 0-byte attachment that opens as a
+    corrupt mesh in ParaView -- a failure the user has to debug themselves.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store)
+
+    assert app.test_client().get(
+        f"/jobs/{job['job_id']}/files/mode_01.vtu").status_code == 404
+
+
+def test_a_vtu_is_not_downloadable_before_the_solver_wrote_it(tmp_path):
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    _plant_vtu(store, job["job_id"])
+
+    assert app.test_client().get(
+        f"/jobs/{job['job_id']}/files/mode_01.vtu").status_code == 404
+
+
+def test_an_unreachable_store_does_not_hand_back_a_partial_vtu(tmp_path):
+    """The store failing must not read as a file that simply is not there.
+
+    A 404 here would tell the user the solver never wrote the mode; the truth is
+    that we could not look. This route already distinguishes them, so the test
+    exists to keep it that way.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store)
+    _plant_vtu(store, job["job_id"])
+
+    def unreachable(key):
+        raise STORE.StorageError("the store is unreachable")
+
+    # The route closes over the store object built at create_app time, so the
+    # one it will actually call is the one in the app's extensions.
+    app.extensions["mse"]["store"].read = unreachable
+    assert app.test_client().get(
+        f"/jobs/{job['job_id']}/files/mode_01.vtu").status_code == 502
+
+
+@pytest.mark.parametrize("name", [
+    "mode_01.vtu.bak", "../mode_01.vtu", "mode_1.vtu", "mode_001.vtu",
+    "mode_01.VTU", "sub/mode_01.vtu", "mode_01.vtu/../modes.json",
+])
+def test_a_vtu_has_to_be_a_vtu_the_solver_writes(tmp_path, name):
+    """The whitelist is what makes traversal impossible, so prove it holds.
+
+    Nothing shaped like a path can satisfy the pattern at all, which is why the
+    guard is a full match rather than a sanitizer: there is no escaping step to
+    get wrong.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    db.finish(job["job_id"], store)
+
+    response = app.test_client().get(f"/jobs/{job['job_id']}/files/{name}")
+    assert response.status_code == 404, name
 
 
 # ---------------------------------------------------------------------------

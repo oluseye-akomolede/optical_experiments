@@ -1,0 +1,10 @@
+{
+  "name": "mse-rendercheck",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Loads the MSE viewer headless and fails if the volume plot does not draw",
+  "type": "module",
+  "dependencies": {
+    "playwright-core": "1.49.0"
+  }
+}

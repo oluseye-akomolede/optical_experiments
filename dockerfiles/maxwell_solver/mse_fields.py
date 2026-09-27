@@ -424,8 +424,23 @@ def write_vtu(path, field: np.ndarray, shape, origin, spacing):
 
     ``path`` may be a filename or any binary file object, so callers can either
     write straight to disk or hand the bytes to object storage.
+
+    Built with pyvista/VTK rather than by assembling the XML here. The format
+    looks like text -- it is XML with base64 arrays -- but the appended-data
+    framing (per-block lengths, per-block compression, and a base64 unit per
+    block rather than one continuous stream) is where a hand-written writer goes
+    wrong silently: a file with a mis-framed header is well-formed XML, opens
+    without complaint, and then has VTK allocate against a length it read out of
+    the payload. The library that defines the format writes it.
+
+    VTK's own writer emits the arrays as base64 float32 with zlib compression
+    rather than as ascii. That is the point of this change: the ascii spelling
+    rounded every sample to six significant digits (``%.6g``), so the field in
+    ParaView was not quite the field that was computed. The binary spelling is
+    the exact float32 the solver held, at a fraction of the size.
     """
-    from xml.etree import ElementTree as ET
+    import pyvista as pv
+    import vtk
 
     nz, ny, nx = shape
     zs = origin[2] + np.arange(nz) * spacing[2]
@@ -434,43 +449,27 @@ def write_vtu(path, field: np.ndarray, shape, origin, spacing):
     zz, yy, xx = np.meshgrid(zs, ys, xs, indexing="ij")
 
     coords = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=1)
-    ex = field[:, :, :, 0].ravel()
-    ey = field[:, :, :, 1].ravel()
-    ez = field[:, :, :, 2].ravel()
-    mag = np.linalg.norm(field, axis=-1).ravel()
+    count = coords.shape[0]
 
-    root = ET.Element("VTKFile", type="UnstructuredGrid", version="0.1",
-                      byte_order="LittleEndian")
-    grid = ET.SubElement(root, "UnstructuredGrid")
-    piece = ET.SubElement(
-        grid, "Piece",
-        NumberOfPoints=str(coords.shape[0]), NumberOfCells=str(coords.shape[0]),
-    )
-    pts = ET.SubElement(piece, "Points")
-    da = ET.SubElement(pts, "DataArray", type="Float32", NumberOfComponents="3",
-                       format="ascii")
-    da.text = "\n".join(" ".join(f"{v:.6g}" for v in row) for row in coords)
+    # One vertex cell per sample, so ParaView shows the field where it was
+    # sampled rather than interpolating it onto cells it invented. The prefix
+    # column is the VTK cell format: how many point ids follow each cell.
+    cells = np.hstack([np.ones((count, 1), dtype=np.int64),
+                       np.arange(count, dtype=np.int64).reshape(-1, 1)])
+    grid = pv.UnstructuredGrid(cells.ravel(),
+                               np.full(count, vtk.VTK_VERTEX, dtype=np.uint8),
+                               coords)
+    grid["E"] = field.reshape(-1, 3)
+    grid["E_magnitude"] = np.linalg.norm(field, axis=-1).ravel()
 
-    cells = ET.SubElement(piece, "Cells")
-    conn = ET.SubElement(cells, "DataArray", type="Int32", Name="connectivity",
-                         format="ascii")
-    conn.text = " ".join(str(i) for i in range(coords.shape[0]))
-    offs = ET.SubElement(cells, "DataArray", type="Int32", Name="offsets",
-                         format="ascii")
-    offs.text = " ".join(str(i + 1) for i in range(coords.shape[0]))
-    types = ET.SubElement(cells, "DataArray", type="UInt8", Name="types",
-                          format="ascii")
-    types.text = " ".join("1" for _ in range(coords.shape[0]))   # VTK_VERTEX
+    if hasattr(path, "write"):
+        # pyvista writes by filename, so an in-memory caller gets a temporary
+        # file and the bytes are forwarded to it. The solver hands the result
+        # straight to object storage, which is why this branch exists at all.
+        import tempfile
 
-    pd = ET.SubElement(piece, "PointData")
-    vec = ET.SubElement(pd, "DataArray", type="Float32", Name="E",
-                        NumberOfComponents="3", format="ascii")
-    vec.text = "\n".join(
-        f"{a:.6g} {b:.6g} {c:.6g}"
-        for a, b, c in zip(ex, ey, ez, strict=False)
-    )
-    mg = ET.SubElement(pd, "DataArray", type="Float32", Name="E_magnitude",
-                       NumberOfComponents="1", format="ascii")
-    mg.text = "\n".join(f"{v:.6g}" for v in mag)
-
-    ET.ElementTree(root).write(path, encoding="UTF-8", xml_declaration=True)
+        with tempfile.NamedTemporaryFile(suffix=".vtu") as tmp:
+            grid.save(tmp.name)
+            path.write(tmp.read())
+    else:
+        grid.save(str(path))

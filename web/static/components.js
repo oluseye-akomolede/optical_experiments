@@ -211,3 +211,26 @@ export function float32ToHalf(value) {
   }
   return sign | (half << 10) | m;
 }
+
+// --------------------------------------------------------------------------
+// float16 -> float32
+// --------------------------------------------------------------------------
+// The inverse of the above, and the same reasoning for writing it by hand:
+// DataView's half-float read is not in every engine, and Float16Array is the
+// same recent addition. The field route sends half floats, so without this the
+// viewer has no way to read the payload it fetches at all -- and reading the
+// bytes as float32 instead does not fail loudly, it produces a plausible array
+// of the wrong length whose numbers are nonsense. That is the bug this exists
+// to close: the viewer decoded the wire format with the wrong assumption and
+// the only thing that caught it was the payload-length guard downstream.
+//
+// NaN decodes back to NaN rather than to Infinity, because the solver uses NaN
+// to mean "outside the object" and the shader tests for it.
+export function halfToFloat32(h) {
+  const sign = h & 0x8000 ? -1 : 1;
+  const exp = (h >> 10) & 0x1f;
+  const frac = h & 0x3ff;
+  if (exp === 0x1f) return frac ? NaN : sign * Infinity;
+  if (exp === 0) return sign * frac * 2 ** -24;   // subnormal (and zero)
+  return sign * (1 + frac / 1024) * 2 ** (exp - 15);
+}
