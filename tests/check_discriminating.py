@@ -560,10 +560,24 @@ def run_case(case: Case) -> bool:
     ok = True
     try:
         case.apply()
+        # ``-B`` / PYTHONDONTWRITEBYTECODE, and it is not an optimization. This
+        # tool reverts a source file and runs pytest against it; without this,
+        # pytest imports the *reverted* module and writes a matching .pyc, which
+        # then outlives the restore. The next run serves that stale bytecode
+        # while the source on disk is correct -- so tests fail for a reason that
+        # is not in the tree, every case reports them as "failed but not
+        # expected", and the checker exits 1 on a tree that is fine. Reproduced
+        # on 2026-09-27: a web/db.py compiled before the isfile change made the
+        # four test_schema_paths.py cases fail while the source used isfile.
+        # The failure moves between runs, which is what makes it worth fixing
+        # rather than re-reading: it is the same defect this file warns about in
+        # its own docstring -- a half-reverted artefact outliving the run that
+        # made it. The cure is not to compile it in the first place.
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         proc = subprocess.run(
-            [sys.executable, "-m", "pytest", case.test_file, "-q", "--no-header",
-             "-p", "no:randomly", "--tb=no"],
-            cwd=str(ROOT), capture_output=True, text=True,
+            [sys.executable, "-B", "-m", "pytest", case.test_file, "-q",
+             "--no-header", "-p", "no:randomly", "--tb=no"],
+            cwd=str(ROOT), capture_output=True, text=True, env=env,
         )
         # "Unrunnable" and "passing" must not be the same input. If pytest never
         # ran -- wrong interpreter, import error, a collection failure -- stdout
