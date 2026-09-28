@@ -169,6 +169,264 @@ def _check_the_harness_models_the_real_store(work_root: Path) -> None:
         )
 
 
+def _struct_pack_floats(field, n_samples: int) -> bytes:
+    """Pack a ``(nz, ny, nx, 3)`` nested list as little-endian float32.
+
+    Deliberately NOT ``web/fields.py``'s ``encode_field16``: this is the
+    SOLVER's output format, which is float32 (``decode_mode`` reads ``<f4`` and
+    ``field_is_readable`` sizes against ``n_samples * 3 * 4``). Using the
+    reader's own encoder to produce the file the reader will decode would make
+    the format check circular.
+    """
+    import struct  # noqa: PLC0415
+
+    flat: list[float] = []
+    for z_plane in field:
+        for y_plane in z_plane:
+            for sample in y_plane:
+                flat.extend(sample)
+    assert len(flat) == n_samples * 3, (len(flat), n_samples * 3)
+    return struct.pack(f"<{len(flat)}f", *flat)
+
+
+def _json_dumps(obj) -> bytes:
+    """``json.dumps`` that REFUSES NaN/Infinity instead of emitting them.
+
+    ``json.dumps`` writes the bare tokens by default, which no browser's
+    ``JSON.parse`` accepts -- so the default would let the stub produce a
+    ``modes.json`` the app parses and a browser cannot. The strict flags make
+    the writer agree with the reader used in ``_strict_json``.
+    """
+    import json  # noqa: PLC0415
+
+    return json.dumps(obj, allow_nan=False).encode("utf-8")
+
+
+def _strict_json(raw: bytes, url: str):
+    """``json.loads`` that REFUSES NaN and Infinity instead of reading them.
+
+    WHY THIS IS NOT ``json.loads``. Python's decoder accepts the bare tokens
+    ``NaN``, ``Infinity`` and ``-Infinity`` and returns ``float('nan')`` for
+    them -- they are not JSON, but the decoder is permissive. So a 200 that
+    ``json.loads`` parses happily can still be a payload no browser can render,
+    which is the shape v1 shipped once: a JSON body carrying NaN. A browser's
+    own ``JSON.parse`` rejects those tokens, so the decoder used here is made to
+    agree with the browser rather than with the lenient default.
+
+    ``parse_constant`` is what fires on those three tokens; raising from it
+    turns the acceptance into a parse failure at the position it occurred.
+    """
+    import json  # noqa: PLC0415
+
+    def refuse(token: str):
+        raise ValueError(f"{url} carried the non-JSON token {token!r}")
+
+    return json.loads(raw.decode("utf-8"), parse_constant=refuse)
+
+
+def _http_get(url: str, timeout: float = 30.0) -> tuple[int, bytes]:
+    """GET ``url``, returning (status, body). Does not raise on a non-200."""
+    import urllib.error  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            return int(resp.status), resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        return int(exc.code), body
+
+
+def _check_the_delivery_surfaces_through_the_app(url: str, job_id: str,
+                                                 n_modes: int) -> bool:
+    """Fetch what the VIEWER fetches, through the app's own routes.
+
+    WHY THIS EXISTS. The verdict above reads the mode rows out of the DB double
+    (``jobs_db.list_modes``). That proves the writer wrote a row object, and it
+    is exactly the claim the deploy-3 fix needed -- but it does NOT prove the
+    bytes reached a browser. Every route below reads the STORE, not the DB:
+    ``/status`` reads the rows the API would put on the page, ``/index.json``
+    reads ``modes.json`` back and stats each field file, and ``/field/1.bin``
+    decodes and re-encodes a real field array. A job whose rows were written
+    correctly and whose files were not (or were written where no reader looks)
+    passes the DB check and fails here.
+
+    Each leg reports its own reason, and a leg that cannot be fetched at all is
+    a failure rather than a skip -- the whole point of this file is that a check
+    which cannot ask must not look like a check that passed.
+    """
+    ok = True
+    base = f"{url}/jobs/{job_id}"
+
+    # 1. /status -- the payload the job page renders its mode table from.
+    payload = None
+    try:
+        code, raw = _http_get(f"{base}/status")
+        print(f"[e2e] GET /status -> {code} ({len(raw)} bytes)")
+        if code != 200:
+            print(f"[e2e]   body: {raw[:300]!r}")
+            ok = False
+        else:
+            payload = _strict_json(raw, "/status")
+    except Exception as exc:                       # noqa: BLE001 - report it
+        print(f"[e2e] GET /status could not be parsed: "
+              f"{type(exc).__name__}: {exc}")
+        ok = False
+
+    if payload is not None:
+        modes = payload.get("modes")
+        if not isinstance(modes, list):
+            print(f"[e2e] /status listed no mode array: modes={modes!r}")
+            ok = False
+        else:
+            indices = [m.get("index") for m in modes]
+            freqs = [m.get("freq_hz") for m in modes]
+            finite = all(
+                isinstance(f, (int, float)) and not isinstance(f, bool)
+                and math.isfinite(f) for f in freqs
+            )
+            print(f"[e2e] /status modes: {len(modes)} (job says n_modes="
+                  f"{n_modes}); indices={indices[:8]}"
+                  f"{' ...' if len(indices) > 8 else ''}; freqs finite={finite}")
+            if len(modes) != n_modes or indices != list(range(1, n_modes + 1)):
+                print("[e2e] /status lists a mode set that disagrees with the "
+                      "job: the page would show the wrong table")
+                ok = False
+            if not finite:
+                print("[e2e] /status carried a frequency that is not a finite "
+                      "number -- a browser cannot render that row")
+                ok = False
+
+    # 2. /index.json -- the viewer's own mode list, which re-reads modes.json
+    #    from the store and stats every field file against the grid.
+    try:
+        code, raw = _http_get(f"{base}/index.json")
+        print(f"[e2e] GET /index.json -> {code} ({len(raw)} bytes)")
+        if code != 200:
+            print(f"[e2e]   body: {raw[:300]!r}")
+            ok = False
+        else:
+            index = _strict_json(raw, "/index.json")
+            entries = index.get("modes")
+            if not isinstance(entries, list) or len(entries) != n_modes:
+                print(f"[e2e] /index.json has {len(entries) if isinstance(entries, list) else entries!r} "
+                      f"entries, expected {n_modes}")
+                ok = False
+            else:
+                # ``available`` is computed from a real stat of every field
+                # file, and the stub above wrote one for every mode -- so on
+                # this run every entry MUST read True, and a False here means
+                # the file the viewer would fetch is missing or the wrong size
+                # for the grid. That False direction is pinned by a mutation:
+                # swapping the computed flag for a constant ``True`` reddens
+                # it, which is what proves the leg reads a real value rather
+                # than restating the stub's own layout.
+                #
+                # The OTHER direction -- a True that should have been False --
+                # is deliberately NOT claimed here. It cannot arise on this
+                # run: the stub's files are all present and readable, so True
+                # is the correct answer, and no edit to how ``available`` is
+                # COMPUTED can make it wrong while the files are fine. The
+                # shape that would produce it (a promised mode whose fetch
+                # 404s) needs a file removed from under a written index, which
+                # the tier-2 race checks cover; claiming the field leg catches
+                # it here would be a guard comment asserting something it does
+                # not do.
+                unavailable = [m["index"] for m in entries
+                               if m.get("available") is not True]
+                print(f"[e2e] /index.json: grid={index.get('grid')} "
+                      f"units={index.get('units')!r} "
+                      f"unavailable={unavailable}")
+                if not all(
+                    isinstance(m.get("freq_hz"), (int, float))
+                    and not isinstance(m.get("freq_hz"), bool)
+                    and math.isfinite(m["freq_hz"]) for m in entries
+                ):
+                    print("[e2e] /index.json carried a non-finite frequency")
+                    ok = False
+                if unavailable:
+                    print("[e2e] /index.json marks modes unavailable, so the "
+                          "viewer would grey them out -- the field files are "
+                          "missing or the wrong size for the grid")
+                    ok = False
+                # An index whose ``available`` flags were computed but never
+                # SET is the could-not-ask shape one level down: the flag is
+                # absent, the viewer treats absence as "yes", and the mode 404s
+                # on click. ``avail_ok`` needs each flag to be a real bool, so
+                # a None or a missing key fails here rather than being read as
+                # permissive.
+                bad_flags = [m["index"] for m in entries
+                             if not isinstance(m.get("available"), bool)]
+                if bad_flags:
+                    print(f"[e2e] /index.json did not answer 'available' with "
+                          f"a bool for modes {bad_flags}")
+                    ok = False
+    except Exception as exc:                       # noqa: BLE001 - report it
+        print(f"[e2e] GET /index.json could not be parsed: "
+              f"{type(exc).__name__}: {exc}")
+        ok = False
+
+    # 3. /field/1.bin -- a real field array, decoded and re-encoded by the
+    #    app. A 200 with a non-empty body is the smallest honest claim, and it
+    #    is NOT enough: /index.json's ``available`` flag answers the same
+    #    question by arithmetic (``n_samples * 3 * 4``), and a flag that says
+    #    True while the fetch returns the wrong number of bytes is the viewer
+    #    promising a mode it cannot draw. So the length is asserted against the
+    #    grid, which is what makes the mutation that empties the body, or drops
+    #    a sample, actually red.
+    #
+    #    The body is float16 (half the float32 the file holds), gzipped, so the
+    #    comparison is decompressed bytes, not wire bytes -- 31 bytes on the
+    #    wire for 288 bytes of samples is correct, not a truncated file.
+    try:
+        code, raw = _http_get(f"{base}/field/1.bin")
+        print(f"[e2e] GET /field/1.bin -> {code} ({len(raw)} bytes on the wire, "
+              f"gzip)")
+        if code != 200:
+            print(f"[e2e]   body: {raw[:300]!r}")
+            ok = False
+        else:
+            index = None
+            try:
+                _, raw_index = _http_get(f"{base}/index.json")
+                index = _strict_json(raw_index, "/index.json")
+            except Exception:                   # noqa: BLE001 - reported above
+                pass
+            grid = (payload or {}).get("grid") if payload else None
+            if grid is None and isinstance(index, dict):
+                grid = index.get("grid")
+            if not isinstance(grid, dict):
+                print("[e2e] /field/1.bin: could not obtain the grid to size "
+                      "the body against, so the length is unchecked")
+                ok = False
+            else:
+                import gzip as GZIP  # noqa: PLC0415
+                try:
+                    body = GZIP.decompress(raw)
+                except OSError as exc:
+                    print(f"[e2e] /field/1.bin is not gzip: {exc}")
+                    body = b""
+                n_samples = int(grid["nz"]) * int(grid["ny"]) * int(grid["nx"])
+                expected = n_samples * 3 * 2      # float16 = 2 bytes
+                print(f"[e2e] /field/1.bin body: {len(body)} bytes, expected "
+                      f"{expected} (grid {n_samples} samples x3 x float16)")
+                if not body:
+                    print("[e2e] /field/1.bin returned an EMPTY body -- the "
+                          "viewer would upload zero bytes into a texture, "
+                          "while /index.json calls the mode available")
+                    ok = False
+                elif len(body) != expected:
+                    print(f"[e2e] /field/1.bin is {len(body)} bytes but the "
+                          f"grid demands {expected} -- the index's "
+                          f"'available: true' is a promise this fetch breaks")
+                    ok = False
+    except Exception as exc:                       # noqa: BLE001 - report it
+        print(f"[e2e] GET /field/1.bin failed: {type(exc).__name__}: {exc}")
+        ok = False
+
+    return ok
+
+
 def _e2e_sibling_names(store, job_id: str) -> list[str]:
     """The names the WORKER's reader finds, using the worker's own function.
 
@@ -374,24 +632,63 @@ def main(argv=None) -> int:
         def stub(job, store_in, store_out, stage=None):  # noqa: ARG001
             import mse_storage as STORE  # noqa: PLC0415
             jid = job["job_id"]
+            n = int(job.get("n_modes") or 1)
             # Real STL bytes, not a placeholder: the app validates the artifact
             # it is sent, and a stub that uploads b"glb" would prove only that
             # the wire carries bytes.
             mesh = trimesh.creation.box(extents=[10.0, 7.0, 5.0])
             store_out.write(STORE.job_key(jid, "surface.glb"), mesh.export(
                 file_type="glb"))
+
+            # The artifacts below are shaped like the SOLVER's, because the
+            # route checks now read them back through the app's own decoder.
+            # A stub that writes 8-byte placeholders passes a DB-only verdict
+            # and fails /index.json (which stats every field file against the
+            # grid) -- which is the point: the stub is only honest if what it
+            # writes is what a reader expects.
+            #
+            # The grid is small on purpose: these are real arrays of
+            # 4x3x2x3 float32 = 288 bytes, so the decode, the gzip and the
+            # float16 re-encode in /field/1.bin all run for real without
+            # dragging the builder's box into a mode-sized payload.
+            grid = {"nx": 2, "ny": 3, "nz": 4,
+                    "origin": [0.0, 0.0, 0.0],
+                    "spacing": [1e-3, 1e-3, 1e-3]}
+            n_samples = grid["nz"] * grid["ny"] * grid["nx"]
+            rows = []
             modes = {}
-            for n in range(1, int(job.get("n_modes") or 1) + 1):
-                name = f"mode_{n:02d}"
-                store_out.write(STORE.job_key(jid, name + ".bin"),
-                                (n.to_bytes(2, "little") * 4))
-                store_out.write(STORE.job_key(jid, name + ".vtu"),
+            for i in range(1, n + 1):
+                # A field with NaN outside the object, which is what the solver
+                # writes and what the viewer relies on for the silhouette.
+                field = [[[([0.0, 0.0, 0.0] if (x + y + z) % 2 else
+                            [float("nan")] * 3) for x in range(grid["nx"])]
+                          for y in range(grid["ny"])] for z in range(grid["nz"])]
+                store_out.write(
+                    STORE.job_key(jid, f"mode_{i:02d}.bin"),
+                    _struct_pack_floats(field, n_samples))
+                store_out.write(STORE.job_key(jid, f"mode_{i:02d}.vtu"),
                                 b"<?xml version='1.0'?><VTKFile/>")
-                modes[f"{n:02d}"] = {"freq_ghz": n}
-            import json  # noqa: PLC0415
-            store_out.write(STORE.job_key(jid, "modes.json"),
-                            json.dumps(modes).encode())
-            return {"n_modes": len(modes)}
+                freq = 1.0e14 + i
+                wavelength = 2.99792458e8 / freq
+                modes[f"{i:02d}"] = {
+                    "index": i,
+                    "k0_per_m": 2.0 * math.pi / wavelength,
+                    "freq_hz": freq,
+                    "vacuum_wavelength_m": wavelength,
+                    "freq_ghz": freq / 1e9,
+                }
+                rows.append((i, modes[f"{i:02d}"]["k0_per_m"], freq, wavelength))
+            store_out.write(STORE.job_key(jid, "modes.json"), _json_dumps(
+                {"grid": grid, "units": job.get("units"),
+                 "n_index": float(job.get("n_index") or 1.0),
+                 "modes": list(modes.values())}))
+            # The rows go to the db reporter, which is the seam the deploy-3
+            # fix created and which a stub that only wrote files would skip:
+            # the worker takes them from here, not from modes.json.
+            if stage is not None:
+                stage.delete_modes(jid)
+                stage.insert_modes(jid, rows)
+            return {"n_modes": n}
 
         worker._solve = stub
         print("[e2e] --stub-solve: the GPU arithmetic is replaced; the worker, "
@@ -408,11 +705,24 @@ def main(argv=None) -> int:
 
     outcome = "unknown"
     traceback_text = None
+    routes_ok = False
     try:
         outcome = worker.run_job(job)
     except BaseException:                       # noqa: BLE001 - that is the point
         traceback_text = traceback.format_exc()
     finally:
+        # The route checks must happen while the server is UP, so they run
+        # before the shutdown rather than beside the disk inspection below.
+        # A harness that closed the socket first would report every route as a
+        # connection failure -- and a check that cannot ask must not be read as
+        # a check that failed for the right reason.
+        try:
+            routes_ok = _check_the_delivery_surfaces_through_the_app(
+                url, job_id, args.n_modes)
+        except Exception:                       # noqa: BLE001 - report it
+            print("[e2e] the route checks could not run:\n"
+                  + traceback.format_exc())
+            routes_ok = False
         server.shutdown()
 
     row = jobs_db.jobs.get(job_id, {})
@@ -474,7 +784,12 @@ def main(argv=None) -> int:
             print("[e2e] the rows are present but the wrong shape or count -- a "
                   "job page would show a mode list that disagrees with the job")
 
-    ok = ok and modes_ok
+    ok = ok and modes_ok and routes_ok
+    if outcome == "done" and row.get("status") == "done" and not routes_ok:
+        print("\n[e2e] the job reached DONE and the DB rows are fine, but what "
+              "the VIEWER fetches is not: the app's own routes disagree with "
+              "the rows. That is the deploy-3 shape one level up -- 'finished' "
+              "with nothing a browser can show.")
     if outcome == "done" and row.get("status") == "done" and not modes_ok:
         print("\n[e2e] the job reached DONE with no usable mode rows. That is "
               "the deploy-3 shape: 'finished' with nothing to show for it, "
