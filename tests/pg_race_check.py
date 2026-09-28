@@ -102,6 +102,11 @@ from pathlib import Path
 _TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(_TESTS))
 sys.path.insert(0, str(_TESTS.parent / "web"))
+# The WORKER's own module, so the Gap-B leg drives the real ``WorkerAPI`` and
+# the real ``LeaseLost`` rather than a transcription of them. Under ``web/``
+# only, ``import mse_worker`` would resolve to nothing -- and a leg that
+# re-implemented the client would be testing its own copy of the contract.
+sys.path.insert(0, str(_TESTS.parent / "worker"))
 
 
 #: The parsed dsn dict, set once in main(). JobStore reads dsn["host"] etc, so
@@ -1278,6 +1283,280 @@ def check_the_two_connection_paths_differ_only_in_autocommit(r: Result,
             f"_open(False) autocommit={plain_autocommit!r} -- want True/False")
 
 
+def check_the_real_worker_client_against_the_real_app(conn, r: Result,
+                                                      JobStore):
+    """Gap B: the worker's OWN HTTP client, against the app's OWN routes.
+
+    Every other leg here calls ``JobStore`` methods directly, and every leg in
+    ``tests/test_worker.py`` drives ``WorkerAPI`` against a double. So the two
+    halves are each covered and the SEAM between them is not: nothing runs the
+    real urllib client against the real Flask routes against the real store.
+    The reviewer ran exactly this path by hand and it passed, which is why this
+    is a COVERAGE leg and not a bug fix -- but a seam with no automated leg is a
+    seam that regresses silently, and the deploy-3 precedent in this repo is
+    precisely a set of components that were each green alone.
+
+    What this leg can fail on that no other can: a route spelling that the
+    client does not use, a claim payload field the client reads under a
+    different name, a 409 mapping that the client translates wrongly, and the
+    ''/progress after the app failed the job'' transition that is the whole
+    lease contract.
+
+    **The double is what makes that last one demonstrable.** After the app fails
+    the job, the leg re-opens the lease with a direct SQL UPDATE and asserts the
+    worker is served a 409 again. Without that, "the gate refused" would also
+    pass on a store that had simply deleted its lease row -- the refusal has to
+    come from the STATUS, not from the absence of a lease.
+
+    Asserted through the client's own exceptions (``LeaseLost``), not through
+    its returned dicts, because the exception is what a real caller branches on:
+    a route that returned 409 but a client that swallowed it would look
+    identical from the JSON alone.
+    """
+    import io  # noqa: PLC0415
+    import os  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    import urllib.error  # noqa: PLC0415
+
+    import mse_db_shim  # noqa: PLC0415
+    import mse_worker  # noqa: PLC0415
+
+    # The APP's worker blueprint, loaded by the shim as part of web/app.py's
+    # imports. ``owner_id`` is used rather than re-derived here so the owner the
+    # leg claims under and the owner it fails under cannot drift apart.
+    import worker_api  # noqa: PLC0415
+    from werkzeug.test import Client  # noqa: PLC0415
+
+    # The token is set HERE, for this process only, and never printed. It is a
+    # throwaway for a disposable database -- but the habit is what matters: the
+    # rig's rule is that a real token never reaches argv or a log, and a check
+    # that broke that rule for convenience would be the wrong example.
+    TOKEN = "pg-check-" + uuid.uuid4().hex
+    os.environ["MSE_WORKER_TOKEN"] = TOKEN
+    # ``web/config.py`` reads this from the environment and refuses to default
+    # it (the old default was the scalar solver, which would return wrong modes
+    # silently). Loading the app therefore needs a value even though nothing
+    # here launches a Job -- the launcher is constructed eagerly at import.
+    # Set only if the caller has not, so a real deployment value still wins.
+    os.environ.setdefault("MSE_SOLVER_IMAGE", "pg-check-no-such-image:0")
+
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    _insert_jetson_job(conn, jid)
+    # The input the worker fetches. Written through the PROJECT's key helper so
+    # this cannot disagree with the route about where it lives.
+    input_bytes = b"# wedge\nv 0 0 0\n"
+
+    with tempfile.TemporaryDirectory(prefix="pgcheck-worker-") as tmp:
+        app_mod = mse_db_shim.load_app_module()
+        storage_mod = sys.modules.get("storage")
+        if storage_mod is None:
+            raise AssertionError(
+                "storage did not import alongside web/app.py; without it this "
+                "leg cannot write the input the fetch route reads")
+        local = storage_mod.LocalStore(tmp)
+        local.write(storage_mod.job_key(jid, "input.obj"), input_bytes)
+
+        # The REAL app: real Flask, real routes, real JobStore (the store comes
+        # from MSE_DSN, not a mock), real LocalStore. The launcher is left out
+        # deliberately -- no leg here launches anything, and a real launcher
+        # would try to reach a cluster this check must not touch.
+        app, _s, jobs_db, _l = app_mod.create_app({
+            "TESTING": True,
+            "MSE_DSN": DSN_OF[0],
+            "MSE_LOCAL_STORE": tmp,
+        })
+        if jobs_db is None:
+            raise AssertionError("create_app returned no jobs db")
+
+        client = Client(app)
+        api = mse_worker.WorkerAPI("http://worker.invalid", TOKEN,
+                                   timeout=30.0)
+
+        # Route the client's urllib requests into the WSGI app. This is the
+        # whole point: the client's OWN ``_request`` builds a real
+        # ``urllib.request.Request`` with a real Authorization header, and that
+        # request is what the real route authorises.
+        def _opener(request, timeout=None):  # noqa: ARG001
+            """Deliver one worker request to the real WSGI app.
+
+            The non-2xx branch is the whole point of writing this rather than
+            calling the client against a real socket: ``urllib`` RAISES
+            ``HTTPError`` for a 4xx/5xx, and the client's ``_request`` catches
+            exactly that to build its ``APIError`` -- which ``progress()``
+            inspects for ``status == 409`` to raise ``LeaseLost``.
+
+            An earlier version of this function returned the Flask response
+            object for every status, and Werkzeug's ``Client.open`` does NOT
+            raise on a 4xx. So a 409 arrived at the client shaped exactly like a
+            200, ``progress()`` returned normally, and the leg reported "the
+            client did not see LeaseLost" -- blaming the code for the shim's
+            silence. That is this rig's could-not-ask failure in its usual
+            costume: a sub-200 that cannot be distinguished from a success.
+            """
+            method = request.get_method()
+            path = ("/" + request.full_url.split("//", 1)[1].split("/", 1)[1]
+                    if "//" in request.full_url else "/")
+            headers = dict(request.header_items())
+            body = request.data
+            resp = Client(app).open(path, method=method, headers=headers,
+                                    data=body,
+                                    content_type=headers.get("Content-type"))
+            if resp.status_code >= 300:
+                # Exactly what urlopen does: raise, with the body readable.
+                raise urllib.error.HTTPError(
+                    request.full_url, resp.status_code,
+                    f"HTTP {resp.status_code}", resp.headers,
+                    io.BytesIO(resp.get_data()))
+            return _FakeURLResponse(resp)
+
+        import urllib.request  # noqa: PLC0415
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = _opener
+        try:
+            claimed = api.claim()
+            r.check("B the real worker client claims a job through the real "
+                    "app and the real store",
+                    claimed is not None and claimed.get("job_id") == jid,
+                    f"claim() returned {claimed!r}; want job_id {jid}")
+
+            # The input route, through the client.
+            fetched = api.fetch_input(jid)
+            r.check("B the real client fetches the input through the real "
+                    "input route, byte for byte",
+                    fetched == input_bytes,
+                    f"fetch_input returned {fetched!r}; want {input_bytes!r}")
+
+            # A real tick. The app's own reaper must not touch a job this
+            # worker is actively holding -- the D2 property, now exercised
+            # through the route the worker actually uses rather than the store.
+            tick = app_mod.run_tick(local, jobs_db, None, log=lambda *_: None)
+            still = store.get(jid) if hasattr(store, "get") else None
+            if still is None:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT status, lease_owner FROM mse.jobs "
+                                "WHERE job_id = %s", (jid,))
+                    still = cur.fetchone()
+                still = {"status": still[0], "lease_owner": still[1]}
+            r.check("B a real tick leaves a job this worker is holding alone",
+                    still.get("status") == "running",
+                    f"after run_tick the row is {still!r}; a tick that reclaims "
+                    f"a live claim is the D2 defect")
+            r.check("B the tick did not strand the job either (it is still "
+                    "claimable by none, because it is still running)",
+                    tick is not None, f"run_tick returned {tick!r}")
+
+            # The heartbeat, through the client. This is the lease renewal; if
+            # the client's stage payload were malformed the route would 400 and
+            # every long solve would lose its lease.
+            api.progress(jid, "meshing")
+            r.check("B the real client renews the lease through the real "
+                    "/progress route", True, "progress() did not raise")
+
+            # The app fails the job underneath the worker, through the APP'S
+            # OWN route -- not a hand-written UPDATE.
+            #
+            # This distinction is the whole reason this leg is worth having, and
+            # the first version got it wrong. A synthetic ``UPDATE ... status =
+            # 'failed'`` that leaves ``lease_owner`` set produces a state the
+            # real app does not make: every app-side terminal path clears the
+            # lease in the same statement (``fail_jetson`` and ``mark_failed``
+            # both say so, and why). Against that fabricated row,
+            # ``renew_lease`` -- which is guarded on the OWNER only -- still
+            # returned True and this leg reported a defect that does not exist.
+            #
+            # The 409 the worker depends on is delivered by the LEASE CLEAR, not
+            # by a status filter on the heartbeat. So the leg must drive the
+            # real route and assert the real mechanism; anything else is testing
+            # a row the app cannot produce.
+            # The owner id is derived from the token by the APP's own helper, so
+            # this cannot disagree with what the claim route recorded.
+            failed_ok = jobs_db.fail_jetson(jid, worker_api.owner_id(TOKEN),
+                                            "failed by the app")
+            r.check("B the app fails the job through its own terminal path",
+                    failed_ok is True,
+                    f"fail_jetson returned {failed_ok!r}; it is guarded on the "
+                    f"lease owner, so False means the worker's owner id and the "
+                    f"row's disagree and the rest of this leg proves nothing")
+            with conn.cursor() as cur:
+                cur.execute("SELECT status, lease_owner FROM mse.jobs "
+                            "WHERE job_id = %s", (jid,))
+                status, owner_after = cur.fetchone()
+            r.check("B the app's failure CLEARS the lease (that clear is the "
+                    "mechanism that turns the next heartbeat into a 409)",
+                    status == "failed" and owner_after is None,
+                    f"after fail_jetson status={status!r} lease_owner="
+                    f"{owner_after!r} -- want 'failed'/None")
+
+            # THE ASSERTION THAT MATTERS: the next heartbeat is refused, and
+            # the client translates 409 into LeaseLost -- which is the contract
+            # ``beat()`` in mse_worker.py branches on.
+            lost = False
+            try:
+                api.progress(jid, "uploading")
+            except mse_worker.LeaseLost:
+                lost = True
+            except Exception as exc:  # noqa: BLE001
+                r.check("B /progress on a failed job raises LeaseLost",
+                        False, f"raised {type(exc).__name__}: {exc}")
+            r.check("B the real client sees LeaseLost when the app has failed "
+                    "the job underneath it (a 409 the client must translate, "
+                    "not swallow)",
+                    lost,
+                    "progress() raised LeaseLost, which is what stops the "
+                    "worker solving a dead job" if lost
+                    else "progress() did NOT raise LeaseLost on a terminal row; "
+                         "the worker would keep beating forever")
+
+            # The positive control for the line above. It must run BEFORE the
+            # failure and on the SAME client, or "it raised" would also pass on
+            # a client that raises unconditionally. It was already run above --
+            # "the real client renews the lease" -- on this client and this job,
+            # while the row was still running. That is the control, and it is
+            # deliberately not repeated here: re-opening the row by hand would
+            # mean asserting against a state the app does not produce, which is
+            # the mistake this leg was rewritten to remove.
+        finally:
+            urllib.request.urlopen = original
+
+    # Plain-language summary line, so a reader of the log sees the seam named.
+    r.check("B the worker client / real app / real store seam was exercised "
+            "end to end", True,
+            "claim -> input -> tick -> progress -> 409 LeaseLost")
+
+
+class _FakeURLResponse:
+    """The slice of ``http.client.HTTPResponse`` the worker client uses.
+
+    ``urllib.request.urlopen`` returns something with ``.status``, ``.read()``
+    and ``.headers``; the client touches exactly those. A real socket is not
+    needed because the route under test IS the real one -- only the transport is
+    substituted, and this class is small enough that a gap in it shows up as an
+    AttributeError rather than a silent pass.
+    """
+
+    def __init__(self, flask_response):
+        self._resp = flask_response
+        self.status = flask_response.status_code
+        self.headers = flask_response.headers
+
+    def read(self) -> bytes:
+        return self._resp.get_data()
+
+    def getcode(self) -> int:
+        return self.status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def close(self):
+        pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Race/lease checks against a throwaway Postgres. The "
@@ -1373,6 +1652,11 @@ def main() -> int:
         # working version AND on the autocommit version that loses the rows.
         check_finish_writes_the_modes_and_the_status_atomically(conn, r, JobStore)
         check_the_two_connection_paths_differ_only_in_autocommit(r, JobStore)
+        # Gap B: the SEAM between the halves above. Every leg to this point
+        # calls JobStore directly; tests/test_worker.py drives WorkerAPI
+        # against a double. Neither runs the real client against the real app
+        # routes, which is where a spelling or payload drift lives.
+        check_the_real_worker_client_against_the_real_app(conn, r, JobStore)
     finally:
         conn.close()
     print("RESULT:", "PASS" if r.ok else "FAIL")

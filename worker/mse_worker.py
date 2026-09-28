@@ -892,9 +892,11 @@ class Worker:
                 # immediately. Reporting it FAILED would burn a perfectly good
                 # job every time the service is restarted.
                 raise WorkerError(
-                    "the worker was asked to stop while this job was running; "
-                    "handing it back to the queue rather than reporting a "
-                    "result nobody is waiting for"
+                    "the worker was asked to stop; this check runs after "
+                    "solve() returned, so it sees a stop that landed while the "
+                    "worker was between operations -- handing the job back to "
+                    "the queue rather than reporting a result nobody is "
+                    "waiting for"
                 )
             self._stage = "uploading"
             reporter.stage = "uploading"
