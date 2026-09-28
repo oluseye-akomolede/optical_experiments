@@ -155,6 +155,27 @@ class FakeDb:
                    message=None, lease_owner=None, lease_expires_at=None)
         return True
 
+    def finish_jetson_with_modes(self, job_id, owner, rows):
+        """Mark done AND record the rows, as the real store does in one transaction.
+
+        The rows are recorded HERE rather than by the route, because the whole
+        point of the paired write is that a caller cannot get DONE without
+        modes. A double that marked the job done and dropped the rows would let
+        a route that forgot to pass them still go green -- the fake would be the
+        only thing that noticed, and it would not notice.
+        """
+        job = self.jobs.get(str(job_id))
+        if not job or job.get("lease_owner") != owner:
+            return False
+        job.update(status=DB.DONE, stage=DB.DONE, finished_at="2026-09-26T00:00:00Z",
+                   message=None, lease_owner=None, lease_expires_at=None)
+        self.modes[str(job_id)] = [
+            {"index": int(i), "k0_per_m": float(k0), "freq_hz": float(f),
+             "vacuum_wavelength_m": float(w)}
+            for (i, k0, f, w) in rows
+        ]
+        return True
+
     def fail_jetson(self, job_id, owner, message):
         job = self.jobs.get(str(job_id))
         if not job or job.get("lease_owner") != owner:

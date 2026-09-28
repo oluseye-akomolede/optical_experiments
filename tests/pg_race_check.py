@@ -1122,6 +1122,162 @@ def check_a_terminal_row_serves_no_worker_write(conn, r: Result, JobStore):
             f"False (the 409 that stops the worker)")
 
 
+def check_finish_writes_the_modes_and_the_status_atomically(conn, r: Result,
+                                                            JobStore):
+    """D7: DONE and the mode rows are ONE write, and a failure writes neither.
+
+    This is the leg that would have caught the bug the deploy-3 fix turns on,
+    and no Python double can exhibit it: a double reimplements the transaction,
+    so it passes on the working version AND on one that loses the rows.
+
+    **What provides the transaction, measured rather than assumed.** Three
+    shapes, each seeding ``[1]``, running ``DELETE`` then a failing INSERT, and
+    read back through an INDEPENDENT connection (a same-connection read cannot
+    tell a rollback from an uncommitted-but-open transaction):
+
+      A  ``autocommit=False`` + ``with conn``   -> ``[1]``  rolled back
+      B  ``autocommit=True``  + ``with conn``   -> ``[1]``  rolled back too
+      C  ``autocommit=True``, NO ``with conn``  -> ``[]``   THE TRAP
+
+    So the transaction comes from ``with conn`` -- psycopg2's context manager
+    issues BEGIN/ROLLBACK regardless of the autocommit flag -- and NOT from
+    ``autocommit = False``. An earlier version of this docstring claimed the
+    opposite and an earlier version of this leg could not tell A from B.
+
+    The leg therefore asserts the two things that are load-bearing: the
+    FAILURE path keeps the rows (which C breaks), and the SUCCESS path commits
+    them (which a missing commit breaks -- the other direction, and the one a
+    ``with conn`` that only ever rolled back would fail).
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    _insert_jetson_job(conn, jid)
+    if _claim_row(store, jid, owner="w-d7") is None:
+        return r.check("D7 the seeding claim works", False,
+                       f"claim_jetson never returned {jid}")
+
+    good = [(1, 1.0e6, 1.0e14, 1.0e-6), (2, 2.0e6, 2.0e14, 5.0e-7)]
+
+    # -- the happy path: the write must COMMIT -----------------------------
+    store.finish_jetson_with_modes(jid, "w-d7", good)
+    written = store.list_modes(jid)
+    with conn.cursor() as cur:
+        cur.execute("SELECT status FROM mse.jobs WHERE job_id = %s", (jid,))
+        status = cur.fetchone()[0]
+    r.check("D7 the happy path marks the row done AND writes every mode row",
+            status == "done" and len(written) == 2,
+            f"status={status!r} rows={len(written)} -- want done and 2")
+
+    # -- the failure path: the DELETE must be UNDONE -----------------------
+    # Re-open the row and seed it with a row that must survive the failure.
+    with conn.cursor() as cur:
+        cur.execute("UPDATE mse.jobs SET status = 'running', lease_owner = "
+                    "'w-d7', lease_expires_at = now() + interval '300 seconds', "
+                    "finished_at = NULL WHERE job_id = %s", (jid,))
+        cur.execute("DELETE FROM mse.modes WHERE job_id = %s", (jid,))
+        cur.execute(
+            "INSERT INTO mse.modes (job_id, mode_index, k0_per_m, freq_hz, "
+            "vacuum_wavelength_m) VALUES (%s, 1, 9.9, 9.9, 9.9)", (jid,))
+        # A CHECK constraint nothing in production uses, added only so the
+        # INSERT can fail on a row the store WILL send. This is deliberate: a
+        # ``None`` index raises TypeError in the row comprehension BEFORE the
+        # DELETE is reached, so it proves nothing about the transaction -- the
+        # first version of this leg made exactly that mistake and passed on the
+        # broken implementation too. The value has to survive the comprehension
+        # and die in the database.
+        cur.execute("ALTER TABLE mse.modes DROP CONSTRAINT IF EXISTS "
+                    "d7_no_absurd_k0")
+        cur.execute("ALTER TABLE mse.modes ADD CONSTRAINT d7_no_absurd_k0 "
+                    "CHECK (k0_per_m < 1e30)")
+    conn.commit()
+
+    broke = [(1, 1.0e6, 1.0e14, 1.0e-6), (2, 1.0e40, 2.0e14, 5.0e-7)]
+    raised = False
+    try:
+        store.finish_jetson_with_modes(jid, "w-d7", broke)
+    except Exception:  # noqa: BLE001 - any failure is the case under test
+        raised = True
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE mse.modes DROP CONSTRAINT IF EXISTS "
+                        "d7_no_absurd_k0")
+        conn.commit()
+
+    # Read through a FRESH connection, so what it sees is committed state.
+    independent = JobStore(dsn=DSN_OF[0])
+    survived = independent.list_modes(jid)
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, lease_owner FROM mse.jobs WHERE job_id = %s",
+                    (jid,))
+        status, owner = cur.fetchone()
+
+    r.check("D7 the broken INSERT raises rather than reporting success",
+            raised is True,
+            "finish_jetson_with_modes returned normally on a value the column "
+            "rejects -- the failure never happened, so the rollback was never "
+            "exercised")
+    r.check("D7 a failed write leaves the job's EXISTING mode rows in place "
+            "(the DELETE and the INSERT are one transaction; autocommit with no "
+            "`with conn` commits the DELETE and loses them)",
+            len(survived) == 1 and survived[0]["freq_hz"] == 9.9,
+            f"a fresh connection sees {survived!r} -- want the one seeded row")
+    r.check("D7 a failed write also leaves the job NOT done and still leased",
+            status == "running" and owner == "w-d7",
+            f"status={status!r} lease_owner={owner!r} -- want running/w-d7")
+
+
+def check_the_two_connection_paths_differ_only_in_autocommit(r: Result,
+                                                            JobStore):
+    """D8: every connection JobStore opens is built the same way.
+
+    ``_connect`` and ``finish_jetson_with_modes`` share ``_open`` so they cannot
+    drift. The consequence of a drift is invisible in the passing suite: the
+    transaction that must roll back would not, and a job would lose its modes on
+    a failure that looks like nothing happened. This leg pins the property
+    directly -- the two connections agree on everything except the one knob the
+    caller chooses.
+
+    Asserted through the store's OWN ``dsn``, read by the same rule libpq
+    applies, rather than by retyping the host and port here.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+
+    def identity(conn):
+        """The connection's real parameters, as libpq reports them.
+
+        ``conn.info`` rather than attributes on the connection: psycopg2 exposes
+        no ``.host``/``.port`` on the connection itself, and reaching for them
+        is how this leg first reported COULD-NOT-RUN instead of a verdict.
+        ``password`` is not on ``info`` (it is not a server-visible fact), so it
+        is read back from the connection's own DSN instead.
+        """
+        return {
+            "host": conn.info.host, "port": str(conn.info.port),
+            "dbname": conn.info.dbname, "user": conn.info.user,
+            "password": conn.dsn.split("password=")[1].split()[0],
+        }
+
+    with store._connect() as default_conn:
+        plain = store._open(autocommit=False)
+        try:
+            same = {f: identity(default_conn)[f] == identity(plain)[f]
+                    for f in ("host", "port", "dbname", "user", "password")}
+            plain_autocommit = plain.autocommit
+        finally:
+            plain.close()
+        default_autocommit = default_conn.autocommit
+
+    r.check("D8 the two connection paths are the same connection in every "
+            "respect but autocommit",
+            all(same.values()),
+            f"the params differ on {[f for f, ok in same.items() if not ok]}")
+    r.check("D8 _connect is autocommit and the writing path is NOT (the whole "
+            "reason there are two paths)",
+            default_autocommit is True and plain_autocommit is False,
+            f"_connect autocommit={default_autocommit!r} "
+            f"_open(False) autocommit={plain_autocommit!r} -- want True/False")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Race/lease checks against a throwaway Postgres. The "
@@ -1211,6 +1367,12 @@ def main() -> int:
         # this stops one being SERVED. Both must refuse, or the worker still
         # writes onto a job the owner was told was over.
         check_a_terminal_row_serves_no_worker_write(conn, r, JobStore)
+        # D7/D8: the /done write itself. D7 is the atomicity the deploy-3 fix
+        # rests on, and the one property a tier-1 double structurally cannot
+        # exhibit -- a double reimplements the transaction, so it passes on the
+        # working version AND on the autocommit version that loses the rows.
+        check_finish_writes_the_modes_and_the_status_atomically(conn, r, JobStore)
+        check_the_two_connection_paths_differ_only_in_autocommit(r, JobStore)
     finally:
         conn.close()
     print("RESULT:", "PASS" if r.ok else "FAIL")

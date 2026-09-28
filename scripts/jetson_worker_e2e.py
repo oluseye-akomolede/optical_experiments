@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import math
 import os
 import socket
 import sys
@@ -441,6 +442,45 @@ def main(argv=None) -> int:
             print("   " + ln)
 
     ok = outcome == "done" and row.get("status") == "done"
+
+    # The mode rows, which is the whole point of the deploy-3 fix and which the
+    # status check above cannot see: a DONE with an empty mode list passed this
+    # harness at e824780. The rows are read through the APP's own job list, so a
+    # store written without the writer's own convention shows up here.
+    modes_ok = False
+    try:
+        stored = jobs_db.list_modes(job_id)
+    except Exception as exc:                     # noqa: BLE001 - report, do not hide
+        stored = None
+        print(f"[e2e] could not read the mode rows: {type(exc).__name__}: {exc}")
+    if stored is not None:
+        n_modes = int(row.get("n_modes") or 0)
+        indices = [m.get("index") for m in stored]
+        finite = all(
+            isinstance(m.get(f), (int, float)) and math.isfinite(m.get(f))
+            for m in stored
+            for f in ("k0_per_m", "freq_hz", "vacuum_wavelength_m")
+        ) if stored else False
+        print(f"[e2e] mode rows in mse.modes: {len(stored)} (job says "
+              f"n_modes={n_modes}); indices={indices[:8]}"
+              f"{' ...' if len(indices) > 8 else ''}")
+        modes_ok = (
+            stored
+            and len(stored) == n_modes
+            and indices == list(range(1, n_modes + 1))
+            and finite
+        )
+        if stored and not modes_ok:
+            print("[e2e] the rows are present but the wrong shape or count -- a "
+                  "job page would show a mode list that disagrees with the job")
+
+    ok = ok and modes_ok
+    if outcome == "done" and row.get("status") == "done" and not modes_ok:
+        print("\n[e2e] the job reached DONE with no usable mode rows. That is "
+              "the deploy-3 shape: 'finished' with nothing to show for it, "
+              "which reads as a job that HAS no modes rather than one that "
+              "never reported them.")
+
     if not args.keep:
         import shutil  # noqa: PLC0415
         shutil.rmtree(work_root, ignore_errors=True)

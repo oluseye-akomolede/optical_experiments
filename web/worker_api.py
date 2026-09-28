@@ -33,6 +33,7 @@ Nothing here logs the token, and nothing reads it into an error message.
 from __future__ import annotations
 
 import hmac
+import math
 import os
 import re
 
@@ -273,12 +274,35 @@ def _register_routes():
 
     @bp.post("/worker/jobs/<job_id>/done")
     def done(job_id):
-        """Mark the job finished. Only the current lease holder may."""
+        """Finish the job: mark it DONE *and* write the modes, in one transaction.
+
+        The body carries the mode rows the solver produced. A DONE with no
+        modes is the deploy-3 shape -- the app reports a finished job whose mode
+        list is empty, which reads as "this job has no modes" rather than "this
+        job never told us its modes" -- so a body without valid rows is a 400
+        and the job is NOT marked done. Only the current lease holder may call
+        this, and the lease is checked again inside the transaction that writes.
+        """
         owner = _require_worker()
         job = _held(_deps()["jobs_db"], job_id, owner)
-        _deps()["jobs_db"].finish_jetson(job["job_id"], owner)
-        _deps()["log"](f"[mse-web] worker {owner} finished {job_id}")
-        return jsonify({"ok": True})
+        rows = _mode_rows(request.get_json(silent=True), job)
+        if rows is None:
+            abort(400, description=(
+                "the done body must carry 'modes': a list of "
+                "{index, k0_per_m, freq_hz, vacuum_wavelength_m} with exactly "
+                f"n_modes ({int(job['n_modes'])}) entries, indices 1..n_modes, "
+                "and finite numbers (NaN and Infinity are refused)"
+            ))
+        wrote = _deps()["jobs_db"].finish_jetson_with_modes(
+            job["job_id"], owner, rows)
+        if not wrote:
+            # The lease went between ``_held`` and the write. Nothing was
+            # written -- see the store method -- so the job is untouched and
+            # claimable by whoever holds it now.
+            abort(409, description="this worker no longer holds the lease")
+        _deps()["log"](f"[mse-web] worker {owner} finished {job_id} with "
+                       f"{len(rows)} modes")
+        return jsonify({"ok": True, "modes": len(rows)})
 
     @bp.post("/worker/jobs/<job_id>/failed")
     def failed(job_id):
@@ -347,6 +371,60 @@ def register_blueprint(app) -> None:
     gets that same blueprint.
     """
     app.register_blueprint(bp)
+
+
+def _mode_rows(body, job) -> list[tuple] | None:
+    """The validated mode rows from a ``/done`` body, or ``None`` if unusable.
+
+    Returns ``(index, k0_per_m, freq_hz, vacuum_wavelength_m)`` tuples ready for
+    SQL, or ``None`` -- one return for "this body cannot be trusted", so the
+    caller has a single refusal path and cannot half-accept.
+
+    **Why every number goes through ``math.isfinite``.** ``json.loads``, which
+    is what Flask's ``get_json`` runs, accepts a bare ``NaN`` and a bare
+    ``Infinity`` and hands back a float. ``isinstance(nan, float)`` is True, so
+    a type check alone would wave both through and the app would store a NaN
+    frequency and serve it to the owner's browser. That is not hypothetical:
+    v1 shipped NaN in its JSON payload once. A value that is not a real number
+    is a bad body, not a value to coerce.
+
+    ``bool`` is rejected with the numbers: ``isinstance(True, int)`` is True in
+    Python, and an index of ``True`` is a caller that is confused about what it
+    is sending. It would land in the table as ``1`` and hide the confusion.
+
+    The index set is checked as a SET, not by counting: n entries of 1..n is
+    exactly the condition, and it refuses a duplicate and a gap in the same
+    expression -- a count check alone would accept ``[1, 1, 3]`` for n=3.
+    """
+    if not isinstance(body, dict):
+        return None
+    raw = body.get("modes")
+    if not isinstance(raw, list):
+        return None
+    n_modes = int(job["n_modes"])
+    if len(raw) != n_modes:
+        return None
+    rows = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return None
+        index, k0, freq, wavelength = (
+            entry.get("index"), entry.get("k0_per_m"),
+            entry.get("freq_hz"), entry.get("vacuum_wavelength_m"),
+        )
+        if isinstance(index, bool) or not isinstance(index, int):
+            return None
+        if index < 1 or index > n_modes:
+            return None
+        for value in (k0, freq, wavelength):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            if not math.isfinite(value):
+                return None
+        rows.append((index, float(k0), float(freq), float(wavelength)))
+    if {r[0] for r in rows} != set(range(1, n_modes + 1)):
+        return None
+    return rows
 
 
 def _held(jobs_db, job_id, owner) -> dict:

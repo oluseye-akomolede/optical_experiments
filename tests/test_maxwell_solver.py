@@ -891,3 +891,161 @@ def test_the_bench_reports_the_writing_stage_among_its_timings():
     printed = [s for s in ("meshing", "assembling", "solving", "writing")
                if s in timings]
     assert printed == ["meshing", "assembling", "solving", "writing"]
+
+
+# ---------------------------------------------------------------------------
+# The `db` contract: what a reporter handed to solve() must be able to do
+#
+# Deploy 3 died here. The solver calls three methods on its `db`, and the
+# worker's StageReporter implemented one of them, so the solve completed every
+# tet, wrote every result file, and then raised AttributeError on the line that
+# put its modes in the table. Nothing in tier 1 caught it because every test that
+# drove the real solve() passed `db=None` -- so the whole `if db is not None:`
+# region was dead code as far as the suite was concerned.
+#
+# These legs run the REAL solve() against the REAL StageReporter at bench size.
+# ---------------------------------------------------------------------------
+class _RecordingReporter:
+    """A ``db`` that implements the three methods solve() calls, and no others.
+
+    ``__getattr__`` raises ``AttributeError`` for anything else, which is what
+    makes this a guard rather than a convenience: if the solver learns a fourth
+    method, the solve fails HERE with the method's name, on a tiny box, instead
+    of on the Jetson after a nine-thousand-tet solve.
+
+    Deliberately NOT a double that records unknown names and returns a lambda.
+    That converts the defect -- a method the caller does not have -- into a
+    silent no-op, which is the exact shape being fixed: the solve would look
+    like it wrote its modes and the table would stay empty.
+    """
+
+    def __init__(self):
+        self.stages: list[str] = []
+        self.modes: list[tuple] = []
+        self.deleted = 0
+
+    def set_stage(self, _job_id, _status, stage=None, **_ignored):
+        if stage:
+            self.stages.append(str(stage))
+
+    def delete_modes(self, _job_id):
+        self.deleted += 1
+        self.modes = []
+
+    def insert_modes(self, _job_id, rows):
+        self.modes = [tuple(r) for r in rows]
+
+    def __getattr__(self, name):
+        raise AttributeError(
+            f"solve() called db.{name}, which this reporter does not implement. "
+            f"The worker's StageReporter must implement every method solve() "
+            f"uses -- see the other leg in this section."
+        )
+
+
+def _add_web_and_worker_to_path():
+    """``storage`` and ``mse_worker`` live outside the solver directory.
+
+    They are imported inside the tests that need them rather than at module
+    scope, because the rest of this file is physics and must not depend on the
+    web layer being importable.
+    """
+    for part in ("web", "worker"):
+        path = str(Path(__file__).resolve().parents[1] / part)
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+
+def _tiny_box(tmp_path, job_id="reptest"):
+    import trimesh
+
+    box = trimesh.creation.box(extents=[40.0, 30.0, 20.0])
+    root = Path(tmp_path)
+    path = root / "jobs" / job_id / "input.obj"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(box.export(file_type="obj").encode())
+    return root
+
+
+def test_the_real_solve_reports_its_modes_to_the_db_it_was_handed(tmp_path):
+    """The path that failed on deploy 3, on a box small enough for tier 1.
+
+    This is the leg that would have caught it. It calls the production
+    ``solve()`` with a ``db`` -- which ``bench_box.run_writing_stage`` does NOT,
+    and that omission is why a missing method could ship twice.
+    """
+    import mse_maxwell_solver as SOL
+
+    _add_web_and_worker_to_path()
+    import mse_worker as W
+    import storage as STORE
+
+    n_modes = 2
+    root = _tiny_box(tmp_path)
+    store = STORE.LocalStore(root)
+    reporter = W.StageReporter()
+
+    summary = SOL.solve(
+        "reptest", "mm", 1.0, n_modes, store, store,
+        max_tets=3000, grid=10, verbose=False, db=reporter,
+    )
+
+    # The rows reached the reporter, one per mode, with finite fields.
+    assert len(reporter.modes) == n_modes, (
+        f"the solve reported {len(reporter.modes)} rows for {n_modes} modes")
+    import math
+
+    for index, k0, freq, wavelength in reporter.modes:
+        assert all(math.isfinite(v) for v in (k0, freq, wavelength)), (
+            f"mode {index} has a non-finite field: {(k0, freq, wavelength)}")
+    assert [r[0] for r in reporter.modes] == list(range(1, n_modes + 1))
+
+    # The single-source claim: what the reporter recorded is the same list the
+    # summary carries. If these ever drift, the table and modes.json would
+    # describe different solves.
+    by_index = {int(m["index"]): m for m in summary["modes"]}
+    for index, k0, freq, wavelength in reporter.modes:
+        entry = by_index[index]
+        assert (k0, freq, wavelength) == (
+            entry["k0_per_m"], entry["freq_hz"], entry["vacuum_wavelength_m"]), (
+            f"row {index} disagrees with summary['modes']")
+
+
+def test_the_worker_reporter_can_do_everything_solve_asks_of_a_db(tmp_path):
+    """The seam guard: a FOURTH method on the solver cannot slip through.
+
+    ``_RecordingReporter`` raises on any attribute it does not implement, so
+    driving the real solve() with it fails loudly and by name the moment the
+    solver's ``db`` contract grows. ``StageReporter`` is asserted to satisfy the
+    same contract by exposing the same names -- and the assertion is that it can
+    be used, not that the name exists: the solve above already proves that.
+    """
+    import mse_maxwell_solver as SOL
+
+    _add_web_and_worker_to_path()
+    import mse_worker as W
+
+    for name in ("set_stage", "delete_modes", "insert_modes"):
+        assert callable(getattr(W.StageReporter(), name, None)), (
+            f"StageReporter is missing {name}, which solve() calls")
+
+    # And the reverse direction: the recording double must NOT be able to
+    # silently absorb a name it lacks. This is the guard's own positive
+    # control -- a `__getattr__` that returned a lambda would pass the loop
+    # above and catch nothing.
+    probe = _RecordingReporter()
+    with pytest.raises(AttributeError, match="not implement"):
+        probe.something_the_solver_might_learn_to_call  # noqa: B018
+
+
+def test_a_reporter_refuses_a_method_it_does_not_implement(tmp_path):
+    """The refusal must be an AttributeError, not a silent None.
+
+    Every ``except AttributeError: pass`` in the app exists because a missing
+    method is expected in some places; if this guard returned None instead, a
+    future solver call would get ``None`` where it expected a bound method, and
+    the failure would move somewhere less legible than the call site.
+    """
+    reporter = _RecordingReporter()
+    with pytest.raises(AttributeError):
+        reporter.set_stages("j", "running")  # a plausible pluralisation typo

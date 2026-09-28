@@ -135,6 +135,27 @@ def queued_job(jobs_db, job_id="11111111-2222-3333-4444-555555555555", **extra):
 # The worker, and its fakes
 # ---------------------------------------------------------------------------
 
+def report_modes(stage, job_id, n_modes):
+    """Report the mode rows a successful solve hands its ``db``.
+
+    A hand-written solve callable that returns success must call this, because
+    ``/done`` refuses a body with no mode rows -- the app will not mark a job
+    DONE without them. Kept as one function so the fakes share the real
+    solver's contract instead of each one restating it, and so a change to what
+    ``/done`` requires is one edit here rather than a hunt through callables.
+
+    Mirrors ``mse_maxwell_solver.solve``: ``delete_modes`` then
+    ``insert_modes``, with ``(index, k0_per_m, freq_hz, vacuum_wavelength_m)``
+    tuples for indices 1..n.
+    """
+    if stage is None:
+        return
+    rows = [(i + 1, 1.0e6 + i, 1.0e14 + i, 1.0e-6 - i * 1.0e-9)
+            for i in range(int(n_modes))]
+    stage.delete_modes(job_id)
+    stage.insert_modes(job_id, rows)
+
+
 class FakeSolve:
     """Stand-in for the production solver. Writes the real filenames.
 
@@ -146,12 +167,22 @@ class FakeSolve:
     (an unrecognised exception is more likely a solver fault than a blip --
     see the default there). A test that wants the transient path raises an
     ``OSError`` itself.
+
+    On the success path it calls ``stage.insert_modes`` as the real solver does,
+    with ``n_modes`` rows for the job. That is not decoration: ``/done`` refuses
+    a body with no mode rows, so a fake that skipped this would be a fake whose
+    contract the real client does not share -- and the route would look broken
+    for a reason the production code never meets. The rows are the same four
+    fields, in the solver's own order.
     """
 
     def __init__(self, behaviour="ok"):
         self.behaviour = behaviour
         self.calls: list[dict] = []
         self.stages: list[str] = []
+        #: every row set the fake "wrote", so a test can compare the app's copy
+        #: against what the solve actually reported.
+        self.rows: list[tuple] = []
 
     def __call__(self, job, store_in, store_out, stage=None):
         self.calls.append(dict(job))
@@ -171,6 +202,8 @@ class FakeSolve:
         if stage is not None:
             stage.set_stage(job["job_id"], "running", stage="solving")
             self.stages.append(stage.stage)
+            report_modes(stage, job["job_id"], job["n_modes"])
+            self.rows = list(stage.modes)
         return {"n_modes": job["n_modes"], "n_tets": 1234}
 
 
@@ -368,6 +401,7 @@ def test_a_transient_failure_is_handed_back_and_can_be_retried(
             raise OSError("the connection dropped")
         for name, data in RESULT_FILES.items():
             store_out.write(f"jobs/{job['job_id']}/{name}", data)
+        report_modes(stage, job["job_id"], job["n_modes"])
         return {"n_tets": 1}
 
     worker = make_worker(server, tmp_path, solve=fails_once)
@@ -654,6 +688,7 @@ def test_a_successful_job_leaves_no_work_directory(tmp_path, server):
     def fatten(job, store_in, store_out, stage=None):
         store_out.write(f"jobs/{job['job_id']}/mode_01.bin", b"x" * 200_000)
         store_out.write(f"jobs/{job['job_id']}/modes.json", b"{}")
+        report_modes(stage, job["job_id"], job["n_modes"])
         return {"n_tets": 1}
 
     worker = make_worker(server, tmp_path, solve=fatten)
@@ -743,6 +778,7 @@ def test_the_heartbeat_renews_with_the_real_stage_not_a_constant(tmp_path,
             time.sleep(0.25)                 # let beats fire inside this stage
         for fname, data in RESULT_FILES.items():
             store_out.write(f"jobs/{job['job_id']}/{fname}", data)
+        report_modes(stage, job["job_id"], job["n_modes"])
         return {"n_tets": 1}
 
     # Enough beats to move through the stages: the solve holds each stage for

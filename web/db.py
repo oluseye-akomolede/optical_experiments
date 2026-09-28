@@ -167,8 +167,18 @@ class JobStore:
     def __init__(self, dsn: dict | None = None):
         self.dsn = dsn or dsn_from_env()
 
-    @contextmanager
-    def _connect(self):
+    def _open(self, autocommit: bool = True):
+        """A new connection, with the ONE knob that differs between callers.
+
+        Every connection this class opens is built here -- same DSN source, same
+        options -- so ``autocommit`` is the only thing a caller can get wrong,
+        and ``_connect`` and ``finish_jetson_with_modes`` cannot drift apart. The
+        check ``check_the_two_connection_paths_differ_only_in_autocommit`` in
+        ``tests/pg_race_check.py`` exists because a divergence here is silent:
+        it would show up as a transaction that does not roll back, which is a
+        data-loss bug, not an error. It needs Postgres, so it is a tier-2 check
+        and not part of the default suite.
+        """
         import psycopg2
 
         conn = psycopg2.connect(
@@ -176,7 +186,12 @@ class JobStore:
             dbname=self.dsn["dbname"], user=self.dsn["user"],
             password=self.dsn["password"],
         )
-        conn.autocommit = True
+        conn.autocommit = autocommit
+        return conn
+
+    @contextmanager
+    def _connect(self):
+        conn = self._open(autocommit=True)
         try:
             yield conn
         finally:
@@ -661,6 +676,73 @@ class JobStore:
                 (DONE, DONE, str(job_id), owner),
             )
             return cur.rowcount > 0
+
+    def finish_jetson_with_modes(self, job_id, owner: str, rows) -> bool:
+        """Mark a jetson job done AND write its mode rows, in ONE transaction.
+
+        This is what ``/done`` uses. ``finish_jetson`` remains for the cluster
+        path and for the tests that predate this method, but the Jetson route
+        may not use it: marking the job DONE without writing ``mse.modes`` is
+        exactly the deploy-3 shape, where the app reports a finished job whose
+        mode list is empty -- a failure that reads as a successful job with no
+        modes rather than as a job that did not report them.
+
+        ``rows`` are ``(index, k0_per_m, freq_hz, vacuum_wavelength_m)``
+        four-tuples, already validated by the route.
+
+        Returns whether it wrote. ``False`` means the lease went between the
+        route's check and this statement, and then NOTHING was written: the
+        status update, the DELETE and the INSERT are one unit, so a lost lease
+        cannot leave a job with its modes deleted.
+
+        **Why this opens its own connection.** Not because ``autocommit = True``
+        would break the rollback -- measured on Postgres 16, and it does not:
+        psycopg2's ``with conn`` is a TRANSACTION context manager that issues
+        ``BEGIN`` on entry and ``ROLLBACK`` on an exception *regardless* of the
+        autocommit flag, so ``_connect()`` plus ``with conn`` would also be
+        atomic. The transaction here comes from ``with conn``; pinning the
+        connection to ``autocommit = False`` states that intent on the connection
+        itself rather than resting it on a protocol detail of the driver.
+
+        The shape that genuinely loses data -- and the one the probe in the
+        commit message demonstrates -- is autocommit with NO ``with conn``: the
+        DELETE commits the instant it runs, and a later failure leaves the job
+        with its modes gone and nothing written. Do not "simplify" the
+        ``with conn`` away; it is the transaction.
+        """
+        conn = self._open(autocommit=False)
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE mse.jobs SET status = %s, stage = %s, finished_at = now(), "
+                    "lease_owner = NULL, lease_expires_at = NULL "
+                    "WHERE job_id = %s AND lease_owner = %s",
+                    (DONE, DONE, str(job_id), owner),
+                )
+                if cur.rowcount == 0:
+                    # The lease went between the route's check and this write.
+                    # ``rollback`` explicitly rather than falling out of the
+                    # ``with``: on the clean path the ``with`` COMMITS, and a
+                    # bare ``return False`` would commit the empty transaction
+                    # -- harmless today, but it is the wrong reflex to leave in
+                    # a method whose whole point is that nothing is written when
+                    # the lease is gone.
+                    conn.rollback()
+                    return False
+                cur.execute("DELETE FROM mse.modes WHERE job_id = %s", (str(job_id),))
+                cur.executemany(
+                    "INSERT INTO mse.modes "
+                    "(job_id, mode_index, k0_per_m, freq_hz, vacuum_wavelength_m) "
+                    "VALUES (%s, %s, %s, %s, %s) "
+                    "ON CONFLICT (job_id, mode_index) DO UPDATE SET "
+                    "k0_per_m = EXCLUDED.k0_per_m, freq_hz = EXCLUDED.freq_hz, "
+                    "vacuum_wavelength_m = EXCLUDED.vacuum_wavelength_m",
+                    [(str(job_id), int(i), float(k0), float(f), float(wl))
+                     for (i, k0, f, wl) in rows],
+                )
+        finally:
+            conn.close()
+        return True
 
     def fail_jetson(self, job_id, owner: str, message: str) -> bool:
         """Mark a jetson job FAILED for good, if ``owner`` still holds the lease.

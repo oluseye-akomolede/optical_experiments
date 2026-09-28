@@ -20,6 +20,7 @@ can never actually obtain one.
 from __future__ import annotations
 
 import io
+import json
 import sys
 import types
 from pathlib import Path
@@ -608,6 +609,10 @@ class LeaseDb(RoutingDb):
         self.claims: list[tuple[str, str]] = []
         #: every stage the server was told, in order (see set_jetson_stage)
         self.stages_seen: list[str] = []
+        #: mode rows by job, populated by finish_jetson_with_modes. Backed here
+        #: rather than left to the base because a leg that asserts the rows were
+        #: written must read them from somewhere that the WRITE populated.
+        self.modes: dict[str, list] = {}
 
     #: The columns the real ``claim_jetson`` SELECTs, named here so the double
     #: cannot be more generous than the query it stands in for. Returning
@@ -694,6 +699,24 @@ class LeaseDb(RoutingDb):
         job.update(status=DB.DONE, stage=DB.DONE, lease_owner=None)
         return True
 
+    def finish_jetson_with_modes(self, job_id, owner, rows):
+        """Mark done and record the rows; ``False`` if the lease went.
+
+        Both writes or neither, matching the real store -- a double that marked
+        the job done on a lost lease would make the route's 409 branch
+        unreachable and hide exactly the case the real transaction exists for.
+        """
+        job = self.jobs.get(str(job_id))
+        if not job or job.get("lease_owner") != owner:
+            return False
+        job.update(status=DB.DONE, stage=DB.DONE, lease_owner=None)
+        self.modes[str(job_id)] = [
+            {"index": int(i), "k0_per_m": float(k0), "freq_hz": float(f),
+             "vacuum_wavelength_m": float(w)}
+            for (i, k0, f, w) in rows
+        ]
+        return True
+
     def set_jetson_stage(self, job_id, stage):
         job = self.jobs.get(str(job_id))
         if job:
@@ -714,6 +737,24 @@ def worker(tmp_path, monkeypatch):
 
 def _auth(token="tok-abc-123"):
     return {"Authorization": f"Bearer {token}"}
+
+
+def _rows(n, **overrides):
+    """``n`` mode rows as a ``/done`` body carries them.
+
+    Indices are 1..n and every number is finite, so this is the VALID shape --
+    the legs that test refusal mutate a copy of it. Defaults to the ``n_modes``
+    ``_jetson_job`` creates, because the route checks the count against the JOB,
+    not against anything the caller says.
+    """
+    rows = [
+        {"index": i + 1, "k0_per_m": 1.0e6 + i, "freq_hz": 1.0e14 + i,
+         "vacuum_wavelength_m": 1.0e-6 - i * 1.0e-9}
+        for i in range(n)
+    ]
+    for row in rows:
+        row.update(overrides)
+    return rows
 
 
 def test_a_claimed_job_carries_the_mesh_inputs(tmp_path, monkeypatch):
@@ -1021,8 +1062,101 @@ def test_done_marks_the_job_finished_for_the_lease_holder(tmp_path, worker):
     client, db, _store = worker
     _jetson_job(db, est_tets=20_000)
     db.jobs["job-1"]["lease_owner"] = WORKER.owner_id("tok-abc-123")
-    assert client.post("/worker/jobs/job-1/done", headers=_auth()).status_code == 200
+    assert client.post("/worker/jobs/job-1/done", headers=_auth(),
+                       json={"modes": _rows(20)}).status_code == 200
     assert db.jobs["job-1"]["status"] == DB.DONE
+
+
+def test_done_writes_the_mode_rows_it_was_given(tmp_path, worker):
+    """DONE and the rows land together -- the point of the paired write.
+
+    Asserting only the status would pass on the deploy-3 shape: a finished job
+    whose mode list is empty, which the job page renders as a job with no modes
+    rather than as a job that never reported any.
+    """
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    db.jobs["job-1"]["lease_owner"] = WORKER.owner_id("tok-abc-123")
+    rows = _rows(20)
+    assert client.post("/worker/jobs/job-1/done", headers=_auth(),
+                       json={"modes": rows}).status_code == 200
+    written = db.modes["job-1"]
+    assert len(written) == 20, f"expected 20 mode rows, got {written!r}"
+    assert [m["index"] for m in written] == list(range(1, 21))
+    assert written[0]["freq_hz"] == rows[0]["freq_hz"]
+    assert db.jobs["job-1"]["status"] == DB.DONE
+
+
+@pytest.mark.parametrize("body, why", [
+    ({}, "no modes key at all"),
+    ({"modes": []}, "an empty list"),
+    ({"modes": _rows(19)}, "too few rows"),
+    ({"modes": _rows(21)}, "too many rows"),
+    ({"modes": "not a list"}, "the wrong type"),
+    ({"modes": [None] * 20}, "entries that are not objects"),
+])
+def test_done_refuses_a_body_it_cannot_trust(tmp_path, worker, body, why):
+    """A done WITHOUT usable rows must not produce DONE.
+
+    The positive control is in the same leg: the neighbouring test posts a good
+    body and gets 200, so this is not a route that refuses everything.
+    """
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    db.jobs["job-1"]["lease_owner"] = WORKER.owner_id("tok-abc-123")
+    response = client.post("/worker/jobs/job-1/done", headers=_auth(), json=body)
+    assert response.status_code == 400, f"{why}: got {response.status_code}"
+    assert db.jobs["job-1"]["status"] != DB.DONE, (
+        f"{why}: the job was marked DONE anyway")
+    assert db.modes.get("job-1") in (None, []), (
+        f"{why}: rows were written from a body that was refused")
+
+
+def test_done_refuses_a_nan_frequency(tmp_path, worker):
+    """NaN arrives as a real float through JSON, so a type check misses it.
+
+    ``json.loads`` accepts a bare ``NaN`` literal and returns a float for it;
+    ``isinstance(nan, float)`` is True. v1 shipped NaN in a payload once, so the
+    guard is ``math.isfinite`` and this is the leg that proves it.
+    """
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    db.jobs["job-1"]["lease_owner"] = WORKER.owner_id("tok-abc-123")
+    rows = _rows(20)
+    # NOT via json= -- Flask would serialise the NaN back out as a literal and
+    # the point is to hand the route the bytes a hostile or buggy worker would.
+    payload = json.dumps({"modes": rows}).replace('"freq_hz": 1', '"freq_hz": NaN', 1)
+    assert "NaN" in payload, "the NaN never made it into the payload"
+    response = client.post("/worker/jobs/job-1/done", headers=_auth(),
+                           data=payload, content_type="application/json")
+    assert response.status_code == 400, response.get_data(as_text=True)
+    assert db.jobs["job-1"]["status"] != DB.DONE
+    assert db.modes.get("job-1") in (None, [])
+
+
+def test_done_refuses_a_gap_or_a_duplicate_index(tmp_path, worker):
+    """n rows in 1..n is the condition -- counting rows is not enough.
+
+    Each mutation keeps the COUNT right (20 rows) and breaks only the index
+    set, so a route that checked ``len(rows) == n_modes`` and nothing else would
+    pass all of these. The duplicate, the gap and the out-of-range index are
+    three different ways to put a mode list in the app that the job page cannot
+    render honestly.
+    """
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    db.jobs["job-1"]["lease_owner"] = WORKER.owner_id("tok-abc-123")
+    # (position, new index, what is wrong with it)
+    for position, index, why in ((1, 1, "a duplicate of row 0"),
+                                 (19, 21, "out of range for 20 modes"),
+                                 (0, 0, "zero is not a 1-based index")):
+        rows = _rows(20)
+        rows[position]["index"] = index
+        response = client.post("/worker/jobs/job-1/done", headers=_auth(),
+                               json={"modes": rows})
+        assert response.status_code == 400, why
+        assert db.jobs["job-1"]["status"] != DB.DONE, why
+        assert db.modes.get("job-1") in (None, []), why
 
 
 def test_failed_is_terminal_and_the_message_reaches_the_owner(tmp_path, worker):
@@ -1349,7 +1483,35 @@ def test_a_stale_worker_cannot_mark_a_job_done(tmp_path, worker):
     client, db, _store = worker
     _jetson_job(db, est_tets=20_000)
     db.jobs["job-1"]["lease_owner"] = "w-someone-else"
-    assert client.post("/worker/jobs/job-1/done", headers=_auth()).status_code == 409
+    # Valid rows, so the 409 is about the LEASE and not about the body. Sending
+    # an empty body here would pass for the wrong reason once the route validates.
+    response = client.post("/worker/jobs/job-1/done", headers=_auth(),
+                           json={"modes": _rows(20)})
+    assert response.status_code == 409, response.get_data(as_text=True)
+    assert db.jobs["job-1"]["status"] == DB.QUEUED
+
+
+def test_a_lost_lease_does_not_delete_the_rows(tmp_path, worker):
+    """The DELETE and the lease check must be ONE unit, or a stale worker wipes
+    a job it does not own.
+
+    The worker that lost the lease is the one with the rows it computed, and it
+    is the one whose ``/done`` must change nothing. If the DELETE ran before the
+    lease was judged, the job would come back to the queue with the modes of the
+    attempt that failed deleted and no replacement, and whoever claimed it next
+    would be finishing a job whose table had been emptied underneath it.
+    """
+    client, db, _store = worker
+    _jetson_job(db, est_tets=20_000)
+    db.jobs["job-1"]["lease_owner"] = "w-someone-else"
+    db.modes["job-1"] = [{"index": 1, "k0_per_m": 1.0, "freq_hz": 2.0,
+                          "vacuum_wavelength_m": 3.0}]
+    response = client.post("/worker/jobs/job-1/done", headers=_auth(),
+                           json={"modes": _rows(20)})
+    assert response.status_code == 409
+    assert db.modes["job-1"] == [{"index": 1, "k0_per_m": 1.0, "freq_hz": 2.0,
+                                  "vacuum_wavelength_m": 3.0}], (
+        "a refused /done deleted the rows the job already had")
     assert db.jobs["job-1"]["status"] == DB.QUEUED
 
 

@@ -509,9 +509,22 @@ class WorkerAPI:
     def upload(self, job_id: str, name: str, data: bytes) -> None:
         self._request("PUT", f"/worker/jobs/{job_id}/files/{name}", data=data)
 
-    def done(self, job_id: str) -> None:
+    def done(self, job_id: str, modes) -> None:
+        """Claim the job done, carrying the mode rows the app must write.
+
+        The rows are not decoration: the app writes them to ``mse.modes`` in the
+        same transaction that marks the job DONE, so a ``/done`` that reached it
+        without rows would be refused (400) rather than producing a
+        finished job with an empty mode list.
+        """
         try:
-            self._request("POST", f"/worker/jobs/{job_id}/done")
+            self._request("POST", f"/worker/jobs/{job_id}/done",
+                          json_body={"modes": [
+                              {"index": int(i), "k0_per_m": float(k0),
+                               "freq_hz": float(f),
+                               "vacuum_wavelength_m": float(wl)}
+                              for (i, k0, f, wl) in modes
+                          ]})
         except APIError as exc:
             if exc.status == 409:
                 raise LeaseLost(job_id) from None
@@ -888,7 +901,7 @@ class Worker:
 
             for name in _result_names(store, job_id):
                 self.api.upload(job_id, name, store.read(_key(job_id, name)))
-            self._done(job_id, work_dir, summary)
+            self._done(job_id, work_dir, summary, reporter)
             return "done"
         except LeaseLost:
             self._log(f"stopped working on {job_id}: the lease is gone")
@@ -919,12 +932,20 @@ class Worker:
             # requeues the row. This is what stops that happening.
             _release_gpu_memory()
 
-    def _done(self, job_id: str, work_dir: Path, summary) -> None:
+    def _done(self, job_id: str, work_dir: Path, summary, reporter) -> None:
         if self._lease_lost:
             # The heartbeat saw the lease go. Uploading was still correct (the
             # files are the job's), but claiming 'done' would be a lie.
             raise LeaseLost(job_id)
-        self.api.done(job_id)
+        # The ROWS come from the reporter, not from ``summary``. Both carry the
+        # same modes today -- ``summary["modes"]`` is the list ``write_results``
+        # wrote to modes.json, and it is what the solver handed ``insert_modes``
+        # -- but the reporter is the recorded copy of exactly what the solve
+        # reported, so there is one producer and the tier-1 test
+        # ``test_the_reported_rows_agree_with_the_summary`` fails if they drift.
+        # A mismatch here would ship a job whose table rows disagree with its
+        # own modes.json, which is worse than either alone.
+        self.api.done(job_id, reporter.modes)
         self._log(f"finished {job_id}: {summary}")
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1193,7 +1214,7 @@ def _is_mode_file(name: str) -> bool:
 
 
 class StageReporter:
-    """The ``db`` object ``solve()`` reports stages to -- for the heartbeat.
+    """The ``db`` object ``solve()`` reports stages and modes to.
 
     ``solve()`` writes progress with ``db.set_stage(job_id, status, stage=...)``
     when it is given a ``db``, and it has no other channel for "which stage am I
@@ -1201,19 +1222,43 @@ class StageReporter:
     with the *real* stage, and a heartbeat that always says "starting" tells the
     operator nothing about a job that has been meshing for ten minutes.
 
-    This is a duck-type of the one method ``solve`` calls, not a second database
+    It also RECORDS the mode rows. ``solve()`` calls ``delete_modes`` and
+    ``insert_modes`` for a ``db`` that can take them, and this used to implement
+    only ``set_stage`` -- so on the Jetson the solve completed all nine thousand
+    tets, wrote all its result files, and then died with ``AttributeError:
+    'StageReporter' object has no attribute 'delete_modes'``. The recorded rows
+    are what the worker sends to ``/done``; the app writes them to ``mse.modes``
+    in the same transaction that marks the job done, because a DONE with no
+    modes is indistinguishable from a job that has none.
+
+    This is a duck-type of the methods ``solve`` calls, not a second database
     client. It deliberately does NOT talk to the database: the Jetson has no
-    credentials and no route, and the stage reaches the app through the
-    heartbeat's own ``/progress`` call, which is the authenticated path it
-    already has.
+    credentials and no route, and both the stage and the rows reach the app
+    through its own authenticated calls -- ``/progress`` and ``/done``.
     """
 
     def __init__(self):
         self.stage = "starting"
+        #: The rows as ``solve()`` handed them to ``insert_modes``:
+        #: ``(index, k0_per_m, freq_hz, vacuum_wavelength_m)``.
+        self.modes: list[tuple] = []
 
     def set_stage(self, _job_id, _status, stage=None, **_ignored):
         if stage:
             self.stage = str(stage)
+
+    def delete_modes(self, _job_id):
+        """Drop the rows already recorded, mirroring the table's own DELETE.
+
+        A solve reports its modes once, but this is the same contract the
+        cluster path's ``JobStore.delete_modes`` implements, and a re-solve
+        under the same reporter must not accumulate duplicate rows.
+        """
+        self.modes = []
+
+    def insert_modes(self, _job_id, rows):
+        """Record the mode rows ``solve()`` produced."""
+        self.modes = [tuple(row) for row in rows]
 
 
 def _release_gpu_memory() -> None:
