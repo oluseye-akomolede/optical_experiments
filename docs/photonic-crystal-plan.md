@@ -18,8 +18,8 @@ and all measured rather than argued here:
 2. **The p admittance is `k_x/ε`, not `k_x/ε²`.** The oracle now **validates
    itself** against an independent ODE shooting solve before any mesh is
    compared to it, at **ε₂ = 4** — never ε = 1, where the two forms coincide and
-   the check cannot fail. Measured: **6.7e-12** (`rtol = 1e-13`) against a
-   1e-10 bar, with the `1/ε²` form rejected at **3.7**.
+   the check cannot fail. Measured: **6.86e-12** (`rtol = 1e-13`) against a
+   1e-10 bar, with the `1/ε²` form rejected at **3.71**.
 3. **1e-6 is not achievable on a P1 mesh.** Only `λ = 0` at Γ is exact; the rest
    is stated as `O(h²)` convergence with a pre-stated bound and an observed rate.
    The 1e-10 sits on the oracle, not the mesh.
@@ -160,8 +160,8 @@ plus the four-fold degeneracy at Γ at 1.0.
 >   boundary term.
 >
 > The 1e-10 belongs on the **oracle**, not the mesh: the closed-form-vs-shooting
-> self-check above. A wrong band ordering, a broken pairing constraint, or a bad
-> stiffness still moves these numbers well outside 1e-3.
+> self-check stated in Control B. A wrong band ordering, a broken pairing
+> constraint, or a bad stiffness still moves these numbers well outside 1e-3.
 
 **Control B — a 1-D layered cell against the exact transfer-matrix bands
 (analytic, can fail, and catches the ε swap).**
@@ -187,13 +187,13 @@ and it is a one-line geometric fact rather than a convention. Revision 2 said
 "s (TE)"; it is **TM ↔ s, TE ↔ p**.
 
 **The two closed forms** (1-D transfer matrix over the stripe, `k_x,j = √(λ ε_j − k_y²)`,
-`η` the `u'/u` admittance):
+`η` the `ψ'/ψ` admittance, `ψ` the out-of-plane field in each case):
 
-- **s (TM, `E_z`)**: `(u, u')` continuous; `η_s = k_x,j`.
-- **p (TE, `H_z`)**: `H` and `(1/ε)∂H/∂x` continuous, so the continuous state is
-  `(ψ, (1/ε)∂ψ/∂x)` and **`η_p = k_x,j / ε_j`** — *not* `k_x,j/ε_j²`. (My message
-  to the lead said `ε²`; that was wrong. Integrate `(ψ, w)` with `w = (1/ε)∂ψ/∂x`
-  directly: `ψ' = εw`, `w' = (k_y²/ε − λ)ψ`.)
+- **s (TM, `ψ = E_z`)**: `(ψ, ψ')` is continuous; `η_s = k_x,j`.
+- **p (TE, `ψ = H_z`)**: `ψ` and `(1/ε)∂ψ/∂x` are continuous, so the state that
+  propagates is `(ψ, (1/ε)∂ψ/∂x)` and **`η_p = k_x,j / ε_j`** — *not*
+  `k_x,j/ε_j²`. (My message to the lead said `ε²`; that was wrong. Integrate
+  `(ψ, w)` with `w = (1/ε)∂ψ/∂x` directly: `ψ' = εw`, `w' = (k_y²/ε − λ)ψ`.)
 
 The oracle is a **single script** used by both this control and Control D's
 generator, and that script **validates itself on its own** before any mesh is
@@ -227,8 +227,8 @@ at least one of the two comparisons must move. Confirmed numerically here: at
 why the parallel component is required. **A uniform-ε check cannot see the swap;
 this one cannot miss it.**
 
-**Tolerance on the mesh comparison: see Control A's note below — `O(h²)`
-convergence, not 1e-6.**
+**Tolerance on the mesh comparison: the same `O(h²)` convergence structure as
+Control A above — not 1e-6.**
 
 **Control C — qualitative, and the one a human can read at a glance.**
 Dielectric rods in air must show a **TM 1–2 gap and no TE 1–2 gap**. This is
