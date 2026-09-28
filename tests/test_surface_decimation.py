@@ -196,7 +196,7 @@ def test_an_over_fine_surface_meshes_under_the_cap():
     mesh = _sphere()
     cap = 80_000
 
-    points_m, tets = MESH.tetrahedralize(
+    points_m, tets, _ = MESH.tetrahedralize(
         mesh, "mm", n_modes=20, max_tets=cap, verbose=False
     )
 

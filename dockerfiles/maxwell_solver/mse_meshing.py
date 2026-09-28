@@ -45,6 +45,7 @@ from mse_common import (  # noqa: F401
     MeshingError,
     apply_scale,
     effective_edge_m,
+    region_plan as region_plan_by_region,
     enclosure_volume_m3,
     estimate_tet_count,
     target_edge_length,
@@ -351,8 +352,10 @@ def tetrahedralize(
     enforce_resolution: bool = True,
     min_feature_m: float | None = None,
     scale: float = 1.0,
+    materials: dict | None = None,
+    parts=None,
 ):
-    """Tetrahedralize a cleaned surface and return ``(points_m, tets)`` in metres.
+    """Tetrahedralize and return ``(points_m, tets, region_of_tet)`` in metres.
 
     Resolution is driven by TetGen's ``maxvolume`` -- **which only takes effect
     together with ``fixedvolume=True``**. Without ``fixedvolume`` the Python
@@ -403,6 +406,27 @@ def tetrahedralize(
 
     surface = apply_scale(surface, scale)
 
+    # The merged PLC must carry every part's faces -- checked HERE, on the
+    # surface as the caller handed it, and NOT after the decimation below.
+    #
+    # This check used to sit after ``decimate_to_edge_length``, where it was
+    # UNSOUND: decimation's whole job is to return a surface with fewer faces
+    # than it was given (on a 24x48 sphere asked for a coarse edge it collapsed
+    # 4416 merged faces to 1068), so the check could only pass when decimation
+    # had been a no-op. It therefore fired on perfectly valid multi-part
+    # uploads whose facets were fine enough to coarsen -- the exact
+    # false-positive shape this rig calls could-not-ask's twin, a guard that
+    # refuses a correct upload. Moving it before the decimation tests the thing
+    # it was always about (did the caller concatenate the parts?) and leaves
+    # the face count free to fall afterwards, which is expected.
+    if parts is not None and getattr(parts, "is_multi", False):
+        n_expected = sum(len(p.faces) for p in parts.parts)
+        if len(surface.faces) != n_expected:
+            raise MeshingError(
+                f"internal error: the merged surface has {len(surface.faces)} "
+                f"face(s) for {n_expected} across {len(parts)} part(s)"
+            )
+
     # Metres per user unit, from here down. Named ``unit_scale_m`` and not
     # ``scale``: the parameter above is the owner's free scale factor, and an
     # earlier version rebound the name here, which is how the two length spaces
@@ -431,10 +455,16 @@ def tetrahedralize(
     physics_m = target_edge_length(
         surface, n_modes=n_modes, units=units, n_index=n_index
     ) * unit_scale_m
+    # ``parts``/``materials`` go in so a multi-part upload's edge is the
+    # SMALLEST h/n_region -- the whole-object edge alone under-resolves a
+    # high-index region while every count still looks right. This is the
+    # GLOBAL edge both the mesher and the app's estimate route on, so the rule
+    # lives in ``mse_common`` and both callers take it from there.
     edge_m = effective_edge_m(
         surface, n_modes=n_modes, units=units,
         min_feature_m=min_feature_m, n_index=n_index,
         physics_m=physics_m,
+        parts=parts, materials=materials,
     )
     edge_units = edge_m / unit_scale_m
     if verbose and min_feature_m is not None and edge_m < physics_m:
@@ -453,7 +483,39 @@ def tetrahedralize(
     if verbose and decimation_note:
         print(f"[mse] {decimation_note}", flush=True)
 
+    # --- the FINEST REGION EDGE, resolved before maxvolume ------------------
+    #
+    # For a multi-part upload EVERY region is meshed at ``h_min`` -- the finest
+    # region edge -- and ``maxvolume`` is its volume. That is the whole of the
+    # uniform rule, and it is what makes one global number do the job a
+    # per-region volume list cannot: see ``mse_common.region_edges`` for the
+    # measurement (a nine-order sweep of a region's ``max_vol`` moved that
+    # region's element count by exactly zero on a nested PLC).
+    #
+    # ``edge_units`` is the wall's edge for the one-part path and for the wall
+    # region's own target; a denser region pulls it DOWN here, so the cavity is
+    # resolved for the densest part and the wall is over-resolved -- the
+    # deliberate price of correctness. For n_max <= n_wall this is
+    # ``edge_units`` exactly, so an upload whose densest part IS the wall meshes
+    # at the wall's edge, and the one-part path (which never reaches here) is
+    # untouched.
+    region_plan = None
+    multi = parts is not None and getattr(parts, "is_multi", False)
+    if multi:
+        region_plan = _region_plan(parts, materials, edge_units, units, verbose)
+        edge_units = region_plan["h_min_units"]
+
     maxvolume = target_maxvolume(surface, edge_units)
+
+    # The merged-PLC face count was already checked against the parts in the
+    # ``multi`` branch above; this note stays next to ``maxvolume`` because that
+    # is the quantity it is about: the global ``maxvolume`` is now the SAME
+    # quantity for both paths -- one edge, one volume -- and the region branch
+    # differs only by ``regionattrib`` (which tags each tet with its part) and by
+    # ``docheck`` (TetGen's own overlap instrument). The one-part branch keeps
+    # its exact call, so its meshes stay byte-identical; for a multi-part upload
+    # whose densest region is the wall, ``edge_units`` here is the value the
+    # one-part path would have used.
 
     vertices = np.asarray(surface.vertices, dtype=float)
     faces = np.asarray(surface.faces, dtype=np.int32)
@@ -509,12 +571,80 @@ def tetrahedralize(
     previous_tets = None
     for attempt in range(MAX_MESH_ATTEMPTS):
         tet = tetgen.TetGen(vertices, faces)
-        # minratio/mindihedral keep element quality up; fixedvolume makes
-        # maxvolume binding. All three are needed for a usable interior.
-        tet.tetrahedralize(
-            order=1, mindihedral=20, minratio=2.0,
-            maxvolume=maxvolume, fixedvolume=True,
-        )
+
+        # The one-part path is UNCHANGED, and that is a requirement rather than
+        # a convenience: regionattrib=True passes -A to TetGen, which changes
+        # its switches even for a single region and so changes the mesh. The
+        # acceptance criterion for this feature is that a one-part upload meshes
+        # byte-identically to before it existed, and the only way to honour that
+        # is for the single-part case to run exactly the call it always ran.
+        # Regions are a BRANCH, not a replacement.
+        if region_plan is None:
+            # minratio/mindihedral keep element quality up; fixedvolume makes
+            # maxvolume binding. All three are needed for a usable interior.
+            tet.tetrahedralize(
+                order=1, mindihedral=20, minratio=2.0,
+                maxvolume=maxvolume, fixedvolume=True,
+            )
+        else:
+            # docheck=True is the OVERLAP instrument. TetGen checks its own PLC
+            # for self-intersections and refuses a surface that has them, which
+            # is exactly an overlapping pair of parts -- and it does not
+            # false-positive on nested parts (both directions measured). It is
+            # the mesher's own view of the geometry rather than a second
+            # geometric opinion computed here, which is why it is preferred.
+            #
+            # It does NOT catch touching parts (measured: two boxes sharing a
+            # face plane give 12 tets, no error), so touching is refused earlier
+            # by mse_parts.load_parts. The two cases need different instruments
+            # and neither substitutes for the other.
+            #
+            # The region SEEDS are placed from the parts, recomputed here so
+            # the canonical frame is applied to the same points the vertices
+            # were. No per-region VOLUME is passed: see below.
+            for region_id, seed_canonical in _region_requests(
+                region_plan, canonical_offset, canonical_scale
+            ):
+                tet.add_region(region_id, tuple(seed_canonical))
+            # THE SWITCHES ARE THE ONE-PART SWITCHES, plus ``-A``. No
+            # ``varvolume``, no per-region ``max_vol``.
+            #
+            # This is a MEASURED decision, not a stylistic one. Per-region
+            # volumes supplied through ``add_region``'s ``max_vol`` were
+            # measured INERT on a nested PLC: sweeping a region's volume over
+            # NINE orders of magnitude left that region's own element count and
+            # the total byte-identical (hand-built two-shell cube, no
+            # application code; identical under ``varvolume=True``,
+            # ``fixedvolume=True``, and with neither flag set). An earlier
+            # version of this comment claimed ``varvolume`` was the mechanism
+            # and ``fixedvolume`` was silently overriding it -- that claim did
+            # NOT reproduce, and the instrument errors that produced it (a
+            # ``steinerleft`` cap that bounded every run identically, and
+            # reading only the global tet total, which the wall region
+            # dominates) are recorded on the row.
+            #
+            # So the resolution is set the way it provably works: ONE global
+            # ``maxvolume``, at ``h_min`` -- the finest region edge -- computed
+            # above. Every region is meshed at it. TetGen still needs the
+            # region SEEDS to know which part each tet is in, which is what
+            # ``add_region`` is now used for here and all it is used for.
+            #
+            # ``docheck=True`` is the OVERLAP instrument. TetGen checks its own
+            # PLC for self-intersections and refuses a surface that has them,
+            # which is exactly an overlapping pair of parts -- and it does not
+            # false-positive on nested parts (both directions measured). It is
+            # the mesher's own view of the geometry rather than a second
+            # geometric opinion computed here, which is why it is preferred.
+            #
+            # It does NOT catch touching parts (measured: two boxes sharing a
+            # face plane give 12 tets, no error), so touching is refused earlier
+            # by mse_parts.load_parts. The two cases need different instruments
+            # and neither substitutes for the other.
+            tet.tetrahedralize(
+                order=1, mindihedral=20, minratio=2.0,
+                maxvolume=maxvolume, fixedvolume=True,
+                regionattrib=True, docheck=True,
+            )
         # Read the mesh from tetgen's OWN arrays, not from ``tet.grid``.
         #
         # ``tet.grid`` builds a pyvista.UnstructuredGrid, and pyvista pulls in
@@ -539,6 +669,24 @@ def tetrahedralize(
         # tests/test_meshing_guard.py holds both, so a future tetgen that
         # changes either fails there rather than in a deployed solve.
         tets = np.asarray(tet.elem, dtype=np.int64)
+        # The region attributes are re-read on EVERY pass for the same reason
+        # ``tets`` and ``node`` are: each retry re-tetrahedralizes and returns a
+        # fresh attribute array. Reading it once outside the loop is the defect
+        # this feature is *about* -- it would quietly give every tet one
+        # material while every count still agreed, and the eigenvalues would be
+        # for a uniformly-filled cavity the owner did not upload.
+        #
+        # ``tet.attributes`` (not ``attrib``) is the tet-indexed array; it is
+        # (n_tets, 1) float64. It is confirmed to carry the region ids by
+        # tests/test_meshing_guard.py, not taken from the docs -- the tetgen
+        # docs' own example shows a differently-shaped return.
+        if region_plan is not None:
+            attrib = np.asarray(tet.attributes, dtype=np.int64).reshape(-1)
+            if attrib.shape[0] != tets.shape[0]:
+                raise MeshingError(
+                    f"internal error: TetGen returned {attrib.shape[0]} region "
+                    f"attributes for {tets.shape[0]} tetrahedra"
+                )
         # Map the points straight back to the scaled surface's units. This is
         # the exact inverse of the mapping above, and it happens per attempt
         # because each retry re-tetrahedralizes and returns fresh points.
@@ -645,7 +793,127 @@ def tetrahedralize(
 
     global LAST_ACHIEVED_EDGE_M
     LAST_ACHIEVED_EDGE_M = float(achieved)
-    return points_m, tets
+    # A third return value even when there is one region, so no caller branches
+    # on how many regions there turned out to be: an all-zeros array is the
+    # same shape as a two-region one, and a caller written for the one-region
+    # case keeps working unchanged. The one-part path still runs the SAME
+    # TetGen call it always did -- region_of_tet is all zeros because the
+    # mesher was never told about regions, not because a region was added and
+    # then ignored.
+    #
+    # When regions ARE in play this is TetGen's own ``attrib``, from the pass
+    # that actually succeeded -- not a plan computed before meshing. The tets
+    # are indexed the same way the attributes are, and neither is touched by
+    # the canonical frame (that maps POINTS only), so no correction is needed:
+    # verified rather than assumed, because an off-by-one or a frame-mapped
+    # index would tag every tet with a neighbouring region's material.
+    if region_plan is None:
+        region_of_tet = np.zeros(n_tets, dtype=np.int64)
+    else:
+        region_of_tet = attrib.astype(np.int64, copy=True)
+    return points_m, tets, region_of_tet
+
+
+def _region_plan(parts, materials, edge_units: float, units: str,
+                 verbose: bool) -> dict:
+    """The resolution plan for a multi-part upload, under the uniform rule.
+
+    Returns a dict the mesher reads:
+
+        region_of_part   region id per part, from the PartSet
+        seeds_units      per-region seed point, in the SCALED surface's units
+        h_min_units      the ONE edge the whole cavity is meshed at
+
+    ``materials`` maps part name -> n and must name every part. A region with no
+    material is refused rather than defaulted, because the default would be
+    vacuum and the owner would get frequencies for a cavity that is partly empty
+    with nothing saying so.
+
+    ``h_min_units`` is ``min_r(edge_units * n_wall / n_r)``, floored at
+    ``edge_units`` -- the finest region edge. See
+    :func:`mse_common.region_edges` for why the mesher uses ONE edge rather than
+    a per-region volume list: the per-region mechanism is not realisable in this
+    TetGen build (measured inert over nine orders on a nested PLC).
+
+    There is deliberately NO per-region volume in the plan. Producing one and
+    passing it to ``add_region`` is the shape that LOOKED like it worked and
+    did not -- a plan whose numbers are correct and whose effect is nil. If a
+    future TetGen makes per-region grading possible, this is the function to
+    change, and the row records the measurement that would have to be redone.
+    """
+    # The per-region fill and edge come from ``mse_common.region_plan`` -- the
+    # SAME call the web app's estimate makes. Deriving them here instead would
+    # be two expressions of one quantity in two processes, which is the shape
+    # the row names: the app routes on its estimate and the mesher builds the
+    # mesh, and if they disagree the route is decided for a job nobody runs.
+    # ``units`` goes in: without it ``region_plan`` converted every part's
+    # volume as if it were written in mm, so the mesher's own verbose figures
+    # were wrong by the cube of the unit ratio for any non-mm upload. The edge
+    # beside them was always true, so the two disagreed silently.
+    shared = region_plan_by_region(parts, materials, edge_units, units)
+    region_of_part = parts.region_of_part
+
+    # Every region is meshed at the same edge. Resolved as a MIN over the plan
+    # rather than recomputed from the materials, so the value here is the value
+    # the estimate used even if the two ever disagree about how to get it.
+    h_min_units = min(float(info["edge_units"]) for info in shared.values())
+
+    seeds_units = {}
+    for part_index, region_id in enumerate(region_of_part):
+        seeds_units[region_id] = np.asarray(parts.seeds[part_index], dtype=float)
+
+    if verbose:
+        print(
+            f"[mse] uniform region edge h_min = {h_min_units:.4g} {units} "
+            f"for all {len(region_of_part)} region(s)",
+            flush=True,
+        )
+        for part_index, region_id in enumerate(region_of_part):
+            info = shared[int(region_id)]
+            print(
+                f"[mse] region {region_id}: part {info['part']!r}, "
+                f"n={materials[info['part']]:g}, fills "
+                f"{info['filled_volume_m3']:.4g} m3",
+                flush=True,
+            )
+    return {
+        "region_of_part": region_of_part,
+        "seeds_units": seeds_units,
+        "h_min_units": h_min_units,
+        "shared": shared,
+    }
+
+
+def _region_requests(region_plan, canonical_offset, canonical_scale):
+    """``(region_id, seed)`` pairs in the canonical frame.
+
+    ONLY the seeds. There is no per-region volume, because the mesher computes
+    none: every region is meshed at the one global ``h_min`` (see
+    ``_region_plan`` and ``mse_common.region_edges``). TetGen still needs the
+    seeds -- they are how it decides which part each tet lies in, which is what
+    the region ATTRIBUTE is for -- but they carry no size.
+
+    The seeds are mapped with the same affine the vertices get, and ``add_region``
+    must receive the point in the frame TetGen is actually meshing, or a seed
+    written for the scaled surface can land in the wrong region once the
+    canonical frame moves the geometry.
+
+    WHAT THIS FUNCTION USED TO DO, kept because the shape is a trap: it computed
+    a per-region ``max_vol`` as a RATIO of the plan's own base, so every ratio
+    was ``<= 1`` and each bound was at most the global's -- the global capped
+    the whole mesh at the coarsest region's resolution. Rewriting it to
+    absolute per-region volumes did NOT fix that, because the region volume
+    itself turned out to be inert on nested input (nine-order measurement on the
+    row). The uniform rule removes the quantity entirely rather than computing
+    it correctly for a mechanism that cannot use it.
+    """
+    out = []
+    for region_id, seed_units in sorted(region_plan["seeds_units"].items()):
+        seed_canonical = (
+            np.asarray(seed_units, dtype=float) - canonical_offset
+        ) * canonical_scale
+        out.append((int(region_id), seed_canonical))
+    return out
 
 
 def achieved_edge_length(points_m: np.ndarray, tets: np.ndarray) -> float:

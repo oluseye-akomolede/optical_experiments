@@ -254,7 +254,8 @@ class JobStore:
                    min_feature_m: float | None = None,
                    min_feature_value: float | None = None,
                    min_feature_unit: str | None = None,
-                   scale: float = 1.0) -> None:
+                   scale: float = 1.0,
+                   materials: dict | None = None) -> None:
         """Create the upload row. Status starts ``queued``, not ``running``.
 
         ``target`` is the machine the upload-time estimate chose. It is recorded
@@ -277,15 +278,23 @@ class JobStore:
 
         ``min_feature_m`` is the only one the solver sees; the other two exist
         so the page can show the owner their own input back.
+
+        ``materials`` is the part-name -> ``n`` table, or ``None`` for a one-part
+        vacuum upload. ``None`` is stored as SQL NULL rather than ``{}``: an empty
+        object would say the owner submitted a table with no parts in it, which
+        is a different statement from "there is no table". It is serialised here
+        with ``json.dumps`` because psycopg2 does not adapt a dict for a jsonb
+        parameter on its own, and a silently stringified dict would be a jsonb
+        scalar that every reader then has to parse back out.
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO mse.jobs "
                 "(job_id, original_filename, units, n_index, n_modes, status, stage, "
                 " target, est_tets, min_feature_m, min_feature_value, "
-                " min_feature_unit, scale, gpu_queued_at) "
+                " min_feature_unit, scale, gpu_queued_at, materials) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "        CASE WHEN %s = 'jetson' THEN now() END)",
+                "        CASE WHEN %s = 'jetson' THEN now() END, %s)",
                 (str(job_id), original_filename, units, float(n_index),
                  int(n_modes), QUEUED, QUEUED, target,
                  None if est_tets is None else int(est_tets),
@@ -293,7 +302,8 @@ class JobStore:
                  None if min_feature_value is None else float(min_feature_value),
                  min_feature_unit,
                  float(1.0 if scale is None else scale),
-                 target),
+                 target,
+                 None if materials is None else json.dumps(materials)),
             )
 
     def mark_failed(self, job_id, message: str) -> None:
@@ -510,7 +520,7 @@ class JobStore:
                 "SELECT job_id, created_at, original_filename, units, n_index, "
                 "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
                 "finished_at, target, est_tets, min_feature_m, scale, "
-                "min_feature_value, min_feature_unit "
+                "min_feature_value, min_feature_unit, materials "
                 "FROM mse.jobs WHERE job_id = %s",
                 (str(job_id),),
             )
@@ -523,7 +533,7 @@ class JobStore:
                 "SELECT job_id, created_at, original_filename, units, n_index, "
                 "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
                 "finished_at, target, est_tets, min_feature_m, scale, "
-                "min_feature_value, min_feature_unit "
+                "min_feature_value, min_feature_unit, materials "
                 "FROM mse.jobs ORDER BY created_at DESC LIMIT %s",
                 (int(limit),),
             )
@@ -555,7 +565,8 @@ class JobStore:
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT job_id, original_filename, units, n_index, n_modes, est_tets "
+                "SELECT job_id, original_filename, units, n_index, n_modes, est_tets, "
+                "min_feature_m, scale, materials "
                 "FROM mse.jobs WHERE status = %s AND target = %s "
                 "ORDER BY created_at LIMIT 1",
                 (QUEUED, target),
@@ -565,7 +576,8 @@ class JobStore:
             return None
         return {"job_id": str(row[0]), "original_filename": row[1],
                 "units": row[2], "n_index": row[3], "n_modes": row[4],
-                "est_tets": row[5]}
+                "est_tets": row[5], "min_feature_m": row[6], "scale": row[7],
+                "materials": row[8]}
 
     def jetson_waiting(self, older_than_seconds: float) -> list[dict]:
         """Jetson rows nobody has claimed for longer than the wait window.
@@ -604,7 +616,7 @@ class JobStore:
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT job_id, units, n_index, n_modes, min_feature_m, scale "
+                "SELECT job_id, units, n_index, n_modes, min_feature_m, scale, materials "
                 "FROM mse.jobs "
                 "WHERE target = %s AND status = %s AND lease_owner IS NULL "
                 "ORDER BY created_at "
@@ -624,7 +636,7 @@ class JobStore:
             )
         return {"job_id": job_id, "units": row[1], "n_index": row[2],
                 "n_modes": row[3], "min_feature_m": row[4], "scale": row[5],
-                "lease_owner": owner}
+                "lease_owner": owner, "materials": row[6]}
 
     def renew_lease(self, job_id, owner: str, lease_seconds: float) -> bool:
         """Extend ``owner``'s lease. Returns whether it still holds it.
@@ -940,6 +952,13 @@ def _job_row(row) -> dict:
         "scale": row[15],
         "min_feature_value": row[16],
         "min_feature_unit": row[17],
+        # A jsonb column comes back as a dict, or as None for the one-part
+        # vacuum uploads. The two are left DISTINCT on purpose: None is "no
+        # materials table", {} would be "a table with no parts", and a page or
+        # a solver that collapsed them could not tell an old job from a
+        # malformed new one. Row values are passed through as read rather than
+        # normalised, for the same reason.
+        "materials": row[18],
     }
 
 

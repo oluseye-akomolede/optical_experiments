@@ -33,6 +33,12 @@ _UNSAFE = re.compile(r"[^a-z0-9.-]")
 #: the solver CLI takes n-modes; the owner-facing default lives in config
 DEFAULT_N_MODES = 20
 
+#: where the cluster Job's materials table lives in object storage, relative to
+#: the job's prefix. The same name the upload writes and the solver reads, so
+#: there is one spelling of it in the tree -- see the note in
+#: ``build_job_manifest`` for why it is a file and not an argument.
+_MATERIALS_OBJECT = "input.materials.json"
+
 
 def job_name(job_id) -> str:
     """Deterministic, DNS-1123-safe Kubernetes object name for a job id."""
@@ -48,7 +54,8 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
                        max_tets: int | None = None,
                        cpu_max_tets: int | None = None,
                        min_feature_m: float | None = None,
-                       scale: float = 1.0):
+                       scale: float = 1.0,
+                       materials: dict | None = None):
     """Return the ``batch/v1`` Job manifest that solves one upload.
 
     Pure: no environment lookups, no cluster calls, no time.
@@ -103,6 +110,23 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
         # this function produced before the argument existed -- which is what
         # the pre-existing tests assert against.
         args += ["--scale", repr(float(scale))]
+    # Materials are NOT passed in argv. Two reasons, and the first one is
+    # enough: argv is world-readable on the shared VM -- any seat's `ps` shows
+    # it -- and this is a data structure that will only grow (a dozen parts is
+    # already long, and a quoted JSON blob on a command line is a parsing bug
+    # waiting for the first part name with a space in it). The Job carries the
+    # table as an OBJECT IN MINIO, ``input.materials.json``, which the solver
+    # already has credentials for and already reads its geometry from.
+    #
+    # The flag says only WHETHER the table exists. Absent means the one-part
+    # vacuum path, exactly as before this argument was added; present means the
+    # solver must find the object and refuse if it cannot. That is deliberately
+    # not "present iff materials is not None" reversed -- a missing object with
+    # the flag set is an error, never a silent fallback to vacuum, because
+    # falling back would solve a different problem than the owner asked for and
+    # report it as success.
+    if materials is not None:
+        args += ["--materials-from", _MATERIALS_OBJECT]
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -186,7 +210,8 @@ class K8sJobLauncher:
 
     def manifest(self, job_id, units: str, n_index: float, n_modes: int,
                  min_feature_m: float | None = None,
-                 scale: float = 1.0) -> dict:
+                 scale: float = 1.0,
+                 materials: dict | None = None) -> dict:
         return build_job_manifest(
             job_id, units, n_index, n_modes, self.image, self.pull_secret,
             self.namespace, cpu=self.cpu, memory=self.memory,
@@ -194,7 +219,7 @@ class K8sJobLauncher:
             ttl_seconds_after_finished=self.ttl_seconds_after_finished,
             max_tets=self.max_tets,
             cpu_max_tets=self.cpu_max_tets,
-            min_feature_m=min_feature_m, scale=scale,
+            min_feature_m=min_feature_m, scale=scale, materials=materials,
         )
 
     # -- cluster state -----------------------------------------------------
@@ -337,10 +362,18 @@ class K8sJobLauncher:
 
     # -- mutation ----------------------------------------------------------
     def create(self, job_id, units: str, n_index: float, n_modes: int,
-               min_feature_m: float | None = None, scale: float = 1.0) -> str:
-        """Create the Job and return its name."""
+               min_feature_m: float | None = None, scale: float = 1.0,
+               materials: dict | None = None) -> str:
+        """Create the Job and return its name.
+
+        ``materials`` is passed for the FLAG only -- it decides whether the
+        solver is told to look for the table. The table itself was written to
+        object storage by the upload, before this is called, so a Job can never
+        be launched pointing at a table that has not been stored yet.
+        """
         manifest = self.manifest(job_id, units, n_index, n_modes,
-                                 min_feature_m=min_feature_m, scale=scale)
+                                 min_feature_m=min_feature_m, scale=scale,
+                                 materials=materials)
         if self.dry_run:
             return manifest["metadata"]["name"]
         from kubernetes import client

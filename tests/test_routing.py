@@ -1648,3 +1648,913 @@ def test_the_claim_payload_carries_both_caps(tmp_path, worker):
     body = client.post("/worker/claim", headers=_auth()).get_json()
     assert body["max_tets"] == CFG.max_tets()
     assert body["cpu_max_tets"] == CFG.cpu_max_tets()
+
+
+# ---------------------------------------------------------------------------
+# The multi-part estimate -- the routing-critical piece.
+# ---------------------------------------------------------------------------
+#
+# The solver's own mesher module, imported by name here rather than reached
+# through ``MESH``: ``web/meshing.py`` re-exports the estimate and the edge
+# helper, but ``tetrahedralize`` and ``effective_edge_m`` in the length space
+# the SOLVER uses live in the image's module. Importing it is what makes these
+# tests speak about the mesh the solver builds rather than about the app's view
+# of it.
+import mse_common as COMMON  # noqa: E402
+import mse_meshing as MESHSOLVER  # noqa: E402
+import numpy as np  # noqa: E402
+#
+# These are tier-1: they mesh a 6 mm box with a 2 mm core, which is ~20k tets
+# and takes a second or two. The route decision is made from this number, so a
+# test that only checked "the estimate went up" would be the shape this rig
+# keeps finding -- a check that cannot fail for the reason it exists.
+
+def _nested_parts(units="mm"):
+    """A 6 mm wall box with a 2 mm core, as a validated PartSet."""
+    import trimesh
+
+    import mse_parts as PARTS
+
+    wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
+    core = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    obj = trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8")
+    return PARTS.load_parts(obj, units=units), PARTS.merged_surface(
+        PARTS.load_parts(obj, units=units))
+
+
+def test_the_wall_region_volume_excludes_its_children():
+    """Decision 6, on the object that decides the route.
+
+    A nested part's every point is inside its parent, so the parent's ENCLOSED
+    volume counts it twice -- once as parent, once as child. The element count
+    goes like V/h^3, so that inflation is what pushes a Jetson-sized job onto
+    the cluster.
+
+    Measured on this fixture: the merged PLC reports 224 mm^3 where the object
+    fills 216 (6^3), because the 2 mm core is inside the 6 mm box.
+
+    The mutation is "fill = enclosed": it must redden HERE and on the
+    estimate test below.
+    """
+    parts, merged = _nested_parts()
+    wall_fill_m3 = parts.filled_volume_m3(0, "mm")
+    core_fill_m3 = parts.filled_volume_m3(1, "mm")
+
+    assert core_fill_m3 == pytest.approx(8e-9, rel=1e-9), (
+        "the core has nothing nested in it, so its fill IS its enclosed volume"
+    )
+    assert wall_fill_m3 == pytest.approx(208e-9, rel=1e-9), (
+        f"the wall fills 6^3 - 2^3 = 208 mm3; got {wall_fill_m3 * 1e9:.4g}"
+    )
+    # And the DOUBLE COUNT the enclosed volume would give, named so the figure
+    # in the comment above is measured rather than remembered.
+    enclosed_m3 = abs(float(merged.volume)) * MESHSOLVER.unit_scale("mm") ** 3
+    assert enclosed_m3 == pytest.approx(224e-9, rel=1e-9), (
+        "the merged PLC's own volume should be 216 + 8 = 224 mm3 -- the core "
+        "counted twice, which is exactly what filled_volume_m3 subtracts"
+    )
+    assert wall_fill_m3 < enclosed_m3, (
+        "the wall's fill must be LESS than the merged enclosure; equal means "
+        "the children were not subtracted"
+    )
+
+
+def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
+    """The estimate and the mesher must agree, in one length space.
+
+    This is the row's own trap. The app's estimate ROUTES the job -- cluster
+    (slow, cheap) vs Jetson (fast, scarce) -- and the mesher builds the mesh.
+    If the two derive the per-region edge or the region volume independently,
+    the app decides the route for a job nobody runs: a job that needs 19k
+    elements is estimated at 3k and sent to the Jetson to die.
+
+    So the assertion is not "the estimate grew". It is that the estimate and the
+    count TetGen actually returns agree within the fitted coefficient's own
+    slack -- and the multi-part estimate is asserted to be EXACTLY the one-part
+    formula at h_min (here 8x the one-part count at h, because the core's index
+    halves the edge), which is what makes this a test of the multi-part branch
+    rather than of arithmetic both paths share.
+    """
+    parts, merged = _nested_parts()
+    materials = {"wall": 1.0, "core": 2.0}
+
+    estimate = MESH.estimate_tets(merged, 3, "mm", parts=parts,
+                                  materials=materials)
+    assert estimate > 0, "the multi-part estimate returned 0 (could not ask)"
+
+    _points, tets, region_of_tet = MESHSOLVER.tetrahedralize(
+        merged, "mm", n_modes=3, n_index=1.0, max_tets=200_000, verbose=False,
+        materials=materials, parts=parts,
+    )
+    actual = int(tets.shape[0])
+    assert actual > 1000, "the fixture must be big enough for a ratio to mean"
+    assert len(np.unique(region_of_tet)) == 2, (
+        "the mesher must build two regions, or this is not the multi-part path"
+    )
+
+    ratio = estimate / actual
+    # The slack is the coefficient's own: EST_TETS_C is calibrated against real
+    # tetrahedralizations to within a small factor, and the whole point is that
+    # the TWO PATHS share it. A ratio near 1.5 is the fitted factor; a ratio of
+    # 0.15 is not a slack, it is the wrong formula.
+    assert 0.5 <= ratio <= 3.0, (
+        f"the estimate ({estimate:,}) and the mesh ({actual:,}) disagree by "
+        f"{ratio:.2f}x -- the app would route this job on a number the mesher "
+        f"does not confirm"
+    )
+
+    # THE DISCRIMINATOR. Under the uniform rule the multi-part estimate IS the
+    # one-part formula evaluated at h_min, so the discriminating claim is about
+    # the EDGE, not about two formulas existing: this object has a core at n=2 in
+    # a wall at n=1, so h_min = h/2 and the estimate must be the one-part count
+    # at that finer edge -- 2^3 = 8x the one-part count at h, same volume, same
+    # coefficient. A branch that forgot the index (leaving h_min = h) gives 1x; a
+    # branch that squared the edge instead of cubing gives 2x or 4x.
+    #
+    # This is deliberately NOT `one_part != estimate` as a bare inequality: that
+    # passes for any accidental difference. It is the exact factor, which names
+    # the mechanism.
+    one_part_at_h = MESH.estimate_tets(merged, 3, "mm")
+    assert one_part_at_h != estimate, (
+        f"the one-part and multi-part estimates are both {estimate:,}, so this "
+        f"test cannot tell whether the multi-part branch ran at all"
+    )
+    h = COMMON.effective_edge_m(merged, n_modes=3, units="mm")
+    plan = COMMON.region_plan(parts, materials, h, "mm")
+    h_min = plan[0]["edge_units"]
+    v_cavity = sum(info["filled_volume_m3"] for info in plan.values())
+    expected = int(MESH.EST_TETS_C * v_cavity / (h_min ** 3))
+    assert estimate == expected, (
+        f"the multi-part estimate ({estimate:,}) is not the one-part formula at "
+        f"h_min ({expected:,}); the two paths must share the expression and the "
+        f"calibration constant, or the route and the mesh disagree"
+    )
+
+    # THE VOLUME IS THE FILLED SUM, NOT THE MERGED SURFACE'S ENCLOSED VOLUME.
+    # The merged PLC of a nested pair has its inner shell wound relative to the
+    # CORE, so trimesh's oriented volume ADDS it: measured 2.24e-7 for a wall of
+    # 216 mm^3 holding a core of 8 mm^3, where the cavity is 216 mm^3 and the
+    # filled sum is 2.16e-7. Using the merged figure over-counts the core by
+    # 2x (it appears once in the wall's enclosed volume and once again as its
+    # own region) -- the double-count the filled volume exists to remove.
+    # `enclosure_volume_m3` is the one-part path's input and stays that; it is
+    # the wrong input HERE, and the gap is large enough to move a route.
+    merged_enclosed = COMMON.enclosure_volume_m3(merged, "mm")
+    assert merged_enclosed > v_cavity, (
+        f"the merged enclosed volume ({merged_enclosed:g}) is not above the filled "
+        f"sum ({v_cavity:g}); this test's premise about nested windings has changed"
+    )
+    assert merged_enclosed == pytest.approx(224.0 * 1e-9, rel=1e-9), (
+        f"the merged enclosed volume is {merged_enclosed:g} m^3, not 224 mm^3 -- "
+        f"the inner shell's winding (and so the double-count) has changed"
+    )
+    assert v_cavity == pytest.approx(216.0 * 1e-9, rel=1e-9), (
+        f"the filled sum is {v_cavity:g} m^3, not 216 mm^3 -- 6^3 with the 2^3 "
+        f"core removed"
+    )
+    octave = (h / h_min) ** 3
+    assert octave == pytest.approx(8.0, rel=1e-9), (
+        f"h/h_min cubed is {octave:g}, not 8 -- the fixture no longer has the "
+        f"n=2-in-n=1 shape this test is built on"
+    )
+    # THE 8x, MEASURED AGAINST THE EXACT ONE-PART EXPRESSION, NOT ITS ROUNDED
+    # COUNT. `estimate_tets` returns `int(c*V/h^3)`, so comparing against
+    # `one_part_at_h * 8 * (vc/me)` would multiply an ALREADY-TRUNCATED integer:
+    # the one-part count is int(2971.4508) = 2971, and 2971*8*(216/224) = 22919.1
+    # against the true 22922.6 -- a 3.5-element gap invented entirely by where the
+    # int() sits. The claim is about the FORMULA (the multi-part path is the
+    # one-part formula at h_min on the filled volume), so both sides are compared
+    # before truncation and the code's own int() is asserted separately below.
+    exact_one_part = (MESH.EST_TETS_C * merged_enclosed / (h ** 3))
+    exact_multi = MESH.EST_TETS_C * v_cavity / (h_min ** 3)
+    assert exact_multi == pytest.approx(exact_one_part * 8.0 * (v_cavity / merged_enclosed),
+                                        rel=1e-12), (
+        f"the multi-part formula ({exact_multi:.4f}) is not the one-part formula "
+        f"({exact_one_part:.4f}) rescaled by the two real changes -- the edge "
+        f"({h/h_min:g}x finer, so 8x the count) and the volume ({v_cavity/merged_enclosed:.6f}x, "
+        f"because the merged surface double-counts the nested core). That identity "
+        f"IS the uniform rule."
+    )
+    # ...and the code's own truncation is the one it should be.
+    assert estimate == int(exact_multi), (
+        f"the estimate ({estimate:,}) is not int({exact_multi:.4f}) = "
+        f"{int(exact_multi):,}; the branch is not computing the one-part formula "
+        f"at h_min on the filled volume"
+    )
+
+
+def test_every_region_is_meshed_at_h_min_the_finest_region_edge():
+    """The uniform rule: ONE edge for the whole cavity, the finest region's.
+
+    THIS TEST HAS ASSERTED THREE DIFFERENT MODELS, and the history is the point.
+    It first required ``effective_edge_m`` to return ``min(h / n_region)`` --
+    the finest region's edge applied as the GLOBAL -- which meshed the WALL at
+    the core's resolution and refused a GPU-sized upload as cluster-sized. Then
+    it required the opposite: the global stays the WALL's edge and each region
+    is fined RELATIVE to it. That model is right about the physics and cannot be
+    implemented here: TetGen's per-region volume, ``add_region``'s ``max_vol``,
+    was measured INERT on a nested PLC -- a nine-order sweep left the region's
+    own element count byte-identical.
+
+    So the model is now UNIFORM: every region is meshed at ``h_min = min_r(h *
+    n_wall / n_r)``, floored at ``h``. ``effective_edge_m`` still returns the
+    WEYL edge (index-independent, as its own docstring says); ``h_min`` lives in
+    ``region_plan``, which the mesher AND the estimate both call.
+
+    Three claims, each with its mutation named:
+      * ``effective_edge_m`` does not move with either index. Mutation: make
+        ``target_edge_length`` fold ``n_index`` in.
+      * a denser core moves the plan's single edge DOWN, by exactly
+        ``n_wall/n_core``. Mutation: collapse the ratio to 1.
+      * a LESS dense core does not move it UP. Mutation: drop the ``min(h, ...)``
+        floor, so a vacuum core coarsens the wall.
+    """
+    parts, merged = _nested_parts()
+
+    vacuum = MESHSOLVER.effective_edge_m(merged, n_modes=3, units="mm",
+                                         parts=parts,
+                                         materials={"wall": 1.0, "core": 1.0})
+    # ``target_edge_length`` states that n_index deliberately does not enter --
+    # the geometric k is independent of the filling medium, and the in-medium
+    # wavelength is handled downstream. So neither index moves this.
+    for mats in ({"wall": 3.0, "core": 1.0}, {"wall": 1.0, "core": 4.0}):
+        got = MESHSOLVER.effective_edge_m(
+            merged, n_modes=3, units="mm", parts=parts, materials=mats
+        )
+        assert got == pytest.approx(vacuum, rel=1e-9), (
+            f"materials {mats} moved the Weyl edge to {got:.6g} from "
+            f"{vacuum:.6g}; it is index-independent by design"
+        )
+
+    base = vacuum / MESHSOLVER.unit_scale("mm")
+
+    # Equal indices: the plan's one edge IS the Weyl edge.
+    eq = COMMON.region_plan(parts, {"wall": 1.0, "core": 1.0}, base, "mm")
+    assert {round(i["edge_units"], 12) for i in eq.values()} == {round(base, 12)}, (
+        f"equal indices must give one edge equal to h, got "
+        f"{[i['edge_units'] for i in eq.values()]}"
+    )
+
+    # A DENSER core pulls the single edge down by exactly n_wall/n_core.
+    dense = COMMON.region_plan(parts, {"wall": 1.0, "core": 4.0}, base, "mm")
+    edges = {i["edge_units"] for i in dense.values()}
+    assert len(edges) == 1, (
+        f"the plan must report ONE edge for every region, got {edges}"
+    )
+    assert next(iter(edges)) == pytest.approx(base / 4.0, rel=1e-9), (
+        f"a core of n=4 must mesh the cavity at h*n_wall/n_core = "
+        f"{base / 4.0:.6g}, got {next(iter(edges)):.6g}"
+    )
+
+    # A LESS dense core must NOT coarsen the wall: h_min is a floor.
+    thin = COMMON.region_plan(parts, {"wall": 1.0, "core": 0.25}, base, "mm")
+    thin_edges = {i["edge_units"] for i in thin.values()}
+    assert len(thin_edges) == 1
+    assert next(iter(thin_edges)) == pytest.approx(base, rel=1e-9), (
+        f"a core of n=0.25 must not coarsen the cavity past h={base:.6g}; got "
+        f"{next(iter(thin_edges)):.6g} -- h_min is a resolution floor, not a "
+        f"function of the densest region alone"
+    )
+
+
+def _region_median_edges(points_m, tets, region_of_tet):
+    """Per-region (median edge length in METRES, tet count) from a mesh.
+
+    ``tetrahedralize`` returns its nodes in METRES. Measured two ways on a 6 mm
+    box: the returned point extent is 0.006, which equals the box extent (6) x
+    ``unit_scale("mm")`` = 0.006 m; and ``achieved_edge_length(points, tets)``
+    gives 1.1687e-3 against a 1.169 mm verbose line, while
+    ``achieved_edge_length(points * unit_scale, tets)`` gives 1.1687e-6.
+
+    THIS HELPER ASSERTED BOTH WRONG ANSWERS BEFORE IT ASSERTED THIS ONE, which
+    is why the unit is spelled out here rather than implied. Version 1 took the
+    points as already metres and multiplied by ``unit_scale`` again; version 2
+    took them as surface units and did not convert, then compared a metre median
+    against a millimetre bound. Each made the resolution assertion below pass
+    vacuously (a 1000x-small edge is under every bound), which is the
+    could-not-ask shape, so the comparison is now also pinned from below.
+    """
+    from itertools import combinations
+
+    pairs = np.array(list(combinations(range(4), 2)))
+    out = {}
+    for rid in np.unique(region_of_tet):
+        sel = np.nonzero(region_of_tet == rid)[0]
+        V = points_m[tets[sel]]
+        e = np.linalg.norm(V[:, pairs[:, 0], :] - V[:, pairs[:, 1], :], axis=2).ravel()
+        out[int(rid)] = (float(np.median(e)), int(sel.size))
+    return out
+
+
+def test_the_matrix_holds_with_real_tetgen_and_no_steiner_cap():
+    """The lead's acceptance test 1: n_wall x n_core, REAL TetGen, 9 cells.
+
+    Two things made an earlier version of this measurement lie, and both are
+    removed here:
+
+      * a ``steinerleft`` cap that bounded EVERY run identically, so nine very
+        different meshes all returned the same count. There is no such cap
+        here, and the per-region counts are printed so a capped run is visible
+        in the log rather than inferred.
+      * reading only the GLOBAL tet total, which the wall region dominates, so
+        a change confined to the core was invisible. The assertion below is on
+        the CORE'S OWN median edge.
+
+    The claims, under the uniform rule:
+
+    1. THE RESOLUTION REQUIREMENT. Each region r must be meshed no coarser than
+       its own required edge ``h * n_wall / n_r``. Since ``h_min`` is
+       ``min(h, h*n_wall/n_max)`` and ``n_r <= n_max``, the tightest case is
+       ``r = argmax n`` -- so proving the tightest case proves them all, and
+       the test asserts it on the DENSEST region's measured median edge, which
+       is what actually failed under the old model.
+    2. THE ESTIMATE AGREES. ``est / actual`` sits in the same band the one-part
+       calibration is fitted to, because under (i') the two are the SAME
+       expression at the same edge on the same volume. A band of [0.5, 3.0]
+       would be too loose to catch a wrong formula; the one-part fit is
+       conservative (~1.0-2.0 measured), so the band here is the same shape.
+
+    Cost: the feature floor is set to 0.9 mm so the whole matrix is a few
+    thousand to ~140k tets -- tier 1, seconds, no cluster.
+    """
+    parts, merged = _nested_parts()
+    min_feature_m = 9.0e-4  # metres; floors the edge so the matrix stays tiny
+
+    us = MESHSOLVER.unit_scale("mm")  # metres per surface unit
+    h_base = MESHSOLVER.effective_edge_m(
+        merged, n_modes=3, units="mm", min_feature_m=min_feature_m
+    )
+    # ``h_base`` is METRES and so are the returned points (see
+    # ``_region_median_edges``), so there is ONE space here and no conversion.
+    rows = []
+    for n_wall in (1.0, 2.0, 3.0):
+        for n_core in (1.0, 2.0, 3.5):
+            materials = {"wall": n_wall, "core": n_core}
+            plan = COMMON.region_plan(parts, materials, h_base, "mm")
+            h_min = plan[0]["edge_units"]
+            assert all(
+                info["edge_units"] == h_min for info in plan.values()
+            ), "the uniform rule means ONE edge for every region"
+
+            points, tets, region_of_tet = MESHSOLVER.tetrahedralize(
+                merged, "mm", n_modes=3, n_index=1.0, max_tets=500_000,
+                min_feature_m=min_feature_m, verbose=False,
+                materials=materials, parts=parts,
+            )
+            actual = int(tets.shape[0])
+            # ``points`` are in the surface's own units (mm); no rescaling.
+            med = _region_median_edges(points, tets, region_of_tet)
+            # Region ids follow part order: 0 = wall (the enclosure), 1 = core.
+            assert set(med) == {0, 1}, (
+                f"n_wall={n_wall} n_core={n_core}: expected 2 regions, got "
+                f"{sorted(med)}"
+            )
+
+            est = MESH.estimate_tets(
+                merged, 3, "mm", parts=parts, materials=materials,
+                min_feature_m=min_feature_m,
+            )
+            rows.append((n_wall, n_core, {
+                "h_min_m": h_min, "n_tets": actual, "est": est,
+                "wall": med[0], "core": med[1],
+            }))
+
+            # 1. THE RESOLUTION REQUIREMENT, on the DENSEST region (the core
+            #    here, since n_core >= n_wall in every cell that has one). Its
+            #    required edge is h * n_wall / n_core; its achieved median edge
+            #    must be no coarser than that, times the mesh's own overshoot.
+            #
+            #    BOTH SIDES ARE IN SURFACE UNITS. A previous version compared a
+            #    metre-space bound against a number it had already divided by
+            #    1000, so every cell passed at ~1e-6 against ~0.9 -- a vacuous
+            #    green. The lower bound below proves the bound can fail.
+            h_core_required_m = h_base * n_wall / n_core
+            achieved_core = med[1][0]
+            assert achieved_core <= h_core_required_m * MESHSOLVER.MAX_EDGE_OVERSHOOT, (
+                f"n_wall={n_wall} n_core={n_core}: the core is meshed at "
+                f"{achieved_core * 1e3:.4f} mm but needs "
+                f"{h_core_required_m * 1e3:.4f} mm (h_min="
+                f"{h_min * 1e3:.4f} mm); the densest region is under-resolved, "
+                f"which is the exact failure (i) would have shipped"
+            )
+            # POSITIVE CONTROL: the median edge must also be no finer than a
+            # small fraction of the requirement. Without this half, a bound
+            # written ``achieved <= required`` is satisfied by ANY fine mesh --
+            # including one built at a 1000x-too-small edge, which is exactly
+            # the unit bug this test already shipped once. Requiring the edge
+            # to be within [required/10, required*overshoot] pins it from BOTH
+            # sides, so a mesh at the wrong SCALE fails here even though it
+            # would pass the upper bound alone.
+            assert achieved_core >= h_core_required_m / 10.0, (
+                f"n_wall={n_wall} n_core={n_core}: the core's median edge "
+                f"{achieved_core * 1e3:.5f} mm is more than 10x FINER than "
+                f"required ({h_core_required_m * 1e3:.5f} mm); that is not a mesh "
+                f"this code asks for, it is a scale error, and the upper bound "
+                f"alone would accept it"
+            )
+            assert med[1][1] > 0, (
+                f"n_wall={n_wall} n_core={n_core}: the core got no tets at all, "
+                f"so every other number here is about the wall only"
+            )
+
+            # 2. THE ESTIMATE. Same band the one-part calibration is fitted to.
+            ratio = est / actual
+            assert 0.5 <= ratio <= 3.0, (
+                f"n_wall={n_wall} n_core={n_core}: est {est:,} vs actual "
+                f"{actual:,} is {ratio:.3f}x, outside the calibrated band"
+            )
+
+    # PER-REGION COUNTS, PRINTED. A capped or collapsed run shows up here as
+    # rows whose counts are identical across very different h_min -- which is
+    # the signature of the instrument error this test exists to exclude.
+    # ``med`` is in metres; printing at 1e3 gives mm, and the label says so.
+    report = "\n".join(
+        f"  n_wall={nw:>3} n_core={nc:>3}  h_min={r['h_min_m'] * 1e3:7.4f}mm  "
+        f"n={r['n_tets']:>7,}  est={r['est']:>7,}  "
+        f"wall(med {r['wall'][0] * 1e3:7.4f}mm, {r['wall'][1]:>6,} tets)  "
+        f"core(med {r['core'][0] * 1e3:7.4f}mm, {r['core'][1]:>6,} tets)"
+        for nw, nc, r in rows
+    )
+    print("\nMATRIX (real TetGen, no steinerleft cap):\n" + report)
+
+    # A collapse detector, not decoration: the rows must not all share a count.
+    counts = {r["n_tets"] for _nw, _nc, r in rows}
+    assert len(counts) >= 3, (
+        f"only {len(counts)} distinct tet counts across nine cells -- a cap or a "
+        f"collapsed edge is bounding every run the same way:\n{report}"
+    )
+
+
+def test_equal_indices_give_the_same_count_as_the_one_part_mesh():
+    """The lead's acceptance test 4. With one index everywhere the cavity is
+    ONE material, so the multi-part mesh and the one-part mesh must agree.
+
+    This is the test that catches ``eps_by_tet`` applied twice, or the region
+    branch passing ``-A`` with a switch set that changes TetGen's element
+    count. It is asserted on the COUNT rather than on bytes because the
+    multi-part path must add the region attribute and the one-part path must
+    not (``regionattrib=True`` changes TetGen's switches, so byte-identity
+    across the two branches is not achievable -- only the one-part path against
+    ITSELF is byte-identical, which the one-part regression test covers).
+
+    Equal indices also mean ``h_min = h`` exactly, so the two meshes are asked
+    for the SAME edge on the SAME PLC -- if the counts differ, the region
+    branch changed something other than the tags.
+    """
+    parts, merged = _nested_parts()
+    materials = {"wall": 1.0, "core": 1.0}
+    min_feature_m = 9.0e-4
+
+    h_base = MESHSOLVER.effective_edge_m(
+        merged, n_modes=3, units="mm", min_feature_m=min_feature_m
+    )
+    plan = COMMON.region_plan(parts, materials, h_base, "mm")
+    assert plan[0]["edge_units"] == pytest.approx(h_base, rel=1e-12), (
+        "equal indices must leave h_min at h, or this test is not comparing "
+        "like with like"
+    )
+
+    _p_multi, tets_multi, region_of_tet = MESHSOLVER.tetrahedralize(
+        merged, "mm", n_modes=3, n_index=1.0, max_tets=500_000,
+        min_feature_m=min_feature_m, verbose=False,
+        materials=materials, parts=parts,
+    )
+    _p_one, tets_one = MESHSOLVER.tetrahedralize(
+        merged, "mm", n_modes=3, n_index=1.0, max_tets=500_000,
+        min_feature_m=min_feature_m, verbose=False,
+    )[:2]
+
+    assert len(np.unique(region_of_tet)) == 2, (
+        "the region branch must still tag both parts even when their indices "
+        "are equal; otherwise the mesh is right and the materials are lost"
+    )
+    assert tets_multi.shape[0] == tets_one.shape[0], (
+        f"equal indices gave {tets_multi.shape[0]:,} tets through the region "
+        f"branch and {tets_one.shape[0]:,} through the one-part branch; with "
+        f"h_min = h and one material these are the same mesh"
+    )
+
+
+def test_the_dense_core_upload_routes_on_the_real_mesh_not_the_estimate(tmp_path):
+    """The lead's acceptance test 2: {wall 2.0, core 3.5} through the REAL upload.
+
+    The estimate is what routes, so this test does not compare the estimate to
+    itself. It takes the job the app actually created -- its ``est_tets`` and its
+    ``target`` -- and puts the DECISION next to the count a real TetGen returns
+    for the same upload:
+
+      * if the app sent it to the Jetson, a real mesh must fit the GPU's range
+        (below the absolute cap), or the route sent it somewhere it cannot run;
+      * if the app refused it, the real mesh must genuinely exceed the cap --
+        the refusal has to be about a mesh that exists, not about an estimate
+        nobody confirmed.
+
+    The pair is chosen so h_min = h * 2/3.5 moves the estimate across the 15k
+    GPU threshold: a job that the OLD model (wall edge only) would have called
+    small. The discriminator is that the app's ``target`` is the GPU, which only
+    happens because the core's index lowered h_min.
+    """
+    import trimesh
+
+    wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
+    core = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    data = trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8")
+
+    app, store, jobs_db, launcher = _make(tmp_path)
+    payload = {
+        "meshfile": (io.BytesIO(data), "nested.obj"),
+        "units": "mm",
+        "n_index": "1.0",
+        "n_modes": "10",
+        "part_index.wall": "2.0",
+        "part_index.core": "3.5",
+    }
+    resp = app.test_client().post("/", data=payload,
+                                  content_type="multipart/form-data")
+    assert resp.status_code == 302, (
+        "the upload must be accepted; a redirect means the form validation "
+        "passed, which is itself part of what this test checks"
+    )
+    assert jobs_db.jobs, (
+        "the upload created no job, so it was refused -- the flash said why; "
+        "this test needs an ACCEPTED upload to compare a route against a mesh"
+    )
+    (job,) = jobs_db.jobs.values()
+
+    # The upload REALLY carried the materials: a job with no materials table
+    # would route through the one-part branch and this test would prove nothing.
+    assert job.get("materials") == {"wall": 2.0, "core": 3.5}, (
+        f"the job carried materials {job.get('materials')!r}, not the two "
+        f"indices the form posted -- the multi-part branch did not run"
+    )
+
+    # The real mesh, at the same settings the upload used.
+    parts, merged = _nested_parts()
+    points, tets, region_of_tet = MESHSOLVER.tetrahedralize(
+        merged, "mm", n_modes=10, n_index=1.0, max_tets=CFG.max_tets(),
+        verbose=False, materials={"wall": 2.0, "core": 3.5}, parts=parts,
+    )
+    real = int(tets.shape[0])
+    assert len(np.unique(region_of_tet)) == 2
+
+    if job["target"] == DB.JETSON:
+        # ROUTED TO THE GPU: the real mesh must fit the GPU's range.
+        assert real <= CFG.max_tets(), (
+            f"the app sent this to the Jetson on est={job['est_tets']:,} but the "
+            f"real mesh is {real:,} elements, over the {CFG.max_tets():,} cap "
+            f"the GPU enforces -- the route sent it where it cannot run"
+        )
+        assert job["est_tets"] >= CFG.gpu_min_tets(), (
+            "a Jetson target below the GPU threshold is not a route this code "
+            "can produce, so the assertion above is about nothing"
+        )
+    elif job["target"] == DB.CLUSTER:
+        # ROUTED TO THE CPU: only correct if the real mesh genuinely fits there,
+        # because a dense core sent to the cluster dies at the memory limit.
+        assert real <= CFG.cpu_max_tets(), (
+            f"the app sent this to the cluster on est={job['est_tets']:,} but "
+            f"the real mesh is {real:,} elements, over the CPU's "
+            f"{CFG.cpu_max_tets():,} -- this is the dense-core-to-the-CPU "
+            f"failure the multi-part estimate exists to prevent"
+        )
+    else:  # pragma: no cover - refusal path is asserted separately below
+        raise AssertionError(f"unexpected target {job['target']!r}")
+
+    # THE DISCRIMINATOR, on the decision itself: the core's n=3.5 is what moved
+    # this across the GPU threshold. With the WALL edge alone (the old model)
+    # the estimate would be the one-part number at h, which is below the
+    # threshold -- so a target of JETSON is only reachable via h_min.
+    one_part_est = MESH.estimate_tets(merged, 10, "mm")
+    assert job["est_tets"] > one_part_est, (
+        f"the multi-part estimate ({job['est_tets']:,}) is not above the "
+        f"one-part one ({one_part_est:,}); the core's index did not move the "
+        f"edge, so this upload would have routed the same under the old model "
+        f"and the test proves nothing about the new one"
+    )
+
+
+def test_a_dense_core_upload_too_big_is_refused_on_the_real_mesh(tmp_path):
+    """The other half of test 2: a refusal must be about a mesh that exists.
+
+    The refusal threshold is TWICE the cap, so a refused upload must produce a
+    real mesh that genuinely exceeds the cap. This test drives the REAL route
+    with a coefficient raised to force the refusal, then builds the real mesh
+    and shows it is over -- the refusal is not an estimate refusing itself.
+    """
+    import os
+
+    import trimesh
+
+    # The coefficient goes through the ENVIRONMENT, because that is where
+    # ``CFG.est_tets_c()`` reads it: an ``app.config`` key is silently ignored
+    # and the upload is accepted, which is how the first version of this test
+    # failed -- a green-looking refusal test that refused nothing.
+    os.environ["MSE_EST_TETS_C"] = "100000"
+    try:
+        wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
+        core = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+        data = trimesh.Scene({"wall": wall, "core": core}).export(
+            file_type="obj").encode("utf-8")
+        app, store, jobs_db, launcher = _make(tmp_path)
+        resp = app.test_client().post("/", data={
+            "meshfile": (io.BytesIO(data), "nested.obj"),
+            "units": "mm",
+            "n_index": "1.0",
+            "n_modes": "10",
+            "part_index.wall": "2.0",
+            "part_index.core": "3.5",
+        }, content_type="multipart/form-data")
+        assert resp.status_code == 302
+        assert not jobs_db.jobs, (
+            "a refused upload must create no job at all -- otherwise it is "
+            "queued for a machine that cannot run it"
+        )
+    finally:
+        os.environ.pop("MSE_EST_TETS_C", None)
+
+    # AND THE REAL MESH, at the same settings, is genuinely large. The point is
+    # not that it exceeds the (raised-coefficient) threshold -- that is
+    # arithmetic -- but that a real TetraGen mesh of this upload exists and has
+    # a definite size, so the refusal is about a real object.
+    parts, merged = _nested_parts()
+    _p, tets, _r = MESHSOLVER.tetrahedralize(
+        merged, "mm", n_modes=3, n_index=1.0, max_tets=2_000_000,
+        verbose=False, materials={"wall": 2.0, "core": 3.5}, parts=parts,
+    )
+    assert int(tets.shape[0]) > 0, (
+        "the refused upload must still be a meshable object; a refusal on "
+        "something TetGen cannot mesh at all would be a different message"
+    )
+
+
+def test_meshing_at_the_walls_edge_leaves_the_dense_core_unresolved(monkeypatch):
+    """The lead's acceptance test 3: the MUTATION.
+
+    Mesh the whole cavity at the WALL's h instead of h_min -- i.e. drop the
+    ``n_wall / n_max`` factor from ``region_edges`` -- and test 1's
+    core-resolution assertion must go red, by name.
+
+    This is the mutation that separates (i) from (i'): (i) meshed at the wall's
+    edge and is exactly this. If the mutation does NOT redden the matrix's
+    assertion, then that assertion is not testing the uniform rule and the whole
+    of test 1 is decoration.
+
+    The mutation is applied to ``region_edges`` itself, so it moves the EDGE the
+    mesher is handed -- not a copy in the test.
+    """
+    import mse_common as COMMON
+
+    parts, merged = _nested_parts()
+    min_feature_m = 9.0e-4
+    us = MESHSOLVER.unit_scale("mm")
+    h_base = MESHSOLVER.effective_edge_m(
+        merged, n_modes=3, units="mm", min_feature_m=min_feature_m
+    )
+
+    # THE ANCHOR: prove the mutation is applied before believing the red.
+    original = COMMON.region_edges
+
+    def wall_edge_only(h, n_wall, materials, parts_):
+        # The mutation: every region at the wall's edge, no n_wall/n_max factor.
+        return {int(r): float(h) for r in
+                parts_.region_materials(materials)}
+
+    # Apply it where region_plan reads it -- mse_common's own module global.
+    monkeypatch.setattr(COMMON, "region_edges", wall_edge_only)
+    assert COMMON.region_edges is wall_edge_only, (
+        "the mutation did not take: region_plan would still call the original"
+    )
+
+    n_wall, n_core = 2.0, 3.5
+    materials = {"wall": n_wall, "core": n_core}
+
+    # Under the mutation the planned edge is h, not h*2/3.5.
+    mutated_h_min = COMMON.region_plan(parts, materials, h_base, "mm")[0]["edge_units"]
+    assert mutated_h_min == pytest.approx(h_base, rel=1e-12), (
+        f"the mutation must leave the edge at the wall's h={h_base:.4f}, got "
+        f"{mutated_h_min:.4f}"
+    )
+    true_h_min = h_base * n_wall / n_core
+    assert mutated_h_min > true_h_min * 1.5, (
+        "the mutated edge is not coarser than the true h_min, so the mutation "
+        "is not (i) and this test is not testing the discrimination between "
+        "them"
+    )
+
+    points, tets, region_of_tet = MESHSOLVER.tetrahedralize(
+        merged, "mm", n_modes=3, n_index=1.0, max_tets=500_000,
+        min_feature_m=min_feature_m, verbose=False,
+        materials=materials, parts=parts,
+    )
+    med = _region_median_edges(points, tets, region_of_tet)
+    achieved_core = med[1][0]
+    h_core_required_m = h_base * n_wall / n_core
+
+    # THE ASSERTION THAT MUST REDDEN -- the same predicate as test 1, on the
+    # same quantity. It is written as an explicit ``not`` so the failure names
+    # the mutation rather than reading as a generic assertion error.
+    assert not (achieved_core <= h_core_required_m * MESHSOLVER.MAX_EDGE_OVERSHOOT), (
+        f"the mutation did NOT redden the core-resolution assertion: with the "
+        f"edge clamped to the wall's h={mutated_h_min * 1e3:.4f} mm, the core's "
+        f"median edge is {achieved_core * 1e3:.4f} mm, which still satisfies the "
+        f"required {h_core_required_m * 1e3:.4f} mm -- so test 1's assertion "
+        f"does not discriminate the uniform rule from meshing at the wall"
+    )
+
+
+def _nested_parts_in(units, size_units):
+    """The SAME physical object as ``_nested_parts``, written in ``units``.
+
+    ``size_units`` is the object's size expressed in ``units``, so that every
+    call describes one object: a 6x6x6 mm box is 0.6x0.6x0.6 cm and
+    0.006x0.006x0.006 m. That is the whole point -- the estimate must not care
+    which spelling it is handed.
+    """
+    import trimesh
+
+    import mse_parts as PARTS
+
+    wall = trimesh.creation.box(extents=(size_units, size_units, size_units))
+    core = trimesh.creation.box(
+        extents=(size_units / 3.0, size_units / 3.0, size_units / 3.0))
+    obj = trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8")
+    parts = PARTS.load_parts(obj, units=units)
+    return parts, PARTS.merged_surface(parts)
+
+
+def test_the_multipart_estimate_is_invariant_to_the_upload_units():
+    """GATE (a): ONE physical object, six spellings, one estimate.
+
+    This is the defect this test exists for. ``region_plan`` called
+    ``PartSet.filled_volume_m3(part_index)`` without ``units``, so every
+    multi-part upload's volume was converted as if written in millimetres while
+    ``h_min`` beside it stayed true metres. The estimate was then wrong by the
+    cube of the unit ratio -- measured through the real upload on one physical
+    object: mm 51,187 (GPU), in 3 (cluster, 17,000x UNDER), um 5.1e13 and
+    nm 5.1e19 (refused).
+
+    Note the TWO directions of failure, which is why this needs a sweep and not
+    one check: for a LARGER unit (m, in) the estimate collapses and a job the
+    GPU should run is routed to the cluster, where it dies at the memory limit;
+    for a SMALLER unit (um, nm) it explodes and the upload is REFUSED. The old
+    test suite was green through all of it because every fixture was in mm --
+    the default WAS the bug, so nothing that used the default could see it.
+
+    The one-part path is checked beside it: it threaded units already, so it is
+    the control that proves invariance is achievable on this fixture rather
+    than being a property the assertion cannot have.
+    """
+    mm_size = 6.0
+    cases = {
+        "m": mm_size * 1e-3,
+        "cm": mm_size * 1e-2,
+        "mm": mm_size,
+        "um": mm_size * 1e3,
+        "nm": mm_size * 1e6,
+        "in": mm_size / 25.4,
+    }
+
+    multi = {}
+    one_part = {}
+    for units, size in cases.items():
+        parts, merged = _nested_parts_in(units, size)
+        materials = {"wall": 1.0, "core": 2.0}
+        edge = COMMON.effective_edge_m(merged, n_modes=10, units=units,
+                                       parts=parts, materials=materials)
+        multi[units] = COMMON.estimate_tets_by_region(
+            parts, materials, edge, merged, units, MESH.EST_TETS_C)
+        one_part[units] = MESH.estimate_tets(
+            merged, n_modes=10, units=units, c=MESH.EST_TETS_C)
+
+    base = multi["mm"]
+    for units, value in multi.items():
+        assert value == pytest.approx(base, rel=1e-9), (
+            f"the MULTI-part estimate for one physical object depends on the "
+            f"unit it was written in: {units} gives {value:,} where mm gives "
+            f"{base:,} (ratio {value / max(base, 1):.4g}). The volume and the "
+            f"edge are in different length spaces somewhere on this path."
+        )
+
+    base_one = one_part["mm"]
+    for units, value in one_part.items():
+        assert value == pytest.approx(base_one, rel=1e-9), (
+            f"the ONE-part estimate is not invariant either: {units} gives "
+            f"{value:,} vs mm {base_one:,}. This path threaded units already, "
+            f"so a failure here means the regression is not the one this test "
+            f"was written for."
+        )
+
+    # The estimate must also be non-degenerate: an invariance test is satisfied
+    # by a constant, and a constant of 0 would route every job to the GPU.
+    assert base > 1_000, (
+        f"the multi-part estimate is {base:,}, which is too small to be a real "
+        f"count -- a sweep that returns a constant would pass the invariance "
+        f"assertions above for the wrong reason."
+    )
+
+
+def test_the_multipart_estimate_mutation_reddens_the_invariance_test():
+    """GATE (c): drop ``units`` again and the invariance test must REDDEN.
+
+    A mutation must be confirmed to APPLY before a green suite means anything,
+    and it must redden the RIGHT test by name. Here the mutation restores the
+    exact defect -- ``filled_volume_m3`` called without its unit -- so the
+    assertion is not "a test failed" but "the test that exists for this failed".
+    """
+    import mse_parts as PARTS
+
+    original = PARTS.PartSet.filled_volume_m3
+
+    def drop_units(self, part_index, units):
+        return original(self, part_index, "mm")
+
+    PARTS.PartSet.filled_volume_m3 = drop_units
+    try:
+        with pytest.raises(AssertionError) as excinfo:
+            test_the_multipart_estimate_is_invariant_to_the_upload_units()
+    finally:
+        PARTS.PartSet.filled_volume_m3 = original
+
+    assert "depends on the unit it was written in" in str(excinfo.value), (
+        f"the mutation reddened something, but not the unit-invariance "
+        f"assertion: {excinfo.value}"
+    )
+    assert "in" in str(excinfo.value) or "nm" in str(excinfo.value), (
+        f"the mutation reddened, but not on a NON-mm unit -- which would mean "
+        f"the fixture is not actually exercising the default: {excinfo.value}"
+    )
+
+
+def test_a_nanometre_multipart_upload_is_not_refused_by_a_unit_bug(tmp_path):
+    """GATE (b): the REAL route, a non-mm multi-part upload.
+
+    The defaulted unit in ``filled_volume_m3`` made a small unit's volume
+    explode: the same physical object measured as if in mm reads a volume
+    1e9x (nm) or 1e18x (nm^3) too large, so the estimate crossed the refusal
+    threshold and the owner was told their model was too detailed -- for a
+    model that meshes to a few thousand elements.
+
+    The upload is the SAME PHYSICAL OBJECT as the mm case, written in nm: a
+    6 mm box is 6,000,000 nm across. What makes this a real test rather than a
+    restatement is that the assertion is on the ROUTE the app took, and the
+    mesh is built from the same bytes the app saw.
+
+    Named for the nanometre case because that is the failure the owner would
+    have hit -- "too detailed" for a tiny object -- but the sweep in the
+    invariance test is what covers every unit.
+    """
+    import trimesh
+
+    # 6 mm expressed in nm.
+    size_nm = 6.0e6
+    wall = trimesh.creation.box(extents=(size_nm, size_nm, size_nm))
+    core = trimesh.creation.box(extents=(size_nm / 3.0, size_nm / 3.0,
+                                         size_nm / 3.0))
+    data = trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8")
+
+    app, store, jobs_db, launcher = _make(tmp_path)
+    payload = {
+        "meshfile": (io.BytesIO(data), "nested_nm.obj"),
+        "units": "nm",
+        "n_index": "1.0",
+        "n_modes": "10",
+        "part_index.wall": "1.0",
+        "part_index.core": "2.0",
+    }
+    resp = app.test_client().post("/", data=payload,
+                                  content_type="multipart/form-data")
+    assert resp.status_code == 302, (
+        "the upload must be ACCEPTED -- it is the same physical object as the "
+        "mm case, which routes fine. A refusal here is the unit bug: the "
+        "volume was converted as if the upload were in mm."
+    )
+    assert jobs_db.jobs, (
+        "the nm upload created no job, so it was refused. The flash message "
+        "would say 'too detailed'; the real mesh is a few thousand elements."
+    )
+    (job,) = jobs_db.jobs.values()
+    assert job.get("units") == "nm", (
+        f"the job's units are {job.get('units')!r}, not nm -- the route is not "
+        f"testing what this test says it is"
+    )
+
+    # And the estimate must be the SAME as the mm case's, because it is the
+    # same object. Computed here from the app's own stored value rather than
+    # re-derived, so a drift between the two paths is visible.
+    parts_mm, merged_mm = _nested_parts()
+    edge_mm = COMMON.effective_edge_m(
+        merged_mm, n_modes=10, units="mm",
+        parts=parts_mm, materials={"wall": 1.0, "core": 2.0})
+    est_mm = COMMON.estimate_tets_by_region(
+        parts_mm, {"wall": 1.0, "core": 2.0}, edge_mm, merged_mm, "mm",
+        MESH.EST_TETS_C)
+
+    assert job["est_tets"] == pytest.approx(est_mm, rel=1e-6), (
+        f"the nm upload estimated {job['est_tets']:,} where the identical mm "
+        f"object estimated {est_mm:,} -- the estimate is unit-dependent, which "
+        f"is the defect this test is for."
+    )

@@ -293,7 +293,7 @@ def main(argv=None) -> int:
     # -- production meshing path -----------------------------------------
     t0 = time.time()
     surface, _scale = MESH.load_surface(obj_bytes, units=args.units)
-    points_m, tets = MESH.tetrahedralize(
+    points_m, tets, _ = MESH.tetrahedralize(
         surface, args.units, n_modes=args.n_modes, n_index=args.n_index,
         max_tets=args.max_tets, verbose=True,
         enforce_resolution=not (args.allow_coarse

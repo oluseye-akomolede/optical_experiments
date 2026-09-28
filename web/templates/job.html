@@ -40,6 +40,30 @@
     </p>
   {% endif %}
 
+  {# The material table, rendered from the STORED JSON -- the table the solve
+     actually used -- and deliberately not re-parsed from the upload. The two
+     can be told apart: the file on disk is the one the solver read, and a page
+     that re-derived the names could show a table the solver never saw while
+     every number on it looked right. Sorted by name for a stable order, since
+     JSON object order is not a contract. #}
+  {% if job.materials %}
+    <div id="materials">
+      <p class="muted small">
+        This cavity holds {{ job.materials|length }} materials, each meshed to
+        its own resolution (a region's element target is divided by its index,
+        because the wavelength inside is shorter by that factor):
+      </p>
+      <table class="materials">
+        <thead><tr><th>Part</th><th>Refractive index</th></tr></thead>
+        <tbody>
+          {% for part, n in job.materials|dictsort %}
+            <tr><td>{{ part }}</td><td>{{ '%g'|format(n) }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+
   {# Where this job runs. Shown from the ROUTING DECISION the app made at upload,
      not inferred from the status: "queued for the GPU" and "running on the GPU"
      are different things to wait for, and the owner should be able to tell a job

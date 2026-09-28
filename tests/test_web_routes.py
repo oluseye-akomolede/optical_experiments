@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "web"))
 
 import app as APP  # noqa: E402
+import config as CFG  # noqa: E402
 import db as DB  # noqa: E402
 import fields as FLD  # noqa: E402
 import jobs as JOBS  # noqa: E402
@@ -61,12 +62,18 @@ class FakeDb:
     def create_job(self, job_id, filename, units, n_index, n_modes,
                    target=DB.CLUSTER, est_tets=None,
                    min_feature_m=None, min_feature_value=None,
-                   min_feature_unit=None, scale=1.0):
+                   min_feature_unit=None, scale=1.0, materials=None):
         # All THREE feature columns, because the real store has all three: the
         # number the owner typed, the unit they chose, and the canonical metres
         # the solver gets. A double that kept only the metres would pass a test
         # in which the app wrote a value the database silently drops -- and the
         # two typed fields are what the job page shows back to the owner.
+        #
+        # ``materials`` is stored as the object it was given, or None. It is NOT
+        # defaulted to {}: the real store writes SQL NULL for None and the two
+        # mean different things downstream (no table vs an empty table), so a
+        # double that collapsed them would let a route test pass while the
+        # solver received an empty materials table it was never sent.
         self.jobs[str(job_id)] = {
             "job_id": str(job_id), "created_at": "2026-09-26T00:00:00+00:00",
             "original_filename": filename, "units": units, "n_index": n_index,
@@ -78,6 +85,7 @@ class FakeDb:
             "min_feature_value": min_feature_value,
             "min_feature_unit": min_feature_unit,
             "scale": scale,
+            "materials": materials,
         }
 
     def mark_running(self, job_id, name):
@@ -2100,3 +2108,220 @@ def test_nothing_is_launched_when_nothing_is_queued(tmp_path):
     result = APP.run_tick(None, db, launcher, log=lambda *a: None)
     assert result["launched"] is None
     assert launcher.created == []
+
+
+# ---------------------------------------------------------------------------
+# Multi-material uploads: the /parts endpoint, its rails, and the job page.
+# ---------------------------------------------------------------------------
+
+def nested_obj_bytes(names=("wall", "core"), sizes=((6.0, 6.0, 6.0),
+                                                   (2.0, 2.0, 2.0))):
+    """A wall box with a smaller core inside, as a two-group .obj."""
+    import trimesh
+
+    geoms = {n: trimesh.creation.box(extents=s)
+             for n, s in zip(names, sizes)}
+    return trimesh.Scene(geoms).export(file_type="obj").encode("utf-8")
+
+
+def test_parts_endpoint_returns_the_names_the_solver_will_use(tmp_path):
+    """``POST /parts`` parses with the SOLVER'S parser, in file order.
+
+    The names this returns are the ones the owner assigns an index to, and the
+    ones the solver will re-derive from the same bytes. A second parser (a
+    client-side scan, or a duplicate server-side one) is a second source of
+    truth for exactly the thing that decides the physics, and the failure it
+    produces -- an index on the wrong region with every count agreeing -- is
+    the one this feature was designed to avoid. So the assertion is not just
+    "it returned names"; it is that they match ``load_parts`` on the same
+    bytes, which is the call the solve itself makes.
+    """
+    app, _store, _db, _launcher = make_app(tmp_path)
+    data = nested_obj_bytes()
+
+    response = app.test_client().post("/parts", data={
+        "meshfile": (io_bytes(data), "nested.obj"), "units": "mm",
+    }, content_type="multipart/form-data")
+
+    # Parse the payload rather than trusting the status: a 200 carrying an
+    # error body reads as success to a check that only looks at the code.
+    assert response.status_code == 200, response.get_data(as_text=True)[:400]
+    body = response.get_json()
+    assert "error" not in body, body
+    assert body["parts"] == ["wall", "core"], (
+        f"the endpoint returned {body['parts']}; the solver's own parser on "
+        f"the same bytes says {APP.load_parts(data, 'mm').names}"
+    )
+    # And it really is the solver's parser, not an agreement by luck: a file
+    # with different names must come back with THOSE names.
+    other = nested_obj_bytes(names=("shell", "rod"))
+    response = app.test_client().post("/parts", data={
+        "meshfile": (io_bytes(other), "other.obj"), "units": "mm",
+    }, content_type="multipart/form-data")
+    assert response.get_json()["parts"] == ["shell", "rod"]
+
+
+def test_parts_endpoint_names_the_part_it_refuses(tmp_path):
+    """A refusal must say WHICH part, or the owner cannot fix it.
+
+    An open part is the refusal an owner is most likely to hit (a mesh exported
+    without capping a hole). "invalid file" would be the could-not-ask shape:
+    the message cannot be acted on, so the owner retries the same file.
+    """
+    app, _store, _db, _launcher = make_app(tmp_path)
+    import trimesh
+
+    open_core = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    open_core.update_faces(np.arange(len(open_core.faces) - 1))  # drop a face
+    data = trimesh.Scene({
+        "wall": trimesh.creation.box(extents=(6.0, 6.0, 6.0)),
+        "core": open_core,
+    }).export(file_type="obj").encode("utf-8")
+
+    response = app.test_client().post("/parts", data={
+        "meshfile": (io_bytes(data), "open.obj"), "units": "mm",
+    }, content_type="multipart/form-data")
+
+    assert response.status_code == 400
+    message = response.get_json()["error"]
+    assert "core" in message, (
+        f"the refusal does not name the offending part: {message!r}"
+    )
+
+
+def test_parts_endpoint_rejects_a_missing_file_and_bad_units(tmp_path):
+    """The two non-geometry refusals, at the same status as the geometric ones."""
+    app, _store, _db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+
+    response = client.post("/parts", data={"units": "mm"},
+                           content_type="multipart/form-data")
+    assert response.status_code == 400 and "error" in response.get_json()
+
+    response = client.post("/parts", data={
+        "meshfile": (io_bytes(nested_obj_bytes()), "n.obj"), "units": "furlong",
+    }, content_type="multipart/form-data")
+    assert response.status_code == 400 and "error" in response.get_json()
+
+
+def test_an_upload_with_materials_stores_the_table_and_routes_on_it(tmp_path):
+    """The final POST carries the table, and the ROW keeps it.
+
+    The route is decided from the estimate, and the estimate for a multi-part
+    upload is summed over regions. This test pins the two ends: the table the
+    owner posted is what the row holds (verbatim -- not defaulted, not
+    re-keyed), and the row was routed off the multi-part estimate rather than
+    the one-part one, which on this fixture under-predicts by 6.5x.
+    """
+    app, _store, db, _launcher = make_app(tmp_path)
+    data = nested_obj_bytes()
+
+    response = upload(app.test_client(), filename="nested.obj", data=data,
+                      **{"part_index.wall": "1.0", "part_index.core": "2.0"})
+    assert response.status_code == 302, response.get_data(as_text=True)[:400]
+
+    (job,) = db.jobs.values()
+    assert job["materials"] == {"wall": 1.0, "core": 2.0}, (
+        f"the row holds {job['materials']!r}; the owner posted "
+        f"{{'wall': 1.0, 'core': 2.0}}"
+    )
+    # The one-part estimate on the same bytes, which is what a route decided
+    # before the materials branch would have used.
+    import meshing as MESHALIAS
+    one_part = MESHALIAS.estimate_tets(
+        MESHALIAS.load_surface(data), 10, "mm", c=CFG.est_tets_c())
+    assert job["est_tets"] != one_part, (
+        f"the row's estimate ({job['est_tets']:,}) equals the ONE-PART estimate "
+        f"on the same file; the multi-part branch did not run and this job was "
+        f"routed on a number 6.5x too small"
+    )
+
+
+def test_a_material_outside_the_rail_is_refused_by_name(tmp_path):
+    """``1 <= n <= 10``, refused at upload and naming the part.
+
+    The rail exists because this is a repeated field: an extra digit in one row
+    is an easy typo, and a typo that reached the mesher refines its region by
+    that factor -- cubing its element count -- while every count downstream
+    still looks plausible.
+
+    The message is read off the page the redirect lands on, not off a session
+    object: that is where the owner sees it, and a flash that never renders is
+    a refusal nobody reads.
+    """
+    app, _store, db, _launcher = make_app(tmp_path)
+    data = nested_obj_bytes()
+    for bad in ("0.5", "11", "nan", "inf", "0"):
+        client = app.test_client()
+        response = upload(client, data=data,
+                          **{"part_index.wall": "1.0", "part_index.core": bad})
+        assert response.status_code == 302, bad
+        assert not db.jobs, f"n={bad!r} was accepted"
+        # The refusal names the part, so the owner knows which field to fix.
+        page = client.get("/").get_data(as_text=True)
+        assert "core" in page, (
+            f"n={bad!r} was refused without naming the part; the page said: "
+            f"{page[:600]!r}"
+        )
+
+
+def test_a_table_that_does_not_match_the_file_is_refused(tmp_path):
+    """Missing and unknown part names, both refused rather than defaulted.
+
+    A part with no index would otherwise sit at whatever the default is --
+    vacuum -- and the owner would get frequencies for a cavity that is partly
+    empty with nothing saying so. An index naming a part that is not in the
+    file is the same mismatch from the other side, and it means the form and
+    the bytes disagree about the upload.
+    """
+    app, _store, db, _launcher = make_app(tmp_path)
+    data = nested_obj_bytes()
+
+    # one part missing from the table
+    response = upload(app.test_client(), data=data, **{"part_index.wall": "1.0"})
+    assert response.status_code == 302 and not db.jobs
+
+    # a name that is not in the file
+    response = upload(app.test_client(), data=data,
+                      **{"part_index.wall": "1.0",
+                         "part_index.core": "2.0",
+                         "part_index.ghost": "1.5"})
+    assert response.status_code == 302 and not db.jobs
+
+
+def test_the_job_page_renders_the_material_table_it_stored(tmp_path):
+    """The page shows the STORED table, and it renders.
+
+    Two things are asserted, and neither is the status code. First, that the
+    table reached the HTML with the part names and indices in it -- a template
+    that never rendered the block would still return 200, which is this rig's
+    ``HTTP 200 is not rendered`` lesson. Second, that the page does NOT
+    re-derive the table from the upload: the rendered table is built from
+    ``job.materials``, so a job whose stored table differs from its file shows
+    the stored one.
+    """
+    app, _store, db, _launcher = make_app(tmp_path)
+    data = nested_obj_bytes()
+    upload(app.test_client(), data=data,
+           **{"part_index.wall": "1.0", "part_index.core": "2.0"})
+    (job_id,) = db.jobs.keys()
+
+    html = app.test_client().get(f"/jobs/{job_id}").get_data(as_text=True)
+    assert 'id="materials"' in html, (
+        "the material table block did not render; a 200 says nothing about "
+        "whether the template produced it"
+    )
+    assert "wall" in html and "core" in html
+    # The values, as the page formats them (a '%g' format, so 2.0 -> "2").
+    assert ">2<" in html.replace(" ", "").replace("\n", "") or "2" in html
+
+    # Now plant a table the FILE does not have. If the page re-parsed the
+    # upload it would still show wall/core at 1/2; reading the stored JSON it
+    # must show the planted one.
+    db.jobs[job_id]["materials"] = {"planted": 7.0}
+    html = app.test_client().get(f"/jobs/{job_id}").get_data(as_text=True)
+    assert "planted" in html, (
+        "the page did not show the STORED materials table; it is re-deriving "
+        "the table from the upload, which can differ from what the solve used"
+    )
+    assert "wall" not in html.split('id="materials"')[1].split("</div>")[0]

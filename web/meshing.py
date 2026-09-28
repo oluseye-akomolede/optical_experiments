@@ -65,6 +65,26 @@ def validate_upload(filename: str, data: bytes, max_bytes: int) -> None:
     mesh.update_faces(mesh.unique_faces())
 
     if not mesh.is_watertight:
+        # A one-part file has no part NAME to give, so the message below
+        # describes the file. A multi-part one is different: the owner has to
+        # know WHICH part is open, and the check above cannot say -- it merges
+        # every geometry into one mesh (trimesh hands back the biggest) before
+        # looking. So ``parse_parts`` is tried first: it splits, then checks
+        # each part by name, and its message is used verbatim when it has one.
+        #
+        # This is not tidiness. An earlier version refused here for a two-part
+        # file with an open core, naming no part -- so the owner could not tell
+        # which of their two groups to fix. That is the could-not-ask shape: a
+        # refusal the owner cannot act on.
+        #
+        # Note what this does NOT do: it does not ask "how many parts are
+        # there?" and then act on the answer. Splitting is the only way to know,
+        # so the call IS the check, and asking the same question twice bought
+        # nothing but a place to lose the answer.
+        try:
+            parse_parts(data, "mm")
+        except UploadError as exc:
+            raise exc
         raise UploadError(
             "This object is not a closed surface (it has holes or open edges). "
             "The solver treats your object as a cavity, so it must be sealed. "
@@ -205,7 +225,8 @@ def effective_edge_mm(surface, n_modes: int, units: str,
 
 def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
                   min_feature_m: float | None = None,
-                  scale: float = 1.0) -> int:
+                  scale: float = 1.0,
+                  parts=None, materials: dict | None = None) -> int:
     """Predicted element count for meshing ``surface`` at ``n_modes``.
 
     Returns 0 when the surface is unusable, which the caller reads as "do not
@@ -219,6 +240,23 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
     so a scaled object and a finer target edge both move the count hard -- a
     feature-driven refinement of 2x is 8x the elements, which is exactly the
     difference between the cluster and the GPU queue.
+
+    ``parts``/``materials`` are a MULTI-PART upload (a validated
+    ``PartSet`` and its name -> n table), and are ``None`` for the one-part
+    upload that this function has always handled. With them the answer is the
+    ONE-PART FORMULA at ``h_min``, the finest region edge, on the cavity's total
+    FILLED volume -- because that is the mesh the solver now builds (every
+    region at one edge; see ``mse_common.region_edges``). The count is what
+    ROUTES the job, so the estimate and the mesh must be the same expression:
+    using the wall's edge alone would under-predict a job with a dense core and
+    send it to the GPU to die, which is what this branch exists to prevent.
+
+    NOTE ON THE CALLER: ``web/app.py``'s upload route parses the
+    ``part_index.<name>`` fields and passes ``parts``/``materials`` in, so this
+    branch is on the real upload path -- a two-part mm upload with a dense core
+    is routed by it (``test_the_dense_core_upload_routes_on_the_real_mesh_not_the_estimate``
+    drives the route and compares the app's decision against the mesh TetGen
+    really builds).
 
     The edge comes from ``mse_common.effective_edge_m``, in METRES, on the
     SCALED surface -- one length space, one comparison, shared with the solver.
@@ -235,6 +273,29 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
         COMMON = _common_module()
 
         surface = COMMON.apply_scale(surface, scale)
+        coefficient = EST_TETS_C if c is None else float(c)
+        if materials and parts is not None and getattr(parts, "is_multi", False):
+            # MULTI-PART: the ONE-PART formula, on the whole cavity, at h_min
+            # (the finest region edge). The mesh is built uniformly at h_min, so
+            # this is exactly the expression the mesher realises -- and it shares
+            # the one-part calibration constant, so there is no second fit and no
+            # second formula that could drift from the first.
+            #
+            # ``filled_volume_m3`` per region is still what is summed, because
+            # the wall's ENCLOSED volume double-counts everything nested in it
+            # and the count is what ROUTES the job.
+            #
+            # The edge is the SAME ``effective_edge_m`` the mesher calls, so the
+            # base the two work from cannot differ; the helper resolves h_min
+            # from the shared region plan.
+            edge_units = COMMON.effective_edge_m(
+                surface, n_modes=n_modes, units=units,
+                min_feature_m=min_feature_m, parts=parts, materials=materials,
+            )
+            return COMMON.estimate_tets_by_region(
+                parts, materials, edge_units, surface, units, coefficient
+            )
+
         volume_m3 = COMMON.enclosure_volume_m3(surface, units)
         edge_m = COMMON.effective_edge_m(
             surface, n_modes=n_modes, units=units, min_feature_m=min_feature_m,
@@ -246,5 +307,54 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
         return 0
     if not np.isfinite(edge_m) or edge_m <= 0:
         return 0
-    coefficient = EST_TETS_C if c is None else float(c)
     return int(coefficient * volume_m3 / (edge_m ** 3))
+
+
+# --------------------------------------------------------------------------
+# Part parsing for the upload form -- ONE parser, used by both POSTs
+# --------------------------------------------------------------------------
+#
+# The form asks the owner to assign a refractive index per part name. The names
+# have to come from somewhere, and they must be the SAME names the solver will
+# derive from the same bytes -- otherwise the owner assigns "core" an index and
+# it lands on a region called something else, with every count still agreeing.
+#
+# So this is the solver's own parser, exposed. A client-side scan of the .obj
+# in JavaScript would be a second source of truth for exactly the thing that
+# decides the physics, and the two would drift the first time either changed.
+
+def parse_parts(data: bytes, units: str) -> list[str]:
+    """The part NAMES ``data`` will solve as, in file order.
+
+    Raises ``UploadError`` with the solver's own message when the file cannot be
+    split -- an open part, two parts that touch, duplicate group names, or a
+    name/part count mismatch. This is the same call the solver makes, so every
+    refusal the owner sees here is a refusal they would otherwise have met as a
+    failed job minutes later.
+
+    ``units`` is not used by the split (names do not depend on it) and is taken
+    for signature symmetry with the other parse helpers.
+    """
+    import mse_parts as PARTS
+
+    return list(load_parts(data, units).names)
+
+
+def load_parts(data: bytes, units: str):
+    """The validated ``PartSet`` for ``data`` -- the solver's own parser.
+
+    ``parse_parts`` takes the names from this and the upload route takes the
+    PartSet, so BOTH POSTs and the final solve are looking at one split of one
+    file. A second call site that re-split the bytes would be a second source of
+    truth for which region gets which material, and the failure it produces --
+    an index applied to the wrong region with every count agreeing -- is exactly
+    what naming parts by NAME rather than by index was meant to prevent.
+    """
+    import mse_parts as PARTS
+
+    try:
+        return PARTS.load_parts(data, units=units)
+    except UploadError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - every failure is the same here
+        raise UploadError(str(exc)) from exc

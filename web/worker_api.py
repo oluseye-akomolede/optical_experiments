@@ -191,6 +191,19 @@ def _register_routes():
             # not a value, so it stays JSON null.
             "min_feature_m": job.get("min_feature_m"),
             "scale": float(job.get("scale") or 1.0),
+            # The part-name -> n table, or JSON null for a one-part vacuum
+            # upload. Sent on EVERY claim, key present either way: a key that is
+            # only sometimes there forces every reader to spell "absent" and
+            # "null" the same way, and the two are not the same statement here
+            # -- null means the row has no materials table, and a worker that
+            # treated a missing key as null would silently solve the wrong
+            # problem if the app ever stopped sending it.
+            #
+            # It is NOT stringified. The worker hands this straight to the
+            # solver's materials argument, so a JSON string here would be a
+            # second encoding for the same data that only one of the two ends
+            # knows about.
+            "materials": job.get("materials"),
             # The element caps travel with the job. They are properties of the
             # MACHINES, not of this upload, but a worker that knows only the
             # row cannot learn them: it has no cluster access and no reason to

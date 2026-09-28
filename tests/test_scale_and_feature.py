@@ -715,7 +715,7 @@ def test_the_mesh_cap_is_a_limit_not_a_target(monkeypatch):
     # 1. The cap is a LIMIT: a mesh that fits it is returned as-is, and one
     #    attempt is all it takes. The fake's default law reports 6 elements
     #    whatever ``maxvolume`` is, so 6 is exactly at the boundary.
-    points, tets = mesh(None, max_tets=6)
+    points, tets, _ = mesh(None, max_tets=6)
     assert tets.shape[0] == 6, (
         f"the mesher returned {tets.shape[0]} elements for a cap of 6")
     assert len(CapFlat.calls) == 1, (

@@ -52,6 +52,19 @@ DEFAULT_FEATURE_UNIT = "mm"
 MAX_SCALE = 1e9
 MIN_SCALE = 1e-9
 
+#: bounds on a per-part refractive index, for the multi-material upload.
+#:
+#: The same acceptance as ``n_index`` (finite, >= 1) except for the top, which
+#: ``n_index`` does not have: this is a form field repeated once per part, and
+#: an accidental extra digit in one row is a much easier mistake to make than in
+#: a single field. 10 is far above any real dielectric at these frequencies
+#: (silicon is 3.5, and the roadmap's materials are all below 4), so a value
+#: over it is a typo rather than an exotic material -- and a typo that reached
+#: the mesher would refine its region by that factor, cubing the element count.
+#: It is a rail, like MIN_SCALE, not a physical limit.
+MAX_MATERIAL_N = 10.0
+MIN_MATERIAL_N = 1.0
+
 #: how many modes the owner may ask for. A picklist, not a free field: the mode
 #: count is the single biggest lever on both the mesh size and the solve time
 #: (it sets the target edge length, and the element count goes like h^-3), so an

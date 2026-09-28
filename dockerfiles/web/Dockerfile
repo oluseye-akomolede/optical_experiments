@@ -30,6 +30,17 @@ COPY db/ /opt/mse/
 # nothing but a 20 KB file, and there is still exactly one definition of each
 # constant for both images to read.
 COPY dockerfiles/maxwell_solver/mse_common.py /opt/app/
+# The multi-part splitter, for the upload's own "which part is open?" refusal.
+# These two files are pure numpy (no trimesh, no manifold3d, no rtree -- measured
+# absent from this image) and mse_geometry imports only mse_common, so they cost
+# the web image nothing it does not already install. They belong here rather
+# than in mse_common because the splitter is 690 lines of geometry, and the same
+# rule as above applies: this image must never import the solver PACKAGE. A
+# web/meshing.py that imported mse_parts without this line would build, push,
+# and die at container start -- the dispatch crashloop, caught by
+# tests/test_web_imports.py before it ever shipped.
+COPY dockerfiles/maxwell_solver/mse_geometry.py /opt/app/
+COPY dockerfiles/maxwell_solver/mse_parts.py /opt/app/
 # The app adds this directory to sys.path for a checkout; in the image the
 # module is already here, so name it explicitly rather than relying on the
 # interpreter's default path.

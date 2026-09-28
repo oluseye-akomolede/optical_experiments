@@ -254,7 +254,7 @@ def test_the_guard_is_on_by_default(monkeypatch):
                             verbose=False, enforce_resolution=True)
 
     # explicit False: the deliberate escape hatch, and it says so on stdout
-    points, tets = MESH.tetrahedralize(FakeSurface(), "mm", n_modes=20,
+    points, tets, _ = MESH.tetrahedralize(FakeSurface(), "mm", n_modes=20,
                                        max_tets=10_000, verbose=False,
                                        enforce_resolution=False)
     assert tets.shape[0] == len(_CUBE_TETS)
@@ -272,7 +272,7 @@ def test_a_resolvable_mesh_is_accepted(monkeypatch):
     # target edge 1.0 x MAX_EDGE_OVERSHOOT (1.6) stays above the achieved 1.0
     monkeypatch.setattr(MESH, "target_edge_length", lambda *a, **k: 1.0)
 
-    points, tets = MESH.tetrahedralize(FakeSurface(), "mm", n_modes=20,
+    points, tets, _ = MESH.tetrahedralize(FakeSurface(), "mm", n_modes=20,
                                        max_tets=10_000, verbose=False)
     assert tets.shape[0] == 10 * len(_CUBE_TETS)
     assert points.shape[1] == 3
@@ -322,7 +322,7 @@ def test_the_guard_measures_in_one_space_at_scale_1000(monkeypatch):
         def copy(self):
             return ScaledSurface(extent=self.bounds[1][0])
 
-    points, tets = MESH.tetrahedralize(ScaledSurface(extent=scale), "mm",
+    points, tets, _ = MESH.tetrahedralize(ScaledSurface(extent=scale), "mm",
                                        n_modes=20, max_tets=10_000,
                                        verbose=False, scale=scale)
     assert points.shape[1] == 3
@@ -356,7 +356,7 @@ def test_allow_coarse_path_still_solves(monkeypatch):
     _install(monkeypatch, CoarseTetGen)
     monkeypatch.setattr(MESH, "target_edge_length", lambda *a, **k: 0.05)
 
-    points, tets = MESH.tetrahedralize(FakeSurface(), "mm", n_modes=20,
+    points, tets, _ = MESH.tetrahedralize(FakeSurface(), "mm", n_modes=20,
                                        max_tets=10_000, verbose=False,
                                        enforce_resolution=False)
     assert tets.shape[0] == len(_CUBE_TETS)
@@ -385,7 +385,7 @@ def test_cap_retry_lands_within_two_passes(monkeypatch):
     # ask for a tiny maxvolume to get ~100_000 tets
     monkeypatch.setattr(MESH, "target_maxvolume", lambda *a, **k: 0.01)
 
-    points, tets = MESH.tetrahedralize(FakeSurface(), "mm", n_modes=20,
+    points, tets, _ = MESH.tetrahedralize(FakeSurface(), "mm", n_modes=20,
                                        max_tets=cap, verbose=False)
     assert tets.shape[0] <= cap
     # the first call is the requested volume, the second is the jump: two passes
@@ -457,7 +457,7 @@ def test_a_responsive_retry_still_gets_its_passes(monkeypatch):
     monkeypatch.setattr(MESH, "target_edge_length", lambda *a, **k: 1.0)
     monkeypatch.setattr(MESH, "target_maxvolume", lambda *a, **k: 0.001)
 
-    points, tets = MESH.tetrahedralize(FakeSurface(), "mm", n_modes=20,
+    points, tets, _ = MESH.tetrahedralize(FakeSurface(), "mm", n_modes=20,
                                        max_tets=cap, verbose=False)
     assert tets.shape[0] <= cap
     # It iterated (rather than stopping after an unresponsive first pass) and
@@ -602,7 +602,7 @@ def _frame_of(monkeypatch, surface, units, **kw):
     # tetrahedralization without the accuracy gate -- the same one the bench's
     # ``--allow-coarse`` path uses.
     kw.setdefault("enforce_resolution", False)
-    points, tets = MESH.tetrahedralize(surface, units, n_modes=20,
+    points, tets, _ = MESH.tetrahedralize(surface, units, n_modes=20,
                                        max_tets=10_000, verbose=False, **kw)
     return seen, points, tets
 
@@ -710,7 +710,7 @@ def test_tetrahedralize_returns_zero_based_in_range_indices():
     is caught here, and neither is caught by comparing two raw tetgen arrays.
     """
     surface = trimesh.creation.box(extents=[4.0, 6.0, 3.0])   # metres
-    points, tets = MESH.tetrahedralize(surface, "m", n_modes=4, max_tets=5000,
+    points, tets, _ = MESH.tetrahedralize(surface, "m", n_modes=4, max_tets=5000,
                                        verbose=False, enforce_resolution=False)
 
     assert tets.ndim == 2 and tets.shape[1] == 4, tets.shape
@@ -742,7 +742,7 @@ def test_tetrahedralize_preserves_the_axis_order_of_the_surface():
     """
     extents = [4.0, 6.0, 3.0]     # metres, all different
     surface = trimesh.creation.box(extents=extents)
-    points, _ = MESH.tetrahedralize(surface, "m", n_modes=4, max_tets=5000,
+    points, _, _ = MESH.tetrahedralize(surface, "m", n_modes=4, max_tets=5000,
                                     verbose=False, enforce_resolution=False)
 
     span = np.asarray(points).max(axis=0) - np.asarray(points).min(axis=0)
@@ -817,3 +817,120 @@ def _strip_comments_and_docstrings(src: str) -> str:
     # version of this helper did exactly that and reported a defect that was
     # not there -- the join was the bug, not the source.
     return tokenize.untokenize(kept)
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+def test_the_region_attribute_array_is_tet_indexed_and_names_the_regions():
+    """Drive the REAL ``tetrahedralize`` and check the region ids it hands back.
+
+    The third return value is what decides every tet's PERMITTIVITY, so an
+    array that is the wrong length, in the wrong order, or off by one produces a
+    plausible-looking solve for a cavity the owner did not upload. That is the
+    defect class this whole feature is about, and it is invisible downstream:
+    the eigenproblem stays well-posed and the eigenvalues barely move.
+
+    Two independent things are pinned, and both must be measured rather than
+    taken from tetgen's docs -- the docs' own example shows a differently
+    shaped return, which is exactly why ``.attrib`` (a name that does not
+    exist) survived in the source until a solve reached it:
+
+      1. the array has one row PER TET, in tet order, and
+      2. its values are the REGION IDS: a tet strictly inside the core region
+         carries the core's id, and no tet strictly inside the core carries the
+         wall's. The geometric control is independent of the array.
+
+    The interface is handled with an explicit tolerance, not ``<=``: a tet with
+    three vertices ON the interface plane is CORRECTLY conforming, and an
+    inclusive test reads it as a straddler. An earlier version of this check
+    made exactly that mistake and reported 251 straddlers on a clean mesh.
+    """
+    wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
+    core = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    import mse_parts as PARTS
+
+    parts = PARTS.load_parts(trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8"), units="mm")
+    assert len(parts) == 2, "this test needs a two-region fixture"
+
+    points, tets, region_of_tet = MESH.tetrahedralize(
+        PARTS.merged_surface(parts), "mm", n_modes=3, n_index=1.0,
+        max_tets=60_000, verbose=False, materials={"wall": 1.0, "core": 2.0},
+        parts=parts,
+    )
+
+    # 1. One region id per tet, addressing the same array the tets do.
+    assert region_of_tet.shape == (tets.shape[0],), (
+        f"{region_of_tet.shape[0]} region ids for {tets.shape[0]} tets -- the "
+        f"array does not address the tetrahedra returned with it"
+    )
+    # Both regions must appear. A single-valued array is the "quietly reverted
+    # to one material" failure, and it is the one that looks most like success.
+    ids = np.unique(region_of_tet)
+    assert len(ids) == 2, (
+        f"the mesh reported region ids {ids}; a two-part upload must produce "
+        f"two regions, not one uniformly-filled cavity"
+    )
+
+    # 2. The ids are MEANINGFUL -- checked against the geometry, not the array.
+    #
+    # ``points`` comes back in METRES while the parts are in MILLIMETRES, so the
+    # core's half-extent is 1e-3 here, not 1. Comparing the metre centroids
+    # against 1.0 selected EVERY tet in the 6 mm wall and made this test report
+    # that one region carried two ids -- an instrument error that read exactly
+    # like a mesher bug. The conversion is done once, on the centroid, from the
+    # SAME unit_scale the mesher used rather than a remembered 1e-3.
+    import mse_common as COMMON
+
+    core_half_extent = 1.0 * COMMON.unit_scale("mm")       # 2 mm cube -> 1e-3 m
+    centroids = np.asarray(points)[np.asarray(tets)].mean(axis=1)
+    # Strictly inside the core, with a tolerance so a centroid exactly on the
+    # interface plane is neither in nor out.
+    in_core = (np.abs(centroids) < core_half_extent - 1e-12).all(axis=1)
+    assert in_core.sum() > 0, (
+        "no tet centroid is strictly inside the core; the fixture does not "
+        "exercise the nested region, so this test could not see a mis-tagging"
+    )
+    core_tets = region_of_tet[in_core]
+    # The core's region id is whichever one the deep-inside tets carry; take it
+    # from the geometry rather than assuming a numbering tetgen does not promise.
+    assert len(np.unique(core_tets)) == 1, (
+        f"tets strictly inside the core carry ids {np.unique(core_tets)}; one "
+        f"region cannot have two ids"
+    )
+    core_id = int(np.unique(core_tets)[0])
+    wall_tets = region_of_tet[~in_core]
+    assert core_id not in np.unique(wall_tets), (
+        f"region id {core_id} is carried by tets both inside and outside the "
+        f"core -- the ids are not regions"
+    )
+
+    # ...and the PARTITION must be the geometric one, not merely a partition.
+    # Everything above is invariant under relabelling, and that is not a
+    # hypothetical: shifting every id by one -- exactly what the ``.ele`` file's
+    # 1-based convention suggests, and what an ``elem - 1``-style read does --
+    # still leaves the core carrying a single id and the wall another, so none
+    # of it can see a shift. Measured on this fixture: with the read mutated to
+    # ``... - 1`` the ids become [-1, 0] and every check above stays green.
+    #
+    # The fix is to stop reading the expected value OUT of the array under
+    # test. An earlier draft took the core's id from ``rot[in_core]`` and then
+    # asserted ``rot == that`` -- which is ``A == A`` with extra steps, and it
+    # passed the mutation for exactly that reason. The id comes from the MESH
+    # instead: the region the mesher was asked to put the core in, read from the
+    # same plan that placed it there.
+    from mse_parts import PartSet  # noqa: F401,PLC0415  (documents the type)
+
+    core_index = list(parts.names).index("core")
+    expected_core_id = int(parts.region_of_part[core_index])
+    assert expected_core_id != int(parts.region_of_part[
+        list(parts.names).index("wall")]), (
+        "the fixture's two parts were given the same region id; the upload "
+        "would be one material and this test could not tell them apart"
+    )
+    assert np.array_equal(region_of_tet == expected_core_id, in_core), (
+        f"{int((region_of_tet == expected_core_id).sum())} tet(s) carry the "
+        f"core's region id {expected_core_id} against {int(in_core.sum())} "
+        f"whose centroid is strictly inside the core -- the region map does not "
+        f"agree with the geometry it was built from"
+    )

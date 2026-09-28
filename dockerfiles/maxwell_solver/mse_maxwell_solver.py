@@ -40,6 +40,7 @@ import mse_eigen as EIG  # noqa: E402
 import mse_fem as F  # noqa: E402
 import mse_fields as FLD  # noqa: E402
 import mse_meshing as MESH  # noqa: E402
+import mse_parts as PARTS  # noqa: E402
 import mse_storage as STORE  # noqa: E402
 
 # Re-exported from :mod:`mse_common`. These two constants and the reroute token
@@ -160,8 +161,61 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scale", type=float, default=1.0,
                         help="multiply every vertex by this before any "
                              "measurement (default: 1.0)")
+    parser.add_argument("--materials-from", default=None, metavar="KEY",
+                        help="object-store key holding the part-name -> n JSON "
+                             "table. The TABLE is a file, not an argument: "
+                             "argv is world-readable on the shared VM and this "
+                             "grows with the part count. Absent means the "
+                             "one-part vacuum path.")
     parser.add_argument("--quiet", action="store_true", help="less progress logging")
     return parser
+
+
+def load_materials(store_in, job_id, key: str | None) -> dict | None:
+    """Read the materials table named by ``--materials-from``.
+
+    ``key`` is None for a one-part upload, and that returns None -- the vacuum
+    path, byte-identical to before this existed.
+
+    When ``key`` is given the object MUST be there and MUST parse. Every way it
+    can fail raises, and none of them falls back to None:
+
+        missing       the app decided this job has materials and launched a Job
+                      for it; a network blip that read as "no table" would
+                      solve the upload as vacuum and report success. That is the
+                      whole defect class this feature is written against -- the
+                      owner gets frequencies for a different object, and nothing
+                      anywhere says so.
+        not JSON      same, and just as silent.
+        not an object a JSON list or scalar would sail through json.loads and
+                      then fail much later inside the mesher, where the message
+                      would be about geometry rather than about this file.
+
+    The key is NOT defaulted from a constant here. The caller passes it, so
+    there is exactly one spelling of the object's name in the tree rather than
+    a copy on each side of the wire that can drift.
+    """
+    if key is None:
+        return None
+    try:
+        raw = store_in.read(key)
+    except Exception as exc:  # noqa: BLE001 - any read failure is this failure
+        raise MESH.MeshingError(
+            f"this job has a materials table but it could not be read from "
+            f"{key!r}: {exc}"
+        ) from exc
+    try:
+        table = json.loads(raw.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise MESH.MeshingError(
+            f"the materials table at {key!r} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(table, dict):
+        raise MESH.MeshingError(
+            f"the materials table at {key!r} must be a JSON object mapping "
+            f"part name to refractive index, got {type(table).__name__}"
+        )
+    return table
 
 
 def make_store(local_root: str | None, job_id: str) -> STORE.ObjectStore:
@@ -176,7 +230,8 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
           db: "mse_db.JobStore | None" = None,
           backend: str | None = None,
           min_feature_m: float | None = None,
-          scale: float = 1.0):
+          scale: float = 1.0,
+          materials: dict | None = None):
     """Run the pipeline and write every result. Returns a summary dict.
 
     ``backend`` selects the solver backend (``cpu``/``gpu``); ``None`` reads
@@ -194,6 +249,21 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
     object's units and the app and the mesher disagreed about which, the two
     estimates differed by a factor of the scale.
 
+    ``materials`` maps a ``.obj`` part NAME to that part's ``n``, or ``None``
+    for a one-part vacuum upload. The name is the key, not an index into the
+    part list: geometry is re-derived from the upload on this side, so an index
+    would be a second key that can drift from the one the owner assigned a
+    material to, and a drifted index applies a material to the wrong region
+    while every count still agrees.
+
+    Every ``n`` must be finite and ``>= 1``. ``n < 1`` is refused rather than
+    clamped: a phase velocity above c is not a lossy simulation, it is a
+    different physical model, and silently accepting it would produce
+    frequencies that look plausible and are not. ``None`` and ``{}`` are NOT
+    interchangeable here -- ``None`` is vacuum, ``{}`` is a table the owner
+    submitted naming no parts, which can only be a mismatch between the upload
+    and the file.
+
     Raises on failure after recording the stage that failed; the caller turns
     that into a ``failed`` status and a non-zero exit.
     """
@@ -201,6 +271,33 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
         raise ValueError("The refractive index must be greater than zero.")
     if n_modes < 1:
         raise ValueError("At least one mode must be requested.")
+    if materials is not None:
+        if not isinstance(materials, dict) or not materials:
+            raise ValueError(
+                "the materials table must be a non-empty object mapping part "
+                "name to refractive index"
+            )
+        for part, n_part in materials.items():
+            if not isinstance(part, str) or not part:
+                raise ValueError(
+                    f"a materials table key must be a non-empty part name, "
+                    f"got {part!r}"
+                )
+            if not isinstance(n_part, (int, float)) or isinstance(n_part, bool):
+                raise ValueError(
+                    f"material {part!r} has a non-numeric refractive index "
+                    f"{n_part!r}"
+                )
+            if not float(n_part) > 0:
+                raise ValueError(
+                    f"material {part!r} has refractive index {n_part!r}; it "
+                    f"must be finite and greater than zero"
+                )
+            if not np.isfinite(float(n_part)):
+                raise ValueError(
+                    f"material {part!r} has a non-finite refractive index "
+                    f"{n_part!r}"
+                )
 
     backend = backend or EIG.BACKEND.selected_backend()
 
@@ -217,13 +314,70 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
     stage("meshing")
     t0 = time.time()
     obj_bytes = store_in.read(STORE.job_key(job_id, "input.obj"))
-    surface, _scale = MESH.load_surface(obj_bytes, units=units)
-    points_m, tets = MESH.tetrahedralize(
-        surface, units, n_modes=n_modes, n_index=n_index,
-        max_tets=max_tets, verbose=verbose,
-        min_feature_m=min_feature_m, scale=scale,
-    )
+    # ONE branch, taken on whether the upload has a materials table:
+    #
+    #   materials is None  the one-part vacuum path, byte-identical to before
+    #                      this feature existed. load_surface takes the surface
+    #                      and tetrahedralize runs the TetGen call it always did.
+    #   materials present  a multi-part upload: load_parts splits and VALIDATES
+    #                      (closed, non-overlapping, non-touching, one wall,
+    #                      a provable seed per region) and tetrahedralize meshes
+    #                      the whole PLC with a region attribute per part.
+    #
+    # The branch is on the presence of the table and not on the part count,
+    # because a one-part file WITH a materials table must still be validated
+    # (the table must name that part) even though it needs no regions.
+    parts = None
+    if materials is not None:
+        parts = PARTS.load_parts(obj_bytes, units=units)
+        if len(parts) == 1 and parts.names[0] not in materials:
+            raise MESH.MeshingError(
+                f"no refractive index given for part {parts.names[0]!r}. "
+                "Every part needs one."
+            )
+        surface = PARTS.merged_surface(parts)
+        points_m, tets, region_of_tet = MESH.tetrahedralize(
+            surface, units, n_modes=n_modes, n_index=n_index,
+            max_tets=max_tets, verbose=verbose,
+            min_feature_m=min_feature_m, scale=scale,
+            materials=materials, parts=parts,
+        )
+    else:
+        surface, _scale = MESH.load_surface(obj_bytes, units=units)
+        points_m, tets, region_of_tet = MESH.tetrahedralize(
+            surface, units, n_modes=n_modes, n_index=n_index,
+            max_tets=max_tets, verbose=verbose,
+            min_feature_m=min_feature_m, scale=scale,
+        )
     timings["meshing"] = time.time() - t0
+
+    # eps_r per tet = n_region^2, from the regions the MESH actually reported.
+    # This is the ONE place eps_r is defined: the physics (the mass matrix) and
+    # everything that talks about it read this array, rather than each
+    # recomputing n^2 from the materials table and risking a disagreement.
+    eps_by_tet = None
+    if parts is not None and len(parts) > 1:
+        materials_by_region = parts.region_materials(materials)
+        known = set(materials_by_region)
+        seen = set(int(r) for r in np.unique(region_of_tet).tolist())
+        unknown = seen - known
+        if unknown:
+            # A tet tagged with a region the plan never asked for means the
+            # attribute pass and the mesh disagree -- exactly the failure that
+            # would silently give some tets vacuum and others a material. Name
+            # it rather than default the missing region to 1.0.
+            raise MESH.MeshingError(
+                f"internal error: {len(unknown)} region id(s) "
+                f"{sorted(unknown)} appear in the mesh but were never "
+                "requested. This is a bug, not a problem with your upload."
+            )
+        # Index by region id; region_of_tet is a tet-indexed array so this is
+        # a straight gather, with no frame correction (the canonical frame maps
+        # points, not tet indices).
+        lookup = np.ones(max(known) + 1, dtype=np.float64)
+        for region_id, n_region in materials_by_region.items():
+            lookup[int(region_id)] = float(n_region) ** 2
+        eps_by_tet = lookup[region_of_tet]
 
     # -- is this machine the right one? ------------------------------------
     #
@@ -264,7 +418,14 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
     t0 = time.time()
     edges, tet_edges, signs = F.build_edges(tets)
     n_edges = int(edges.shape[0])
-    A, B = F.assemble_global(points_m, tets, tet_edges, n_edges)
+    # ``B`` is the eps-weighted mass: with materials it enters solve_modes
+    # already scaled per element, which is what makes the divergence-free
+    # projector enforce div(eps E) = 0 without a second weight parameter. A
+    # caller that forgot ``eps_by_tet`` here would assemble the VACUUM mass and
+    # silently project the wrong subspace, so this argument is gated by a test
+    # that drives this function end to end.
+    A, B = F.assemble_global(points_m, tets, tet_edges, n_edges,
+                             eps_by_tet=eps_by_tet)
     constrained = F.boundary_edges(tets, edges)
     A_free, B_free, free_edges = F.pec_eliminate(A, B, constrained, n_edges)
     timings["assembling"] = time.time() - t0
@@ -649,11 +810,13 @@ def main(argv=None) -> int:
             # would repeat identical work on every upload, and every Job failing
             # at startup because the script was not where this file expected it
             # is exactly the deploy failure that removed this call.
+        materials = load_materials(store_in, job_id, args.materials_from)
         summary = solve(
             job_id, args.units, args.n_index, args.n_modes,
             store_in, store_out, effective_max_tets, args.grid,
             verbose=verbose, db=db,
             min_feature_m=args.min_feature, scale=args.scale,
+            materials=materials,
         )
     except BaseException as exc:  # noqa: BLE001 - record, then re-raise as exit code
         print(f"[mse] FAILED: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)

@@ -226,6 +226,8 @@ def effective_edge_m(
     min_feature_m: float | None = None,
     n_index: float = 1.0,
     physics_m: float | None = None,
+    parts=None,
+    materials: dict | None = None,
 ) -> float:
     """The edge length the mesh is built to, in METRES on the scaled surface.
 
@@ -251,6 +253,18 @@ def effective_edge_m(
     ``physics_m`` is the only length in this function that needs a factor, and
     it needs exactly one.
 
+    ``parts`` and ``materials`` describe a MULTI-PART upload. With them this
+    still returns the WEYL edge, unchanged -- and NOT a function of the wall's
+    index. In a uniform cavity the mesh is independent of n: ``target_edge_
+    length`` computes the geometric k from the mode count and the volume, and
+    says so ("n_index deliberately does not enter"). The index enters
+    DOWNSTREAM, in ``region_edges``, which fines each region relative to the
+    wall. So this value is the wall's edge by construction -- the wall is the
+    region that keeps it -- and the multi-part branch below does not shrink it.
+
+    ``None`` for either is the one-part upload, which is byte-identical to
+    before this existed.
+
     ``physics_m`` may be passed in by a caller that already computed it. The
     solver's tetrahedralizer does, because it needs the same number for its own
     verbose line AND needs the call to go through ``mse_meshing``'s module
@@ -265,16 +279,33 @@ def effective_edge_m(
         ) * unit_scale(units)
 
     if min_feature_m is None:
-        return physics_m
-    feature_m = float(min_feature_m)
-    if not np.isfinite(feature_m) or feature_m <= 0:
-        # A nonsense feature is ignored rather than divided by. Same rule as
-        # the app's validation, applied here too because this function is
-        # reachable from the solver's own CLI.
-        return physics_m
-    # Whichever is SMALLER wins: a feature left unresolved and a top mode left
-    # unresolved both give frequencies that are confidently wrong.
-    return min(physics_m, feature_m)
+        base_m = physics_m
+    else:
+        feature_m = float(min_feature_m)
+        if not np.isfinite(feature_m) or feature_m <= 0:
+            # A nonsense feature is ignored rather than divided by. Same rule as
+            # the app's validation, applied here too because this function is
+            # reachable from the solver's own CLI.
+            base_m = physics_m
+        else:
+            # Whichever is SMALLER wins: a feature left unresolved and a top
+            # mode left unresolved both give frequencies that are confidently
+            # wrong.
+            base_m = min(physics_m, feature_m)
+
+    # --- the per-region rule ------------------------------------------------
+    #
+    # ``parts``/``materials`` are a multi-part upload, and the GLOBAL edge above
+    # is the WALL's edge. It is NOT shrunk to the densest region's edge: the
+    # per-region edges are a RATIO of it (``h_r = base_m * n_wall / n_r``, see
+    # ``region_edges``), so shrinking the base would drag every region down --
+    # including the wall, which is the reference.
+    #
+    # An earlier version took ``min(base_m / n_r)`` here and applied it as the
+    # global. For {wall 2.0, core 3.5} that meshed the WALL at base/2 and
+    # over-predicted the count by more than 10x, refusing an upload the GPU
+    # could run. The wall's edge is the base; the regions divide it.
+    return base_m
 
 
 def target_maxvolume(surface, edge_length: float) -> float:
@@ -304,3 +335,203 @@ def estimate_tet_count(surface, edge_length: float) -> tuple[int, float]:
     volume = max(float(np.prod(bounds[1] - bounds[0])), 1e-18)
     maxvolume = target_maxvolume(surface, edge_length)
     return int(volume / max(maxvolume, 1e-30)), volume
+
+
+def region_edges(h: float, n_wall: float, materials: dict, parts) -> dict:
+    """``{region_id: h_r}`` -- the per-region target edge for a multi-part mesh.
+
+    THE ONE HELPER. The mesher and the web estimate both call this, so the
+    edge a region is built to and the edge the route was decided on cannot
+    drift apart. ``min`` over the values it returns is ``h_min``, the SINGLE
+    edge the whole cavity is meshed at -- see below.
+
+    THE RULE: UNIFORM AT THE FINEST REGION EDGE. Every region gets the same
+    edge,
+
+        h_min = min_r ( h * n_wall / n_r )  ==  h * n_wall / max_r(n_r)
+
+    and never coarser than ``h`` (the wall's own edge is ``h`` by construction,
+    so the min is at most ``h``). A dense region therefore sets the resolution
+    for the WHOLE cavity, wall included -- denser than necessary in the wall,
+    which is the deliberate price.
+
+    WHY UNIFORM, and what this replaced. The previous rule gave each region
+    ``h * n_wall / n_r`` as its OWN target, on the theory that a region denser
+    than the wall should be finer and a less dense one coarser. That theory is
+    sound and the mechanism to implement it is NOT AVAILABLE in this build:
+    TetGen's per-region volume, supplied through ``add_region``'s ``max_vol``,
+    was measured INERT on a nested PLC -- a nine-order sweep of the core's
+    region volume moved the core's own element count by exactly zero, with
+    identical totals under ``varvolume=True``, ``fixedvolume=True``, and with
+    neither flag. (Hand-built PLC, no application code involved; the numbers
+    and the two instrument errors that hid this for a session are on the row.)
+    So a per-region TARGET that the mesher cannot realise is a target that
+    misleads the estimate -- which is the whole defect this function exists to
+    prevent.
+
+    Meshing everything at ``h_min`` realises the resolution requirement with a
+    mechanism that provably works (a single global ``maxvolume``, the same one
+    the one-part path uses), and it keeps the estimate on the SAME calibrated
+    constant as the one-part path -- one formula, one calibration, no new
+    fitting.
+
+    ``n_wall`` is still required: it is what converts a region's index into a
+    length relative to the wall's medium, and without it ``h * n_wall / n_r``
+    would be ``h / n_r``, whose meaning depends on which medium ``h`` was
+    derived in. The wall is the reference; the ratio to it is the physics.
+    """
+    by_region = parts.region_materials(materials)
+    n_max = 0.0
+    for region_id, n_region in by_region.items():
+        n_region = float(n_region)
+        if not (n_region > 0) or not np.isfinite(n_region):
+            raise MeshingError(
+                f"region {region_id} has refractive index {n_region:g}; it "
+                f"must be finite and greater than zero."
+            )
+        n_max = max(n_max, n_region)
+    if n_max <= 0:
+        raise MeshingError(
+            "a multi-part mesh needs at least one region with a refractive "
+            "index to mesh to, and this upload has none."
+        )
+    # ONE edge for every region. `min(h, ...)` rather than the raw ratio so a
+    # region LESS dense than the wall cannot coarsen the wall: h_min is a
+    # resolution floor for the cavity, not a function of the densest region
+    # alone.
+    h_min = min(float(h), float(h) * float(n_wall) / n_max)
+    return {int(region_id): h_min for region_id in by_region}
+
+
+def region_plan(parts, materials, edge_units: float, units: str,
+                n_wall: float | None = None) -> dict:
+    """Per-region ``(edge_units, filled_volume_m3)`` for a multi-part upload.
+
+    ONE expression, called by BOTH the mesher and the web app's ``estimate_tets``.
+    They answer the same question -- how fine the mesh is, and how much material
+    is in each region -- in two processes, and the row that asked for this
+    feature names the trap exactly: if the estimate and the mesher derive the
+    mesh parameters from different places, the app's route decision and the mesh
+    the solver builds disagree, and the estimate is what routes.
+
+    UNDER THE UNIFORM RULE the two quantities are:
+
+    * ``edge_units`` is the SAME for every region: ``h_min``, the finest region
+      edge (``edge_units * n_wall / max n_r``, floored at ``edge_units``). The
+      whole cavity is meshed at it -- see ``region_edges`` for why per-region
+      targets are not realisable in this TetGen build, which is why the plan
+      reports one edge and not a distinct edge per region.
+    * the volume is the region's FILLED volume, not its enclosed one:
+      ``PartSet.filled_volume_m3`` subtracts everything nested inside it. The
+      wall's enclosed volume counts its core twice. (The estimate now works on
+      the total cavity volume rather than summing ``V_r / h_r^3``, but the
+      filled volume is still what the estimate must convert, and the per-region
+      figure is what the mesher's own verbose line reports.)
+
+    ``n_region`` comes from ``materials`` (part name -> n, naming every part).
+    A region with no material is REFUSED by ``PartSet.region_materials`` rather
+    than defaulted: the default would be vacuum, and the owner would get
+    frequencies for a cavity that is partly empty with nothing saying so.
+
+    ``units`` is the UPLOAD's unit and has no default. It reaches
+    ``PartSet.filled_volume_m3``, which converts the region volume to cubic
+    metres. There is no default here for the same reason there is none there:
+    with one, a caller that forgot the argument silently got millimetres while
+    ``edge_units`` beside it stayed true metres, making the estimate wrong by
+    the cube of the unit ratio -- for inches, 17,000x UNDER, which routes a job
+    to the cluster that the GPU would have solved. Measured through the real
+    upload on one physical object: mm 51,187 (GPU), in 3 (cluster), um 5.1e13
+    and nm 5.1e19 (refused). The unit-invariance test pins this.
+    """
+    by_region = parts.region_materials(materials)
+    # The wall's index is the reference the other regions are measured against.
+    # ``n_wall`` comes from the CALLER when it has one (the solver knows which
+    # part is the wall); otherwise it is the wall region's own material, which
+    # is what ``parts`` records. Either way it is one number, resolved once.
+    if n_wall is None:
+        wall_index = getattr(parts, "wall_index", None)
+        if wall_index is None:
+            raise MeshingError(
+                "a multi-part mesh needs a wall part to measure the other "
+                "regions against, and this upload has none. The first part "
+                "must contain every other part."
+            )
+        n_wall = float(by_region[int(parts.region_of_part[wall_index])])
+    edges = region_edges(edge_units, n_wall, materials, parts)
+    out = {}
+    for part_index, region_id in enumerate(parts.region_of_part):
+        out[int(region_id)] = {
+            "part": parts.names[part_index],
+            "edge_units": edges[int(region_id)],
+            "filled_volume_m3": parts.filled_volume_m3(part_index, units),
+            "n": float(by_region[region_id]),
+        }
+    return out
+
+
+def estimate_tets_by_region(parts, materials, edge_units: float,
+                            surface, units: str, c: float) -> int:
+    """Weyl-free element estimate for a multi-part upload.
+
+    THE ONE-PART FORMULA, on the whole cavity, at ``h_min``:
+
+        est = c * V_cavity / h_min^3
+
+    This is deliberately NOT a per-region sum any more. Under the uniform rule
+    every region is meshed at the SAME edge, so ``sum_r V_r / h_min^3`` is
+    ``V_cavity / h_min^3`` -- algebraically the one-part expression. Writing it
+    as the one-part expression is the point: the mesh and the estimate then
+    agree through the calibration constant ``c`` that the one-part path already
+    has, with NO new fitting, and there is no second formula that could drift
+    from the first.
+
+    ``V_cavity`` is the sum of the regions' FILLED volumes, which is the
+    cavity's own volume with no double counting (a nested part's every point is
+    inside its parent, so summing enclosed volumes would count the core twice).
+
+    UNITS -- NO CONVERSION HAPPENS HERE, and that is a measured claim, not a
+    stylistic one. This function produced a 2.3e13-element estimate for a 19k
+    mesh on its first attempt because it multiplied by ``unit_scale(units)``
+    "to get metres". Measured for the 6 mm fixture (wall n=2, core n=3.5, mm):
+
+        effective_edge_m(...)        -> 1.0181282863016227e-03   [= 1.018 mm]
+        region_edges(= h*2/3.5)      -> 5.817875921723558e-04    [= 1.018/1.75]
+        filled_volume_m3 (sum)       -> 2.16e-07                 [cubic metres]
+        unit_scale('mm')             -> 1.0e-03
+
+    ``effective_edge_m`` returns METRES (1.018e-3 m is 1.018 mm, the right edge
+    for a 6 mm box), and ``region_edges`` divides by a bare index ratio, so the
+    plan's ``edge_units`` is in the SAME metres -- the name says "units" but the
+    value is metres, because that is what the caller feeds it. ``filled_volume_m3``
+    is cubic metres by construction. So the pair is already coherent and
+    ``unit_scale`` here applies the factor a SECOND time, making the count wrong
+    by ``1/scale^3`` = 1e9 for mm. That is the "one quantity, two spaces" shape
+    this rig keeps meeting: the quantity was already in the target space and a
+    second conversion was invisible to reading.
+
+    ``c`` is the SAME constant the one-part estimate uses -- passed in, never
+    re-derived here, so the two paths cannot disagree about it.
+    """
+    plan = region_plan(parts, materials, edge_units, units)
+    h_m = None
+    v_m3 = 0.0
+    for info in plan.values():
+        h_m = info["edge_units"] if h_m is None else h_m
+        v_m3 += float(info["filled_volume_m3"])
+    if h_m is None:
+        # No regions at all -- not a multi-part upload. Refuse rather than
+        # return 0, which would look like "a tiny job" and route it to the GPU.
+        raise MeshingError(
+            "the multi-part estimate was asked for a mesh with no regions; "
+            "this is the one-part path's job and calling it here would route "
+            "a job on a number of zero."
+        )
+    h_m = float(h_m)
+    if not (h_m > 0) or not (v_m3 > 0):
+        # Could not ask. A zero here would route a real job to the fast machine
+        # on the strength of a number nothing computed -- refuse instead.
+        raise MeshingError(
+            f"the multi-part estimate got h={h_m:g} m and V={v_m3:g} m3 from "
+            f"the region plan; neither can be used to size a mesh."
+        )
+    return int(float(c) * v_m3 / (h_m ** 3))

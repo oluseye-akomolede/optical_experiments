@@ -64,12 +64,33 @@ def build_edges(tets: np.ndarray):
     return edges, tet_edges, signs
 
 
-def element_matrices(points: np.ndarray, tets: np.ndarray, tet_edges: np.ndarray):
+def element_matrices(
+    points: np.ndarray,
+    tets: np.ndarray,
+    tet_edges: np.ndarray,
+    eps_by_tet: np.ndarray | None = None,
+):
     """Vectorised closed-form curl-curl (A) and mass (B) element matrices.
 
     ``points`` is ``(n_points, 3)`` in metres, ``tets`` is ``(n_tets, 4)``.
     Everything is assembled in one pass over all tets, in metres, so the
     eigenvalues are ``k^2`` in ``1/m^2``.
+
+    ``eps_by_tet`` is the relative permittivity per tetrahedron -- ``n**2`` for
+    the material filling that tet, ``(n_tets,)``. It enters the MASS matrix and
+    only the mass matrix: the weak form is
+
+        integral of curl(E).curl(v)  =  k^2 * integral of eps_r * E.v
+
+    so ``A`` (the curl-curl) is untouched by the material and ``B`` (the mass)
+    is scaled by ``eps_r`` elementwise. That is the whole of the multi-material
+    physics, which is why this is a broadcast on ``Mn`` rather than a second
+    assembly path.
+
+    ``None`` means vacuum everywhere and must give bit-identical results to the
+    path before this parameter existed -- the one-part upload's regression test
+    rests on that, so the scaling is skipped entirely rather than multiplying by
+    a ones array.
 
     Returns ``(A_elem, B_elem, volumes)`` with shapes ``(n_tets, 6, 6)``,
     ``(n_tets, 6, 6)`` and ``(n_tets,)``.
@@ -124,6 +145,20 @@ def element_matrices(points: np.ndarray, tets: np.ndarray, tet_edges: np.ndarray
     delta = np.eye(4)[None, :, :]                    # (1, 4, 4) node deltas
     Mn = vol * (1.0 + delta) / 20.0                  # (n_tets, 4, 4), node indexed
 
+    # The material. ``B_elem`` below is LINEAR in ``Mn`` -- every term is one of
+    # the four Mn_* blocks times a gradient dot product -- so scaling ``Mn`` by
+    # eps_r scales the whole mass matrix by eps_r and leaves the curl-curl
+    # alone. Scaling ``Mn`` rather than ``B_elem`` keeps the four blocks and the
+    # assembled matrix consistent by construction, so there is no way to scale
+    # three of the four.
+    if eps_by_tet is not None:
+        eps = np.asarray(eps_by_tet, dtype=np.float64).reshape(-1, 1, 1)
+        if eps.shape[0] != Mn.shape[0]:
+            raise ValueError(
+                f"eps_by_tet has {eps.shape[0]} entries for {Mn.shape[0]} tets"
+            )
+        Mn = Mn * eps
+
     # pull the four node-pair blocks of Mn into edge-pair form
     Mn_ik = Mn[:, a_idx][:, :, a_idx]                # (n_tets, 6, 6)
     Mn_il = Mn[:, a_idx][:, :, b_idx]
@@ -147,15 +182,21 @@ def element_matrices(points: np.ndarray, tets: np.ndarray, tet_edges: np.ndarray
     return A_elem, B_elem, volumes
 
 
-def assemble_global(points, tets, tet_edges, n_edges, dtype=np.float64):
+def assemble_global(
+    points, tets, tet_edges, n_edges, dtype=np.float64, eps_by_tet=None
+):
     """Assemble the global sparse A and B from the element matrices.
 
     Accumulates the COO triplets with ``coo_matrix``, which sums duplicate
     ``(row, col)`` entries on conversion. That is O(nnz) in memory; a
     ``np.bincount`` over ``rows * n_edges + cols`` would instead allocate a
     dense ``n_edges^2`` array (1.96 TiB at 500k edges), so it is not used here.
+
+    ``eps_by_tet`` is the per-tet relative permittivity (see
+    :func:`element_matrices`); ``None`` is vacuum and reproduces the old path
+    exactly.
     """
-    A_elem, B_elem, _ = element_matrices(points, tets, tet_edges)
+    A_elem, B_elem, _ = element_matrices(points, tets, tet_edges, eps_by_tet)
 
     ii = np.repeat(tet_edges, 6, axis=1)              # (n_tets, 36)
     jj = np.tile(tet_edges, (1, 6))                   # (n_tets, 36)

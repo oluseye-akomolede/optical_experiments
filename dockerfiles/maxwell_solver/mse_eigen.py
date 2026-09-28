@@ -50,6 +50,16 @@ LAST_BACKEND: str = BACKEND.CPU
 LAST_BACKEND_DESCRIPTION: str = BACKEND.CPU
 LAST_WORST_RESIDUAL: float | None = None
 
+#: ``G^T B`` from the last ``solve_modes`` call -- the eps-weighted divergence
+#: annihilator the projector was built from, where ``B`` is the mass matrix the
+#: caller assembled with its ``eps_by_tet``. Exposed because the choice of
+#: weight is barely visible in the eigenvalues (README: ~3e-3 relative, and
+#: eigenvectors close but not identical), so a test that only looked at the
+#: spectrum could not tell a correct projector from a wrong one. This is the
+#: operator a test CAN assert against -- ``G^T B P = 0`` to machine precision
+#: for the eps-weighted divergence, versus ~3e-2 for the vacuum one.
+LAST_PROJECTOR_WEIGHT = None
+
 
 class EigenError(Exception):
     """The eigenproblem could not be solved as posed (e.g. too few elements)."""
@@ -140,6 +150,24 @@ def solve_modes(
     ``tet_edges`` and ``constrained`` refer to the *unreduced* numbering so the
     gradient projector can be built.
 
+    The divergence-free projector is built from ``B``, and that is correct for
+    every material because ``B`` IS the eps-weighted mass: the caller passes
+    ``eps_by_tet`` to :func:`mse_fem.assemble_global`, so ``B`` enters here
+    already scaled by ``eps_r = n^2`` per element. With one material that
+    scaling is a constant and cancels inside the projector, which is why the
+    one-part path is unchanged.
+
+    There is deliberately NO separate ``M_eps`` argument. One existed, and it
+    could only ever do one of two things: equal ``B`` (a correct caller) or
+    disagree with it (a caller that did not pass ``eps_by_tet`` the same way
+    twice). Two parameters that must agree are two parameters that can drift,
+    and the failure they produce -- a projector built from the vacuum mass while
+    the eigenproblem uses the eps-weighted one -- enforces ``div(E) = 0``
+    instead of ``div(eps E) = 0``. So the risk is left where it is observable:
+    the caller assembles ONE mass matrix, and the test that gates this drives
+    ``mse_maxwell_solver.solve`` and checks the matrix that comes back is
+    eps-per-tet times the vacuum one.
+
     ``backend`` is ``"cpu"`` or ``"gpu"``; ``None`` reads ``MSE_SOLVER_BACKEND``.
     Both SPD factorisations go through it -- see :mod:`mse_backend` for why both
     and not just the larger one. Which backend ran is left in
@@ -150,6 +178,7 @@ def solve_modes(
     ``1/m^2``, ascending.
     """
     global LAST_BACKEND, LAST_BACKEND_DESCRIPTION, LAST_WORST_RESIDUAL
+    global LAST_PROJECTOR_WEIGHT
     backend = backend or BACKEND.selected_backend()
     LAST_BACKEND = backend
     LAST_BACKEND_DESCRIPTION = BACKEND.describe(backend)
@@ -211,10 +240,51 @@ def solve_modes(
     except Exception as exc:  # noqa: BLE001
         raise EigenError(f"could not factor A + sB: {exc}") from exc
 
-    # B-orthogonal projector onto the divergence-free subspace
+    # eps-orthogonal projector onto the divergence-free subspace:
+    #
+    #     P y = y - G (G^T B G)^-1 (G^T B) y        enforces  div(eps E) = 0
+    #
+    # ``B`` here is the eps-weighted mass, because the caller assembled it with
+    # ``eps_by_tet`` (see :func:`mse_fem.assemble_global`). There is no separate
+    # weight to pass: an ``M_eps`` parameter would either equal ``B`` -- in
+    # which case it is the same matrix under two names -- or disagree with it,
+    # in which case the caller assembled two different masses and the projector
+    # enforces ``div(E) = 0`` while the eigenproblem uses ``div(eps E) = 0``.
+    # Neither outcome is worth a second parameter, so the caller builds one
+    # matrix and this is it.
+    #
+    # GETTING IT WRONG HARDLY SHOWS IN THE OUTPUT. Measured on a 6x4x3 box with
+    # a 12:1 eps step: projecting with the vacuum mass instead gives eigenvalues
+    # differing by ~3e-3 RELATIVE and converged eigenvectors that are close but
+    # not identical -- and the ~3e-3 is far too little for a "no spurious modes"
+    # test to redden. (An earlier version of this comment claimed the two were
+    # BYTE-identical; the reviewer reproduced the box and they are not. Byte
+    # identity holds only for uniform eps, where the two matrices are
+    # proportional and the constant cancels in the projector. Corrected here
+    # because a comment that overstates the invisibility of a bug is how the
+    # next reader concludes no test is possible.)
+    #
+    # What DOES differ sharply is the operator. Measured on a random vector, the
+    # eps-weighted divergence of what the vacuum projector leaves behind is
+    # 3.3e-2 against 1.3e-16 for the correct one -- fourteen orders of
+    # magnitude. The test suite asserts THAT property, on the operator recorded
+    # below, because it is the only one of the two that can redden.
     G, _ = build_gradient(points, tets, edges, tet_edges, free_edges, constrained)
+    # ONE variable, used in BOTH products and RECORDED. The whole projection
+    # weight is ``G^T B``: it is the outer factor of the projector above and
+    # the matrix S is factored from is built from the same product. Writing it
+    # out once means the recorded operator IS the operator the projector used,
+    # not a second computation of the same quantity that could disagree with it.
+    #
+    # That distinction is the whole reason LAST_PROJECTOR_WEIGHT exists. When the
+    # record was computed from an independent expression the test still passed
+    # with the weight replaced in this line, because it asserted
+    # ``G^T B == G^T B`` -- a check that cannot fail. Reading it back out of the
+    # variable below makes the record a witness to this decision.
     GtB = (G.T @ B).tocsr()
     S = (GtB @ G).tocsc()                       # sparse SPD nodal (interior) matrix
+    global LAST_PROJECTOR_WEIGHT
+    LAST_PROJECTOR_WEIGHT = GtB
     # S is SPD too, and for the same reason: B is SPD and G has full column rank
     # (its columns are the gradients of the nodal basis functions, which are
     # linearly independent, one per interior node). So it takes the same

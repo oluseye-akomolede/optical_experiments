@@ -1350,6 +1350,13 @@ def real_solve(job: dict, store_in, store_out, stage: StageReporter | None = Non
         verbose=True, backend="gpu", db=stage,
         min_feature_m=job.get("min_feature_m"),
         scale=float(job.get("scale") or 1.0),
+        # Straight through, no parsing and no defaulting. The worker does not
+        # interpret the table -- it has no geometry and no business deciding
+        # which part is which -- and it must NOT turn a claim's absent table
+        # into an empty one: the solver is told "vacuum" and told "a table with
+        # no parts" by two different values, and only the app knows which it
+        # meant.
+        materials=job.get("materials"),
     )
 
 

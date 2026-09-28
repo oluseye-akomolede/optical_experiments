@@ -38,7 +38,15 @@ import jobs as JOBS
 import storage as STORE
 import worker_api as WORKER
 from meshing import (MAX_EDGE_OVERSHOOT, UploadError, effective_edge_mm,
-                     estimate_tets, load_surface, unit_scale_m, validate_upload)
+                     estimate_tets, load_parts, load_surface, parse_parts,
+                     unit_scale_m, validate_upload)
+
+#: The form field prefix for a per-part refractive index: ``part_index.<name>``.
+#: The NAME is in the field key rather than a positionally-indexed list, because
+#: a name cannot drift from the part it belongs to the way an index can -- the
+#: form and the solver both re-derive the part list from the same bytes, and the
+#: only thing that has to survive the round trip is the name.
+_MATERIAL_FIELD_PREFIX = "part_index."
 
 #: where the solver puts one mode's field, and the ONE place that decides it.
 #: Both the index (which reads a size to decide `available`) and the fetch route
@@ -139,6 +147,52 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
                               mode_choices=CFG.MODE_CHOICES,
                               default_n_modes=CFG.DEFAULT_N_MODES,
                               max_mb=CFG.MAX_UPLOAD_BYTES // (1024 * 1024))
+
+    @app.route("/parts", methods=["POST"])
+    def parts():
+        """The part names in an uploaded .obj -- the FIRST of the form's two POSTs.
+
+        This is a PARSE-ONLY endpoint: it keeps NO server-side state between the
+        two POSTs. The form sends the file here, gets back the names, and the
+        owner assigns a refractive index to each; the final POST re-sends the
+        file plus the table. Nothing is held in a session, a temp dir or a cache,
+        because a name held server-side is a name that can belong to a different
+        upload than the one that finally arrives.
+
+        The parse is the SOLVER'S parser, not a second one. The owner is choosing
+        which region gets which index, so a client-side or duplicate server-side
+        scan is a second source of truth for exactly the thing that decides the
+        physics -- and it would drift the first time either side changed.
+
+        Returns ``{"parts": [...]}`` on success and ``{"error": "..."}`` with a
+        4xx on a refusal, because every failure here is one the owner can act on
+        (a part that is not closed, two parts that touch) and the message names
+        the part. A refusal that only said "invalid file" would be the
+        could-not-ask shape: the owner cannot fix what the page will not name.
+        """
+        uploaded = request.files.get("meshfile")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "Please choose a file to upload."}), 400
+        units = request.form.get("units", CFG.DEFAULT_UNITS)
+        if units not in CFG.UNIT_CHOICES:
+            return jsonify({"error": "Please choose one of the supported "
+                                     "units."}), 400
+        data = uploaded.read()
+        try:
+            # ``validate_upload`` first for the SIZE and readability rails (it
+            # is the one place MAX_UPLOAD_BYTES is enforced), then the solver's
+            # own parser for everything geometric.
+            #
+            # The order matters and is not cosmetic. ``validate_upload`` merges
+            # a multi-part file into one mesh before checking it is closed, so
+            # its refusal cannot name which part is open -- and naming the part
+            # is the entire reason this endpoint exists. The parser splits
+            # first and names what it rejects, so it speaks last.
+            validate_upload(uploaded.filename, data, CFG.MAX_UPLOAD_BYTES)
+            names = parse_parts(data, units)
+        except UploadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"parts": names})
 
     @app.route("/jobs/<job_id>")
     def job_page(job_id):
@@ -822,9 +876,69 @@ def _handle_upload(app, store, jobs_db):
     # meaning "could not ask") routes to the cluster rather than the GPU: a
     # failed estimate must never send a job to the slower machine, and it is the
     # failure mode this rig keeps finding where a non-answer is read as one.
+    # --- the materials table, if the form sent one ------------------------
+    #
+    # The form posts one ``part_index.<name>`` field per part it showed the
+    # owner. Absent entirely means the one-part path, byte-identical to before
+    # this existed -- NOT an empty table, which would be a form that named no
+    # parts and can only be a mismatch.
+    #
+    # The part list is RE-DERIVED here from the bytes this POST actually
+    # carried, and compared with the names the form used. The owner assigned an
+    # index to a name in an earlier POST; if the file changed in between, the
+    # name they chose belongs to a different upload, and applying it silently
+    # would put a material on the wrong region while every count agreed. This is
+    # the same check the /parts endpoint exists to make possible.
+    materials = None
+    parts = None
+    material_fields = {k: v for k, v in request.form.items()
+                       if k.startswith(_MATERIAL_FIELD_PREFIX)}
+    if material_fields:
+        try:
+            parts = load_parts(data, units)
+        except UploadError as exc:
+            flash(str(exc))
+            return redirect(url_for("index"))
+
+        materials = {}
+        for field, raw in material_fields.items():
+            part_name = field[len(_MATERIAL_FIELD_PREFIX):]
+            try:
+                n_part = float(raw)
+            except (TypeError, ValueError):
+                flash(f"The refractive index for part {part_name!r} must be a "
+                      f"number.")
+                return redirect(url_for("index"))
+            if not (CFG.MIN_MATERIAL_N <= n_part <= CFG.MAX_MATERIAL_N):
+                flash(f"The refractive index for part {part_name!r} must be "
+                      f"between {CFG.MIN_MATERIAL_N:g} and "
+                      f"{CFG.MAX_MATERIAL_N:g}.")
+                return redirect(url_for("index"))
+            materials[part_name] = n_part
+
+        # Every part needs an index, and no index may name a part that is not
+        # in this file. Both are mismatches between the form and the bytes, and
+        # the first would otherwise leave a region at whatever the default
+        # happened to be -- frequencies for a cavity that is partly empty with
+        # nothing saying so.
+        missing = [n for n in parts.names if n not in materials]
+        if missing:
+            flash("No refractive index was given for part(s) "
+                  + ", ".join(repr(m) for m in missing)
+                  + ". Every part needs one.")
+            return redirect(url_for("index"))
+        unknown = [k for k in materials if k not in parts.names]
+        if unknown:
+            flash("The form named part(s) "
+                  + ", ".join(repr(u) for u in unknown)
+                  + " that are not in this upload. Its parts are "
+                  + ", ".join(repr(n) for n in parts.names) + ".")
+            return redirect(url_for("index"))
+
     surface = load_surface(data)
     est_tets = estimate_tets(surface, n_modes, units, c=CFG.est_tets_c(),
-                             min_feature_m=min_feature_m, scale=scale)
+                             min_feature_m=min_feature_m, scale=scale,
+                             parts=parts, materials=materials)
 
     if est_tets > CFG.upload_refuse_tets():
         flash(
@@ -850,7 +964,7 @@ def _handle_upload(app, store, jobs_db):
                        min_feature_value=min_feature_value,
                        min_feature_unit=(feature_unit if min_feature_value
                                          is not None else None),
-                       scale=scale)
+                       scale=scale, materials=materials)
 
     # Try to start it right away; if the slot is busy it simply stays queued and
     # the tick will pick it up.

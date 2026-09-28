@@ -440,7 +440,7 @@ def test_watertight_obj_is_accepted_and_scaled_to_metres():
     assert mesh.is_watertight
     assert scale == pytest.approx(1e-3)
 
-    points_m, tets = M.tetrahedralize(mesh, "mm", n_modes=20, verbose=False)
+    points_m, tets, _ = M.tetrahedralize(mesh, "mm", n_modes=20, verbose=False)
     assert tets.shape[1] == 4
     assert points_m.max() < 0.011, "points must be scaled into metres"
 
@@ -472,7 +472,7 @@ def test_tet_cap_is_respected_or_the_mesh_is_refused():
         M.tetrahedralize(mesh, "mm", n_modes=20, max_tets=50, verbose=False)
 
     # a cap that is generous enough must succeed and stay within it
-    points_m, tets = M.tetrahedralize(mesh, "mm", n_modes=10, max_tets=60_000,
+    points_m, tets, _ = M.tetrahedralize(mesh, "mm", n_modes=10, max_tets=60_000,
                                       verbose=False)
     assert len(tets) <= 60_000
 

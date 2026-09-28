@@ -69,7 +69,19 @@ CREATE TABLE IF NOT EXISTS mse.jobs (
     -- (POST /worker/jobs/<id>/release). It exists so that a job which can never
     -- complete cannot loop forever: releases are legitimate for transient
     -- reasons, but a bounded number of them. See the cap in web/worker_api.py.
-    release_count     integer NOT NULL DEFAULT 0
+    release_count     integer NOT NULL DEFAULT 0,
+    -- The per-part refractive indices, as a JSON object mapping the .obj's part
+    -- NAME to that part's `n`. The name is the key because the name is what the
+    -- owner assigned the material to; geometry is re-derived from the upload, so
+    -- an index into the part list would be a second, weaker key that can drift
+    -- from the first.
+    --
+    -- NULL means "no materials table": the one-part vacuum path, exactly as
+    -- before this column existed. A NULL is not the empty object -- `{}` would
+    -- be a table with no parts, which is a different and wrong statement -- so
+    -- the column stays NULL rather than being defaulted, and every reader
+    -- treats NULL and absent alike.
+    materials         jsonb
 );
 
 -- The solver used to run as a SparkApplication; it is now a plain batch/v1 Job,
@@ -230,6 +242,19 @@ BEGIN
         WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'release_count'
     ) THEN
         ALTER TABLE mse.jobs ADD COLUMN release_count integer NOT NULL DEFAULT 0;
+    END IF;
+
+    -- The materials table, for databases created before multi-material uploads.
+    -- Deliberately NULLABLE with no default: NULL is the true value for every
+    -- existing row (they are one-part vacuum uploads), and unlike `scale` there
+    -- is no sensible non-NULL placeholder -- `{}` would claim a table the owner
+    -- never entered. See the column comment above the CREATE for why the part
+    -- name is the key.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'materials'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN materials jsonb;
     END IF;
 END $$;
 
