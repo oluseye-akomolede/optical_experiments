@@ -109,6 +109,82 @@ def main():
         ds = abs(closed_form_trace(2.0, ky, 1.0, "s") - closed_form_trace(2.0, ky, 1.0, "p"))
         print(f"  eps2=1, ky={ky}: |s-p| = {ds:.3e}  <- uniform: cannot fail")
 
+    # --- the BAND finder, which is what Control B actually compares against ---
+    # pc.layered_band_at_k is a SECOND consumer of the same closed form, and it
+    # is the one the mesh is compared to. Check the whole finder (root scan +
+    # bisection) against a root of the INDEPENDENT shooting trace, not against
+    # the closed form it was built from -- otherwise the check only restates it.
+    #
+    # UNITS. pc.layered_band_at_k takes (kx, ky) in 2 pi/a units (the mesh's
+    # convention) and returns the band w a / (2 pi c). The shooting trace here is
+    # in RAW wavenumbers, so ky_raw = 2 pi ky and the returned band is
+    # sqrt(lam)/2 pi. Both sides therefore carry the same 2 pi and the check
+    # compares like with like.
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..",
+                                    "dockerfiles", "maxwell_solver"))
+    import pc  # noqa: E402
+
+    from scipy.optimize import brentq
+
+    def band_shooting(ky, eps2, pol):
+        """The band from the INDEPENDENT shooting trace, in the same units.
+
+        The root is at lam ~ (2 pi ky)^2 / eps2, which grows with ky, so the
+        bracket is found by scanning for the sign change rather than pinned --
+        a hard-coded [1e-9, 0.5] silently misses the higher-ky cases.
+        """
+        ky_raw = 2.0 * np.pi * ky
+        g = lambda l: float(np.real(shooting_trace(l, ky_raw, eps2, pol, 1e-13))) - 2.0
+        lam_max = 2.0 * (ky_raw ** 2) / min(eps2, 1.0) + 5.0
+        # A COARSE scan finds the bracket; solve_ivp at rtol=1e-13 is the cost, and
+        # a fine scan spends it thousands of times. 120 points bracket the low root
+        # (the band nearest the light line) and brentq then refines with ~40 extra
+        # solves, not thousands.
+        grid = np.linspace(1e-12, lam_max, 120)
+        prev_x, prev_f = None, None
+        for x in grid:
+            fx = g(x)
+            if prev_f is not None and (prev_f <= 0.0 < fx or prev_f >= 0.0 > fx):
+                lam = brentq(g, prev_x, x, xtol=1e-14)
+                return float(np.sqrt(lam) / (2.0 * np.pi))
+            prev_x, prev_f = x, fx
+        raise RuntimeError(f"no shooting root below lam={lam_max} at ky={ky}")
+
+    worst = 0.0
+    for eps2 in (4.0, 12.0):
+        for ky in (0.3, 0.6):
+            for pol in ("s", "p"):
+                mine = pc.layered_band_at_k(0.0, ky, eps2, 0.5, pol)
+                theirs = band_shooting(ky, eps2, pol)
+                d = abs(mine - theirs)
+                worst = max(worst, d)
+                print(f"  band kx=0 ky={ky} eps2={eps2} {pol}: "
+                      f"mine={mine:.12f} shooting={theirs:.12f} |d|={d:.2e}")
+    print(f"  band-finder self-check: worst |d| = {worst:.3e}  required 1e-9 -> "
+          f"{'PASS' if worst < 1e-9 else 'FAIL'}")
+
+    # the could-not-ask guard: the finder must reproduce the EXACT uniform band,
+    # which an edge-scan oracle cannot (it lands on a band edge, 5.7% away).
+    unif = max(
+        abs(pc.layered_band_at_k(0.0, ky, 1.0, 0.5, p) - ky)
+        for ky in (0.2, 0.3, 0.9) for p in ("s", "p")
+    )
+    print(f"  uniform band (eps2=1) vs exact |k|=ky: worst = {unif:.3e}  required "
+          f"1e-10 -> {'PASS' if unif < 1e-10 else 'FAIL'}")
+
+    # The unit pin at eps != 1: a uniform cell at eps gives exactly |k|/sqrt(eps).
+    # This is the relation that a dropped 2 pi on either side breaks, and it is
+    # the one the eps = 1 check above cannot see (w = |k| there).
+    unit = max(
+        abs(pc.layered_band_at_k(kx, ky, eps, 0.5, p, eps1=eps)
+            - np.hypot(kx, ky) / np.sqrt(eps))
+        for eps in (2.25, 4.0) for kx, ky in ((0.13, 0.37), (0.2, 0.0))
+        for p in ("s", "p")
+    )
+    print(f"  unit pin, uniform eps!=1 vs |k|/sqrt(eps): worst = {unit:.3e}  "
+          f"required 1e-12 -> {'PASS' if unit < 1e-12 else 'FAIL'}")
+
 
 if __name__ == "__main__":
     main()

@@ -530,6 +530,135 @@ def test_the_conforming_circle_does_not_move_the_periodic_pairing():
                 )
 
 
+def test_snapped_fill_lands_on_a_grid_column_and_stays_inside():
+    """The stripe is only conforming when its interface is a node column, so the
+    fill is snapped to k/divisions. This asserts the snap is a projection onto
+    the grid, is idempotent, and never produces a zero-width stripe."""
+    for divisions in (8, 12, 24, 40):
+        for fill in (0.25, 0.31, 0.45, 0.5, 0.62, 0.87):
+            f = pc.snapped_fill(fill, divisions)
+            # it IS a grid column
+            assert abs(f * divisions - round(f * divisions)) < 1e-12, (
+                f"fill={fill} divisions={divisions} snapped to {f}, not a "
+                f"node column"
+            )
+            # idempotent: snapping a snapped value changes nothing
+            assert pc.snapped_fill(f, divisions) == f
+            # a stripe with two sides
+            assert 0.0 < f < 1.0, f"fill={fill} snapped to a degenerate {f}"
+            # and it is the NEAREST column, not some other one
+            assert abs(f - fill) <= 0.5 / divisions + 1e-12
+
+
+def test_the_stripe_never_straddles_the_interface():
+    """The stripe's zero-straddle promise, the straight-interface twin of the
+    circle test.
+
+    The stripe takes a DIFFERENT route to the same promise: no nodes are
+    inserted and none are dropped, because the interface is snapped onto a node
+    column. So the straddle test must be run on the stripe independently -- the
+    circle's instrument does not cover it. Measured before snapping: the stripe
+    path had 24 straddlers at square/12/fill=0.5.
+
+    The three claims, in the order they can fail:
+
+      1. the mesh's interface IS at a node column (the snap ran) -- checked by
+         recovering the eps boundary from the element VALUES, not by calling
+         snapped_fill again. Calling snapped_fill to build the reference would
+         make this test pass with the snap deleted: both sides would agree on
+         the un-snapped geometry. (Measured: the first version of this test DID
+         pass under that mutation.)
+      2. no triangle crosses that boundary;
+      3. the eps is two-valued, so a stripe exists to cross.
+    """
+    for lattice in ("square", "triangular"):
+        a1, a2 = pc.lattice_vectors(lattice)
+        A = np.column_stack([a1, a2])
+        for divisions in (8, 12, 24, 40):
+            for fill in (0.25, 0.31, 0.45, 0.5, 0.62, 0.87):
+                pts, tris, eps, pairs = pc.unit_cell_mesh(
+                    lattice, divisions, geometry="stripe", fill=fill,
+                    n_rod=4.0, n_bg=1.0,
+                )
+                ufrac = (pts @ np.linalg.inv(A).T)[:, 0]
+
+                # 1. Recover the interface FROM THE MESH: the u at which eps
+                # changes between adjacent elements is wherever the mesher
+                # actually put it. If the snap did not run and fill=0.31 was
+                # used directly, the columns are still at 0.25/0.375 and the
+                # eps boundary sits BETWEEN them -- so this is not circular.
+                n_rod_sq = 16.0
+                h = 1.0 / divisions
+                cen = pts[tris].mean(axis=1)
+                ucen = (cen @ np.linalg.inv(A).T)[:, 0]
+                inner = ucen[eps == n_rod_sq]
+                assert inner.size > 0, (
+                    f"{lattice} divisions={divisions} fill={fill}: no eps2 "
+                    f"triangles at all, so there is no stripe to test"
+                )
+                # The interface is the far edge of the eps2 elements. With the
+                # snap, that edge is a node column at k/divisions and the last
+                # eps2 centroid sits exactly h/3 inside it, so inner.max is
+                # k/divisions - h/3 -- an exact relation, recoverable from the
+                # mesh. If the snap did not run, the mesh used fill itself and
+                # the eps boundary lands mid-cell: at fill=0.31, divisions=8,
+                # inner.max is 0.2917 where the snapped relation predicts
+                # 0.2083 -- a 2h/3 miss that this catches.
+                f = pc.snapped_fill(fill, divisions)
+                expect = f - h / 3.0
+                boundary = inner.max()
+                assert abs(boundary - expect) < 1e-9, (
+                    f"{lattice} divisions={divisions} fill={fill}: the eps2 "
+                    f"boundary is at {boundary:.6f}; a snapped interface puts "
+                    f"it at {expect:.6f} (= {f} - h/3). The mesh is not "
+                    f"conforming to its own eps boundary."
+                )
+                boundary = f      # the node column the interface sits on
+
+                # 2. No triangle crosses the boundary the mesh itself reports.
+                lo = (ufrac < boundary - 1e-9)[tris]
+                hi = (ufrac > boundary + 1e-9)[tris]
+                n = int((lo.any(axis=1) & hi.any(axis=1)).sum())
+                assert n == 0, (
+                    f"{lattice} divisions={divisions} fill={fill}: {n} "
+                    f"triangles straddle the stripe interface at u={boundary}"
+                )
+                # 3. two-valued eps
+                assert set(np.round(eps, 6).tolist()) == {1.0, 16.0}, (
+                    f"the stripe has one eps value, so it is not a stripe: "
+                    f"{sorted(set(np.round(eps, 6).tolist()))}"
+                )
+
+
+def test_the_stripe_does_not_move_the_periodic_pairing():
+    """Snapping does not touch the periodic pairing: the interface is interior
+    and its column does not include the v = 0 / v = 1 boundary nodes (those
+    belong to the cell faces, which the pairing consumes)."""
+    for lattice in ("square", "triangular"):
+        a1, a2 = pc.lattice_vectors(lattice)
+        A = np.column_stack([a1, a2])
+        for divisions in (8, 12, 24, 40):
+            for fill in (0.25, 0.5, 0.87):
+                pts, tris, eps, pairs = pc.unit_cell_mesh(
+                    lattice, divisions, geometry="stripe", fill=fill,
+                    n_rod=4.0, n_bg=1.0,
+                )
+                assert len(pairs) == 2 * divisions + 1, (
+                    f"{lattice} divisions={divisions} fill={fill}: "
+                    f"{len(pairs)} pairs, expected {2 * divisions + 1}"
+                )
+                frac = np.round(pts @ np.linalg.inv(A).T, 9)
+                far = {
+                    i for i, (u, v) in enumerate(frac)
+                    if abs(u - 1.0) < 1e-9 or abs(v - 1.0) < 1e-9
+                }
+                slaves = [s for s, _, _ in pairs]
+                assert set(slaves) == far, (
+                    f"{lattice} divisions={divisions} fill={fill}: the paired "
+                    f"set is not the far-face set"
+                )
+
+
 def test_the_circle_points_sit_strictly_inside_the_cell():
     """The circle never reaches the cell boundary -- the geometric reason the
     pairing above is undisturbed. At r/a at the inradius it would touch; the
@@ -634,11 +763,11 @@ PRODUCTION_DIVISIONS = 40
 
 
 def _bands(lattice, divisions, r_over_a, n_rod, n_bg, k_points, n_bands,
-           polarisation):
+           polarisation, geometry="rod", fill=0.5):
     """One call into the shared chain, so every control uses the same path."""
     _, bands = pc.bands_from_mesh(
         lattice, divisions, r_over_a, n_rod, n_bg, k_points, n_bands,
-        polarisation=polarisation,
+        polarisation=polarisation, geometry=geometry, fill=fill,
     )
     return bands
 
@@ -678,6 +807,21 @@ def test_control_A_empty_lattice_matches_the_folded_light_line():
             f"exceeds the 1e-3 production-mesh bound"
         )
 
+    # THE LANDMARK THAT CATCHES A MISSING BLOCH 2 pi. The lowest band is a trap:
+    # for an empty lattice its value is |k| in the k-point's own 2 pi/a units,
+    # which is ALSO the correct w a / 2 pi c -- so a phase that drops the 2 pi
+    # AND an output that skips the /2 pi cancel on band 1 at X and M and the two
+    # checks above cannot see it. They do NOT cancel at Gamma, where the second
+    # band must be |G| a / 2 pi c = 1.0 and the (2 pi)-wrong code returns 2 pi.
+    # Measured with the bug in: Gamma band 2 = 6.288989 against this 1.0.
+    gamma_second = bands[0, 1]
+    assert abs(gamma_second - 1.0) < 1e-2, (
+        f"empty lattice, Gamma band 2: {gamma_second:.6f} vs the free-photon "
+        f"value 1.0. A value near 2 pi = 6.283 means the Bloch phase is missing "
+        f"its 2 pi factor (or the band output its /2 pi); the lowest band cannot "
+        f"detect that because both omissions cancel there."
+    )
+
 
 @pytest.mark.heavy
 def test_control_A_convergence_order_is_second_order():
@@ -711,7 +855,7 @@ def test_control_A_convergence_order_is_second_order():
 
 @pytest.mark.heavy
 def test_control_B_layered_cell_matches_the_transfer_matrix_bands():
-    """CONTROL B -- a 1-D layered cell against the exact transfer-matrix bands.
+    """CONTROL B -- a 1-D layered cell against the exact transfer-matrix band.
 
     The stripe varies only in x, and the k-point carries a NONZERO component
     parallel to the layers (ky != 0). Both are required: at ky = 0 (or at
@@ -719,28 +863,114 @@ def test_control_B_layered_cell_matches_the_transfer_matrix_bands():
     swapped eps slot -- which is exactly the defect this control exists to catch.
 
     The mesh dispersion is compared to ITS OWN polarisation's closed-form branch.
+
+    THE ORACLE IS ``layered_band_at_k``, NOT ``layered_bands``. A Bloch band at a
+    k-point is a ROOT of trace(lam) = 2 cos(kx a); ``layered_bands`` returns the
+    band EDGES (crossings of |trace| = 2, the passband/gap boundaries), which is a
+    different quantity. Comparing the mesh's kx = 0 band to an edge is a category
+    error and was measured to give 5.7% here (0.28285 against a true 0.30000 on a
+    uniform cell) -- a wrong instrument reading as a solver failure.
+
+    The bar is O(h^2), NOT a fixed 1e-4. Measured relative error against the
+    production mesh: 6.9e-4 at div 16, 1.7e-4 at div 32, 4.3e-5 at div 64, i.e.
+    the ratio is 4.0 per halving and the observed order is 2.00. The production
+    mesh (div 40) sits at 1.2e-4, so a 1e-4 bar would be measuring the mesh at a
+    single resolution rather than the operator; this measures the ORDER, as
+    Control A does, which is the quantity a wrong operator cannot fake. An error
+    that is FLAT under refinement is the signature of a unit mistake, and it was
+    one once: the oracle took raw wavenumbers where the mesh's k-points are in
+    2 pi/a units, which read ~1 % low at eps = 4 and never converged.
     """
     lattice = "square"
     eps2, fill = 4.0, 0.5
-    n_rod = 1.0                       # the "rod" is the eps2 stripe
+    n_stripe = eps2 ** 0.5            # the stripe's index; eps = n^2
+    n_bg = 1.0
     ky = 0.3
 
-    # per polarisation, the closed-form band edges at this ky
-    bands_s, bands_p = pc.layered_bands(eps2, fill, ky, n_bands=6)
-    assert len(bands_s) >= 2 and len(bands_p) >= 2, (
-        f"oracle returned too few band edges: s={bands_s}, p={bands_p}"
-    )
-
     k_pts = np.array([[0.0, ky]])
-    for polarisation, oracle_bands in (("TM", bands_s), ("TE", bands_p)):
-        got = _bands(lattice, PRODUCTION_DIVISIONS, 0.5, n_rod ** 0.5 * 0.0 + 1.0,
-                     1.0, k_pts, 1, polarisation)[0, 0]
-        # the lowest branch below the first edge is the first band edge
-        want = oracle_bands[0]
-        rel = abs(got - want) / abs(want)
-        assert rel <= 1e-3, (
-            f"Control B {polarisation}: mesh {got:.6f} vs transfer matrix "
-            f"{want:.6f}, rel {rel:.3e} exceeds 1e-3"
+    for pol, mesh_pol in (("s", "TM"), ("p", "TE")):
+        want = pc.layered_band_at_k(0.0, ky, eps2, fill, pol)
+        errs = []
+        for divisions in (16, 32):
+            got = _bands(lattice, divisions, 0.0, n_stripe, n_bg,
+                         k_pts, 1, mesh_pol, geometry="stripe", fill=fill)[0, 0]
+            errs.append(abs(got - want))
+        # the production mesh, as a stated relative bound with the measured
+        # headroom (1.2e-4 measured; 3e-4 is the bound, ~2.5x the measurement)
+        got = _bands(lattice, PRODUCTION_DIVISIONS, 0.0, n_stripe, n_bg,
+                     k_pts, 1, mesh_pol, geometry="stripe", fill=fill)[0, 0]
+        rel = abs(got - want) / want
+        assert rel <= 3e-4, (
+            f"Control B {pol}: mesh {got:.8f} vs transfer-matrix band "
+            f"{want:.8f}, rel {rel:.3e} exceeds the 3e-4 production bound"
+        )
+        # ...and the ORDER, which is what a swapped eps slot or a unit slip
+        # cannot reproduce. A flat error gives ratio 1 and order 0.
+        assert errs[0] > errs[1], (
+            f"Control B {pol}: error does not decrease under refinement: {errs}"
+        )
+        order = np.log2(errs[0] / errs[1])
+        assert 1.7 <= order <= 2.3, (
+            f"Control B {pol}: observed order {order:.3f} (errors {errs}) is "
+            f"outside [1.7, 2.3]; a conforming P1 stripe converges at order 2, "
+            f"and a flat error means the two sides use different k-units."
+        )
+
+
+def test_control_B_fails_if_the_oracle_k_units_drift():
+    """The oracle's unit pin -- exact, and it cannot be satisfied by accident.
+
+    ``layered_band_at_k`` takes ``(kx, ky)`` in ``2 pi / a`` units (the mesh's
+    convention) and returns the dimensionless band ``w a / (2 pi c)``. On a
+    cell that is uniform at ``eps`` (``eps1 = eps2 = eps``) the band is exactly
+    ``|k| / sqrt(eps)``, so both the input and the output unit convention are
+    pinned by one exact relation.
+
+    Why this test exists. The oracle once carried the SAME pair of omissions the
+    mesh did -- raw wavenumbers in, no ``1/2 pi`` out -- and the two omissions
+    cancel in a uniform medium, where ``w = |k|``, so an ``eps = 1`` check could
+    not see it. The tell was that the mesh-vs-oracle error stopped converging:
+    it sat at ~1.2 % from div 16 to div 64. With the units pinned it converges
+    at order 2. So this is the check that must exist BEFORE any epsilon != 1
+    comparison means anything -- a control that cannot fail is not a control,
+    and this one fails at the 1e-16 level if either 2 pi is dropped.
+    """
+    kx, ky = 0.13, 0.37
+    for eps in (1.0, 2.25, 4.0):
+        want = np.hypot(kx, ky) / np.sqrt(eps)
+        for pol in ("s", "p"):
+            got = pc.layered_band_at_k(kx, ky, eps, 0.5, pol, eps1=eps)
+            assert abs(got - want) < 1e-12, (
+                f"uniform eps={eps} cell at (kx,ky)=({kx},{ky}) must give "
+                f"exactly |k|/sqrt(eps) = {want!r}; oracle gave {got!r}. A "
+                f"factor-of-2-pi slip on either the input or the output side "
+                f"shows up here as a ratio, not as a small drift."
+            )
+
+
+def test_control_B_oracle_reproduces_the_exact_uniform_value():
+    """The oracle's own positive control, exact and cheap enough to not be heavy.
+
+    With eps2 = eps1 = 1 the layered cell is uniform, so the band at kx = 0 is
+    exactly |k| = ky. A root finder that happened to converge to a band EDGE, or
+    that bisected the wrong way, fails this at the 5% level -- which is what the
+    edge-scan oracle did (0.28285 vs 0.3). This is the could-not-ask guard: the
+    oracle must be able to produce the right answer before its agreement with the
+    mesh means anything.
+    """
+    ky = 0.3
+    for pol in ("s", "p"):
+        got = pc.layered_band_at_k(0.0, ky, 1.0, 0.5, pol)
+        assert abs(got - ky) < 1e-10, (
+            f"uniform cell at kx=0 must be exactly ky={ky}; oracle gave {got!r}"
+        )
+        # ...and at a NONZERO kx the band is sqrt(kx^2 + ky^2)
+        kx = 0.2
+        got = pc.layered_band_at_k(kx, ky, 1.0, 0.5, pol)
+        want = np.hypot(kx, ky)
+        assert abs(got - want) < 1e-10, (
+            f"uniform cell at (kx,ky)=({kx},{ky}) must be {want}; oracle gave "
+            f"{got!r}"
         )
 
 
@@ -749,17 +979,18 @@ def test_control_B_can_fail_because_the_polarisations_differ():
     """The precondition that makes Control B meaningful.
 
     If the two oracle branches coincided at the chosen k, Control B would pass
-    with eps in EITHER slot. So assert they differ at the tested ky -- the
-    control's own can-fail check -- and that they DO coincide at ky = 0.
+    with eps in EITHER slot. So assert the values differ at the tested (kx, ky)
+    -- the control's own can-fail check -- and that they DO coincide at ky = 0.
     """
-    eps2, fill = 4.0, 0.5
-    s, p = pc.layered_bands(eps2, fill, 0.3, n_bands=4)
-    assert not np.allclose(s[0], p[0], rtol=1e-6), (
-        "the s and p branches coincide at ky=0.3, so Control B cannot detect a "
-        "swapped eps slot"
+    eps2, fill, kx, ky = 4.0, 0.5, 0.0, 0.3
+    s = pc.layered_band_at_k(kx, ky, eps2, fill, "s")
+    p = pc.layered_band_at_k(kx, ky, eps2, fill, "p")
+    assert abs(s - p) / p > 0.05, (
+        f"the s and p bands differ by only {abs(s - p) / p:.3e} at ky={ky}, so "
+        f"Control B cannot detect a swapped eps slot"
     )
-    s0, p0 = pc.layered_bands(eps2, fill, 0.0, n_bands=4)
-    assert np.allclose(s0[0], p0[0], rtol=1e-9), (
-        "at ky=0 the polarisations must coincide; they do not, so the ky=0 "
-        "degeneracy this control relies on is not reproduced"
+    s0 = pc.layered_band_at_k(kx, 0.0, eps2, fill, "s")
+    p0 = pc.layered_band_at_k(kx, 0.0, eps2, fill, "p")
+    assert abs(s0 - p0) < 1e-9, (
+        f"at ky=0 the polarisations must coincide; they differ by {abs(s0 - p0):.3e}"
     )

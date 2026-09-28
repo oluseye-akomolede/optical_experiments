@@ -165,6 +165,23 @@ def _conforming_circle_points(centre, r, h):
     return centre + r * np.column_stack([np.cos(th), np.sin(th)]), n_theta
 
 
+def snapped_fill(fill: float, divisions: int) -> float:
+    """The grid fill a stripe at ``fill`` is actually built at.
+
+    The stripe's interface is conforming only on a node column ``u = k/divisions``
+    (see :func:`unit_cell_mesh`), so the requested fill is snapped to the nearest
+    one, clamped to ``[1, divisions-1]`` so a stripe always has non-zero width on
+    both sides. This is public because the mesh and the 1-D oracle must agree on
+    it: asking the oracle for the un-snapped fill compares two different
+    geometries.
+    """
+    if divisions < 1:
+        raise PCError(f"divisions must be positive, got {divisions}")
+    k = int(round(fill * divisions))
+    k = min(max(k, 1), divisions - 1)
+    return k / divisions
+
+
 def unit_cell_mesh(lattice: str, divisions: int, r_over_a: float = 0.0,
                    n_rod: float = 1.0, n_bg: float = 1.0, n_theta: int = 0,
                    geometry: str = "rod", fill: float = 0.5):
@@ -194,9 +211,12 @@ def unit_cell_mesh(lattice: str, divisions: int, r_over_a: float = 0.0,
     rather than fixed.
 
     ``geometry`` is ``"rod"`` (a circle of radius ``r_over_a`` at the cell
-    centre) or ``"stripe"`` (a slab of width ``fill`` along x, for the 1-D
-    layered control, whose interface is a straight line and gets the same
-    treatment).
+    centre) or ``"stripe"`` (a slab of width ``fill`` along a1, for the 1-D
+    layered control). The two get there differently and both end at zero
+    straddlers: the circle is curved, so its own nodes are inserted and the
+    grid points near it are dropped; the stripe's interface is straight, so the
+    fill is SNAPPED onto a node column (:func:`snapped_fill`) and no node is
+    inserted or dropped at all.
 
     Pairing is done by HASHING the translated coordinate, never by index
     arithmetic: index arithmetic is correct in the interior of an edge and wrong
@@ -212,6 +232,23 @@ def unit_cell_mesh(lattice: str, divisions: int, r_over_a: float = 0.0,
         raise PCError(
             f"stripe fill must be strictly between 0 and 1, got {fill}"
         )
+    if geometry == "stripe":
+        # SNAP the fill to the grid. The stripe's interface is a straight line
+        # parallel to a2, and on a STRUCTURED grid the only way it is conforming
+        # is if it lands exactly on a node column u = k/divisions. Inserting
+        # partial columns instead does not work: the line's end nodes fall on
+        # the cell's v = 0 / v = 1 faces, where they join the periodic pairing
+        # and a triangle still crosses (measured: 2-3 straddlers at fill = 0.31,
+        # 0.45, 0.62 with insertion). Snapped, the column exists in the grid and
+        # the count is 0 at every fill tested.
+        #
+        # This is a REAL geometry change, so the effective fill is exposed as
+        # :func:`snapped_fill` and every consumer of the mesh -- the solver and
+        # the layered oracle in Control B -- must call it before comparing the
+        # two. Otherwise the mesh is built at k/divisions while the oracle is
+        # asked for the requested fill: two different problems, which is the one
+        # failure mode this control exists to catch.
+        fill = snapped_fill(fill, divisions)
     a1, a2 = lattice_vectors(lattice)
 
     # The rod must fit INSIDE the cell, and the cell's inradius is
@@ -240,8 +277,9 @@ def unit_cell_mesh(lattice: str, divisions: int, r_over_a: float = 0.0,
     h = 1.0 / divisions  # |a_i| = 1 for both lattices, so this IS the spacing
 
     centre = 0.5 * (a1 + a2)
-    extra = []           # the interface's own nodes, appended to the grid
+    extra = []             # the rod's own nodes, appended to the grid
     interface_dist = None  # distance of every GRID point from the interface
+                           # (rod only -- the stripe needs neither)
 
     if geometry == "rod":
         rod_radius = r_over_a  # times |a_i| = 1
@@ -256,9 +294,11 @@ def unit_cell_mesh(lattice: str, divisions: int, r_over_a: float = 0.0,
                 circ, _ = _conforming_circle_points(centre, rod_radius, h)
             extra.append(circ)
     else:
-        # The stripe's interface is the pair of lines x = 0 and x = fill along
-        # a1, i.e. constant u. Its nodes are placed on those lines.
-        interface_dist = None
+        # The stripe needs NO inserted nodes: its interface is snapped to a node
+        # column u = k/divisions (see ``snapped_fill``), so the grid already
+        # conforms and no triangle crosses it. ``extra`` stays empty, so the drop
+        # below is a no-op and the point set is exactly the structured grid.
+        pass
 
     # Which grid points sit ON the cell's own far faces. These are the nodes the
     # periodic pairing consumes, and they must NEVER be dropped: on the rhombic
@@ -281,12 +321,15 @@ def unit_cell_mesh(lattice: str, divisions: int, r_over_a: float = 0.0,
         # collapse the interior: a circle with no interior nodes triangulates
         # into boundary-only triangles (measured: 62 "straddlers" that were
         # really a collapsed mesh, not a chord violation).
-        keep = np.ones(len(pts), dtype=bool)
-        if geometry == "rod":
-            keep = (np.abs(interface_dist) > 0.5 * h) | on_face
-            if keep.sum() == 0:
-                # a rod filling the whole cell interior -- keep the closest node
-                keep[np.argmin(np.abs(interface_dist))] = True
+        # Only the rod reaches here: the stripe's interface is snapped onto a
+        # node column, so its ``extra`` is empty and the grid is already
+        # conforming. The rod's grid points within h/2 of the circle are dropped
+        # (they would steal a chord) but the cell's own boundary nodes are kept.
+        keep = (np.abs(interface_dist) > 0.5 * h) | on_face
+        if keep.sum() == 0:
+            # an inclusion filling the whole cell interior -- keep the closest
+            # node rather than collapse to a boundary-only triangulation
+            keep[np.argmin(np.abs(interface_dist))] = True
         pts = np.vstack([pts[keep], extra[0]])
 
     from scipy.spatial import Delaunay
@@ -421,18 +464,32 @@ def bloch_reduce(K, M, pairs, k, a1, a2):
     """Fold the periodic slave nodes onto their masters, carrying the phase.
 
     For a slave ``s`` paired with master ``m`` under translation ``T``, Bloch
-    periodicity gives ``u_s = e^{i k . (T a)} u_m``. Substituting that into the
+    periodicity gives ``u_s = e^{i K . (T a)} u_m``. Substituting that into the
     quadratic forms and summing the slave's row/column into the master's leaves
     a Hermitian problem on the master (free) nodes of HALF the boundary size.
 
+    ``k`` is in units of ``2 pi / a`` (``high_symmetry_path``'s convention), so
+    the physical wavevector is ``K = 2 pi k / a`` and the phase carries the
+    factor of ``2 pi``. MEASURED, and it matters: without the ``2 pi`` the empty
+    lattice gives its band values in the WRONG units and the error is invisible
+    at X and M -- there ``sqrt(lam) = |k|`` happens to be the right number,
+    because dropping the ``2 pi`` from the phase and the ``2 pi`` from the band
+    output cancel. At Gamma they do not: the second band is ``|G| a / 2 pi c``
+    in the free-photon limit, i.e. 1.0, and the unfolded periodic Laplacian puts
+    it at ``lam = (2 pi)^2``. With the phase corrected AND the band value divided
+    by ``2 pi`` (see :func:`solve_bands`) all three landmarks come out right at
+    once: Gamma -> 0, 1, 1; X -> 0.5; M -> 0.7071. A control that only checks the
+    LOWEST band at X and M cannot see any of this.
+
     Returns ``(K_red, M_red, free)`` with ``free`` the surviving node indices.
     """
+    two_pi = 2.0 * np.pi
     n = K.shape[0]
     slave_of = {}
     phase_of = {}
     for slave, master, tvec in pairs:
         T = tvec[0] * a1 + tvec[1] * a2
-        phase = np.exp(1j * float(np.dot(k, T)))
+        phase = np.exp(1j * two_pi * float(np.dot(k, T)))
         slave_of[slave] = master
         phase_of[slave] = phase
 
@@ -467,7 +524,8 @@ def bloch_reduce(K, M, pairs, k, a1, a2):
 
 
 def bands_from_mesh(lattice, divisions, r_over_a, n_rod, n_bg, k_points,
-                    n_bands, sigma=None, polarisation="TM"):
+                    n_bands, sigma=None, polarisation="TM",
+                    geometry="rod", fill=0.5):
     """The whole chain for one polarisation: mesh -> assemble -> reduce -> solve.
 
     This exists so the controls and the shipped solver share ONE assembly path.
@@ -487,7 +545,8 @@ def bands_from_mesh(lattice, divisions, r_over_a, n_rod, n_bg, k_points,
     if polarisation not in ("TM", "TE"):
         raise PCError(f"polarisation must be TM or TE, got {polarisation!r}")
     pts, tris, eps_by_tri, pairs = unit_cell_mesh(
-        lattice, divisions, r_over_a, n_rod, n_bg
+        lattice, divisions, r_over_a, n_rod, n_bg,
+        geometry=geometry, fill=fill,
     )
     a1, a2 = lattice_vectors(lattice)
     if polarisation == "TM":
@@ -505,8 +564,26 @@ def solve_bands(K, M, pairs, k_points, a1, a2, n_bands, sigma=None):
 
     Sparse shift-invert at a NEGATIVE shift, mirroring :mod:`mse_eigen`: at Gamma
     the lowest eigenvalue is exactly 0, so ``sigma = 0`` is singular and a small
-    negative shift is required. Frequencies are returned as ``w a / (2 pi c)``.
+    negative shift is required.
+
+    Units, and the correction that makes them consistent. ``k_points`` are in
+    ``2 pi / a`` units, so the physical wavevector is ``K = 2 pi k / a`` and the
+    assembled ``lam`` (with the phase in :func:`bloch_reduce` carrying that
+    ``2 pi``) is ``(K a)^2`` in rad^2, equal to ``(2 pi w a / c)^2 / (2 pi)^2``
+    -- i.e. ``lam = (2 pi)^2 (w a / 2 pi c)^2``. The band value returned is the
+    dimensionless ``w a / (2 pi c)``, so it is ``sqrt(lam) / (2 pi)``.
+
+    This pair of factors was WRONG from step 1 in a way nothing caught. The old
+    code omitted the ``2 pi`` from the phase AND omitted the ``2 pi`` from this
+    division, and the two omissions CANCEL at X and M: ``sqrt(lam)`` there came
+    out as |k| in ``2 pi/a`` units, which is the right light-line number for the
+    lowest band, so Control A's X and M landmarks passed. At Gamma they do not
+    cancel -- the second band is ``|G| a / 2 pi c = 1.0`` but the old output
+    gave ``2 pi`` -- and no band above the first was ever checked. Measured with
+    both factors restored: Gamma -> 0, 1.000924, 1.000924 (exact 0, 1, 1);
+    X -> 0.500116 (exact 0.5); M -> 0.707609 (exact 0.7071).
     """
+    two_pi = 2.0 * np.pi
     if sigma is None:
         sigma = -0.5
     out = []
@@ -526,7 +603,9 @@ def solve_bands(K, M, pairs, k_points, a1, a2, n_bands, sigma=None):
                     raise PCError(f"band solve failed at k={k}: {exc}") from exc
                 kk = min(kk * 2, n - 1)
         lam = np.sort(np.real(lam))[:n_bands]
-        out.append(np.sqrt(np.clip(lam, 0.0, None)) / (2 * np.pi))
+        # lam = (2 pi w a / c)^2, so the band value w a / (2 pi c) is sqrt(lam)
+        # / 2 pi. See the docstring for the measured empty-lattice landmarks.
+        out.append(np.sqrt(np.clip(lam, 0.0, None)) / two_pi)
     return np.array(out)
 
 
@@ -576,6 +655,68 @@ def _m_p(k, eps, d):
         return np.array([[1.0, eps * d], [0.0, 1.0]], dtype=np.complex128)
     c, s = np.cos(k * d), np.sin(k * d)
     return np.array([[c, eps * s / k], [-k * s / eps, c]], dtype=np.complex128)
+
+
+def layered_band_at_k(kx, ky, eps2, fill, pol, eps1=1.0, a=1.0, lam_max=60.0):
+    """The band frequency of the 1-D layered cell at one ``(kx, ky)``.
+
+    This is the quantity Control B needs and :func:`layered_bands` does NOT give:
+    a Bloch band satisfies ``trace(lam) = 2 cos(kx_raw a)``, so the band AT a
+    k-point is a ROOT of that equation, whereas ``layered_bands`` returns the
+    band EDGES (the crossings of ``|trace| = 2``, where the passband meets a
+    gap). Comparing a k-point's band to an edge was a category error and read
+    5.7 % low on a cell where the mesh was right to 2e-6.
+
+    UNITS -- pinned here because they were wrong once and the error was the
+    same shape as the mesh's own missing-2 pi, so the two conspired. The
+    arguments ``kx, ky`` are in ``2 pi / a`` units, exactly the mesh's
+    ``high_symmetry_path`` convention, and the RETURNED value is the
+    dimensionless band ``w a / (2 pi c)``. Inside, the transfer matrix works in
+    raw wavenumbers (``k_raw = 2 pi k``), for which the band satisfies
+    ``lam = (kx_raw^2 + ky_raw^2) / eps`` on a uniform cell -- MEASURED, exact
+    to machine precision at eps1 = eps2 = 4 (0.025000 at k = (0.1, 0.3)). The
+    output is therefore ``sqrt(lam) / 2 pi``. Omitting either the input or the
+    output ``2 pi`` matches a mesh that omits the other one and looks right at
+    eps = 1, where ``w = |k|`` and the errors cancel; it reads ~1 % low at
+    eps = 4 and does not converge under refinement. See ``tests/test_pc.py``'s
+    ``test_the_layered_oracle_band_uses_the_meshs_k_units``.
+
+    ``pol`` is ``"s"`` or ``"p"``; the PhC mapping is TM <-> s, TE <-> p.
+    """
+    if pol not in ("s", "p"):
+        raise PCError(f"pol must be 's' or 'p', got {pol!r}")
+    two_pi = 2.0 * np.pi
+    kx_raw, ky_raw = two_pi * kx, two_pi * ky
+    target = 2.0 * np.cos(kx_raw * a)
+    idx = 0 if pol == "s" else 1
+    lams = np.linspace(0.0, lam_max, 200000)
+    prev_f = None
+    for lam in lams:
+        f = float(np.real(layered_traces(lam, ky_raw, eps2, fill, eps1, a)[idx])
+                  - target)
+        # The band is a ROOT of trace - 2cos(kx a) = 0, and trace is DESCENDING
+        # across it (measured: +0.0907 at lam=0 down through 0 near lam=0.09 for
+        # the uniform cell), so the crossing runs + to -, not - to +.
+        if prev_f is not None and (prev_f <= 0.0 < f or prev_f >= 0.0 > f):
+            lo, hi = lam - lams[1], lam
+            # Bisect on the SIDE, not on a fixed sign: trace descends through
+            # this root, so the bracket is (+ , -). Keep the side whose f has
+            # the same sign as f(lo) and the root stays bracketed either way.
+            lo_positive = prev_f > 0.0
+            for _ in range(80):        # bisection to machine precision
+                mid = 0.5 * (lo + hi)
+                fm = float(np.real(
+                    layered_traces(mid, ky_raw, eps2, fill, eps1, a)[idx])
+                    - target)
+                if (fm > 0.0) == lo_positive:
+                    lo = mid
+                else:
+                    hi = mid
+            return float(np.sqrt(0.5 * (lo + hi)) / two_pi)
+        prev_f = f
+    raise PCError(
+        f"no band found below lam={lam_max} at kx={kx} ky={ky} pol={pol}"
+    )
 
 
 def layered_bands(eps2, fill, ky, n_bands, eps1=1.0, a=1.0, lam_max=200.0,
