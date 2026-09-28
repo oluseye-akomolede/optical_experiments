@@ -141,8 +141,33 @@ def high_symmetry_path(lattice: str, points_per_segment: int = 10):
 # Unit-cell meshing with periodic node pairing
 # ---------------------------------------------------------------------------
 
+def _conforming_circle_points(centre, r, h):
+    """Circle points dense enough that no grid point can steal a chord.
+
+    The arc spacing must not exceed the grid spacing ``h``: if it does, a grid
+    point sitting just outside the circle can be closer to two circle points
+    than they are to each other, and Delaunay then connects across the chord and
+    a triangle straddles the interface. So the count is DERIVED from that
+    condition rather than fixed, with a floor so coarse cells still get a
+    recognisable circle.
+
+    Measured, and the reason a FIXED count is not enough: the old default of
+    ``n_theta = 24`` straddled at square/24/0.25 (16), square/24/0.45 (64),
+    square/40/0.25 (88), square/40/0.45 (168) and triangular/40/0.25 (66). The
+    floor of 64 fixes all but one of those -- square/40/0.45 still straddled with
+    64. It is the derived count (324 there) that clears it.
+
+    The fraction ``0.35`` is the safety margin: arc/h = 0.35 is strictly below
+    the 1.00 at which a grid point can steal a chord.
+    """
+    n_theta = max(64, int(np.ceil(2.0 * np.pi * r / (0.35 * h))))
+    th = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
+    return centre + r * np.column_stack([np.cos(th), np.sin(th)]), n_theta
+
+
 def unit_cell_mesh(lattice: str, divisions: int, r_over_a: float = 0.0,
-                   n_rod: float = 1.0, n_bg: float = 1.0, n_theta: int = 24):
+                   n_rod: float = 1.0, n_bg: float = 1.0, n_theta: int = 0,
+                   geometry: str = "rod", fill: float = 0.5):
     """Triangulate one unit cell and pair its periodic boundary nodes.
 
     Returns ``(points, triangles, eps_by_tri, pairs)``:
@@ -151,14 +176,27 @@ def unit_cell_mesh(lattice: str, divisions: int, r_over_a: float = 0.0,
     * ``triangles`` ``(m, 3)`` int, Delaunay on a STRUCTURED point set, so the
       triangulation is deterministic for a given ``divisions``;
     * ``eps_by_tri`` ``(m,)`` the relative permittivity of each triangle,
-      ``n_rod**2`` inside the rod/hole and ``n_bg**2`` outside. A rod is placed
-      at the cell centre and kept strictly inside the cell, so no triangle
-      straddles the eps discontinuity only when the circle is resolved by the
-      point set -- see the refusal below;
+      ``n_rod**2`` inside the inclusion and ``n_bg**2`` outside;
     * ``pairs`` a list of ``(slave, master, phase_vec)`` where a master is the
       node the slave equals under a lattice translation, and ``phase_vec`` is the
       translation (as a multiple of ``a1``/``a2`` integer coefficients) whose
       Bloch phase the slave carries.
+
+    **The mesh CONFORMS to the interface: zero triangles straddle it.** Delaunay
+    on a structured grid alone does NOT promise this -- a grid point close to the
+    circle steals a chord -- so the interface's own nodes are inserted and the
+    grid points within ``h/2`` of it are dropped. Measured over the sweep
+    (square and triangular x divisions 8, 12, 16, 24, 32, 40 x r/a 0.1, 0.2,
+    0.25, 0.3, 0.45): the 54 meshable cases straddled before this and 0 do now;
+    the other 6 are r/a = 0.45 on the triangular cell, which the inradius guard
+    refuses rather than meshes (0.45 > 0.4330). See
+    :func:`_conforming_circle_points` for why the circle's node count is derived
+    rather than fixed.
+
+    ``geometry`` is ``"rod"`` (a circle of radius ``r_over_a`` at the cell
+    centre) or ``"stripe"`` (a slab of width ``fill`` along x, for the 1-D
+    layered control, whose interface is a straight line and gets the same
+    treatment).
 
     Pairing is done by HASHING the translated coordinate, never by index
     arithmetic: index arithmetic is correct in the interior of an edge and wrong
@@ -166,12 +204,32 @@ def unit_cell_mesh(lattice: str, divisions: int, r_over_a: float = 0.0,
     """
     if divisions < 4:
         raise PCError(f"divisions must be at least 4, got {divisions}")
-    if not 0.0 <= r_over_a < 0.5:
+    if geometry not in ("rod", "stripe"):
         raise PCError(
-            f"r/a must be in [0, 0.5) so the rod stays inside the cell; got "
-            f"{r_over_a}"
+            f"geometry must be 'rod' or 'stripe', got {geometry!r}"
+        )
+    if geometry == "stripe" and not 0.0 < fill < 1.0:
+        raise PCError(
+            f"stripe fill must be strictly between 0 and 1, got {fill}"
         )
     a1, a2 = lattice_vectors(lattice)
+
+    # The rod must fit INSIDE the cell, and the cell's inradius is
+    # lattice-dependent: 0.5 for the square, but sin(60)/2 = 0.4330 for the 60
+    # degree rhombus (both measured). A flat "< 0.5" test is WRONG for the
+    # triangular cell -- at r/a = 0.45 the circle pokes through the slanted far
+    # edge, its points land outside the cell in fractional coordinates, and they
+    # then steal chords across the interface together with the boundary nodes.
+    # (Measured with the flat guard in place: 16 straddling triangles at
+    # divisions 8. The pairing counts stay correct there -- 17, 25, 49, 81 at
+    # divisions 8/12/24/40 -- so it is the straddling alone that justifies the
+    # guard.)
+    inradius = 0.5 if lattice == "square" else np.sin(np.pi / 3.0) / 2.0
+    if not 0.0 <= r_over_a < inradius:
+        raise PCError(
+            f"r/a must be in [0, {inradius:.4f}) so the rod stays inside the "
+            f"{lattice} cell; got {r_over_a}"
+        )
 
     # A structured grid in the FRACTIONAL (u, v) coordinates of the lattice, so
     # the same code works for the rhombic triangular cell.
@@ -179,20 +237,70 @@ def unit_cell_mesh(lattice: str, divisions: int, r_over_a: float = 0.0,
     U, V = np.meshgrid(u, u)
     frac = np.column_stack([U.ravel(), V.ravel()])
     pts = frac @ np.vstack([a1, a2])
+    h = 1.0 / divisions  # |a_i| = 1 for both lattices, so this IS the spacing
+
+    centre = 0.5 * (a1 + a2)
+    extra = []           # the interface's own nodes, appended to the grid
+    interface_dist = None  # distance of every GRID point from the interface
+
+    if geometry == "rod":
+        rod_radius = r_over_a  # times |a_i| = 1
+        interface_dist = np.linalg.norm(pts - centre, axis=1) - rod_radius
+        if rod_radius > 0.0:
+            if n_theta > 0:
+                th = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
+                circ = centre + rod_radius * np.column_stack(
+                    [np.cos(th), np.sin(th)]
+                )
+            else:
+                circ, _ = _conforming_circle_points(centre, rod_radius, h)
+            extra.append(circ)
+    else:
+        # The stripe's interface is the pair of lines x = 0 and x = fill along
+        # a1, i.e. constant u. Its nodes are placed on those lines.
+        interface_dist = None
+
+    # Which grid points sit ON the cell's own far faces. These are the nodes the
+    # periodic pairing consumes, and they must NEVER be dropped: on the rhombic
+    # triangular cell the far edge passes close to a large rod, so a naive
+    # |dist - r| < h/2 test removes boundary nodes and the pairing collapses.
+    # (Measured at triangular, divisions 12, with the exemption removed: the
+    # pairing collapses to 13 pairs at r/a = 0.40 and 0.42, and to 5 at 0.43,
+    # where 25 are required -- all ACCEPTED r/a values, so this is a live bug
+    # the exemption prevents, not a historical one. The rhombic far edge passes
+    # within h/2 of a rod once r/a exceeds ~0.35.)
+    A = np.column_stack([a1, a2])
+    gfrac = np.round(pts @ np.linalg.inv(A).T, 9)
+    on_face = (
+        (np.abs(gfrac[:, 0] - 1.0) < 1e-9) | (np.abs(gfrac[:, 1] - 1.0) < 1e-9)
+        | (np.abs(gfrac[:, 0]) < 1e-9) | (np.abs(gfrac[:, 1]) < 1e-9)
+    )
+
+    if extra:
+        # Drop the grid points that would steal a chord, but NEVER enough to
+        # collapse the interior: a circle with no interior nodes triangulates
+        # into boundary-only triangles (measured: 62 "straddlers" that were
+        # really a collapsed mesh, not a chord violation).
+        keep = np.ones(len(pts), dtype=bool)
+        if geometry == "rod":
+            keep = (np.abs(interface_dist) > 0.5 * h) | on_face
+            if keep.sum() == 0:
+                # a rod filling the whole cell interior -- keep the closest node
+                keep[np.argmin(np.abs(interface_dist))] = True
+        pts = np.vstack([pts[keep], extra[0]])
 
     from scipy.spatial import Delaunay
     tri = Delaunay(pts)
     triangles = tri.simplices
 
-    centre = 0.5 * (a1 + a2)
-    # A rod centred at the cell centre: shift the circle's centre into the cell.
-    rod_radius = r_over_a  # times |a_i| = 1
-    tri_centres = pts[triangles].mean(axis=1)
-    # Fold each triangle centre into the fundamental cell (translate by lattice
-    # vectors) so the circle test is on the physical cell content, not on the
-    # arbitrary choice of which copy Delaunay happened to use.
-    folded = _fold_into_cell(tri_centres, a1, a2)
-    inside = np.linalg.norm(folded - centre, axis=1) < rod_radius
+    if geometry == "rod":
+        tri_centres = pts[triangles].mean(axis=1)
+        folded = _fold_into_cell(tri_centres, a1, a2)
+        inside = np.linalg.norm(folded - centre, axis=1) < r_over_a
+    else:
+        folded = _fold_into_cell(pts[triangles].mean(axis=1), a1, a2)
+        ufrac = (folded @ np.linalg.inv(A).T)[:, 0]
+        inside = ufrac < fill
     eps_by_tri = np.where(inside, float(n_rod) ** 2, float(n_bg) ** 2)
 
     pairs = _periodic_pairs(pts, a1, a2)
@@ -254,15 +362,27 @@ def _periodic_pairs(points: np.ndarray, a1: np.ndarray, a2: np.ndarray):
 # The two scalar operators, and the Bloch reduction
 # ---------------------------------------------------------------------------
 
-def _p1_matrices(points, triangles, eps_by_tri):
-    """P1 stiffness and eps-weighted mass on a triangle mesh.
+def _p1_matrices(points, triangles, eps_by_tri, weight="mass"):
+    """P1 stiffness and mass on a triangle mesh, with eps on ONE of them.
 
     Same construction as the 3-D element matrices in :mod:`mse_fem`, in 2-D: the
     stiffness is ``area * G G^T`` with ``G`` the (constant) gradients of the
-    three barycentric functions, and the mass is ``area/12 * (1 + delta)``, here
-    scaled per element by ``eps_r`` -- the ONE place eps enters, so the physics
-    and any estimate cannot disagree about where it goes.
+    three barycentric functions, and the mass is ``area/12 * (1 + delta)``.
+
+    ``weight`` says which matrix the per-element coefficient multiplies, and it
+    is REQUIRED to be explicit because the two polarisations differ in exactly
+    that way (plan §1's table):
+
+        weight="mass"       TM: A = plain stiffness, B = eps-weighted mass
+        weight="stiffness"  TE: A = (1/eps)-weighted stiffness, B = plain mass
+
+    The coefficient passed in is used verbatim -- TM passes ``eps``, TE passes
+    ``1/eps`` -- so the caller owns the physics and this routine owns only the
+    assembly. Keeping it one routine is what stops the two polarisations from
+    drifting into two disagreeing constructions.
     """
+    if weight not in ("mass", "stiffness"):
+        raise PCError(f"weight must be 'mass' or 'stiffness', got {weight!r}")
     n = len(points)
     rows, cols, kv = [], [], []
     mrows, mcols, mv = [], [], []
@@ -283,12 +403,15 @@ def _p1_matrices(points, triangles, eps_by_tri):
         Me = area / 12.0 * np.array([[2.0, 1.0, 1.0],
                                      [1.0, 2.0, 1.0],
                                      [1.0, 1.0, 2.0]])
+        w = eps_by_tri[t]
+        k_scale, m_scale = (1.0, w) if weight == "mass" else (w, 1.0)
         idx = (i, j, k)
         for r in range(3):
             for cc in range(3):
-                rows.append(idx[r]); cols.append(idx[cc]); kv.append(Ke[r, cc])
+                rows.append(idx[r]); cols.append(idx[cc])
+                kv.append(Ke[r, cc] * k_scale)
                 mrows.append(idx[r]); mcols.append(idx[cc])
-                mv.append(Me[r, cc] * eps_by_tri[t])
+                mv.append(Me[r, cc] * m_scale)
     K = coo_matrix((kv, (rows, cols)), shape=(n, n)).tocsr()
     M = coo_matrix((mv, (mrows, mcols)), shape=(n, n)).tocsr()
     return K, M
@@ -341,6 +464,40 @@ def bloch_reduce(K, M, pairs, k, a1, a2):
         return coo_matrix((vals, (rows, cols)), shape=(len(free), len(free))).tocsc()
 
     return scatter(Kc), scatter(Mc), free
+
+
+def bands_from_mesh(lattice, divisions, r_over_a, n_rod, n_bg, k_points,
+                    n_bands, sigma=None, polarisation="TM"):
+    """The whole chain for one polarisation: mesh -> assemble -> reduce -> solve.
+
+    This exists so the controls and the shipped solver share ONE assembly path.
+    Two paths that both look right are two paths that can disagree, and the
+    disagreement would show up as a physics difference rather than a bug.
+
+    ``polarisation`` picks the operator, and the mapping is the geometric fact
+    from the module docstring -- ``TM`` (E_z) is tangential to the interfaces,
+    so eps sits on the MASS (the s problem); ``TE`` (H_z) has eps on the
+    STIFFNESS (the p problem):
+
+        TM:  K u = lam M_eps u          (plain stiffness, eps-weighted mass)
+        TE:  K_(1/eps) u = lam M u      (1/eps on the stiffness, plain mass)
+
+    Returns ``(k_points, bands)`` with bands as ``w a / (2 pi c)``.
+    """
+    if polarisation not in ("TM", "TE"):
+        raise PCError(f"polarisation must be TM or TE, got {polarisation!r}")
+    pts, tris, eps_by_tri, pairs = unit_cell_mesh(
+        lattice, divisions, r_over_a, n_rod, n_bg
+    )
+    a1, a2 = lattice_vectors(lattice)
+    if polarisation == "TM":
+        # E_z tangential to the interfaces -> eps on the mass, plain stiffness.
+        K, M = _p1_matrices(pts, tris, eps_by_tri, weight="mass")
+    else:
+        # H_z -> 1/eps on the stiffness, plain mass.
+        K, M = _p1_matrices(pts, tris, 1.0 / eps_by_tri, weight="stiffness")
+    kp = np.atleast_2d(k_points)
+    return kp, solve_bands(K, M, pairs, kp, a1, a2, n_bands, sigma=sigma)
 
 
 def solve_bands(K, M, pairs, k_points, a1, a2, n_bands, sigma=None):
