@@ -24,6 +24,26 @@ and all measured rather than argued here:
    is stated as `O(h²)` convergence with a pre-stated bound and an observed rate.
    The 1e-10 sits on the oracle, not the mesh.
 
+**Revision 4.** §3 (**Compute tier**) was rejected and is rewritten from
+timings taken here, not estimates:
+
+4. **The solve is not inline in the web pod.** Measured: **0.2 s/k-point median,
+   6.1 s max** at the production mesh, so a 30 k × 2 polarisation path is
+   **≈ 12 s clean, ≈ 6.1 min under contention** — against
+   `gunicorn -w 1 --threads 8` with the tick in the same
+   process and `cpu: 500m`. It runs as a **job kind** (`kind = 'pc'`) claimed by
+   the worker with the cluster Job as the 3-D jobs' existing fallback; the web
+   side validates, estimates, refuses with the limit named, and enqueues. The
+   caps (30 k-points/polarisation, 5,000 nodes) are **set from the measurement**.
+5. **Two figures in revision 3 were simply wrong** and are corrected: the
+   production mesh is **1,681 nodes / 3,200 triangles** (not "~1,600
+   triangles"), and a dense complex `eigh` did **not** finish inside 4 minutes —
+   so the sparse shift-invert route is required, and it is what the plan now
+   specifies in §1 as well.
+6. **No new dependency**: the solver image already carries `numpy==2.5.3` and
+   `scipy==1.18.1`, so `scipy.spatial.Delaunay` and `scipy.sparse.linalg` are
+   already there. The worker's HTTP client stays stdlib-only.
+
 ## Scope of v1
 
 An infinite 2-D lattice of circular rods or holes: square and triangular, index
@@ -78,10 +98,12 @@ nodes and impose `u(r + L) = e^{i k·L} u(r)`, eliminating the slave nodes.
 > numerically in this session), so that is not a cheaper route either.
 
 The linear algebra is therefore: assemble the complex Hermitian generalised pair
-`(A, B)` per k-point and solve with **`scipy.linalg.eigh`**. The cells are small
-(§3), so a dense complex Hermitian solver is the simplest correct choice, and it
-is exactly what revision 1's real-symmetric framing ruled out. Nothing in v1
-needs the 3-D solver's real shift-invert Lanczos path.
+`(A, B)` per k-point and solve with a **sparse** shift-invert eigensolver
+(`scipy.sparse.linalg.eigsh`, `sigma < 0`), for the lowest `n_bands`. Complex
+Hermitian is supported. **§3 measured why sparse and not dense** — dense did not
+finish inside 4 minutes at the production mesh. Nothing in v1 needs the 3-D
+solver's real shift-invert Lanczos path, but the *shape* of the solve is the same
+one: sparse, shift-invert, lowest few modes.
 
 ---
 
@@ -106,27 +128,107 @@ a square (`a1 = (a,0)`, `a2 = (0,a)`) or a rhombus for the triangular lattice.
   index arithmetic, which breaks at the cell corners.
 
 **Which image.** Pure numpy/scipy on a 2-D triangulation of at most a few
-thousand nodes. It runs **inline in the web pod**, does **not** enter
-`dockerfiles/maxwell_solver/`, and adds **no dependency to the Orin worker venv**.
+thousand nodes. **Both are already in the solver image** — `numpy==2.5.3` and
+`scipy==1.18.1` (`dockerfiles/maxwell_solver/requirements.txt:15-16`), read from
+the tree — so this needs **no new dependency anywhere**, and `scipy.spatial.Delaunay`
+and `scipy.sparse.linalg` are exactly what the image already carries. The solve
+runs in `dockerfiles/maxwell_solver/` alongside the 3-D solver (`_SOLVER_DIR`,
+`worker/mse_worker.py:49`), **not** inline in the web pod (§3). The worker's
+*client* stays stdlib-only, as its docstring requires.
 
 ---
 
 ## 3. Compute tier
 
-At ~40 divisions per lattice vector: ~1,600 triangles, ~1,700 nodal unknowns;
-after eliminating the pairing slaves, a complex Hermitian problem of order ~1,700
-for 10–20 bands.
+> **Rewritten in revision 4 — the lead rejected revision 3's §3, and was right.**
+> Revision 3 said "a dense complex `eigh` at n ≈ 1,700 is well under a second"
+> and "a 60-point path is seconds". **Neither was measured**, and both are wrong.
+> The revision that follows is built from timings taken here.
 
-- **Per k-point**: a dense complex `eigh` at n ≈ 1,700 is well under a second.
-  A 60-point path is **seconds**. For scale, the 3-D solver's 100k-element solves
-  take minutes on the Jetson.
-- **Where it runs: web pod inline, synchronously.** It does **not** go to the
-  Jetson and does **not** launch a k8s Job — those exist for the heavy 3-D vector
-  solves, and routing a 2-second scalar problem through a lease, a Job and a
-  scheduling tick would make it slower and less reliable.
-- **Bound, stated before running**: hard caps of 20 s wall clock and 20,000
-  nodes. Above either, the form is **refused with the limit named**, never run to
-  a timeout with no page (the could-not-ask guard).
+**The production mesh, measured (not estimated).** At 40 divisions per lattice
+vector the Delaunay cell has **1,681 nodes and 3,200 triangles** — revision 3
+said "~1,600 triangles", which was the node-like count halved; the real triangle
+count is `2N²` = 3,200. After eliminating the periodic pairing slaves the reduced
+problem is that size. (`N = 30` → 961 nodes; `N = 56` → 3,249 nodes.)
+
+**Measured cost, one k-point, one polarisation.** Sparse assembly +
+`scipy.sparse.linalg.eigsh` with shift-invert at `sigma < 0` (Γ has `λ = 0`, so
+`sigma = 0` is exactly singular), 12 bands, complex Hermitian, at `n = 1,681`,
+under the capped tier-1 command on this VM. Reproduce with
+`benchmarks/pc_tier_timing.py`:
+
+| quantity | measured |
+|---|---|
+| production mesh, N = 40 | **1,681 nodes / 3,200 triangles** |
+| per-k, 20 independent k-points | **median 0.2 s**, max **6.1 s**, min 0.1 s |
+| 30 k × 2 polarisations at the **median** | **≈ 12 s** |
+| 30 k × 2 polarisations at the **max** | **≈ 6.1 min** |
+
+**The spread is contention, and it is stated as such rather than averaged away.**
+The median is the machine doing this work; the max is this shared VM under other
+tenants (`ps` during the run showed a `pip install` at 67 % CPU and several
+development servers). A **first, contaminated** measurement of the same thing
+reported median 5.7 s because a background dense solve was running underneath it
+— that number is discarded, and it is why the figure is reported here as
+median-and-max from one clean script rather than as a single average. Two
+consequences the plan takes seriously:
+
+- the **median 0.2 s** is what makes this cheap work in the common case;
+- the **max 6.1 s** is what a cap must survive, because a cap is a bound on the
+  worst case, and the worst case is somebody else's `pip install`.
+
+A single sparse LU factorisation at this `n` is only **7 ms** (one solve 0.5 ms),
+so the cost is ARPACK's convergence work, not the factorisation. A dense complex
+`eigh` at `n = 1,681` did **not finish inside 4 minutes** — so the sparse route
+is required for the time budget as well as for memory, and dense is ruled out by
+measurement, not by preference.
+
+**Where it runs: a job kind through the existing queue.** `kind = 'pc'`, claimed
+by the Jetson worker on CPU, with the **cluster Job as the same fallback the 3-D
+jobs use**. It is **not** inline in the web pod, and the reason is worth stating
+precisely because the *clean* median (0.2 s/k, ≈ 12 s a path) looks affordable:
+
+- the web pod is `cpu: 500m` (`manifests/mse/deployment.yaml:114`) — **half a
+  core shared by everything in the process** — and it runs
+  `gunicorn -w 1 --threads 8` (`dockerfiles/web/Dockerfile:65`, same command at
+  `manifests/mse/deployment.yaml:56`) with the **scheduler tick every 5 s**
+  (`web/config.py:81`, `TICK_SECONDS = 5`) in a thread of that same process
+  (`web/app.py:1240-1258`). A CPU-bound solve does not merely occupy a request
+  thread: it consumes the shared 500m quota, so the tick thread and the other
+  seven request threads are starved for the whole solve. **Halving a core away
+  from a 5-second tick is the failure**, not the total minutes.
+- under contention the same work is **6.1 min** (measured), which is a page
+  timeout with no page — the could-not-ask shape.
+
+So the routing is decided by the pod's **concurrency model**, not only by the
+solve's size: the web pod's job is to validate the form, estimate, **refuse with
+the limit named**, and enqueue.
+
+**The web side does**: parse and validate the form; build the mesh and count
+nodes/triangles **without solving** (measured: the Delaunay is **12.5 ms** at
+N = 40 and **43.8 ms** at N = 70, so the count is cheap enough to do inline even
+on half a core); compare against the caps;
+refuse naming the limit if over; otherwise enqueue a `pc` job. **No solve in the
+web process, ever** — that is the guard, and it is testable (the solve function
+must not be imported by any web module).
+
+**Caps, set from the measurement above.** The two caps are independent and each
+is refused with its own number:
+
+- **k-points per polarisation: 30** (a Γ–X–M–Γ path at ~10 points per segment).
+  At the measured **median 0.2 s/k** that is **≈ 12 s**; at the measured **max
+  6.1 s/k** under contention it is **≈ 6.1 min**. Both are compatible with the
+  Jetson's existing job timeouts and the cluster-Job fallback's
+  `ttlSecondsAfterFinished`, and 6.1 min is the number the cap is sized against.
+- **nodes: 5,000** (meshes up to `N ≈ 70`). Beyond that the per-k cost grows
+  superlinearly and the k-point cap no longer bounds the wall clock.
+
+Both numbers are **stated before running and refused by name**, never run to a
+timeout with no page (the could-not-ask guard). If a future refinement changes
+the measured per-k cost, **both caps are re-derived from the new measurement**,
+not adjusted by feel. The web pod is never in this path at all, so the caps are
+about worker and cluster budget, not about page latency.
+
 
 ---
 
@@ -292,10 +394,18 @@ END IF;
 NULL means "not a photonic-crystal job", exactly as `materials` NULL means "the
 one-part path".
 
-**Routing.** A `kind` discriminator (proposed `jobs.kind text NOT NULL DEFAULT
-'cavity'`, values `cavity` | `pc`) so the 3-D pages and the band-diagram page are
-two views of one table. The default keeps every existing row and reader on the
-cavity path unchanged.
+**Routing.** A `kind` discriminator (`jobs.kind text NOT NULL DEFAULT 'cavity'`,
+values `cavity` | `pc`) so the 3-D pages and the band-diagram page are two views
+of one table. The default keeps every existing row and reader on the cavity path
+unchanged. **This column is new** — feature 1 shipped `materials` but not a
+`kind` discriminator (`db/001_schema.sql:84`, and the additive block at :247-257
+is `materials` only), so `kind` and `pcs` are both new in this feature.
+
+A `pc` job is **enqueued, not solved inline** (§3): the web side validates,
+estimates, refuses with the limit named, and writes the row; the worker claims
+it, runs `dockerfiles/maxwell_solver/pc.py`, and stores the bands. This is the
+same claim → solve → store path the 3-D jobs already take, with the cluster Job
+as the existing fallback.
 
 **UI, without breaking 3-D jobs.**
 - The upload form gains a mode selector; the `pc` branch renders a lattice /
@@ -328,7 +438,8 @@ cavity path unchanged.
 
 | file | change |
 |---|---|
-| `web/pc.py` (new) | lattice vectors, unit-cell meshing + periodic node matching, the two scalar operators, `scipy.linalg.eigh` on the complex Hermitian pair, k-path, band assembly |
+| `dockerfiles/maxwell_solver/pc.py` (new) | lattice vectors, unit-cell meshing + periodic node matching, the two scalar operators, **sparse shift-invert** `eigsh` on the complex Hermitian pair, k-path, band assembly — runs beside the 3-D solver, in the image that already has scipy |
+| `web/pc.py` (new) | the **web-side** half only: form validation, node/triangle estimate, the caps and the refusals. **Must not import the solve** (the guard, §3) |
 | `web/app.py` | `kind` selector on upload; `pc` form; refuse `.obj` there; band-diagram panel |
 | `web/db.py`, `db/001_schema.sql` | `kind` and `pcs` columns (additive idiom) |
 | `templates/`, `web/static/` | the form and the canvas chart (no new library) |
@@ -342,7 +453,7 @@ Tier 1, the capped command, **read the COUNTS**:
 
 0. **Oracle self-check first** — closed form vs ODE shooting (`solve_ivp`,
    `rtol = 1e-13`) at ε₂ = 4 to **1e-10**, with the `1/ε²` admittance shown to
-   fail it (measured 3.7). No mesh comparison runs until this passes.
+   fail it (measured 3.71). No mesh comparison runs until this passes.
 1. Control A (empty lattice): **λ = 0 at Γ tight (1e-10)**; the other landmarks
    as `O(h²)` **convergence** — rel. err. ≤ 1e-3 at the production mesh and an
    observed rate near 2 across two refinements. **Not** 1e-6.
@@ -352,5 +463,17 @@ Tier 1, the capped command, **read the COUNTS**:
 3. Control C: dielectric rods give a TM 1–2 gap and no TE 1–2 gap.
 4. Periodic pairing: a **mutation** dropping the phase factor reddens the k≠0
    bands and leaves Γ green.
-5. Refusals: node cap and `r/a` too large, each **naming the limit**.
-6. Control D (MPB) at **1% of midgap** (unchanged).
+5. Refusals: **k-point cap and node cap**, each **naming its own number** (the two
+   are independent, so a mutation raising one must redden only its own test —
+   the summed-count trap).
+6. **The web side never solves** (§3's guard): assert `web/` does not import the
+   pc solve — a test that imports the web app and asserts `pc.solve` is not
+   reachable from it, *and* a mutation that adds the import back must redden it.
+   A name-check alone is not enough (the rig's "a name-check is not a
+   behaviour-check"); the assertion is on the import graph, and the mutation
+   proves the check can fail.
+7. **The tier number is reproducible**: `benchmarks/layered_oracle_check.py`
+   covers the oracle; a second dev-only script times **one k-point at the
+   production mesh** and prints the per-k seconds, so the caps in §3 can be
+   re-derived rather than recalled.
+8. Control D (MPB) at **1% of midgap** (unchanged).
