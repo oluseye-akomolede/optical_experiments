@@ -315,23 +315,22 @@ def _check_the_delivery_surfaces_through_the_app(url: str, job_id: str,
             else:
                 # ``available`` is computed from a real stat of every field
                 # file, and the stub above wrote one for every mode -- so on
-                # this run every entry MUST read True, and a False here means
-                # the file the viewer would fetch is missing or the wrong size
-                # for the grid. That False direction is pinned by a mutation:
-                # swapping the computed flag for a constant ``True`` reddens
-                # it, which is what proves the leg reads a real value rather
-                # than restating the stub's own layout.
+                # this run a False here means the file the viewer would fetch
+                # is missing or the wrong size for the grid.
                 #
-                # The OTHER direction -- a True that should have been False --
-                # is deliberately NOT claimed here. It cannot arise on this
-                # run: the stub's files are all present and readable, so True
-                # is the correct answer, and no edit to how ``available`` is
-                # COMPUTED can make it wrong while the files are fine. The
-                # shape that would produce it (a promised mode whose fetch
-                # 404s) needs a file removed from under a written index, which
-                # the tier-2 race checks cover; claiming the field leg catches
-                # it here would be a guard comment asserting something it does
-                # not do.
+                # A constant ``True`` is deliberately NOT claimed here, because
+                # the files exist on this run: True is the correct answer, and
+                # no change to how the flag is COMPUTED can be observed while
+                # they are. Measured, not argued -- substituting a literal True
+                # for the stat leaves this leg green, `unavailable` empty and
+                # the field body at its exact expected length. So do not read
+                # the check below as catching that; it does not, and a comment
+                # saying it did would be the guard-comment defect this rig has
+                # a memory for.
+                #
+                # The direction it WOULD catch -- a promised mode whose fetch
+                # 404s -- needs a file removed from under an already-written
+                # index, which the tier-2 race checks cover.
                 unavailable = [m["index"] for m in entries
                                if m.get("available") is not True]
                 print(f"[e2e] /index.json: grid={index.get('grid')} "
