@@ -54,6 +54,10 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import * as THREE from '../../web/static/vendor/three.module.min.js';
+// The REAL conversion and bounds helpers, so the "cannot convert" branch below
+// depends on the product's own arithmetic rather than a stub's opinion about it.
+import { surfaceScaleFromGrid as realSurfaceScaleFromGrid,
+         boundsOf as realBoundsOf } from '../../web/static/surface.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(here, 'fixtures', 'two_part_surface.glb');
@@ -264,4 +268,233 @@ test('the loader collects parts before adding them, so it never re-parents in a 
     'the add-after-the-walk loop was found BEFORE the walk -- the regex has ' +
     'latched onto the wrong `for (const part of parts)` and this guard is ' +
     'checking a loop that is not the collect-then-add one');
+});
+
+// ---------------------------------------------------------------------------
+// The NOTE. Everything above checks what reaches the scene; none of it runs a
+// branch that FAILS to reach it. That is the gap: the loader has three
+// non-drawing outcomes -- the fetch/parse rejects, the glb carries no mesh, and
+// the size cannot be converted -- and each is supposed to tell the reader,
+// through surfaceNote, why no outline is drawn. Every guard in this file so far
+// is a regex over the source, and a regex cannot see an empty function body.
+//
+// PROVEN, not assumed: emptying the `.catch` handler at viewer.js:641 (leaving
+// `void err;`) kept the whole 63-test suite GREEN. That is the reviewer's
+// finding 1, reproduced here, and it is the could-not-ask shape -- a surface
+// that fails to load and says nothing is indistinguishable from a job that has
+// no surface at all.
+//
+// So this test DRIVES the real addSurface, the same way the paintComponentNote
+// test drives the real caption: the function is lifted out of viewer.js as
+// source, the file's own surfaceNote is lifted with it, and both are rebuilt
+// with `new Function` against a fake DOM. The three branches are reached by
+// making the stubs fail in the three ways, and the assertion is on what ends up
+// in the note element -- the reader-visible effect, not the source.
+
+test('the surface loader reports each way it can fail to draw, through surfaceNote', () => {
+  // Lift the two functions. `addSurface` closes over a good deal of init()'s
+  // scope (scene, manifest, bounds, surfaceGroup/Parts, clearSurface,
+  // surfaceNote, plus module imports); every closure variable it touches is
+  // supplied below as a parameter so the body can be rebuilt standalone.
+  const addSurface = /function addSurface\(id\)\s*\{([\s\S]*?)\n  \}/.exec(VIEWER);
+  assert.ok(addSurface,
+    'addSurface has moved or changed shape, so this test is not driving it; ' +
+    're-point the extraction at the new definition rather than deleting this');
+  const surfaceNote = /function surfaceNote\(text\)\s*\{([\s\S]*?)\n  \}/.exec(VIEWER);
+  assert.ok(surfaceNote,
+    'surfaceNote has moved or changed shape, and it is the thing under test');
+
+  /**
+   * Run the real addSurface against a chosen stub world and return the note.
+   *
+   * The returned promise resolves once the loader has settled, so the caller
+   * reads the note AFTER the .then/.catch chain has run rather than racing it.
+   */
+  function run({ fetchFails, gltfMeshes, degenerateSurface = false }) {
+    // A DOM good enough for surfaceNote: createElement, a parent to append to,
+    // and the element handed back so its text can be read.
+    const created = [];
+    const fakeDocument = {
+      createElement: () => ({
+        id: '', style: {}, textContent: '',
+        set cssText(_v) {}, get cssText() { return ''; },
+      }),
+      body: { appendChild: (el) => created.push(el) },
+    };
+    globalThis.document = fakeDocument;
+
+    // The scene stand-in records adds so a drawing outcome can be told from a
+    // non-drawing one; this test only cares about the note, but the same world
+    // is used for all three branches.
+    const sceneAdds = [];
+    const scene = {
+      add: (o) => sceneAdds.push(o),
+      remove: () => {},
+    };
+
+    // The parts the loader will collect. Each carries the geometry shape the
+    // loader reads: `geometry.attributes.position.array` and `geometry.dispose`.
+    // A degenerate surface is all-zero vertices, which is a real way a file can
+    // fail: boundsOf gives a size of [0,0,0] and surfaceScaleFromGrid returns
+    // null -- the same null the "no unit conversion available" branch handles.
+    const positions = degenerateSurface
+      ? new Float64Array([0, 0, 0, 0, 0, 0])
+      : new Float64Array([0, 0, 0, 1, 1, 1]);
+    const makeMesh = () => ({
+      isMesh: true,
+      geometry: {
+        attributes: { position: { array: positions } },
+        dispose() {},
+      },
+      material: { dispose() {} },
+      children: [],
+      add() {},
+    });
+    const meshes = Array.from({ length: gltfMeshes }, makeMesh);
+
+    const gltfScene = {
+      traverse(fn) {
+        for (const m of meshes) fn(m);
+      },
+    };
+
+    // THREE stubs: only Group/EdgesGeometry/LineSegments/MeshBasicMaterial/
+    // LineBasicMaterial are constructed on the drawing path.
+    const group = { scale: { set() {} }, position: { set() {} },
+                    add() {}, name: '' };
+    const THREEStub = {
+      Group: function () { return group; },
+      EdgesGeometry: function () { return { dispose() {} }; },
+      LineSegments: function () { return { dispose() {} }; },
+      MeshBasicMaterial: function () { return { dispose() {} }; },
+      LineBasicMaterial: function () { return { dispose() {} }; },
+      DoubleSide: 2,
+    };
+
+    const GLTFLoaderStub = function () {
+      return {
+        parse(_buf, _p, onLoad) {
+          // GLTFLoader.parse calls onLoad(gltf) synchronously with the scene.
+          onLoad({ scene: gltfScene });
+        },
+      };
+    };
+
+    // fetch: resolves to a Response-like object, or rejects, per the case.
+    const fetchStub = () => (fetchFails
+      ? Promise.reject(new Error('boom-404'))
+      : Promise.resolve({ ok: true, arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) }));
+
+    const clearSurface = () => {};
+    const manifest = { grid: { nx: 2, ny: 2, nz: 2, spacing: [1, 1, 1] } };
+    const bounds = { centre: [0, 0, 0] };
+
+    try {
+      const surfacePositions = function (parts) {
+        const chunks = [];
+        for (const p of parts) {
+          const arr = p.geometry && p.geometry.attributes
+            && p.geometry.attributes.position.array;
+          if (arr) chunks.push(arr);
+        }
+        const n = chunks.reduce((s, c) => s + c.length, 0);
+        const out = new Float64Array(n);
+        let at = 0;
+        for (const c of chunks) { out.set(c, at); at += c.length; }
+        return out;
+      };
+
+      // surfaceNote is rebuilt too, so the text under assertion is written by
+      // the real function, not by a stub that could disagree with it. In the
+      // real file `noteEl` is declared once in init()'s scope (`let noteEl =
+      // null;` at viewer.js:738) and the extracted body relies on that outer
+      // slot -- it assigns through it, it does not declare it. So the factory
+      // declares the slot and returns BOTH the function and a getter for it.
+      // `canvas.parentElement` is where the note is appended.
+      const canvas = { parentElement: { appendChild: (el) => created.push(el) } };
+      const makeSurfaceNote = new Function(
+        'document', 'canvas',
+        `let noteEl = null;\n` +
+        `function surfaceNote(text) {${surfaceNote[1]}}\n` +
+        `return { surfaceNote, get noteEl() { return noteEl; } };`);
+      const api = makeSurfaceNote(fakeDocument, canvas);
+      const realSurfaceNote = api.surfaceNote;
+
+      // The rebuilt addSurface needs its own name in scope (`new Function`
+      // makes an anonymous function, so `function addSurface(){}` is declared
+      // inside rather than relied on from outside). The real addSurface returns
+      // nothing -- it fires the fetch chain and walks away -- so the wrapper
+      // RETURNS the chain it built, which is the only way to await it here.
+      // `return addSurface(id)` is replaced by making the function return its
+      // own promise: the body's last expression is the fetch(...).then().catch()
+      // chain, so the wrapper returns and the caller awaits it.
+      const fn = new Function(
+        'id', 'fetch', 'GLTFLoader', 'THREE', 'scene', 'manifest', 'bounds',
+        'surfaceGroup', 'surfaceParts', 'clearSurface', 'surfaceNote',
+        'surfaceScaleFromGrid', 'boundsOfPositions', 'surfacePositions',
+        `function addSurface(id) {${addSurface[1]}}\nreturn addSurface(id);`);
+
+      // The chain is not returned by the real function, so expose it by having
+      // the wrapper await nothing and instead reading the note after the
+      // microtask queue drains. A single `await null` is enough for a chain of
+      // already-resolved promises built from the stubs above.
+      fn('job1', fetchStub, GLTFLoaderStub, THREEStub, scene, manifest,
+         bounds, null, [], clearSurface, realSurfaceNote,
+         realSurfaceScaleFromGrid, realBoundsOf, surfacePositions);
+      return Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve())
+        // The note is returned as TEXT, not as the element. A branch that never
+        // calls surfaceNote leaves api.noteEl null, and reading `.textContent`
+        // off it would throw a TypeError -- which reddens the test but proves
+        // nothing about the assertion (any crash reddens a test). Collapsing an
+        // absent element to '' means the failures below are the ASSERTIONS
+        // firing on the caption's content, which is the property under test.
+        .then(() => ({ created, sceneAdds,
+                       note: api.noteEl ? api.noteEl.textContent : '' }));
+    } finally {
+      delete globalThis.document;
+    }
+  }
+
+  // -- branch 1: the fetch/parse REJECTS. --------------------------------
+  // This is the branch emptying the .catch kills. The note must name a reason.
+  return run({ fetchFails: true, gltfMeshes: 1 }).then((r) => {
+    assert.equal(r.sceneAdds.length, 0,
+      'a fetch failure still drew a surface, so the failure path is not what ' +
+      'this test thinks it is');
+    assert.ok(r.note.length > 0,
+      'a surface that fails to load leaves the note EMPTY: the reader cannot ' +
+      'tell a load failure from a job that has no surface. This is reviewer ' +
+      'finding 1 -- emptying the .catch keeps the suite green, because nothing ' +
+      'drives it');
+    assert.match(r.note, /could not be loaded/i,
+      'the failure note does not say the surface could not be loaded');
+    assert.match(r.note, /boom-404/,
+      'the failure note does not carry the underlying reason (the error ' +
+      'message), so the reader is told something failed but not why');
+  }).then(() => {
+    // -- branch 2: parsed, but NO MESH. -----------------------------------
+    return run({ fetchFails: false, gltfMeshes: 0 });
+  }).then((r) => {
+    assert.equal(r.sceneAdds.length, 0, 'an empty glb still drew something');
+    assert.ok(r.note.length > 0,
+      'a glb with no mesh leaves the note EMPTY: an outline-less surface ' +
+      'looks identical to no surface at all');
+    assert.match(r.note, /no mesh/i,
+      'the no-mesh note does not say the file carried no mesh');
+  }).then(() => {
+    // -- branch 3: a mesh, but the size cannot be converted. --------------
+    // A zero/non-finite surface extent makes surfaceScaleFromGrid return null,
+    // which is the real "cannot convert" trigger.
+    return run({ fetchFails: false, gltfMeshes: 1, degenerateSurface: true });
+  }).then((r) => {
+    assert.equal(r.sceneAdds.length, 0,
+      'an unconvertible surface was still drawn, so it was drawn at the wrong ' +
+      'size -- the original "cubic region" defect');
+    assert.ok(r.note.length > 0,
+      'an unconvertible surface leaves the note EMPTY: "could not determine" ' +
+      'looks like "no scaling", which is the defect this branch exists to stop');
+    assert.match(r.note, /could not be matched|no unit conversion/i,
+      'the conversion note does not say the size could not be matched to the ' +
+      'grid');
+  });
 });
