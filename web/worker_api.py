@@ -316,6 +316,26 @@ def _register_routes():
         """
         owner = _require_worker()
         job = _held(_deps()["jobs_db"], job_id, owner)
+        if job.get("kind") == DB.PC:
+            # A pc job reports a band diagram, not modes. The branch is on the
+            # CLAIMED ROW's kind, so a cavity job can never take it and a pc job
+            # can never take the modes branch -- the two result shapes cannot
+            # be confused for each other.
+            got = _band_payload(request.get_json(silent=True))
+            if got is None:
+                abort(400, description=(
+                    "a pc done body must carry 'bands': {labels, k_points, "
+                    "bands} with one k_point [kx, ky] and one band vector per "
+                    "k-point, every vector the same length, and finite numbers "
+                    "(NaN and Infinity are refused)"
+                ))
+            wrote = _deps()["jobs_db"].finish_jetson_with_bands(
+                job["job_id"], owner, job.get("pcs") or {}, got)
+            if not wrote:
+                abort(409, description="this worker no longer holds the lease")
+            _deps()["log"](f"[mse-web] worker {owner} finished pc job {job_id} "
+                           f"with {len(got['bands'])} k-points")
+            return jsonify({"ok": True, "k_points": len(got["bands"])})
         rows = _mode_rows(request.get_json(silent=True), job)
         if rows is None:
             abort(400, description=(
@@ -456,6 +476,73 @@ def _mode_rows(body, job) -> list[tuple] | None:
     if {r[0] for r in rows} != set(range(1, n_modes + 1)):
         return None
     return rows
+
+
+def _band_payload(body) -> dict | None:
+    """The validated band diagram from a pc ``/done`` body, or ``None``.
+
+    The pc sibling of :func:`_mode_rows`, and it holds the same line: one
+    ``None`` return for "this body cannot be trusted", so the route has a single
+    refusal path and cannot half-accept. A pc job's result is a band diagram,
+    not modes, and a DONE with an empty diagram is the same deploy-3 shape --
+    a finished job that displays as blank.
+
+    Shape, and every part of it is checked because a diagram is only meaningful
+    if its three lists agree:
+
+        {"labels": [...], "k_points": [[kx, ky], ...], "bands": [[...], ...]}
+
+    ``k_points`` and ``bands`` must be the SAME length (one band vector per
+    k-point) and every band vector must have the same length (the band count).
+    Without that, the plot draws a ragged thing or silently truncates, and the
+    numbers are still "valid" one by one -- so the agreement is the check, not
+    the values alone.
+
+    Numbers go through ``math.isfinite`` for the reason :func:`_mode_rows` gives:
+    ``json.loads`` accepts bare ``NaN``/``Infinity`` and ``isinstance(nan,
+    float)`` is True, so a type check alone would store and serve a NaN. A value
+    that is not a real number is a bad body.
+    """
+    if not isinstance(body, dict):
+        return None
+    raw = body.get("bands")
+    if not isinstance(raw, dict):
+        return None
+    labels = raw.get("labels")
+    k_points = raw.get("k_points")
+    bands = raw.get("bands")
+    if not isinstance(labels, list) or not isinstance(k_points, list) \
+            or not isinstance(bands, list):
+        return None
+    if not labels or not k_points or not bands:
+        return None
+    if len(k_points) != len(bands):
+        return None
+    n_bands = len(bands[0]) if bands else 0
+    if n_bands == 0:
+        return None
+    if not all(isinstance(v, str) for v in labels):
+        return None
+    for k, vec in zip(k_points, bands):
+        if not isinstance(k, list) or len(k) != 2:
+            return None
+        for value in k:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            if not math.isfinite(value):
+                return None
+        if not isinstance(vec, list) or len(vec) != n_bands:
+            return None
+        for value in vec:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            if not math.isfinite(value):
+                return None
+    return {
+        "labels": list(labels),
+        "k_points": [[float(x), float(y)] for x, y in k_points],
+        "bands": [[float(v) for v in vec] for vec in bands],
+    }
 
 
 def _held(jobs_db, job_id, owner) -> dict:

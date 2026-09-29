@@ -724,6 +724,26 @@ class LeaseDb(RoutingDb):
         ]
         return True
 
+    def finish_jetson_with_bands(self, job_id, owner, request, bands):
+        """Mark a pc job done and merge the bands into pcs; ``False`` if the
+        lease went.
+
+        The MERGE is modelled, not a plain assignment: the real statement is
+        ``pcs = coalesce(pcs, '{}') || %s``, so the request that was solved
+        survives. A double that overwrote ``pcs`` outright would let a test
+        assert the bands landed while the real store dropped the request --
+        the exact shape of a double more generous than the query it stands in
+        for, which this file has a KNOWN LIMIT about already.
+        """
+        job = self.jobs.get(str(job_id))
+        if not job or job.get("lease_owner") != owner:
+            return False
+        job.update(status=DB.DONE, stage=DB.DONE, lease_owner=None)
+        merged = dict(job.get("pcs") or {})
+        merged["bands"] = bands
+        job["pcs"] = merged
+        return True
+
     def set_jetson_stage(self, job_id, stage):
         job = self.jobs.get(str(job_id))
         if job:
@@ -2613,3 +2633,181 @@ def test_the_claim_payload_says_cavity_for_a_cavity_job(tmp_path, monkeypatch):
 
     assert "kind" in body and body["kind"] == DB.CAVITY
     assert "pcs" in body and body["pcs"] is None
+
+
+# ---------------------------------------------------------------------------
+# The pc result path: a band diagram, not modes
+# ---------------------------------------------------------------------------
+
+#: The owner id the test token resolves to, read from the ROUTE's own
+#: derivation rather than hand-rolled: a magic string that happened to match
+#: would pass here and fail against a route that hashed differently.
+_OWNER = WORKER.owner_id("tok-abc-123")
+
+_PC_REQUEST = {"lattice": "square", "r_over_a": 0.2, "n_rod": 3.5,
+               "n_bg": 1.0, "n_bands": 3, "divisions": 16, "polarisation": "TM"}
+
+
+def _pc_job(db, job_id="job-pc"):
+    """A CLAIMED pc row with a real request in pcs.
+
+    Status is RUNNING, not queued: the route only reaches the kind branch after
+    ``_held`` sees a live lease, and a row that is queued carries no lease in
+    the real store. Modelling it queued would let the tests pass against a row
+    the route could never actually have been called on.
+    """
+    db.create_job(job_id, None, "mm", 1.0, 12, target=DB.JETSON,
+                  kind=DB.PC, pcs=dict(_PC_REQUEST))
+    db.jobs[job_id]["status"] = DB.RUNNING
+    return db.jobs[job_id]
+
+
+def _bands_body(n_k=3, n_bands=3, **over):
+    """A valid ``/done`` body for a pc job.
+
+    One k_point [kx, ky] and one band vector per k-point, every vector the same
+    length -- the shape ``_band_payload`` requires and the legs below mutate.
+    """
+    body = {
+        "labels": ["G", "X", "M", "G"][:n_k],
+        "k_points": [[float(i) * 0.5, 0.0] for i in range(n_k)],
+        "bands": [[float(i + b) for b in range(n_bands)] for i in range(n_k)],
+    }
+    body.update(over)
+    return body
+
+
+def test_a_pc_job_is_done_with_its_band_diagram(tmp_path, monkeypatch):
+    """The pc branch of /done writes pcs, and does NOT touch mse.modes.
+
+    The whole point of the kind branch: a pc job has no modes, and a route that
+    tried to validate a modes list would 400 and never mark it done.
+    """
+    monkeypatch.setenv("MSE_WORKER_TOKEN", "tok-abc-123")
+    db = LeaseDb()
+    job = _pc_job(db)
+    job["lease_owner"] = _OWNER
+    app, _s, _d, _l = _make(tmp_path, db=db)
+
+    body = _bands_body()
+    resp = app.test_client().post("/worker/jobs/job-pc/done",
+                                  headers=_auth(), json={"bands": body})
+
+    assert resp.status_code == 200, resp.data
+    assert db.jobs["job-pc"]["status"] == DB.DONE
+    assert db.jobs["job-pc"]["pcs"]["bands"] == body
+    # The REQUEST survives the merge -- a pc row that lost its request could
+    # not say what was solved.
+    assert db.jobs["job-pc"]["pcs"]["lattice"] == "square"
+    # No mode rows: the pc path never reaches finish_jetson_with_modes.
+    assert str("job-pc") not in db.modes
+
+
+def test_a_pc_done_without_bands_is_refused_and_leaves_the_job_running(
+        tmp_path, monkeypatch):
+    """A malformed diagram is a 400, and the job is NOT marked done.
+
+    The deploy-3 shape, pc edition: a DONE with an empty diagram reads as "a
+    finished job with no bands" rather than "a job that never reported them".
+    """
+    monkeypatch.setenv("MSE_WORKER_TOKEN", "tok-abc-123")
+    db = LeaseDb()
+    job = _pc_job(db)
+    job["lease_owner"] = _OWNER
+    app, _s, _d, _l = _make(tmp_path, db=db)
+
+    resp = app.test_client().post("/worker/jobs/job-pc/done",
+                                  headers=_auth(), json={})
+
+    assert resp.status_code == 400, resp.data
+    assert db.jobs["job-pc"]["status"] == DB.RUNNING
+    assert "bands" not in (db.jobs["job-pc"].get("pcs") or {})
+
+
+@pytest.mark.parametrize("bad,raw", [
+    ({"labels": [], "k_points": [], "bands": []}, None),
+    ({"labels": ["G"], "k_points": [[0.0, 0.0], [0.5, 0.0]], "bands": [[1.0]]}, None),
+    ({"labels": ["G", "X"], "k_points": [[0.0, 0.0]], "bands": [[1.0], [2.0]]}, None),
+    ({"labels": ["G"], "k_points": [[0.0]], "bands": [[1.0]]}, None),
+    ({"labels": [1], "k_points": [[0.0, 0.0]], "bands": [[1.0]]}, None),
+    ({"labels": ["G"], "k_points": [[0.0, 0.0]], "bands": [[]]}, None),
+    # NaN/Infinity cannot go through ``json=``: Flask's encoder REFUSES them
+    # before the route sees them, so the test would prove the encoder, not the
+    # guard. They arrive as a real float through a raw body, exactly as
+    # ``test_done_refuses_a_nan_frequency`` sends them -- a bare literal that
+    # ``json.loads`` accepts and hands back as a float.
+    ({"labels": ["G"], "k_points": [[0.0, 0.0]], "bands": [[1.0]]},
+     ('"bands": [[1.0]]', '"bands": [[1.0, NaN]]')),
+    ({"labels": ["G"], "k_points": [[0.0, 0.0]], "bands": [[1.0]]},
+     ('"k_points": [[0.0, 0.0]]', '"k_points": [[0.0, Infinity]]')),
+])
+def test_a_ragged_or_non_finite_diagram_is_refused(bad, raw, tmp_path,
+                                                   monkeypatch):
+    """Every part of the shape is checked: lengths agree and numbers are real.
+
+    A diagram is only meaningful if its three lists agree and its numbers are
+    finite. Each case here is valid element-by-element and wrong as a whole,
+    which is exactly what a per-value type check would wave through.
+    """
+    monkeypatch.setenv("MSE_WORKER_TOKEN", "tok-abc-123")
+    db = LeaseDb()
+    job = _pc_job(db)
+    job["lease_owner"] = _OWNER
+    app, _s, _d, _l = _make(tmp_path, db=db)
+
+    if raw is None:
+        resp = app.test_client().post("/worker/jobs/job-pc/done",
+                                      headers=_auth(), json={"bands": bad})
+    else:
+        payload = json.dumps({"bands": bad}).replace(*raw)
+        assert raw[1].split(": ")[1] in payload, "the literal never made it in"
+        resp = app.test_client().post("/worker/jobs/job-pc/done",
+                                      headers=_auth(), data=payload,
+                                      content_type="application/json")
+
+    assert resp.status_code == 400, resp.data
+    assert db.jobs["job-pc"]["status"] == DB.RUNNING
+
+
+def test_a_cavity_job_still_takes_the_modes_branch(tmp_path, monkeypatch):
+    """A bands body on a CAVITY job is refused; kind decides, not the body.
+
+    The branch is on the claimed ROW's kind, so a cavity job cannot be finished
+    with a diagram, and a pc job cannot be finished with mode rows -- the two
+    result shapes are not interchangeable by payload.
+    """
+    monkeypatch.setenv("MSE_WORKER_TOKEN", "tok-abc-123")
+    db = LeaseDb()
+    _jetson_job(db, est_tets=1000)
+    db.jobs["job-1"].update(lease_owner=_OWNER, status=DB.RUNNING)
+    app, _s, _d, _l = _make(tmp_path, db=db)
+
+    # A bands body against a cavity job: the pc branch is skipped, _mode_rows
+    # sees no 'modes' key and refuses.
+    resp = app.test_client().post("/worker/jobs/job-1/done",
+                                  headers=_auth(),
+                                  json={"bands": _bands_body()})
+    assert resp.status_code == 400, resp.data
+    assert db.jobs["job-1"]["status"] == DB.RUNNING
+
+    # And the cavity body still works, unchanged.
+    ok = app.test_client().post("/worker/jobs/job-1/done",
+                                headers=_auth(), json={"modes": _rows(20)})
+    assert ok.status_code == 200, ok.data
+    assert db.jobs["job-1"]["status"] == DB.DONE
+
+
+def test_a_pc_done_on_a_lost_lease_is_a_409(tmp_path, monkeypatch):
+    """The merge and the DONE are one unit: a lost lease writes neither."""
+    monkeypatch.setenv("MSE_WORKER_TOKEN", "tok-abc-123")
+    db = LeaseDb()
+    _pc_job(db)
+    db.jobs["job-pc"]["lease_owner"] = "someone-else"
+    app, _s, _d, _l = _make(tmp_path, db=db)
+
+    resp = app.test_client().post("/worker/jobs/job-pc/done",
+                                  headers=_auth(),
+                                  json={"bands": _bands_body()})
+
+    assert resp.status_code == 409, resp.data
+    assert "bands" not in (db.jobs["job-pc"].get("pcs") or {})

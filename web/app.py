@@ -225,13 +225,24 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
             "finished_at": job["finished_at"],
             "peak_rss_mb": job["peak_rss_mb"],
             "queue_position": jobs_db.queue_position(job_id),
+            # The route, so the page picks a view without a second request.
+            # Adding a key is backward-compatible: an old reader ignores it.
+            "kind": job["kind"],
         }
         if job["status"] == DB.DONE:
-            payload["modes"] = jobs_db.list_modes(job_id)
-            payload["manifest_url"] = url_for("job_file", job_id=job_id,
-                                              name="modes.json")
-            payload["surface_url"] = url_for("job_file", job_id=job_id,
-                                             name="surface.glb")
+            if job["kind"] == DB.PC:
+                # A pc job's result is the band diagram the worker wrote back
+                # into pcs. The 3-D keys (modes/manifest/surface) are NOT sent:
+                # sending an empty mode list would read as "no modes" rather
+                # than "not a mode job" -- the deploy-3 shape, at the page.
+                pcs = job.get("pcs") or {}
+                payload["bands"] = pcs.get("bands")
+            else:
+                payload["modes"] = jobs_db.list_modes(job_id)
+                payload["manifest_url"] = url_for("job_file", job_id=job_id,
+                                                  name="modes.json")
+                payload["surface_url"] = url_for("job_file", job_id=job_id,
+                                                 name="surface.glb")
         return jsonify(payload)
 
     # -- proxied result files ---------------------------------------------

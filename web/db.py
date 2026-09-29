@@ -548,7 +548,7 @@ class JobStore:
                 "SELECT job_id, created_at, original_filename, units, n_index, "
                 "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
                 "finished_at, target, est_tets, min_feature_m, scale, "
-                "min_feature_value, min_feature_unit, materials "
+                "min_feature_value, min_feature_unit, materials, kind, pcs "
                 "FROM mse.jobs WHERE job_id = %s",
                 (str(job_id),),
             )
@@ -561,7 +561,7 @@ class JobStore:
                 "SELECT job_id, created_at, original_filename, units, n_index, "
                 "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
                 "finished_at, target, est_tets, min_feature_m, scale, "
-                "min_feature_value, min_feature_unit, materials "
+                "min_feature_value, min_feature_unit, materials, kind, pcs "
                 "FROM mse.jobs ORDER BY created_at DESC LIMIT %s",
                 (int(limit),),
             )
@@ -786,6 +786,53 @@ class JobStore:
             conn.close()
         return True
 
+    def finish_jetson_with_bands(self, job_id, owner: str, request: dict,
+                                 bands: dict) -> bool:
+        """Mark a pc job done AND write its band diagram, in ONE transaction.
+
+        The pc counterpart to :meth:`finish_jetson_with_modes`, and the same
+        argument applies to why it is one statement-unit: marking the job DONE
+        while the diagram is absent is the deploy-3 shape, where a finished job
+        displays as an empty panel rather than as a job that did not report.
+
+        **The bands are MERGED into the existing ``pcs``, not written over it.**
+        The column already holds the REQUEST (``web/pc_form.request_json`` writes
+        exactly the seven request keys) and §5 says the same column holds the
+        request *and* the computed bands. Writing only ``bands`` would drop the
+        request, and writing ``request | bands`` from the route's copy would race
+        a second claim; the merge is done in SQL against the row's current value
+        with ``||``, so the request that was solved is the request that stays.
+
+        ``request`` is passed but not stored: it is the route's proof of what it
+        validated, and keeping the parameter means a future caller cannot write
+        bands for a request the row does not hold. It is compared in the route,
+        not here -- this method's job is the one atomic write.
+
+        Returns whether it wrote. ``False`` means the lease went between the
+        route's check and this statement, and then NOTHING is written: the
+        status update and the jsonb merge are one unit.
+
+        The connection dance is the same as :meth:`finish_jetson_with_modes`,
+        for the same measured reason -- see that method's docstring. The
+        ``with conn`` IS the transaction; do not "simplify" it away.
+        """
+        conn = self._open(autocommit=False)
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE mse.jobs SET status = %s, stage = %s, finished_at = now(), "
+                    "pcs = coalesce(pcs, '{}'::jsonb) || %s::jsonb, "
+                    "lease_owner = NULL, lease_expires_at = NULL "
+                    "WHERE job_id = %s AND lease_owner = %s",
+                    (DONE, DONE, json.dumps({"bands": bands}), str(job_id), owner),
+                )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    return False
+        finally:
+            conn.close()
+        return True
+
     def fail_jetson(self, job_id, owner: str, message: str) -> bool:
         """Mark a jetson job FAILED for good, if ``owner`` still holds the lease.
 
@@ -989,6 +1036,13 @@ def _job_row(row) -> dict:
         # malformed new one. Row values are passed through as read rather than
         # normalised, for the same reason.
         "materials": row[18],
+        # The job's ROUTE and, for a pc job, the request being solved. Selected
+        # here rather than by a second query because the ``/done`` route has to
+        # branch on ``kind`` and every reader of a job (the status payload, the
+        # job page) needs the same field to pick a view. Added after
+        # ``materials`` for the same additive reason the column was.
+        "kind": row[19],
+        "pcs": row[20],
     }
 
 

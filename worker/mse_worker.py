@@ -530,6 +530,22 @@ class WorkerAPI:
                 raise LeaseLost(job_id) from None
             raise
 
+    def done_bands(self, job_id: str, bands: dict) -> None:
+        """Claim a pc job done, carrying the band diagram the app must write.
+
+        The pc sibling of :meth:`done`, and the same argument holds: the app
+        merges the diagram into ``pcs`` in the same transaction that marks the
+        job DONE, so a ``/done`` without a diagram is refused (400) rather than
+        leaving a finished job that displays as blank.
+        """
+        try:
+            self._request("POST", f"/worker/jobs/{job_id}/done",
+                          json_body={"bands": bands})
+        except APIError as exc:
+            if exc.status == 409:
+                raise LeaseLost(job_id) from None
+            raise
+
     def failed(self, job_id: str, message: str) -> None:
         """Give up on this job for good. TERMINAL.
 
@@ -947,7 +963,16 @@ class Worker:
         # ``test_the_reported_rows_agree_with_the_summary`` fails if they drift.
         # A mismatch here would ship a job whose table rows disagree with its
         # own modes.json, which is worse than either alone.
-        self.api.done(job_id, reporter.modes)
+        # The pc job's result is a band diagram, and it travels under its own
+        # key. Branched on the SUMMARY's shape, not on the row's kind again:
+        # the solve that just ran is what says what it produced, so the two
+        # cannot disagree. ``summary`` is a dict for both paths (cavity's
+        # ``SOLVER.solve`` returns one too).
+        bands = summary.get("bands") if isinstance(summary, dict) else None
+        if bands is not None:
+            self.api.done_bands(job_id, bands)
+        else:
+            self.api.done(job_id, reporter.modes)
         self._log(f"finished {job_id}: {summary}")
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1328,6 +1353,27 @@ def real_solve(job: dict, store_in, store_out, stage: StageReporter | None = Non
     that made every large job fail. A claim that arrives without them is a
     protocol error, not a cue to guess.
     """
+    if job.get("kind") == "pc":
+        # A photonic-crystal job: no mesh, no GPU, no modes. Dispatched on the
+        # claim's kind, which the app set from the row -- the worker does not
+        # guess a kind from the payload's shape, because a cavity job with an
+        # absent upload and a pc job would then be indistinguishable.
+        from pc_solve import solve_pc  # noqa: PLC0415 - sibling module, late
+
+        # The stage names the page shows. "solving" rather than "meshing": a pc
+        # job's mesh is built inside the solve, and a stage that named a phase
+        # the worker does not control would be a lie the progress bar repeats.
+        if stage is not None:
+            stage.stage = "solving"
+        bands = solve_pc(job)
+        # A summary shaped like the cavity one for the fields ``_done`` and the
+        # log read, but carrying ``bands`` instead of ``modes``. ``_done``
+        # branches on which key is present, NOT on job["kind"] a second time:
+        # one decision, made here where the solve happened, so the two cannot
+        # disagree about what was just produced.
+        return {"job_id": str(job["job_id"]), "kind": "pc", "bands": bands,
+                "modes": []}
+
     if str(_SOLVER_DIR) not in sys.path:
         sys.path.insert(0, str(_SOLVER_DIR))
     import mse_maxwell_solver as SOLVER  # noqa: PLC0415 - deliberately late
