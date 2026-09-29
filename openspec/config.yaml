@@ -1,0 +1,28 @@
+schema: spec-driven
+
+context: |
+  Mode search engine (mse): the owner uploads a closed .obj (one or more named parts),
+  picks a feature-size unit, a global scale and a refractive index per part. The app computes
+  full-vector electromagnetic eigenmodes of the PEC cavity the surface bounds (optical modes,
+  not vibration), and shows the object, mode frequencies and 3-D field plots in a browser.
+  Components:
+    - web/ (Flask app, image mse-web): upload, validation, job DB rows, status/index/field routes,
+      static viewer (web/static/*.js, WebGL raymarch of a 0..1 box; tests in tests/js/*.mjs).
+    - dockerfiles/maxwell_solver/ (image mse-maxwell-solver): meshing (TetGen), Nedelec FEM,
+      shift-invert eigen solve, field sampling, results to MinIO + Postgres.
+    - worker/ (Jetson GPU worker, systemd user service): claims jobs, runs the solver bounded.
+    - dockerfiles/rendercheck/: headless-browser render check of a finished job.
+    - manifests/mse/: k8s deployment in ns mode-search-engine (quota mse-power-cap).
+  Specs describe behaviour that is LIVE in production and matters to the owner or to
+  correctness: routes and their payloads, validation rules, units/scale semantics, physics
+  invariants, failure reporting, resource bounds. Not every line of code.
+
+rules:
+  specs:
+    - Every requirement has at least one scenario with concrete inputs and outputs.
+    - Name the numeric bounds and units exactly as the code enforces them; cite the source file.
+    - A failure the user can hit must be specified as a visible message, never a silent default.
+  proposal:
+    - Say which spec requirements change, and why; keep it under 400 words.
+  tasks:
+    - Include the verification step (which tests, and whether an image smoke test or e2e job runs).
