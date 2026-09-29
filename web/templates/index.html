@@ -157,11 +157,16 @@
   <h2>Recent jobs</h2>
   {% if jobs %}
     <table class="jobs">
-      <thead><tr><th>Object</th><th>Uploaded</th><th>Status</th></tr></thead>
+      <thead><tr><th>Object</th><th>Kind</th><th>Uploaded</th><th>Status</th></tr></thead>
       <tbody>
       {% for job in jobs %}
         <tr>
           <td><a href="{{ url_for('job_page', job_id=job.job_id) }}">{{ job.original_filename or job.job_id }}</a></td>
+          {# A pc job has no uploaded object, so its name is the cell. Say which
+             kind it is here rather than leaving the reader to open the page:
+             two rows can otherwise look identical and one of them is a 2-D
+             band diagram, not a 3-D object. #}
+          <td class="muted">{{ 'crystal' if job.kind == 'pc' else 'object' }}</td>
           <td class="muted">{{ job.created_at }}</td>
           <td><span class="pill pill-{{ job.status }}">{{ job.status }}</span>
               {% if job.stage and job.stage != job.status %}<span class="muted small">{{ job.stage }}</span>{% endif %}</td>
