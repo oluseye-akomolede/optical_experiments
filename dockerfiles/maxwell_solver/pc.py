@@ -678,8 +678,11 @@ def layered_band_at_k(kx, ky, eps2, fill, pol, eps1=1.0, a=1.0, lam_max=60.0):
     output is therefore ``sqrt(lam) / 2 pi``. Omitting either the input or the
     output ``2 pi`` matches a mesh that omits the other one and looks right at
     eps = 1, where ``w = |k|`` and the errors cancel; it reads ~1 % low at
-    eps = 4 and does not converge under refinement. See ``tests/test_pc.py``'s
-    ``test_the_layered_oracle_band_uses_the_meshs_k_units``.
+    eps = 4 and the error stops converging under refinement (it sat at ~1.2 %
+    from div 16 to div 64). See ``tests/test_pc.py``'s
+    ``test_control_B_fails_if_the_oracle_k_units_drift``, which pins both
+    conventions at once on a uniform cell, where the band is exactly
+    ``|k| / sqrt(eps)``.
 
     ``pol`` is ``"s"`` or ``"p"``; the PhC mapping is TM <-> s, TE <-> p.
     """
