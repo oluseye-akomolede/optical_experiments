@@ -178,9 +178,10 @@ void main() {
 // transform; the final + 0.5 then moves -0.5..0.5 to 0..1, exactly as the
 // vertex shader does, so the ray is marched in the same frame as `vLocal`.
 // Without the + 0.5 the eye sits half a box off on every axis and the plot
-// smears into a box-shaped haze outside the object (2026-09-29). Skipping this
-// works only for a box at the origin with unit scale -- with a real grid the
-// camera sits offset and the ray misses or grazes the volume.
+// smears into a box-shaped haze outside the object (2026-09-29). Every step
+// is needed for every box, even one at the origin with unit scale. This
+// assumes the mesh has no rotation and no parent transform (fitVolume sets
+// only scale and position); adding either means inverting it here too.
 const CAMERA_LOCAL = `
 uniform vec3 uBoxCentre;
 uniform vec3 uBoxSize;
