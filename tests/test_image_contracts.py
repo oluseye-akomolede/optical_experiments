@@ -201,3 +201,70 @@ def test_the_web_initcontainer_and_env_agree():
     )
     # and the filename is the one the resolver looks for
     assert declared.endswith(WEB_DB.SCHEMA_FILENAME)
+
+
+# ---------------------------------------------------------------------------
+# the shared solver files the web image copies
+# ---------------------------------------------------------------------------
+def _web_dockerfile_copied_solver_files() -> set[str]:
+    """The ``dockerfiles/maxwell_solver/<name>.py`` files the web image COPYs.
+
+    Read from the Dockerfile rather than listed here, so a COPY that is added
+    or removed is what this reflects. A list retyped in a test checks the
+    test's own arithmetic.
+    """
+    copied: set[str] = set()
+    for raw in WEB_DOCKERFILE.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line.upper().startswith("COPY "):
+            continue
+        for token in line.split()[1:-1]:
+            marker = "dockerfiles/maxwell_solver/"
+            if token.startswith(marker) and token.endswith(".py"):
+                copied.add(token[len(marker):])
+    return copied
+
+
+def test_the_web_image_copies_the_photonic_crystal_geometry():
+    """``pc.py`` must be in the web image, or ``web/pc_form.py`` dies at start.
+
+    This is the dispatch crashloop's shape a third time: the module builds,
+    pushes, and dies on the first request with ``ModuleNotFoundError: No module
+    named 'pc'``. The count and the caps in the pc form come from the solver's
+    own ``unit_cell_mesh``, so the file has to be here.
+
+    Stated as a contract on the Dockerfile rather than left to
+    ``tests/test_web_imports.py``, because that check resolves a module by
+    asking whether the Dockerfile COPIES a file of that NAME -- it would pass
+    just as happily if ``pc.py`` were copied but were the wrong file.
+    """
+    assert "pc.py" in _web_dockerfile_copied_solver_files(), (
+        "the web Dockerfile must COPY dockerfiles/maxwell_solver/pc.py; "
+        "web/pc_form.py imports it for the unit-cell count."
+    )
+
+
+def test_the_photonic_crystal_geometry_adds_no_web_dependency():
+    """The COPY is free: numpy and scipy are already in this image.
+
+    ``pc.py`` imports numpy and ``scipy.sparse`` at module level, and the web
+    image installs neither directly. It does not need to -- ``trimesh`` requires
+    both, so ``tests/test_web_imports.py`` resolves them from the installed
+    distribution. This asserts the reasoning rather than the outcome, because
+    the tempting "fix" for an unresolved import is to add a pin, and pinning
+    scipy here would freeze a version the SOLVER image owns and let the two
+    images drift apart.
+
+    If trimesh ever drops scipy, this test fails instead of the image.
+    """
+    from importlib.metadata import distribution
+
+    required = {
+        name.split(";")[0].split("[")[0].split(">=")[0].split("==")[0]
+            .split("<")[0].strip()
+        for name in (distribution("trimesh").requires or ())
+    }
+    assert "numpy" in required and "scipy" in required, (
+        "the web image reaches numpy and scipy only through trimesh; if that "
+        "stopped being true, pc.py needs a direct requirement here"
+    )

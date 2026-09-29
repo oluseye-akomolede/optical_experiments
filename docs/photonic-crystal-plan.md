@@ -36,10 +36,10 @@ timings taken here, not estimates:
    side validates, estimates, refuses with the limit named, and enqueues. The
    caps (30 k-points/polarisation, 5,000 nodes) are **set from the measurement**.
 5. **Two figures in revision 3 were simply wrong** and are corrected: the
-   production mesh is **1,681 nodes / 3,200 triangles** (not "~1,600
-   triangles"), and a dense complex `eigh` did **not** finish inside 4 minutes —
-   so the sparse shift-invert route is required, and it is what the plan now
-   specifies in §1 as well.
+   production mesh is **1,777 nodes / 3,392 triangles** (not "~1,600
+   triangles"; re-measured in §3), and a dense complex `eigh` did **not** finish
+   inside 4 minutes — so the sparse shift-invert route is required, and it is
+   what the plan now specifies in §1 as well.
 6. **No new dependency**: the solver image already carries `numpy==2.5.3` and
    `scipy==1.18.1`, so `scipy.spatial.Delaunay` and `scipy.sparse.linalg` are
    already there. The worker's HTTP client stays stdlib-only.
@@ -146,10 +146,35 @@ runs in `dockerfiles/maxwell_solver/` alongside the 3-D solver (`_SOLVER_DIR`,
 > The revision that follows is built from timings taken here.
 
 **The production mesh, measured (not estimated).** At 40 divisions per lattice
-vector the Delaunay cell has **1,681 nodes and 3,200 triangles** — revision 3
-said "~1,600 triangles", which was the node-like count halved; the real triangle
-count is `2N²` = 3,200. After eliminating the periodic pairing slaves the reduced
-problem is that size. (`N = 30` → 961 nodes; `N = 56` → 3,249 nodes.)
+vector the Delaunay cell has **1,777 nodes and 3,392 triangles**, re-measured
+2026-09-29 by calling `web/pc_form.py`'s `cell_size` — which goes through the
+solver's own `unit_cell_mesh`, so it is the mesh the worker will build, not an
+estimate of it:
+
+| `divisions` N | nodes | triangles |
+|---|---|---|
+| 16 | 329 | 592 |
+| 24 | 684 | 1,270 |
+| 32 | 1,168 | 2,206 |
+| **40** | **1,777** | **3,392** |
+| 56 | 3,379 | 6,532 |
+| 70 | 5,205 | 10,128 |
+
+> **This replaces 1,681 / 3,200, which is wrong.** Revision 4 derived those from
+> a regular-triangle count (`2N²` = 3,200) rather than measuring the cell the
+> code returns, and the cells are not regular: the conforming circle's own nodes
+> are inserted and the grid points within `h/2` of the interface are dropped, so
+> the count is a property of the interface, not of `N` alone. `N = 56` is the
+> clearest case — the formula predicts 6,272 triangles and the mesh has 6,532.
+> The measured node count at N = 40 is **5.7 % above** what the plan carried. The
+> two consequences below (the caps, and the caveat on the timings) are stated
+> against the re-measured number; the per-k TIMINGS were taken at the old n and
+> are therefore mildly optimistic — see the caveat under the cost table.
+
+The `2N²` formula is still the right order of magnitude and `N = 70` is 10,128
+triangles against a predicted 9,800, so nothing in §3 turns on the old figure
+except the caps' margin — which is the point: the cap's operand is now the
+measured count.
 
 **Measured cost, one k-point, one polarisation.** Sparse assembly +
 `scipy.sparse.linalg.eigsh` with shift-invert at `sigma < 0` (Γ has `λ = 0`, so
@@ -159,10 +184,19 @@ under the capped tier-1 command on this VM. Reproduce with
 
 | quantity | measured |
 |---|---|
-| production mesh, N = 40 | **1,681 nodes / 3,200 triangles** |
+| production mesh, N = 40 | **1,777 nodes / 3,392 triangles** (re-measured; the timing below was taken at the old 1,681) |
 | per-k, 20 independent k-points | **median 0.2 s**, max **6.1 s**, min 0.1 s |
 | 30 k × 2 polarisations at the **median** | **≈ 12 s** |
 | 30 k × 2 polarisations at the **max** | **≈ 6.1 min** |
+
+**These timings are at `n = 1,681` and the mesh is `n = 1,777`**, so they are
+mildly optimistic — 5.7 % more nodes, and ARPACK's work grows faster than that.
+The figure to carry is the **max**: it is what the caps are sized against, and a
+6.1 min measurement understating the real worst case by a few percent does not
+change which route this is (a Jetson job with a cluster-Job fallback either way).
+It is stated rather than silently scaled because a scaled number is a guess in
+the shape of a measurement. Re-running `benchmarks/pc_tier_timing.py` against the
+current mesh is the way to replace it.
 
 **The spread is contention, and it is stated as such rather than averaged away.**
 The median is the machine doing this work; the max is this shared VM under other
@@ -181,7 +215,9 @@ A single sparse LU factorisation at this `n` is only **7 ms** (one solve 0.5 ms)
 so the cost is ARPACK's convergence work, not the factorisation. A dense complex
 `eigh` at `n = 1,681` did **not finish inside 4 minutes** — so the sparse route
 is required for the time budget as well as for memory, and dense is ruled out by
-measurement, not by preference.
+measurement, not by preference. (This claim is only strengthened by the larger
+mesh: it is a lower bound on a dense solve, and the sparse route is what the
+measured consequence for a dense one was derived to rule out.)
 
 **Where it runs: a job kind through the existing queue.** `kind = 'pc'`, claimed
 by the Jetson worker on CPU, with the **cluster Job as the same fallback the 3-D
@@ -220,8 +256,11 @@ is refused with its own number:
   6.1 s/k** under contention it is **≈ 6.1 min**. Both are compatible with the
   Jetson's existing job timeouts and the cluster-Job fallback's
   `ttlSecondsAfterFinished`, and 6.1 min is the number the cap is sized against.
-- **nodes: 5,000** (meshes up to `N ≈ 70`). Beyond that the per-k cost grows
-  superlinearly and the k-point cap no longer bounds the wall clock.
+- **nodes: 5,000.** Measured, the cap bites between `N = 68` (4,930 nodes,
+  accepted) and `N = 69` (5,064 nodes, refused) on the square cell. Revision 4
+  said "meshes up to `N ≈ 70`", which was a formula's prediction; the measured
+  boundary is one step lower. Beyond it the per-k cost grows superlinearly and
+  the k-point cap no longer bounds the wall clock.
 
 Both numbers are **stated before running and refused by name**, never run to a
 timeout with no page (the could-not-ask guard). If a future refinement changes
