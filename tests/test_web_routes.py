@@ -62,7 +62,8 @@ class FakeDb:
     def create_job(self, job_id, filename, units, n_index, n_modes,
                    target=DB.CLUSTER, est_tets=None,
                    min_feature_m=None, min_feature_value=None,
-                   min_feature_unit=None, scale=1.0, materials=None):
+                   min_feature_unit=None, scale=1.0, materials=None,
+                   kind=DB.CAVITY, pcs=None):
         # All THREE feature columns, because the real store has all three: the
         # number the owner typed, the unit they chose, and the canonical metres
         # the solver gets. A double that kept only the metres would pass a test
@@ -86,6 +87,13 @@ class FakeDb:
             "min_feature_unit": min_feature_unit,
             "scale": scale,
             "materials": materials,
+            # ``kind`` and ``pcs`` are modelled because the real store has
+            # them and the claim payload now carries them. Left out, this
+            # double would raise TypeError the moment a route test enqueued a
+            # pc job -- the same class of hole as the missing ``import json``
+            # that 500'd multi-part uploads against 591 green tests.
+            "kind": kind,
+            "pcs": pcs,
         }
 
     def mark_running(self, job_id, name):

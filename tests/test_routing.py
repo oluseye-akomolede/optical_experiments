@@ -365,10 +365,12 @@ class RoutingDb(FakeDb):
 
     def create_job(self, job_id, filename, units, n_index, n_modes,
                    target=DB.CLUSTER, est_tets=None,
-                   min_feature_m=None, scale=1.0):
+                   min_feature_m=None, scale=1.0,
+                   kind=DB.CAVITY, pcs=None):
         super().create_job(job_id, filename, units, n_index, n_modes,
                            target=target, est_tets=est_tets,
-                           min_feature_m=min_feature_m, scale=scale)
+                           min_feature_m=min_feature_m, scale=scale,
+                           kind=kind, pcs=pcs)
         self.jobs[str(job_id)].update(target=target, est_tets=est_tets,
                                       gpu_queued_at="2026-09-26T00:00:00+00:00"
                                       if target == DB.JETSON else None,
@@ -379,7 +381,12 @@ class RoutingDb(FakeDb):
                                       # real column is NOT NULL DEFAULT 0, and
                                       # every ``.get(..., 0)`` would paper over
                                       # the difference.
-                                      release_count=0)
+                                      release_count=0,
+                                      # Modelled so a pc row keeps its kind
+                                      # through the routing double. The base
+                                      # FakeDb stores them now; these are the
+                                      # schema's own defaults made explicit.
+                                      kind=kind, pcs=pcs)
 
     def reroute_to_cluster(self, job_id, reason):
         job = self.jobs.get(str(job_id))
@@ -622,7 +629,7 @@ class LeaseDb(RoutingDb):
     #: held. A double that returns MORE than the query would is a double that
     #: cannot fail for the reason the query can.
     CLAIM_COLUMNS = ("job_id", "units", "n_index", "n_modes",
-                     "min_feature_m", "scale")
+                     "min_feature_m", "scale", "materials", "kind", "pcs")
 
     def claim_jetson(self, owner, lease_seconds):
         for job in self.jobs.values():
@@ -2558,3 +2565,51 @@ def test_a_nanometre_multipart_upload_is_not_refused_by_a_unit_bug(tmp_path):
         f"object estimated {est_mm:,} -- the estimate is unit-dependent, which "
         f"is the defect this test is for."
     )
+
+
+def test_the_claim_payload_names_the_kind_and_carries_the_pc_request(tmp_path, monkeypatch):
+    """The worker's only way to learn WHICH solve to run.
+
+    The worker cannot read the job row -- it has no database access and no
+    cluster access. `target` told it which machine to poll; `kind` is the only
+    place it can learn whether to run the 3-D cavity solver or pc.py. A payload
+    that dropped the key, or sent it as a constant, would make every
+    photonic-crystal job silently run the wrong program -- and the two programs
+    read completely different rows for their inputs, so the failure would be a
+    band diagram that is not one rather than an error.
+
+    Mutation that must turn this red: replace ``job.get("kind")`` in
+    web/worker_api.py's claim payload with the literal ``"cavity"``.
+    """
+    monkeypatch.setenv("MSE_WORKER_TOKEN", "tok-abc-123")
+    db = LeaseDb()
+    pcs = {"lattice": "square", "r_over_a": 0.2, "n_rod": 3.5, "n_bg": 1.0,
+           "n_bands": 12, "divisions": 16, "polarisation": "TM"}
+    db.create_job("job-pc", None, "mm", 1.0, 12, target=DB.JETSON,
+                  kind=DB.PC, pcs=pcs)
+    app, _s, _d, _l = _make(tmp_path, db=db)
+
+    body = app.test_client().post("/worker/claim",
+                                  headers=_auth()).get_json()
+
+    assert body["kind"] == DB.PC
+    assert body["pcs"] == pcs, "the request must arrive as an object, not a string"
+
+
+def test_the_claim_payload_says_cavity_for_a_cavity_job(tmp_path, monkeypatch):
+    """The key is ALWAYS present, and a cavity job says so explicitly.
+
+    Not a missing key defaulted by the worker: a worker that read absence as
+    ``cavity`` would run the 3-D solver the day a proxy or an older app stopped
+    sending the field, and the wrong answer would look like a right one.
+    """
+    monkeypatch.setenv("MSE_WORKER_TOKEN", "tok-abc-123")
+    db = LeaseDb()
+    db.create_job("job-cav", "box.obj", "mm", 1.0, 20, target=DB.JETSON)
+    app, _s, _d, _l = _make(tmp_path, db=db)
+
+    body = app.test_client().post("/worker/claim",
+                                  headers=_auth()).get_json()
+
+    assert "kind" in body and body["kind"] == DB.CAVITY
+    assert "pcs" in body and body["pcs"] is None

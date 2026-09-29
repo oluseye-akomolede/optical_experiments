@@ -204,6 +204,24 @@ def _register_routes():
             # second encoding for the same data that only one of the two ends
             # knows about.
             "materials": job.get("materials"),
+            # WHICH SOLVE this is. Same reasoning as `materials` one line up,
+            # and the same key-always-present rule: the worker's whole job is
+            # to run the right program, and it cannot read the row to find out
+            # which. Sent on every claim, cavity included -- a worker that
+            # treated "key absent" as "cavity" would silently run the 3-D
+            # vector solver on a photonic-crystal job the day a proxy or an
+            # older app stopped sending the field, and the two solves read
+            # completely different rows for their inputs.
+            #
+            # It is a ROUTE, not a label, because `pc` runs on the same Jetson
+            # worker as `cavity` but on CPU: `target` said which machine to
+            # claim on, `kind` says which program to run once claimed.
+            "kind": job.get("kind"),
+            # The photonic-crystal request, or JSON null for a cavity job. Passed
+            # through unserialised for the same reason as `materials`: the worker
+            # hands it straight to pc.py, so a JSON string here would be a second
+            # encoding that only one of the two ends knows about.
+            "pcs": job.get("pcs"),
             # The element caps travel with the job. They are properties of the
             # MACHINES, not of this upload, but a worker that knows only the
             # row cannot learn them: it has no cluster access and no reason to

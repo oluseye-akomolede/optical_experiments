@@ -40,6 +40,21 @@ CLUSTER = "cluster"
 JETSON = "jetson"
 TARGETS = (CLUSTER, JETSON)
 
+#: What KIND of solve a job is. ``cavity`` is the 3-D vector solver this table
+#: has always held and is the DEFAULT on the column, so every row written before
+#: the column existed is truly a cavity job rather than a guessed one; ``pc`` is
+#: a 2-D photonic-crystal band diagram.
+#:
+#: This is a ROUTE as well as a label, and it is deliberately not folded into
+#: ``target``: ``target`` says WHICH MACHINE (and `pc` runs on the same Jetson
+#: worker, on CPU), while ``kind`` says WHICH PROGRAM that machine runs. A
+#: single column spelling both would make "jetson" stop meaning "the machine
+#: the worker polls" and start meaning "whichever of the two solves happens to
+#: be the default today".
+CAVITY = "cavity"
+PC = "pc"
+KINDS = (CAVITY, PC)
+
 #: How many times a jetson job may be handed back with no verdict before it is
 #: failed for good. Releases are legitimate for transient reasons; an unbounded
 #: number of them is an infinite loop, so there is a cap. Three is enough for a
@@ -256,7 +271,9 @@ class JobStore:
                    min_feature_value: float | None = None,
                    min_feature_unit: str | None = None,
                    scale: float = 1.0,
-                   materials: dict | None = None) -> None:
+                   materials: dict | None = None,
+                   kind: str = CAVITY,
+                   pcs: dict | None = None) -> None:
         """Create the upload row. Status starts ``queued``, not ``running``.
 
         ``target`` is the machine the upload-time estimate chose. It is recorded
@@ -287,15 +304,23 @@ class JobStore:
         with ``json.dumps`` because psycopg2 does not adapt a dict for a jsonb
         parameter on its own, and a silently stringified dict would be a jsonb
         scalar that every reader then has to parse back out.
+
+        ``kind`` is the solve program and ``pcs`` is the photonic-crystal
+        request; both default to the cavity path, so every caller that predates
+        photonic crystals keeps writing exactly what it wrote before. ``pcs``
+        follows ``materials`` in being stored as NULL rather than ``{}`` for the
+        absent case, and for the same reason: ``{}`` would be a request with
+        every field missing, which is a claim rather than an absence. It is
+        serialised with ``json.dumps`` here for the same psycopg2 reason too.
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO mse.jobs "
                 "(job_id, original_filename, units, n_index, n_modes, status, stage, "
                 " target, est_tets, min_feature_m, min_feature_value, "
-                " min_feature_unit, scale, gpu_queued_at, materials) "
+                " min_feature_unit, scale, gpu_queued_at, materials, kind, pcs) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "        CASE WHEN %s = 'jetson' THEN now() END, %s)",
+                "        CASE WHEN %s = 'jetson' THEN now() END, %s, %s, %s)",
                 (str(job_id), original_filename, units, float(n_index),
                  int(n_modes), QUEUED, QUEUED, target,
                  None if est_tets is None else int(est_tets),
@@ -304,7 +329,9 @@ class JobStore:
                  min_feature_unit,
                  float(1.0 if scale is None else scale),
                  target,
-                 None if materials is None else json.dumps(materials)),
+                 None if materials is None else json.dumps(materials),
+                 kind,
+                 None if pcs is None else json.dumps(pcs)),
             )
 
     def mark_failed(self, job_id, message: str) -> None:
@@ -617,7 +644,8 @@ class JobStore:
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT job_id, units, n_index, n_modes, min_feature_m, scale, materials "
+                "SELECT job_id, units, n_index, n_modes, min_feature_m, scale, materials, "
+                "kind, pcs "
                 "FROM mse.jobs "
                 "WHERE target = %s AND status = %s AND lease_owner IS NULL "
                 "ORDER BY created_at "
@@ -637,7 +665,8 @@ class JobStore:
             )
         return {"job_id": job_id, "units": row[1], "n_index": row[2],
                 "n_modes": row[3], "min_feature_m": row[4], "scale": row[5],
-                "lease_owner": owner, "materials": row[6]}
+                "lease_owner": owner, "materials": row[6], "kind": row[7],
+                "pcs": row[8]}
 
     def renew_lease(self, job_id, owner: str, lease_seconds: float) -> bool:
         """Extend ``owner``'s lease. Returns whether it still holds it.
