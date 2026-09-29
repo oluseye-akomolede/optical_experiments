@@ -87,6 +87,39 @@ test('the empty-frame exemption is gated on the caption, not unconditional', () 
     'frame again (measured: the last of three failures on a correct run)');
 });
 
+test('with the exemption absent, an empty frame FAILS rather than passes', () => {
+  // The else-branch of the gate, and the one that must stay a FAIL. The gate
+  // (`if (problem && opts.accountForEmptyFrame)`) is false in two cases: the
+  // call passes no exemption (every frame but mode 1's Erho), or it passes
+  // `false` (mode 1's Erho on a page whose caption did NOT name the share).
+  // Both must reach `else if (problem) fail(...)`. Pinned by reading the
+  // branch ORDER in the source: if `fail` moved above the exemption, or the
+  // exemption became the fallthrough, an unexplained empty frame would pass.
+  const start = source.indexOf('const fieldVsOutline = ');
+  assert.ok(start >= 0, 'the fieldVsOutline call site has gone');
+  const end = source.indexOf('});', start) + 3;
+  const body = source.slice(start, end);
+  const gateAt = body.indexOf('opts.accountForEmptyFrame');
+  const exemptOkAt = body.indexOf('below its own floor');
+  const failAt = body.indexOf('${what}: ${problem}');
+  assert.ok(gateAt > 0 && exemptOkAt > 0 && failAt > 0,
+    'one of the three branches of fieldVsOutline has gone');
+  assert.ok(gateAt < exemptOkAt,
+    'the exemption is no longer guarded by accountForEmptyFrame -- an ' +
+    'unexplained empty frame (a page whose field never drew) would pass');
+  assert.ok(failAt > exemptOkAt,
+    'the failure branch no longer follows the exemption branch, so an ' +
+    'empty frame now reports ok() instead of fail()');
+  // Positions alone are not enough: swapping fail() for ok() keeps every
+  // position above and turns the empty frame into a pass, which is exactly the
+  // bug this test exists for. Assert the VERB, reading the text between the
+  // failure branch and the problem it reports.
+  const failBranch = body.slice(exemptOkAt, failAt);
+  assert.match(failBranch, /\}\s*else\s+if\s*\(problem\)\s*\{\s*fail\(/,
+    'the empty-frame branch no longer calls fail() -- it reports the frame as ' +
+    'ok, so an unexplained empty frame (the "field never drew" defect) passes');
+});
+
 test('the frame that DOES draw is still judged for its hue', () => {
   // The control case. Removing a judgement for the below-floor frame must not
   // quietly remove it for the frames that carry the field's real colour --
