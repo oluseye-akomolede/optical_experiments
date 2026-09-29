@@ -30,6 +30,8 @@ import { boxCentre, componentShare, componentVolume, float32ToHalf,
   from './components.js';
 import { surfaceScaleFromGrid, boundsOf as boundsOfPositions }
   from './surface.js';
+import { drawBandDiagram } from './bandplot.js';
+import { bandGaps } from './bands.js';
 
 const root = document.getElementById('job');
 if (root) init(root);
@@ -50,6 +52,7 @@ function init(root) {
   const viewer = document.getElementById('viewer');
   const modesCard = document.getElementById('modes-card');
   const modesBody = document.getElementById('modes-body');
+  const bandsCard = document.getElementById('bands-card');
   const started = Date.now();
 
   const STAGE_FRACTION = {
@@ -98,12 +101,30 @@ function init(root) {
 
   let loaded = false;
   function finish(data) {
+    // The result view is chosen by the job's KIND, from the payload, not from
+    // which elements the page happens to have. A pc job's result is a band
+    // diagram; it has no modes, no surface and no field, and asking
+    // /index.json for it would 404 in a way the viewer would report as "results
+    // could not be loaded" -- the could-not-ask shape, where a job that
+    // succeeded perfectly reads as a failure. So the cavity path is not merely
+    // skipped for a pc job: it is never entered, and the band branch returns.
+    if (data.kind === 'pc') {
+      finishBands(data);
+      return;
+    }
     buildModeTable(data.modes || []);
     if (loaded) return;
     loaded = true;
     viewer.hidden = false;
     modesCard.hidden = false;
     loadFieldData(jobId, data);
+  }
+
+  function finishBands(data) {
+    if (loaded) return;
+    loaded = true;
+    bandsCard.hidden = false;
+    renderBands(data.bands);
   }
 
   tick();
@@ -1212,6 +1233,58 @@ function formatSeconds(s) {
   if (s < 60) return `${s.toFixed(0)}s`;
   const m = Math.floor(s / 60);
   return `${m}m ${Math.round(s - m * 60)}s`;
+}
+
+// The band-diagram panel. The plot geometry is in bandplot.js/bands.js; this
+// only fills the caption and the gap table, which is where the app's headline
+// number (the midgap ratio) is stated in words.
+function renderBands(payload) {
+  const svg = document.getElementById('bands-svg');
+  const caption = document.getElementById('bands-caption');
+  const gapBody = document.getElementById('bands-gaps-body');
+  if (!svg) return;
+
+  // ``pcs.bands`` may hold one diagram or a list. A single polarisation is
+  // stored as a list of one, and a payload that is a plain object is wrapped so
+  // the renderer never has to know which shape the worker chose.
+  const diagrams = Array.isArray(payload) ? payload : (payload ? [payload] : []);
+  drawBandDiagram(svg, diagrams, {
+    width: 640, height: 380,
+  });
+
+  if (caption) {
+    if (!diagrams.length) {
+      // An absence must be NAMED. A pc job that finished with no diagram is a
+      // defect in the run, not a loading state, and the panel says so rather
+      // than sitting blank.
+      caption.textContent = 'This job finished without a band diagram.';
+    } else {
+      const pol = diagrams.map((d) => d.polarisation).filter(Boolean).join(' and ');
+      const nBands = diagrams[0].bands ? diagrams[0].bands.length : 0;
+      caption.textContent = `${nBands} bands` + (pol ? `, ${pol} polarisation` : '')
+        + `, ω in units of a/(2πc).`;
+    }
+  }
+
+  if (!gapBody) return;
+  gapBody.innerHTML = '';
+  const gaps = diagrams.length ? bandGaps(diagrams[0]) : [];
+  if (!gaps.length) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td colspan="4" class="muted">No complete gap between the '
+      + 'lowest bands on this path.</td>';
+    gapBody.appendChild(tr);
+    return;
+  }
+  for (const gap of gaps) {
+    const tr = document.createElement('tr');
+    const ratio = Number.isFinite(gap.midgapRatio)
+      ? `${(gap.midgapRatio * 100).toFixed(1)}%` : '—';
+    tr.innerHTML = `<td>${gap.index}–${gap.index + 1}</td>`
+      + `<td>${gap.lower.toFixed(4)}</td><td>${gap.upper.toFixed(4)}</td>`
+      + `<td>${ratio}</td>`;
+    gapBody.appendChild(tr);
+  }
 }
 
 function buildModeTable(list) {

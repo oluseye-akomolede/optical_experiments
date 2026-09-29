@@ -88,6 +88,15 @@ LATTICE_CHOICES = ("square", "triangular")
 #: feature to make.
 POLARISATIONS = ("TM", "TE")
 
+#: The value of the upload form's mode selector that routes a POST here. The
+#: cavity form does not send this field at all, so an absent ``mode`` is the
+#: cavity path -- which is what keeps every form and bookmark from before this
+#: feature working unchanged. It is a named constant rather than a literal
+#: because the template, the route and this module all have to agree on the
+#: spelling, and a lowercase ``"PC"`` mismatching here would silently send a
+#: photonic-crystal request down the cavity path.
+MODE = "pc"
+
 
 class PCRequestError(Exception):
     """A photonic-crystal request the owner can fix, with the reason named.

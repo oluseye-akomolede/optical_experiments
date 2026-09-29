@@ -35,6 +35,7 @@ import config as CFG
 import db as DB
 import fields as FLD
 import jobs as JOBS
+import pc_form as PC
 import storage as STORE
 import worker_api as WORKER
 from meshing import (MAX_EDGE_OVERSHOOT, UploadError, effective_edge_mm,
@@ -139,6 +140,15 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
     @app.route("/", methods=["GET", "POST"])
     def index():
         if request.method == "POST":
+            # The mode selector decides which handler sees this POST. It is
+            # dispatched on a form field, not on whether a file arrived: a pc
+            # form that carried a file by accident must be REFUSED, not quietly
+            # handled as a cavity upload, and the two handlers share no
+            # validation. The default is the cavity path, so a form from before
+            # this selector existed (no `mode` field at all) uploads exactly as
+            # it did.
+            if request.form.get("mode") == PC.MODE:
+                return _handle_pc_upload(app, store, jobs_db)
             return _handle_upload(app, store, jobs_db)
         return render_template("index.html", jobs=jobs_db.list_jobs(25),
                               units=CFG.UNIT_CHOICES, default_units=CFG.DEFAULT_UNITS,
@@ -146,6 +156,10 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
                               default_feature_unit=CFG.DEFAULT_FEATURE_UNIT,
                               mode_choices=CFG.MODE_CHOICES,
                               default_n_modes=CFG.DEFAULT_N_MODES,
+                              lattices=PC.LATTICE_CHOICES,
+                              polarisations=PC.POLARISATIONS,
+                              max_bands=PC.MAX_BANDS,
+                              max_divisions=PC.MAX_DIVISIONS,
                               max_mb=CFG.MAX_UPLOAD_BYTES // (1024 * 1024))
 
     @app.route("/parts", methods=["POST"])
@@ -206,10 +220,18 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
             manifest = _done_manifest(store, jobs_db, job_id)
             if manifest:
                 achieved_m = manifest.get("achieved_median_edge_m")
+        # A pc job's own header fields, read from the row's stored request --
+        # the same reason the materials table is rendered from the STORED JSON:
+        # a page that re-derived them from the form could show a lattice the
+        # solve never used while every number on it looked right. Absent for a
+        # cavity job, so the template's `and pc_request` guard is also the
+        # kind guard rather than a second one that could drift from it.
+        pc_request = job.get("pcs") if job.get("kind") == DB.PC else None
         return render_template("job.html", job=job,
                               effective_size=_effective_size(job),
                               resolution=_resolution_caption(job, achieved_m),
                               max_edge_overshoot=MAX_EDGE_OVERSHOOT,
+                              pc_request=pc_request,
                               queue_position=jobs_db.queue_position(job_id))
 
     # -- JSON the page polls ----------------------------------------------
@@ -983,6 +1005,62 @@ def _handle_upload(app, store, jobs_db):
         run_tick(store, jobs_db, app.extensions["mse"]["jobs"])
     except Exception as exc:  # noqa: BLE001 - the tick is best-effort
         app.logger.warning("scheduler tick failed after upload: %s", exc)
+
+    return redirect(url_for("job_page", job_id=job_id))
+
+
+def _handle_pc_upload(app, store, jobs_db):
+    """Validate, cap-check and queue one photonic-crystal request.
+
+    The cavity handler's sibling and its deliberate opposite in one respect:
+    there is NO FILE. A band diagram is a property of the unit cell and the
+    index contrast, so the request is a handful of numbers and there is nothing
+    to upload. A file that arrives anyway is REFUSED rather than ignored: a
+    request whose parameters came from a form and whose scope silently came from
+    a leftover file input is a job that solves something the owner did not ask
+    for, and the two handlers share no validation that would catch it.
+
+    Everything numeric is validated by :mod:`pc_form`, which refuses by name and
+    counts the cell through the solver's own mesher. This function's job is the
+    part that needs the database: write the row and start it. It is a job like
+    any other -- `kind='pc'`, no target beyond the cluster (a pc solve is small
+    and CPU-bound; it has no GPU path), and the same claim/solve/store journey
+    the cavity jobs take.
+    """
+    uploaded = request.files.get("meshfile")
+    if uploaded is not None and uploaded.filename:
+        # Not merely ignored. See the docstring: a pc form that carries a file
+        # is a mismatch between what the owner saw and what the request means.
+        flash("A band-diagram request has no file to upload. Pick the lattice "
+              "and the parameters, and leave the file box empty.")
+        return redirect(url_for("index"))
+
+    try:
+        planned = PC.plan_request(request.form)
+    except PC.PCRequestError as exc:
+        # Refused by name, with the limit named: this is the same shape as the
+        # solver's own refusals and it is the point of the caps, not a failure
+        # of them.
+        flash(str(exc))
+        return redirect(url_for("index"))
+
+    request_json = PC.request_json(planned)
+    job_id = uuid.uuid4()
+    # The parameters the owner typed are the job's NAME. A pc job has no file,
+    # so a list of rows all called the job id would be a page of UUIDs; the
+    # lattice and the size are what tell one apart from another.
+    label = (f"{planned['lattice']} lattice, r/a={planned['r_over_a']:g}, "
+             f"{planned['n_bands']} bands, {planned['polarisation']}")
+
+    jobs_db.create_job(job_id, label, CFG.DEFAULT_UNITS, 1.0,
+                       planned["divisions"], target=DB.CLUSTER,
+                       est_tets=planned["nodes"], kind=DB.PC,
+                       pcs=request_json)
+
+    try:
+        run_tick(store, jobs_db, app.extensions["mse"]["jobs"])
+    except Exception as exc:  # noqa: BLE001 - the tick is best-effort
+        app.logger.warning("scheduler tick failed after pc upload: %s", exc)
 
     return redirect(url_for("job_page", job_id=job_id))
 

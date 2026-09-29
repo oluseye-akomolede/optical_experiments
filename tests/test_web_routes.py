@@ -2333,3 +2333,172 @@ def test_the_job_page_renders_the_material_table_it_stored(tmp_path):
         "the table from the upload, which can differ from what the solve used"
     )
     assert "wall" not in html.split('id="materials"')[1].split("</div>")[0]
+
+
+# ---------------------------------------------------------------------------
+# The photonic-crystal upload: a second form with no file
+# ---------------------------------------------------------------------------
+def pc_form(**over):
+    """The pc arm's form fields, as the template renders them."""
+    fields = {
+        "mode": "pc", "lattice": "square", "r_over_a": "0.2",
+        "n_rod": "3.5", "n_bg": "1.0", "n_bands": "4",
+        "divisions": "16", "polarisation": "TM",
+    }
+    fields.update(over)
+    return fields
+
+
+def test_a_pc_form_queues_a_pc_job_with_its_request_stored(tmp_path,
+                                                           monkeypatch):
+    """The happy path: the row is a kind='pc' job whose pcs holds the request.
+
+    Every field is asserted against the ROW, not against the response code: a
+    queue that accepted the POST and wrote the wrong request is the failure this
+    is here for, and a 302 would hide it perfectly.
+    """
+    monkeypatch.setenv("MSE_GPU_MIN_TETS", str(10 ** 9))
+    app, _store, db, _launcher = make_app(tmp_path)
+    resp = app.test_client().post("/", data=pc_form(),
+                                  content_type="multipart/form-data")
+    assert resp.status_code == 302, resp.data
+
+    job = next(iter(db.jobs.values()))
+    assert job["kind"] == DB.PC
+    assert job["pcs"] == {"lattice": "square", "r_over_a": 0.2, "n_rod": 3.5,
+                          "n_bg": 1.0, "n_bands": 4, "divisions": 16,
+                          "polarisation": "TM"}
+    # The request is the SEVEN fields -- not the derived node count, which is
+    # the web side's estimate and lives on the row's est_tets instead.
+    assert "nodes" not in job["pcs"] and "k_points" not in job["pcs"]
+    # est_tets is the node count the cap was checked against, recorded for the
+    # same reason a cavity row records its element estimate.
+    assert job["est_tets"] > 0
+    # A pc job runs on the cluster: it has no GPU path.
+    assert job["target"] == DB.CLUSTER
+
+
+def test_a_pc_form_with_a_file_is_refused_not_solved(tmp_path, monkeypatch):
+    """A pc form carrying a file is a mismatch, and it is refused by name.
+
+    The danger is the SILENT version: a handler that ignores the file would
+    queue a band diagram while the owner believes they uploaded something. The
+    assertion is on the row count -- a 302 would look identical either way.
+    """
+    monkeypatch.setenv("MSE_GPU_MIN_TETS", str(10 ** 9))
+    app, _store, db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+    fields = pc_form()
+    fields["meshfile"] = (io_bytes(closed_box_bytes()), "box.obj")
+    resp = client.post("/", data=fields, content_type="multipart/form-data")
+    assert resp.status_code == 302, resp.data
+    assert db.jobs == {}, "a pc form with a file was queued anyway"
+    # The flash lives in the SAME client's session; a fresh test_client() is a
+    # different cookie jar and would see an empty page no matter what was said.
+    # Read it from the session directly, the idiom the scale-refusal test uses.
+    with client.session_transaction() as session:
+        flashes = [str(m) for m in session.get("_flashes", [])]
+    assert any("no file to upload" in m for m in flashes), flashes
+
+
+def test_a_pc_form_over_the_node_cap_is_refused_with_the_limit_named(
+        tmp_path, monkeypatch):
+    """The cap refusal happens BEFORE a row is written.
+
+    A row that is certain to fail is worse than a refusal: it costs a worker a
+    claim and the owner has to read a failure to learn what a form could have
+    said. So the assertion is `db.jobs == {}` -- not merely that the page
+    complained.
+    """
+    monkeypatch.setenv("MSE_GPU_MIN_TETS", str(10 ** 9))
+    app, _store, db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+    resp = client.post("/", data=pc_form(divisions="70"),
+                       content_type="multipart/form-data")
+    assert resp.status_code == 302
+    assert db.jobs == {}, "an over-cap request was queued anyway"
+    with client.session_transaction() as session:
+        flashes = [str(m) for m in session.get("_flashes", [])]
+    # BOTH numbers: the count it computed and the limit it hit. A refusal that
+    # named only "too big" would leave the owner guessing which lever to pull.
+    assert any("over this app's limit" in m for m in flashes), flashes
+    assert any("nodes" in m for m in flashes), flashes
+
+
+def test_an_unknown_lattice_is_refused_by_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("MSE_GPU_MIN_TETS", str(10 ** 9))
+    app, _store, db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+    resp = client.post("/", data=pc_form(lattice="hexagonal"),
+                       content_type="multipart/form-data")
+    assert resp.status_code == 302
+    assert db.jobs == {}
+    with client.session_transaction() as session:
+        flashes = [str(m) for m in session.get("_flashes", [])]
+    assert any("hexagonal" in m and "Unknown lattice" in m for m in flashes), \
+        flashes
+
+
+def test_the_cavity_form_still_uploads_with_no_mode_field(tmp_path,
+                                                          monkeypatch):
+    """A form from before the selector existed still takes the cavity path.
+
+    The dispatch is on `mode == 'pc'`, so an ABSENT mode must mean cavity --
+    and the assertion is that a real upload lands, not merely that no error was
+    returned. This is the negative control for the whole selector: if the
+    dispatch defaulted the other way, every one of these would break and a test
+    that only checked "not refused" would still pass.
+    """
+    monkeypatch.setenv("MSE_GPU_MIN_TETS", str(10 ** 9))
+    app, _store, db, _launcher = make_app(tmp_path)
+    resp = upload(app.test_client())
+    assert resp.status_code == 302, resp.data
+    job = next(iter(db.jobs.values()))
+    assert job["kind"] == DB.CAVITY
+    assert job["pcs"] is None
+
+
+def test_the_job_page_renders_a_pc_summary_and_not_the_cavity_header(
+        tmp_path, monkeypatch):
+    """A pc job's page must not print "(none) modes" over a band diagram.
+
+    The two summaries are mutually exclusive in the template, and this asserts
+    BOTH halves: the pc summary is present AND the cavity line is absent. A test
+    that only checked for the pc text would pass on a page that printed both.
+    """
+    app, _store, db, _launcher = make_app(tmp_path)
+    # A REAL uuid: the job route validates the id before looking it up, so a
+    # readable literal like "job-pc" 404s before the template is reached -- and
+    # a 404 body would make the "expressions absent" half of this test pass for
+    # the wrong reason.
+    job_id = str(uuid.uuid4())
+    db.create_job(job_id, "square lattice", "mm", 1.0, 16,
+                  target=DB.CLUSTER, kind=DB.PC,
+                  pcs={"lattice": "square", "r_over_a": 0.2, "n_rod": 3.5,
+                       "n_bg": 1.0, "n_bands": 4, "divisions": 16,
+                       "polarisation": "TM"})
+    html = app.test_client().get(f"/jobs/{job_id}").get_data(as_text=True)
+    assert 'id="pc-summary"' in html
+    assert "modes requested" not in html, (
+        "the cavity header rendered for a pc job; two summaries on one page "
+        "means the reader cannot tell which the numbers belong to"
+    )
+    # The band panel exists in the DOM (hidden until the status poll says the
+    # job is done) and the 3-D viewer's controls do not.
+    assert 'id="bands-card"' in html
+    assert "TM polarisation" in html
+
+
+def test_the_job_page_for_a_cavity_job_has_no_band_panel(tmp_path):
+    """The other direction: a cavity job must not grow the pc branch.
+
+    Asserted as an absence of the pc-only markers, which is a weaker statement
+    than the pc test's mutual exclusion and is stated as such -- the cavity page
+    has always carried its own summary and this is a regression guard on it.
+    """
+    app, _store, db, _launcher = make_app(tmp_path)
+    job_id = str(uuid.uuid4())
+    db.create_job(job_id, "box.obj", "mm", 1.0, 10, target=DB.CLUSTER)
+    html = app.test_client().get(f"/jobs/{job_id}").get_data(as_text=True)
+    assert 'id="pc-summary"' not in html
+    assert "modes requested" in html

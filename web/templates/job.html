@@ -3,13 +3,29 @@
 {% block content %}
 <section class="card" id="job" data-job-id="{{ job.job_id }}">
   <h1 id="job-title">{{ job.original_filename or job.job_id }}</h1>
-  <p class="muted small">
-    Units {{ job.units }} &middot; refractive index {{ job.n_index }} &middot;
-    {{ job.n_modes }} modes requested
-    {%- if job.scale and job.scale != 1.0 %} &middot; scaled &times;{{ '%g'|format(job.scale) }}{% endif %}
-    {%- if resolution %} &middot; <span id="resolution">requested mesh resolution
-    {{ resolution.requested }}</span>{% endif %}
-  </p>
+  {# Two result shapes, two summaries. A pc job has no units, no refractive
+     index of its own and no mode count -- printing the cavity header for it
+     would put "(none) modes requested" over a band diagram. The discriminator
+     is the same `kind` column every other branch reads. #}
+  {% if job.kind == 'pc' and pc_request %}
+    <p class="muted small" id="pc-summary">
+      {{ pc_request.lattice|capitalize }} lattice &middot;
+      rod radius {{ '%g'|format(pc_request.r_over_a) }}&thinsp;a &middot;
+      n<sub>rod</sub> {{ '%g'|format(pc_request.n_rod) }} &middot;
+      n<sub>bg</sub> {{ '%g'|format(pc_request.n_bg) }} &middot;
+      {{ pc_request.n_bands }} bands &middot;
+      {{ pc_request.divisions }} divisions per edge &middot;
+      {{ pc_request.polarisation }} polarisation
+    </p>
+  {% else %}
+    <p class="muted small">
+      Units {{ job.units }} &middot; refractive index {{ job.n_index }} &middot;
+      {{ job.n_modes }} modes requested
+      {%- if job.scale and job.scale != 1.0 %} &middot; scaled &times;{{ '%g'|format(job.scale) }}{% endif %}
+      {%- if resolution %} &middot; <span id="resolution">requested mesh resolution
+      {{ resolution.requested }}</span>{% endif %}
+    </p>
+  {% endif %}
   {# The requested resolution, in the unit the OWNER typed it in -- which is the
      feature's own unit and deliberately not the object's. Labelled, because a
      bare "0.2" beside a "0.27" is a pair the reader has to guess at, and a
@@ -46,7 +62,7 @@
      that re-derived the names could show a table the solver never saw while
      every number on it looked right. Sorted by name for a stable order, since
      JSON object order is not a contract. #}
-  {% if job.materials %}
+  {% if job.materials and job.kind != 'pc' %}
     <div id="materials">
       <p class="muted small">
         This cavity holds {{ job.materials|length }} materials, each meshed to
@@ -68,7 +84,13 @@
      not inferred from the status: "queued for the GPU" and "running on the GPU"
      are different things to wait for, and the owner should be able to tell a job
      that is waiting for a machine from one that is using it. #}
-  {% if job.target == 'jetson' %}
+  {% if job.kind == 'pc' %}
+    <p class="muted small" id="target-line">
+      This job grows a unit cell, applies the periodic boundary conditions and
+      walks the high-symmetry path in k-space. It runs as an ordinary queued
+      job; there is nothing to watch but the status below.
+    </p>
+  {% elif job.target == 'jetson' %}
     <p class="muted small" id="target-line">
       This job is queued for the graphics processor, which solves the larger
       meshes. If it is not picked up within a few minutes it will be moved back
@@ -132,6 +154,29 @@
     <thead><tr><th>#</th><th>Frequency</th><th>Vacuum wavelength</th></tr></thead>
     <tbody id="modes-body"></tbody>
   </table>
+</section>
+
+{# The band diagram. Rendered only for a `kind='pc'` job -- the viewer branches
+   on the payload's kind, and this card stays hidden otherwise. It is a separate
+   card from the modes table so the two result shapes never share a container
+   that could show one job's headings over another's data. #}
+<section class="card" id="bands-card" hidden>
+  <h2>Band diagram</h2>
+  <p class="muted small" id="bands-caption"></p>
+  <svg id="bands-svg" class="bands" width="640" height="380"
+       preserveAspectRatio="xMidYMid meet"></svg>
+  <h3>Band gaps</h3>
+  <table class="modes" id="bands-gaps">
+    <thead><tr><th>Between bands</th><th>Lower &omega;</th><th>Upper &omega;</th>
+      <th>Gap / midgap</th></tr></thead>
+    <tbody id="bands-gaps-body"></tbody>
+  </table>
+  <p class="muted small">
+    &omega; is in units of <code>a/(2&pi;c)</code>, so a gap ratio is
+    dimensionless and is the same figure of merit quoted in the photonic-crystal
+    literature. The shaded bands are windows no state occupies anywhere along
+    the k-path.
+  </p>
 </section>
 {% endblock %}
 

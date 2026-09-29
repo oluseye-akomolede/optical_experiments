@@ -13,7 +13,22 @@
     penetrates the metal and the true resonance shifts. Treat these frequencies as the
     ideal-cavity answer, not a measured one.
   </p>
-  <form method="post" enctype="multipart/form-data" class="upload">
+  {# The mode selector. `detail.cavity` and `detail.pc` below are the two arms;
+     the script at the bottom of this file shows exactly one and keeps the
+     `required` attributes in step with what is visible -- a hidden file input
+     that stays `required` blocks submission with a browser message pointing at
+     a control the owner cannot see, which is the could-not-ask shape in a form. #}
+  <form method="post" enctype="multipart/form-data" class="upload" id="upload-form">
+    <div class="row">
+      <label>What would you like to compute?
+        <select name="mode" id="mode-select">
+          <option value="cavity" selected>Optical modes of an object (3-D)</option>
+          <option value="pc">Band diagram of a 2-D photonic crystal</option>
+        </select>
+      </label>
+    </div>
+
+    <fieldset id="detail-cavity" class="mode-detail">
     <label>Model file (.obj, up to {{ max_mb }} MB)
       <input type="file" name="meshfile" accept=".obj" required>
     </label>
@@ -73,7 +88,68 @@
       units, this is how you say how big it really is &mdash; and the size you state is
       the size whose modes you get.
     </p>
-    <button type="submit">Compute modes</button>
+    </fieldset>
+
+    {# The photonic-crystal arm. No file: the request is the geometry of the
+       unit cell and the two indices. Every field here is dimensionless, which
+       is why there is no unit menu and no scale factor -- ω comes back in units
+       of a/(2πc) and the lattice constant never needs a number. #}
+    <fieldset id="detail-pc" class="mode-detail" hidden>
+      <p class="muted small">
+        A 2-D photonic crystal: a square or triangular lattice of rods in a
+        background, solved on the high-symmetry path through the Brillouin
+        zone. The result is a band diagram &mdash; frequency against k &mdash;
+        with any band gaps shaded and their midgap ratios printed. Everything
+        here is a fraction of the lattice constant <code>a</code>, so nothing is
+        stated in metres.
+      </p>
+      <div class="row">
+        <label>Lattice
+          <select name="lattice">
+            {% for lattice in lattices %}
+              <option value="{{ lattice }}"{% if lattice == 'square' %} selected{% endif %}>{{ lattice }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Rod radius (as a fraction of a)
+          <input type="number" name="r_over_a" value="0.2" min="0.001" max="0.499"
+                 step="0.001" required>
+        </label>
+        <label>Polarisation
+          <select name="polarisation">
+            {% for pol in polarisations %}
+              <option value="{{ pol }}"{% if pol == 'TM' %} selected{% endif %}>{{ pol }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Rod refractive index
+          <input type="number" name="n_rod" value="3.5" min="0.001" step="0.001" required>
+        </label>
+        <label>Background refractive index
+          <input type="number" name="n_bg" value="1.0" min="0.001" step="0.001" required>
+        </label>
+        <label>Bands (per polarisation)
+          <input type="number" name="n_bands" value="6" min="1" max="{{ max_bands }}"
+                 step="1" required>
+        </label>
+        <label>Divisions per cell edge
+          <input type="number" name="divisions" value="24" min="4"
+                 max="{{ max_divisions }}" step="1" required>
+        </label>
+      </div>
+      <p class="muted small">
+        <strong>TM</strong> is the field out of the plane (E<sub>z</sub>) and
+        <strong>TE</strong> is its magnetic counterpart (H<sub>z</sub>) &mdash;
+        they are two different problems and are solved separately. More
+        divisions means a finer cell and a longer solve; more bands means a
+        larger eigenvalue problem. The app refuses a request that would exceed
+        its node or k-point ceiling, and says which limit was hit.
+      </p>
+    </fieldset>
+
+    <button type="submit" id="submit-button">Compute modes</button>
   </form>
 </section>
 
@@ -97,4 +173,45 @@
     <p class="muted">No objects yet.</p>
   {% endif %}
 </section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Show one arm of the form. The `required` attribute is toggled WITH visibility:
+// a hidden `required` box blocks the POST and the browser then cannot focus it,
+// so the owner sees "not focusable" pointing at a control that is not on the
+// page. Every input in the hidden arm is disarmed here so only the visible
+// arm's constraints apply. The button label follows the arm, because "Compute
+// modes" over a band-diagram request is the wrong promise.
+(function () {
+  var select = document.getElementById('mode-select');
+  if (!select) return;
+  var arms = {
+    cavity: document.getElementById('detail-cavity'),
+    pc: document.getElementById('detail-pc'),
+  };
+  var button = document.getElementById('submit-button');
+  var labels = { cavity: 'Compute modes', pc: 'Compute the band diagram' };
+
+  function apply() {
+    var chosen = select.value === 'pc' ? 'pc' : 'cavity';
+    Object.keys(arms).forEach(function (name) {
+      var arm = arms[name];
+      if (!arm) return;
+      var visible = name === chosen;
+      arm.hidden = !visible;
+      arm.querySelectorAll('input, select').forEach(function (input) {
+        if (visible) {
+          input.setAttribute('required', '');
+        } else {
+          input.removeAttribute('required');
+        }
+      });
+    });
+    if (button) button.textContent = labels[chosen];
+  }
+  select.addEventListener('change', apply);
+  apply();
+})();
+</script>
 {% endblock %}
