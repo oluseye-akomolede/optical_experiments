@@ -81,7 +81,26 @@ CREATE TABLE IF NOT EXISTS mse.jobs (
     -- be a table with no parts, which is a different and wrong statement -- so
     -- the column stays NULL rather than being defaulted, and every reader
     -- treats NULL and absent alike.
-    materials         jsonb
+    materials         jsonb,
+    -- The job KIND. `cavity` is the 3-D vector solver this table has always
+    -- held; `pc` is a 2-D photonic-crystal band diagram. It is a discriminator
+    -- so the two kinds are views of one table rather than two tables: both go
+    -- through the same claim -> solve -> store path and want the same status,
+    -- lease and routing columns.
+    --
+    -- The DEFAULT 'cavity' is what keeps every existing row and every existing
+    -- reader on the path they were already on: a row written before this column
+    -- existed is a cavity job, so the default is not a placeholder guess but the
+    -- true value. `kind` is NOT NULL for that reason -- unlike `materials`,
+    -- there is no "absent" state, only "cavity".
+    kind              text        NOT NULL DEFAULT 'cavity',
+    -- The photonic-crystal request and its result, as JSON: the request
+    -- (lattice, r_over_a, n_rod, n_bg, n_bands) and the computed bands.
+    --
+    -- NULL means "not a pc job", exactly as NULL `materials` means the one-part
+    -- path. It is NOT defaulted to `{}`: a cavity job has no photonic-crystal
+    -- request, and `{}` would claim one with every field missing.
+    pcs               jsonb
 );
 
 -- The solver used to run as a SparkApplication; it is now a plain batch/v1 Job,
@@ -255,6 +274,25 @@ BEGIN
         WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'materials'
     ) THEN
         ALTER TABLE mse.jobs ADD COLUMN materials jsonb;
+    END IF;
+
+    -- The job kind, for databases created before photonic crystals. Added with
+    -- the DEFAULT so existing rows take the true value ('cavity') and a NOT
+    -- NULL holds from the start -- the same shape as `release_count` above.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'kind'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN kind text NOT NULL DEFAULT 'cavity';
+    END IF;
+
+    -- The photonic-crystal request/result JSON, nullable for the same reason as
+    -- `materials`: NULL is the true value for every pre-existing cavity row.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'pcs'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN pcs jsonb;
     END IF;
 END $$;
 
