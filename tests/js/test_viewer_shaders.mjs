@@ -140,15 +140,44 @@ test('the raymarch step is a fraction of the box, not a physical length', () => 
   // `uAlphaScale * dt` and forbidding `uExtent` would let `* 10.0` through, and
   // a hard-coded constant is the same class of defect: an alpha that is right
   // for one grid and wrong for another. Anything between `clamp(` and the
-  // closing paren that is not exactly `t * uAlphaScale * dt` is a change to the
+  // closing paren that is not exactly the documented form is a change to the
   // optical model and should have to come here and say so.
+  //
+  // THE FORM. The per-step alpha is the sample's own strength times
+  // uAlphaScale*dt, and nothing else -- no physical length, no hard-coded
+  // scale. The strength reaches it LINEARLY in `t`, and `uThreshold` does NOT
+  // appear in the expression.
+  //
+  // That last clause is the load-bearing one, and it is a correction. An
+  // earlier version of this test demanded a floor-relative ramp
+  // `(t - uThreshold)/(1 - uThreshold)`, on the theory that only field
+  // meaningfully above the floor should contribute. It shipped, and it broke
+  // the picture: subtracting the floor cut a ray's accumulated alpha by ~10x
+  // (0.48 -> 0.046 for samples just over it), and at that opacity the pixel's
+  // channels are squeezed so close to the page background that the diverging
+  // classifier sees no colour at all. The render check caught it as 91637
+  // pixels that were neither warm nor cool. Asserting the expression I had
+  // written made the test agree with the bug -- the test was restating the
+  // implementation instead of the property.
+  //
+  // The property is: what the floor admits, it draws at its own strength. The
+  // haze is the FLOOR's job (uThreshold, which is why it is 0.12 and not
+  // 0.02) -- a sample below it contributes nothing, and a sample above it is
+  // drawn in proportion to how strong it is. So `uThreshold` must not reappear
+  // inside the alpha: that is the shape of the regression, not a detail of it.
   const alpha = /float a = clamp\(([^;]*?), 0\.0, 1\.0\)/.exec(source);
   assert.ok(alpha, 'the alpha integral has gone or changed shape');
   const expression = alpha[1].replace(/\s+/g, ' ').trim();
   assert.equal(expression, 't * uAlphaScale * dt',
     `the alpha integral is "${expression}", not "t * uAlphaScale * dt" -- ` +
     'any physical length or hard-coded scale here makes the plot\'s opacity ' +
-    'depend on the grid rather than on the field');
+    'depend on the grid rather than on the field, and subtracting the ' +
+    'threshold here crushes faint-but-real field below the opacity where its ' +
+    'colour is distinguishable from the background');
+  assert.ok(!/uThreshold/.test(expression),
+    'uThreshold appears in the alpha: the floor is being subtracted from the ' +
+    'sample strength as well as gating it, which is what made a signed ' +
+    'component draw as pixels that are neither warm nor cool');
 });
 
 test('a sample at the box face fetches the last texel, not one past it', () => {
@@ -327,4 +356,100 @@ test('the faint-component caption is driven by the measured share, not the name'
   assert.match(html, /id="component-note"/,
     'the page no longer has the #component-note element the caption and the ' +
     'render check both address');
+});
+
+test('a share below the drawing floor gets the below-floor caption', () => {
+  // WHY THIS IS A SEPARATE TEST FROM THE OWN ABOVE. That one checks the caption
+  // is *wired* to the measured share; this one checks what it SAYS. They are
+  // different failures: the caption can be perfectly wired and still tell the
+  // viewer the wrong thing, and that is the defect this row arrived with.
+  //
+  // The defect, measured on the owner's job: THRESHOLD (the drawing floor) is
+  // 0.12 of the mode's peak |E|. Mode 1's Er has a p99 of 8% and mode 2's Ez a
+  // p99 of 11% -- both entirely under the floor. Every sample of those
+  // components is discarded by the shader, so the frame is nearly empty. The
+  // old caption's only small-share branch said the component "draws as a faint
+  // cloud", which is a description of a DIFFERENT picture -- the faint-but-drawn
+  // one that a share between the floor and SMALL_SHARE produces. A caption that
+  // narrates a frame the viewer is not looking at is the could-not-ask shape:
+  // it reads as a measurement while the thing measured is absent.
+  //
+  // Driven rather than read. The old test matched the caption's source text,
+  // which cannot tell an `if` from an `else if` -- exactly the edit this row
+  // makes. So the function is extracted from the real file and CALLED, with the
+  // real constants, against a fake DOM.
+  const threshold = Number(/const THRESHOLD = ([\d.]+);/.exec(source)[1]);
+  const smallShare = Number(/const SMALL_SHARE = ([\d.]+);/.exec(source)[1]);
+  assert.ok(threshold > 0 && threshold < smallShare,
+    `the floor (${threshold}) must sit below SMALL_SHARE (${smallShare}) or ` +
+    'there is no band between them and this test is vacuous');
+
+  const noteEl = { hidden: false, textContent: '' };
+  // Re-derived here rather than shared with the test above: `note` there is
+  // block-scoped to that test, so reaching for it is a ReferenceError, and the
+  // same regex is cheap.
+  const note = /function paintComponentNote\([^)]*\)\s*\{([\s\S]*?)\n  \}/.exec(source);
+  assert.ok(note, 'paintComponentNote has gone -- there is no caption to drive');
+  const body = note[1];
+
+  // A share just under the floor: the arbitrary real case is mode 1's 8%, and
+  // the epsilon below is what makes "just under" test the boundary rather than
+  // a comfortable distance from it.
+  const under = threshold - 0.005;
+  paintNote(under, 'Er');
+  const underText = noteEl.textContent;
+  assert.match(underText, /almost empty/i,
+    `a share of ${under} (under the ${threshold} floor) must be reported as an ` +
+    'almost-empty frame -- the shader discards every sample below the floor, ' +
+    'so the picture really is empty and the caption must say so');
+  assert.match(underText, /not a fault/i,
+    'the below-floor caption must say the emptiness is physics, not a fault, ' +
+    'or the viewer reads an empty frame as a broken one');
+  assert.ok(!/faint cloud/i.test(underText),
+    'the below-floor branch still uses the "faint cloud" wording, which ' +
+    'describes a drawn-but-faint picture -- the caption and the frame disagree');
+  // The floor in the text must be the constant, not a retyped number: a caption
+  // that hard-codes 12% silently lies the moment the floor moves.
+  assert.ok(underText.includes(`${Math.round(threshold * 100)}%`),
+    `the below-floor caption does not name the floor the shader uses ` +
+    `(${Math.round(threshold * 100)}%): it was retyped, so the two can drift`);
+
+  // And a share inside the band: drawn, so faint is the right word and the
+  // below-floor text must not appear.
+  const band = (threshold + smallShare) / 2;
+  paintNote(band, 'Er');
+  const bandText = noteEl.textContent;
+  assert.match(bandText, /faint cloud/i,
+    `a share of ${band} (between the ${threshold} floor and SMALL_SHARE ` +
+    `${smallShare}) IS drawn, so it must keep the faint-cloud wording`);
+  assert.ok(!/almost empty/i.test(bandText),
+    'a component above the floor is being described as an almost-empty frame');
+  assert.notEqual(bandText, underText,
+    'both branches produced the same caption, so the new branch is not ' +
+    'reached -- the split does not exist');
+
+  /**
+   * Call the viewer's real paintComponentNote with a chosen share.
+   *
+   * The function is extracted from viewer.js and rebuilt as a function body
+   * with the file's own three constants injected. Everything else it closes
+   * over is provided by the fake globals set up around the eval: `name` (the
+   * selected component) and `document`.
+   */
+  function paintNote(share, componentName) {
+    const labels = {};   // COMPONENT_LABELS only supplies a display name
+    globalThis.document = { getElementById: () => noteEl };
+    try {
+      const fn = new Function('volumeShare', 'name', 'THRESHOLD', 'SMALL_SHARE',
+                              'COMPONENT_LABELS', 'signed', 'percent',
+                              `${body}\nreturn undefined;`);
+      // `percent` is the file's own formatter, reached for from outside this
+      // test because calling a copy would let the caption's rounding drift
+      // from the legend's. It is a one-liner, same as in viewer.js.
+      const percent = (share2) => `${Math.round(share2 * 100)}%`;
+      fn(share, componentName, threshold, smallShare, labels, true, percent);
+    } finally {
+      delete globalThis.document;
+    }
+  }
 });

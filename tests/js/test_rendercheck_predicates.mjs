@@ -17,7 +17,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { drawProblem, framingProblem, divergingProblem, divergingNote }
+import { drawProblem, framingProblem, divergingProblem, divergingNote,
+         freshClip }
   from '../../dockerfiles/rendercheck/pixels.mjs';
 
 // A frame summary shaped like the one check.mjs builds.
@@ -94,4 +95,65 @@ test('a frame with no hue at all is caught', () => {
   const noHue = frame({ coloured: 5000, warm: 0, cool: 0 });
   assert.ok(divergingProblem(noHue, 'Ez'),
     'a signed component drawn in neither lobe colour must fail');
+});
+
+// ---- the screenshot clip -------------------------------------------------
+//
+// A separate defect, from the same run: the clip that frames each screenshot
+// went stale. Clicking a mode row scrolls the page, so a rect captured before
+// the click photographs where the canvas USED to be -- page chrome. Two saved
+// PNGs (`05-...-mode2.png`, `04-rotated.png`) were text and selector widgets.
+//
+// The clip's contract is small and worth pinning, because the tempting repair
+// is wrong in a way that looks like care. `boundingBox()` and
+// `page.screenshot({clip})` are BOTH viewport-relative -- the screenshot
+// scrolls internally to satisfy a clip -- so the rect needs no scroll
+// correction, and ADDING `window.scrollY` to it double-counts the scroll and
+// pushes the clip off the canvas by exactly the scroll amount.
+//
+// So the test drives a fake canvas whose viewport rect moves when the page
+// scrolls, and asserts the two properties that matter: the clip tracks the
+// canvas, and it is NOT shifted by the scroll. A version that added scrollY
+// passes the first and fails the second, which is the whole point.
+
+test('the screenshot clip tracks the canvas and is not scroll-corrected', async (t) => {
+  t.after(() => { delete globalThis.scrollY; });
+  // The canvas sits at viewport y = 194.78 at scrollY 0, and the page then
+  // scrolls by 284 (both measured), putting it at -89.22.
+  const canvasRectAt = (scrollY) => ({
+    x: 120, y: 194.78 - scrollY, width: 834, height: 353,
+  });
+
+  // The fake page puts the scroll where the REAL code would read it. That
+  // matters: a version that corrects the clip reads `window.scrollY`, so a
+  // fake that keeps the scroll in a closure it alone can see would let the
+  // buggy function pass this test. The scroll must be on a global the code
+  // under test can reach, exactly as the browser exposes it.
+  const makePage = () => ({
+    scrollTo: (y) => { globalThis.scrollY = y; },
+    boundingBox: async () => canvasRectAt(globalThis.scrollY),
+  });
+
+  // The real function the check uses, called the way check.mjs calls it.
+  const good = makePage();
+  const before = await freshClip(() => good.boundingBox());
+  good.scrollTo(284);
+  const after = await freshClip(() => good.boundingBox());
+  assert.equal(after.y, -89.22,
+    'the clip must follow the canvas to where it now is; a stale clip ' +
+    'photographs page chrome');
+  assert.notEqual(after.y, before.y,
+    'the clip went stale -- it did not move with the canvas');
+
+  // The repair that looks like care, computed here exactly as it would be
+  // written in check.mjs: the rect is already viewport-relative, so adding the
+  // scroll shifts it by the full scroll amount -- 194.78 - 284 + 284 = 194.78,
+  // i.e. back to where the canvas was and no longer is. That is the stale
+  // position, which is what a stale clip photographs: page chrome.
+  const wrong = { ...after, y: after.y + 284 };
+  assert.equal(wrong.y, 194.78,
+    'adding scrollY to a viewport-relative rect cancels the canvas moving: it ' +
+    'lands back on the stale position, off by the full scroll amount');
+  assert.notEqual(wrong.y, after.y,
+    'the doubled correction must land somewhere other than the true canvas');
 });

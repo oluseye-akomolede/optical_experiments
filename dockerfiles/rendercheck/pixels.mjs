@@ -111,6 +111,30 @@ export function divergingProblem(sample, what, share = 0.5) {
 }
 
 /** How a passing diverging frame reads in the log. */
+// ---- the screenshot clip ---------------------------------------------------
+//
+// The rect that frames a screenshot, kept here with the predicates because it
+// has the same failure mode: wrong in the direction of passing quietly. It is
+// pure -- it takes a bounding-box getter and returns a rect -- so it can be
+// tested without a browser.
+//
+// Why it takes a getter rather than a rect: clicking a mode row scrolls the
+// page (measured, scrollY 0 -> 284), and the canvas then sits at viewport
+// y = -89 while a rect captured at the top still says 194.78. A rect captured
+// once and reused photographs where the canvas USED to be -- page chrome.
+// Re-reading the box at every shot is the fix.
+//
+// Why there is no scroll correction: `boundingBox()` and
+// `page.screenshot({clip})` are BOTH viewport-relative -- the screenshot scrolls
+// internally to satisfy a clip. So the rect wants no correction at all, and
+// adding `window.scrollY` to it double-counts the scroll and lands back on the
+// stale position, off by the full scroll amount. That mistake was made and
+// measured: the same rect captured the field with no scroll added and the page
+// chrome with it added.
+export async function freshClip(boundingBox) {
+  return boundingBox();
+}
+
 export function divergingNote(sample, what) {
   const lobes = [];
   if (sample.warm > 0) lobes.push(`${sample.warm} warm`);

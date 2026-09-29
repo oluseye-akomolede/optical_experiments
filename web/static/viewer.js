@@ -28,6 +28,8 @@ import { boxCentre, componentShare, componentVolume, float32ToHalf,
          SYSTEM_LABELS, COMPONENT_NAMES, COMPONENT_LABELS, DEFAULT_SYSTEM,
          DEFAULT_COMPONENT }
   from './components.js';
+import { surfaceScaleFromGrid, boundsOf as boundsOfPositions }
+  from './surface.js';
 
 const root = document.getElementById('job');
 if (root) init(root);
@@ -431,6 +433,19 @@ void main() {
       // says "how much of this ray's length lies in field of this strength".
       // A 5 mm object and a 5 m one then draw identically, which is what the
       // owner wants to see: the mode's shape, not its size.
+      //
+      // The strength enters LINEARLY in t, so a sample just over the floor
+      // still contributes, in proportion to how far over it is. This was
+      // briefly changed to (t - uThreshold)/(1 - uThreshold), on the theory
+      // that a ramp starting at zero would stop near-floor field from filling
+      // the silhouette. The theory is wrong for this picture: the ramp makes a
+      // sample's weight depend on uThreshold as well as on t, so the alpha a
+      // ray accumulates is set by where the floor happens to sit -- and the
+      // floor is meant to decide *what counts as field*, not how strongly the
+      // field above it is drawn. Making haze a job for the floor (uThreshold,
+      // now 0.12 rather than 0.02) and leaving the ramp linear keeps those two
+      // decisions in one place each. See tests/js/test_viewer_shaders.mjs,
+      // which pins the expression so this cannot silently return.
       float a = clamp(t * uAlphaScale * dt, 0.0, 1.0);
       acc.rgb += (1.0 - acc.a) * a * c;
       acc.a += (1.0 - acc.a) * a;
@@ -472,8 +487,6 @@ function loadFieldData(jobId, statusData) {
   controls.dampingFactor = 0.08;
   controls.zoomSpeed = 0.8;
 
-  let surfaceMesh = null;
-
   // The box the raymarch runs in: the unit cube centred on the origin, scaled
   // to the grid's physical extent and moved to its centre. Local space is
   // therefore 0..1 across the grid however the box is scaled, which is what
@@ -484,6 +497,13 @@ function loadFieldData(jobId, statusData) {
   // Back faces are rendered on purpose: the camera may sit inside the box, and
   // a front-face-only box would vanish the moment the user zoomed in past the
   // near wall, which reads as the plot having disappeared.
+  // One source of truth for the visibility floor, read by BOTH the shader
+  // uniform and the legend caption. A caption that restated the number would be
+  // free to disagree with the picture it describes -- the "guard must read the
+  // source, not retype it" rule -- and here the caption is the only thing
+  // telling the reader that a faint region may be below the floor rather than
+  // absent.
+  const THRESHOLD = 0.12;
   const volumeMaterial = new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
     vertexShader: VERTEX_SHADER,
@@ -492,7 +512,15 @@ function loadFieldData(jobId, statusData) {
       uField: { value: null },
       uVolumeSize: { value: new THREE.Vector3(1, 1, 1) },
       uAlphaScale: { value: 4.0 },
-      uThreshold: { value: 0.02 },
+      // Raised from 0.02. The owner's complaint was that the object read as a
+      // solid block, and 0.02 admitted every sample within 2% of the component's
+      // own peak -- on a mode whose peak is set by one hot spot, that is most of
+      // the box. 0.12 keeps the shape of the mode's lobes and drops the tail that
+      // was filling the silhouette. This uniform is the ONLY haze control: the
+      // alpha ramp below is linear in the field's strength, so raising the floor
+      // is what removes the faint fill, without also dimming field that is
+      // genuinely above it.
+      uThreshold: { value: THRESHOLD },
       // Multiplied by the box's largest side once the grid is known, so the
       // emissive integral is exp(-k * t * depth) with depth in physical units.
       uSigned: { value: true },
@@ -578,6 +606,31 @@ function loadFieldData(jobId, statusData) {
     controls.update();
   }
 
+  // The uploaded model's own surface. Held as an ARRAY of parts, not a single
+  // mesh: a glb may carry several (job 30796544's nested sphere is one object in
+  // several parts), and the previous single-slot `surfaceMesh` kept only the
+  // last one, so every part but the last drew with no outline at all.
+  let surfaceParts = [];
+  // The group the parts live in, so the whole surface can be scaled and moved as
+  // one object. See addSurface for why it must be.
+  let surfaceGroup = null;
+
+  function clearSurface() {
+    for (const part of surfaceParts) {
+      part.geometry.dispose();
+      if (part.material) part.material.dispose();
+      for (const child of part.children) {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) child.material.dispose();
+      }
+    }
+    if (surfaceGroup) {
+      scene.remove(surfaceGroup);
+      surfaceGroup = null;
+    }
+    surfaceParts = [];
+  }
+
   function addSurface(id) {
     fetch(`/jobs/${id}/files/surface.glb`)
       .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(r.status))))
@@ -585,19 +638,117 @@ function loadFieldData(jobId, statusData) {
         new GLTFLoader().parse(buffer, '', resolve, reject);
       }))
       .then((gltf) => {
-        const material = new THREE.MeshBasicMaterial({
-          color: 0x9fb6cc, transparent: true, opacity: 0.08,
-          side: THREE.DoubleSide, depthWrite: false,
-        });
-        gltf.scene.traverse((child) => {
-          if (child.isMesh) {
-            child.material = material;
-            surfaceMesh = child;
-            scene.add(child);
-          }
-        });
+        clearSurface();
+
+        // COLLECT FIRST, ADD AFTER. Do not `scene.add(child)` inside the walk.
+        // three.js's Object3D.traverse iterates the LIVE children array with a
+        // length bound read before the loop:
+        //     const e = this.children; for (let n=0,i=e.length; n<i; n++) e[n].traverse(t)
+        // re-parenting a child splices it out of `e` while `i` stays put, so the
+        // last iteration reads a hole and calls `.traverse` on `undefined` --
+        // "Cannot read properties of undefined (reading 'traverse')", which is
+        // the error this had on a 2-part model. Collecting into an array and
+        // adding afterwards never mutates the array being walked.
+        const parts = [];
+        gltf.scene.traverse((child) => { if (child.isMesh) parts.push(child); });
+        if (!parts.length) {
+          surfaceNote('The surface file contained no mesh, so no outline is drawn.');
+          return;
+        }
+
+        // THE UNIT CONVERSION, and the whole reason this row exists. The field
+        // grid is in METRES (bounds came from the grid's origin/spacing) and the
+        // uploaded surface is in the USER'S units -- mm on the live job. Drawing
+        // the parts unscaled leaves them ~1000x too big and off the origin, so
+        // the volume fills a small patch inside a huge outline and the reader
+        // sees "a cubic region", not their model. surfaceScaleFromGrid derives
+        // the conversion from the grid's own extent over the surface's, so the
+        // object that is DRAWN and the object the field was SOLVED on are the
+        // same object -- the one shared conversion the row's ask calls for.
+        const grid = manifest && manifest.grid;
+        const surfBounds = boundsOfPositions(surfacePositions(parts));
+        const scale = surfaceScaleFromGrid(grid, surfBounds && surfBounds.size);
+        if (!scale) {
+          // "Could not determine" must not silently look like "factor of 1":
+          // that is exactly the bug. Draw nothing and say so.
+          surfaceNote('Surface outline hidden: its size could not be matched to ' +
+                      'the field grid (no unit conversion available).');
+          return;
+        }
+
+        surfaceGroup = new THREE.Group();
+        for (const part of parts) {
+          // The outline the row asked for: silhouette/edge lines over a faint
+          // shade, so the shape reads even where the field is faint. EdgesGeometry
+          // is computed on the part's own geometry before any scaling, so it is
+          // scale-invariant.
+          part.material = new THREE.MeshBasicMaterial({
+            color: 0x9fb6cc, transparent: true, opacity: 0.10,
+            side: THREE.DoubleSide, depthWrite: false,
+          });
+          const edges = new THREE.LineSegments(
+            new THREE.EdgesGeometry(part.geometry, 20),
+            new THREE.LineBasicMaterial({
+              color: 0xd8e6f2, transparent: true, opacity: 0.55,
+              depthWrite: false,
+            }));
+          part.add(edges);
+          surfaceGroup.add(part);
+          surfaceParts.push(part);
+        }
+        // Scale the surface into the grid's units, and move it to the grid box's
+        // centre. The surface is built centred on its own origin and the grid box
+        // is centred on bounds.centre, so this puts the outline on the same
+        // object the field was solved on.
+        surfaceGroup.scale.set(scale[0], scale[1], scale[2]);
+        if (bounds) surfaceGroup.position.set(bounds.centre[0], bounds.centre[1],
+                                              bounds.centre[2]);
+        scene.add(surfaceGroup);
+        surfaceNote(null);
       })
-      .catch(() => { /* the field is the point; a missing surface is survivable */ });
+      .catch((err) => {
+        // A missing outline must not look the same as no outline. The field is
+        // still the point, so this does not block the view -- but the reader is
+        // told, rather than shown an empty scene and left to guess.
+        surfaceNote(`Surface could not be loaded (${err && err.message ? err.message : err})`);
+      });
+  }
+
+  // Every part's vertex positions, concatenated, so the surface's own bounding
+  // size can be measured from what was actually loaded rather than from a
+  // separate assumption about the file.
+  function surfacePositions(parts) {
+    const chunks = [];
+    for (const part of parts) {
+      const pos = part.geometry && part.geometry.attributes
+        && part.geometry.attributes.position;
+      if (pos) chunks.push(pos.array);
+    }
+    if (!chunks.length) return new Float64Array(0);
+    let n = 0;
+    for (const c of chunks) n += c.length;
+    const out = new Float64Array(n);
+    let o = 0;
+    for (const c of chunks) { out.set(c, o); o += c.length; }
+    return out;
+  }
+
+  // The small note that says a surface load failed. Created once, then only its
+  // text changes, so a re-load does not stack notes.
+  let noteEl = null;
+  function surfaceNote(text) {
+    if (!noteEl) {
+      noteEl = document.createElement('div');
+      noteEl.id = 'surface-note';
+      noteEl.style.cssText =
+        'position:absolute;left:10px;bottom:10px;z-index:5;max-width:60%;' +
+        'padding:4px 8px;border-radius:4px;font:12px/1.4 system-ui,sans-serif;' +
+        'color:#ffe9c7;background:rgba(80,50,10,0.85);pointer-events:none;' +
+        'display:none';
+      (canvas.parentElement || document.body).appendChild(noteEl);
+    }
+    if (text) { noteEl.textContent = text; noteEl.style.display = 'block'; }
+    else { noteEl.textContent = ''; noteEl.style.display = 'none'; }
   }
 
   // -- selectors ----------------------------------------------------------
@@ -671,15 +822,22 @@ function loadFieldData(jobId, statusData) {
     const label = COMPONENT_LABELS[name] || name;
     const note = document.getElementById('legend-note');
     if (note) {
-      note.textContent = signed
+      // The threshold is named here because it is a decision the reader cannot
+      // recover from the picture: below it, field is not drawn at all, and the
+      // alpha ramp starts at zero there, so the faintest few percent of the
+      // component's peak are invisible by construction. Saying so is what keeps
+      // "nothing here" from being read as "no field here" -- the faint-frame
+      // rule this viewer already follows for a small component.
+      const floor = percent(THRESHOLD);
+      const base = signed
         ? `Colour is ${label}, signed: the cool end is negative, the warm end ` +
-          'positive, and the pale middle is the zero crossing. On the left is ' +
-          'the end colour dimmed, so a negative lobe reads as dim and cool ' +
-          'rather than as a different quantity. Every mode is normalised to ' +
-          'max |E| = 1, so the scale is the same for all of them. Transparent ' +
-          'is outside the object.'
-        : 'Colour is |E|, normalised to 1 and the same scale for every mode. ' +
-          'Transparent is outside the object.';
+          'positive, and the pale middle is the zero crossing. Every mode is ' +
+          'normalised to max |E| = 1, so the scale is the same for all of them.'
+        : 'Colour is |E|, normalised to 1 and the same scale for every mode.';
+      note.textContent =
+        `${base} Field weaker than ${floor} of the peak is not drawn, so the ` +
+        'object’s shape stays visible through the haze. Transparent is ' +
+        'outside the object.';
     }
     const lo = document.getElementById('legend-lo');
     const hi = document.getElementById('legend-hi');
@@ -730,10 +888,32 @@ function loadFieldData(jobId, statusData) {
     }
 
     const share = percent(volumeShare);
-    if (volumeShare < SMALL_SHARE) {
-      // The whole point: name the smallness, in the picture's own terms, so a
-      // viewer does not read the faintness as a fault. The reason is physical
-      // -- a mode polarised the other way is small in this component.
+    if (volumeShare < THRESHOLD) {
+      // BELOW THE DRAWING FLOOR, so this is a different case from "faint", and
+      // the caption must not call it faint. The field strength that reaches the
+      // shader is the component as a fraction of the mode's peak |E|, and the
+      // floor is applied to that SAME number: a component whose p99 sits under
+      // the floor leaves almost nothing above it, so the picture is nearly
+      // empty. Telling the reader that is "a faint cloud" would be the
+      // could-not-ask shape -- a caption describing a picture that is not on
+      // screen -- so this branch names the floor instead. The reason is still
+      // physical: a mode polarised the other way is small in this component.
+      //
+      // THRESHOLD is read from the one constant (line ~506), never retyped: a
+      // caption that restated 0.12 could silently disagree with the shader the
+      // moment the floor moved.
+      note.textContent =
+        `${label} reaches only ${share} of this mode's peak |E|, under the ` +
+        `${percent(THRESHOLD)} drawing floor, so this frame is almost empty ` +
+        '-- the field is below the level the picture draws at all. That is ' +
+        `the physics of this mode, not a fault. The same control is strong in ` +
+        `other modes, and the bar below is unchanged: it is the shared ` +
+        `${label} scale for every mode, not a scale for this component alone.`;
+    } else if (volumeShare < SMALL_SHARE) {
+      // Above the floor, so it IS drawn -- faintly. The whole point: name the
+      // smallness, in the picture's own terms, so a viewer does not read the
+      // faintness as a fault. The reason is physical -- a mode polarised the
+      // other way is small in this component.
       note.textContent =
         `${label} is small in this mode: it reaches only ${share} of the ` +
         `mode's peak |E|, so this component draws as a faint cloud. The same ` +

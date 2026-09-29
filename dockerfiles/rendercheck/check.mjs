@@ -32,7 +32,8 @@
 import { chromium } from 'playwright-core';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { divergingNote, divergingProblem, drawProblem, framingProblem }
+import { divergingNote, divergingProblem, drawProblem, framingProblem,
+         freshClip }
   from './pixels.mjs';
 
 const url = process.env.MSE_URL;
@@ -220,15 +221,72 @@ try {
     throw new Error('no canvas box; stopping rather than screenshotting nothing');
   }
 
+  // The clip, re-read at every shot. See freshClip in pixels.mjs for why it is
+  // re-read and why it carries no scroll correction.
+  const clipNow = () => freshClip(() => canvas.boundingBox());
+
+  // Put the canvas back at the top of the viewport before every shot.
+  //
+  // WHAT THIS DOES AND DOES NOT FIX. Clicking a mode row scrolls the page (the
+  // mode table is below the fold), which moves the canvas UP and PARTLY OUT of
+  // the viewport -- measured at y = -89.22 after the mode-2 click, so the top of
+  // the canvas is 89 px above the viewport. Two things were wrong with the older
+  // code:
+  //   1. the clip was captured once, at the top, and reused -- so after any
+  //      scroll it photographed where the canvas USED to be. Two saved PNGs
+  //      (`04-rotated.png`, `05-...-mode2.png`) were page chrome, not the plot.
+  //      Taking a fresh boundingBox() per shot is the fix for that, and it is
+  //      measured: the first run after the change saved a real 834x353 plot
+  //      where the old one had saved text and selector widgets.
+  //   2. a clip extending outside the viewport made the run HANG: the GPU
+  //      process pinned at 99% CPU, node in state R, three shots and then
+  //      nothing until an external kill. Twice. Scrolling back to the top keeps
+  //      the clip inside the viewport.
+  //
+  // (2) IS ONLY PARTLY EVIDENCED, and the honest statement is what changed, not
+  // that it is cured. After this change the run no longer HANGS -- it exits,
+  // with `page.screenshot: Timeout ... exceeded` on the second shot instead of
+  // an unbounded stall. On the VM that run was sharing 12 CPUs with a full
+  // `pytest tests/` at 98% (another seat's process), with this container capped
+  // at --cpus=2, so the timeout is not attributable to the clip. Re-measure on a
+  // quiet machine before claiming the wedge is fixed.
+  //
+  // The clip stays a plain fresh boundingBox(); only the page's scroll position
+  // is reset, so the "no scroll correction on the rect" rule above still holds.
+  const bringCanvasIntoView = async () => {
+    await page.evaluate(() => window.scrollTo(0, 0));
+    // The scroll is async in the compositor; wait for the canvas to be back at
+    // a non-negative y rather than assuming a fixed delay covers it.
+    await page.waitForFunction(() => {
+      const el = document.getElementById('scene');
+      if (!el) return false;
+      return el.getBoundingClientRect().top >= 0;
+    }, null, { timeout: 30000 });
+  };
+
   const shoot = async (name) => {
     const path = join(outDir, name);
+    await bringCanvasIntoView();
+    const clip = await clipNow();
     // The PNG is for a human; every assertion reads the readPixels summary
     // returned below, never this file. It comes off the compositor, so it can in
     // principle catch a frame whose drawing buffer was already presented and
     // cleared (the renderer has no preserveDrawingBuffer -- web/static/viewer.js).
     // The readback below is immune because it reads inside a frame; this one is
     // best-effort. A blank PNG here is that, not a check false-alarm.
-    await page.screenshot({ path, clip: box });
+    // An explicit timeout, above Playwright's 30 s default. A clipped
+    // screenshot is slow on CPU-starved SwiftShader: the compositor has to
+    // render the clip, and under --cpus=2 that is tens of seconds even on an
+    // idle VM (the first shot pays the shader-compile cost as well). This is
+    // not a page slow to become stable -- the pixels are ready and Playwright's
+    // log shows the wait is in "taking page screenshot", after fonts have
+    // loaded -- so a longer timeout is the right lever rather than a workaround
+    // for a real stall. MEASURED LIMIT: on 2026-09-28 the VM was running another
+    // seat's full `pytest tests/` at 98% CPU, and a shot then exceeded even this
+    // 120 s. So this is a bound for a QUIET machine; on a loaded one the run
+    // should be given a Job (or waited for), not a bigger number blindly.
+    // The whole-run budget is MSE_TIMEOUT_MS; this must stay under it.
+    await page.screenshot({ path, clip, timeout: 120000 });
     const { data, width, height } = await page.evaluate(() => new Promise((resolve) => {
       const el = document.getElementById('scene');
       const gl2 = el.getContext('webgl2');
@@ -411,12 +469,18 @@ try {
   // half of what the owner asked for, and a camera that is not the one drawing
   // the scene is the failure it catches.
   //
-  // `box` is the one taken up top, not a fresh boundingBox() -- it is the same
-  // canvas in the same layout, and taking it twice would mean the screenshot
-  // clip and the drag could disagree about where the canvas is.
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  // A FRESH viewport rect for the drag. The `box` taken at the top is stale
+  // here: the mode click above scrolled the page by 284 px, so the canvas has
+  // moved and mouse events (viewport coordinates) must follow it. Taking it
+  // once and reusing it is what the previous version did, and it is what made
+  // the drag land 284 px away from the canvas -- which still "rotated" something
+  // often enough to look like a pass.
+  const dragBox = await canvas.boundingBox();
+  await page.mouse.move(dragBox.x + dragBox.width / 2,
+                        dragBox.y + dragBox.height / 2);
   await page.mouse.down();
-  await page.mouse.move(box.x + box.width / 2 + 220, box.y + box.height / 2 + 60,
+  await page.mouse.move(dragBox.x + dragBox.width / 2 + 220,
+                        dragBox.y + dragBox.height / 2 + 60,
                         { steps: 20 });
   await page.mouse.up();
   await page.waitForTimeout(3000);
