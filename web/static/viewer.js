@@ -175,14 +175,17 @@ void main() {
 // `cameraPosition` is three.js's world-space camera, but everything else in the
 // fragment shader is in the box's own 0..1 space. Translating the camera by the
 // box's centre and dividing by its size is the inverse of the mesh's own
-// transform, so the ray is marched in the same frame as `vLocal`. Skipping this
+// transform; the final + 0.5 then moves -0.5..0.5 to 0..1, exactly as the
+// vertex shader does, so the ray is marched in the same frame as `vLocal`.
+// Without the + 0.5 the eye sits half a box off on every axis and the plot
+// smears into a box-shaped haze outside the object (2026-09-29). Skipping this
 // works only for a box at the origin with unit scale -- with a real grid the
 // camera sits offset and the ray misses or grazes the volume.
 const CAMERA_LOCAL = `
 uniform vec3 uBoxCentre;
 uniform vec3 uBoxSize;
 vec3 cameraLocal() {
-  return (cameraPosition - uBoxCentre) / max(uBoxSize, vec3(1e-12));
+  return (cameraPosition - uBoxCentre) / max(uBoxSize, vec3(1e-12)) + 0.5;
 }
 `;
 
