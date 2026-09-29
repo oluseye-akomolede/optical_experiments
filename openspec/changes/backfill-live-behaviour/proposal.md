@@ -15,7 +15,7 @@ file cited. Where the code has a limit or an absence, the spec says so.
 
 ## What
 
-Eight capability specs, each with ADDED requirements:
+Seven capability specs, each with ADDED requirements:
 
 - **mesh-upload** -- `.obj` intake, units/scale, named-part splitting, per-part
   index, watertightness, the element estimate and routing/refusal, plain-English
@@ -36,10 +36,7 @@ Eight capability specs, each with ADDED requirements:
   agreeing on one filename, opaque binary serving, the surface as its own
   artifact.
 - **mode-viewer** -- the shared colour scale and the captioned faint component,
-  the diverging signed scale, the field-off view, mode and component labelling.
-- **render-check** -- the canvas capture (never a screenshot), judging the field
-  not the box, the outline-only comparison, the below-floor frame, the gap the
-  predicate does not close, and capturing the control after the page closes.
+  the diverging signed scale, mode and component labelling.
 - **deployment-bounds** -- the `mse-power-cap` quota, thread counts matched to
   CPU limits, and the per-component images.
 

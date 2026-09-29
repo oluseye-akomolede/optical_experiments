@@ -44,7 +44,7 @@ smallest feature SHALL carry its OWN unit, chosen from a shorter list
 The app SHALL split a multi-part upload by its `o`/`g` group names, and SHALL
 refuse an upload whose named groups and closed parts do not correspond
 one-for-one. The split SHALL use connected components (union-find on face
-adjacency), not a graph engine. Source: `web/mse_parts.py`.
+adjacency), not a graph engine. Source: `dockerfiles/maxwell_solver/mse_parts.py`.
 
 #### Scenario: a group name is repeated
 - **WHEN** the `.obj` names the same group more than once

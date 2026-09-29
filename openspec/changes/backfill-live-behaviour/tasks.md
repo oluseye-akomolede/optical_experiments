@@ -7,9 +7,8 @@
 - [x] 1.3 maxwell-solver: meshing, FEM, eigen solve, backend seam, artifacts
 - [x] 1.4 jetson-worker: concurrency, memory bound, crash recovery, token discipline
 - [x] 1.5 results-api: store listing, index/fetch agreement, serving
-- [x] 1.6 mode-viewer: colour scale, caption, field-off view
-- [x] 1.7 render-check: capture, predicates, the control
-- [x] 1.8 deployment-bounds: quota, threads, images
+- [x] 1.6 mode-viewer: colour scale, caption, labelling
+- [x] 1.7 deployment-bounds: quota, threads, images
 
 ## 2. Write the capability specs
 
@@ -19,8 +18,7 @@
 - [x] 2.4 jetson-worker/spec.md
 - [x] 2.5 results-api/spec.md
 - [x] 2.6 mode-viewer/spec.md
-- [x] 2.7 render-check/spec.md
-- [x] 2.8 deployment-bounds/spec.md
+- [x] 2.7 deployment-bounds/spec.md
 
 ## 3. Validate and hand off
 

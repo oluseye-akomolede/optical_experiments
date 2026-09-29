@@ -31,17 +31,6 @@ pale tone near zero. Source: `web/static/viewer.js`.
 - **THEN** positive and negative regions take different lobe colours
 - **AND** near-zero regions take the pale near-neutral tone, not the background
 
-### Requirement: The viewer offers a field-off view
-
-The viewer SHALL accept a query parameter that hides the field and shows the
-object's outline (surface) only, so a user or a check can see the object without
-the plot. Source: `web/static/viewer.js`.
-
-#### Scenario: the field is switched off
-- **WHEN** the viewer is opened with the field-off parameter
-- **THEN** the object is drawn with no field colouring
-- **AND** the page still renders the object
-
 ### Requirement: A mode label and a per-component selector
 
 The viewer SHALL let the user choose a mode and a component, and SHALL label

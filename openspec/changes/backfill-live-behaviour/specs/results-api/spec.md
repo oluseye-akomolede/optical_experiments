@@ -7,7 +7,7 @@
 The results API SHALL decide what a finished job offers by LISTING the job's
 store prefix, not by reading a database index. A field SHALL be advertised as
 available only when its artifact is present in the store. Source:
-`web/app.py`, `web/store.py`.
+`web/app.py`, `web/db.py`.
 
 #### Scenario: a field's artifact is absent from the store
 - **WHEN** the results API builds the list of a job's fields and an artifact is
@@ -43,7 +43,7 @@ does not invite the browser to reinterpret it. Source: `web/app.py`.
 
 The job's surface geometry (for the viewer's object) SHALL be served as its own
 artifact, distinct from the mode field data, so a client that draws no field can
-still draw the object. Source: `web/app.py`, `web/store.py`.
+still draw the object. Source: `web/app.py`, `web/db.py`.
 
 #### Scenario: a client asks only for the surface
 - **WHEN** a client requests the job's surface artifact
