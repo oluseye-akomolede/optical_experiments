@@ -539,6 +539,21 @@ function loadFieldData(jobId, statusData) {
   volume.visible = false;
   scene.add(volume);
 
+  // `?field=off` keeps the field hidden so only the object's outline draws.
+  //
+  // Two uses. It is how the render check captures its outline-only CONTROL
+  // frame: the field-versus-outline predicate needs a frame containing the
+  // outline and nothing else, taken from the same page, and a control frame
+  // captured this way cannot be guessed at the way a colour threshold would be
+  // (see outlineOnlyProblem in dockerfiles/rendercheck/pixels.mjs). It is also
+  // the answer to "is my outline right?" when the field is obscuring it.
+  //
+  // Read once, here, from the page URL. It is a display switch only: it
+  // changes nothing about what is fetched or computed, so a job page with it
+  // set is the same job with the field layer turned off.
+  const FIELD_OFF = new URLSearchParams(window.location.search).get('field')
+    === 'off';
+
   let manifest = null;
   let modes = [];
   let current = 0;
@@ -1004,6 +1019,13 @@ function loadFieldData(jobId, statusData) {
     const centre = boxCentre(grid);
     const scalar = componentVolume(vec, positions, centre, system, name);
     volumeShare = componentShare(vec, positions, centre, system, name);
+    // Debug hook: the caption's own number, readable from the page's DevTools
+    // console. One line, read-only, no behaviour -- added so a question about
+    // the caption ("is this component really under the floor in this mode?")
+    // can be answered by measuring the number the caption is built from
+    // instead of inferring it from the text. Used by
+    // scratch/probe_share.mjs; harmless in production.
+    window.__mseShare = volumeShare;
 
     // Normalise the chosen component by its own peak, so the shader's "1.0 is
     // the strongest sample in this picture" is true.
@@ -1085,7 +1107,10 @@ function loadFieldData(jobId, statusData) {
     // picture it is drawing, because the negative half of a signed component
     // gets the cool end of the ramp rather than being folded onto the warm end.
     volumeMaterial.uniforms.uSigned.value = (name !== 'E');
-    volume.visible = true;
+    // `?field=off` holds the field hidden here even though the texture is
+    // built and bound: the texture work still happens, so this is a display
+    // switch and not a second code path that could drift from the real one.
+    volume.visible = !FIELD_OFF;
     paintLegend();
   }
 
