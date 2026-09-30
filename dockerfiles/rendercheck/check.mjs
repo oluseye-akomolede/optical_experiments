@@ -40,7 +40,7 @@ import { chromium } from 'playwright-core';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { decodePng, divergingNote, divergingProblem, drawProblem,
-         framingProblem, knownIssue, outlineOnlyProblem }
+         framingProblem, judgeFrameDecision, outlineOnlyProblem }
   from './pixels.mjs';
 
 const url = process.env.MSE_URL;
@@ -89,12 +89,10 @@ function known(what, reason) {
 // the measurement is still printed in full, and the frame is still on the record
 // as wrong. A named waiver does not weaken the check, it files an exception.
 function judgeFrame(what, problemsOf) {
-  const found = problemsOf();
-  if (!found.length) return 'passed';
-  const reason = knownIssue(what);
-  if (reason) { known(what, reason); return 'known'; }
-  found.forEach(fail);
-  return 'failed';
+  const { verdict, problems: found, reason } = judgeFrameDecision(what, problemsOf());
+  if (verdict === 'known') known(what, reason);
+  if (verdict === 'failed') found.forEach(fail);
+  return verdict;
 }
 
 // A pixel summary that can be compared between two frames without keeping the

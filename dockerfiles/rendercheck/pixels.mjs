@@ -426,6 +426,29 @@ export function knownIssue(what) {
   return KNOWN_ISSUE_FRAMES.has(what) ? KNOWN_ISSUE_FRAMES.get(what) : null;
 }
 
+/**
+ * Decide a frame's verdict from the problems its measurements found.
+ *
+ * This is the ONLY place a waiver is granted, and it is granted on the frame's
+ * own label alone -- `problems` is never inspected for a caption, a share, or a
+ * size. It returns:
+ *   - `{ verdict: 'passed',  problems: [] }`      nothing was wrong
+ *   - `{ verdict: 'known',   problems: [] , reason }` named waiver, run continues
+ *   - `{ verdict: 'failed',  problems }`          real problems, run fails
+ *
+ * `check.mjs` does the logging; the DECISION lives here so it can be tested
+ * without a browser. Splitting it out matters: tests that only called
+ * `knownIssue()` pinned the table, not the decision, so a mutation making the
+ * waiver always apply (M2) or never apply (M3) left every test green.
+ */
+export function judgeFrameDecision(what, problems) {
+  const found = problems || [];
+  if (!found.length) return { verdict: 'passed', problems: [] };
+  const reason = knownIssue(what);
+  if (reason) return { verdict: 'known', problems: [], reason };
+  return { verdict: 'failed', problems: found };
+}
+
 export function divergingNote(sample, what, outline) {
   const lobes = [];
   if (sample.warm > 0) lobes.push(`${sample.warm} warm`);

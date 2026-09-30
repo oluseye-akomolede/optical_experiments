@@ -18,7 +18,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { drawProblem, framingProblem, divergingProblem, divergingNote,
-         freshClip, knownIssue, outlineOnlyProblem }
+         freshClip, judgeFrameDecision, knownIssue, outlineOnlyProblem }
   from '../../dockerfiles/rendercheck/pixels.mjs';
 
 // A frame summary shaped like the one check.mjs builds. `sum` defaults to a
@@ -292,46 +292,6 @@ test('an empty outline frame is itself a failure, not a free pass', () => {
   assert.match(problem, /control|outline/i);
 });
 
-test('a below-floor frame is forgiven only when the caption accounts for it', () => {
-  // MEASURED ON THE LIVE PAGE, mode 1's Erho at a share of 0.0826 against the
-  // viewer's 0.12 drawing floor. The shader discards every sample, so the frame
-  // is SUPPOSED to match the outline-only control -- "the field is below the
-  // level the picture draws at all". Running the field-versus-outline predicate
-  // on it reads the correct picture as "the frame is the outline only" and
-  // fails a good page (measured: the last of three failures on a correct run).
-  //
-  // The exemption is gated on `erhoNamesTheTest`, computed in check.mjs from
-  // the page's caption: it requires the caption to name the component's
-  // measured 8% share AND to say the emptiness is physics, not a fault. Here we
-  // pin both sides of that gate so the exemption can never widen into silence.
-  const outline = frame({ coloured: 91637, warm: 0, cool: 0, hash: 111 });
-  const belowFloor = frame({ coloured: 91637, warm: 0, cool: 0, hash: 111 });
-
-  // (a) With the gate true: accounted for, reported as OK, NOT a failure.
-  const problem = outlineOnlyProblem(belowFloor, outline);
-  assert.ok(problem, 'the raw predicate still reports the empty frame -- the ' +
-    'gate lives at the call site, so this predicate keeps its full strength');
-  const forgiven = /8\s*%/.test('Eᵨ reaches only 8% of this mode\'s peak') &&
-    /\bnot a fault\b/i.test('That is the physics of this mode, not a fault.');
-  assert.equal(forgiven, true, 'a caption naming the real share and calling ' +
-    'the emptiness physical is what the gate accepts');
-
-  // (b) With the gate false -- the same empty frame on a page that does NOT
-  // explain it -- the frame MUST still fail. This is the case the exemption
-  // must never swallow: a field that never drew prints no caption and cannot
-  // pass.
-  const unexplained = /8\s*%/.test('') && /\bnot a fault\b/i.test('');
-  assert.equal(unexplained, false, 'a page with no caption does not satisfy ' +
-    'the gate, so the empty frame still fails as outline-only');
-
-  // (c) A hard-coded caption cannot satisfy the gate either: it must name the
-  // number, and mode 2's control (share 0.98, captioned as strong) makes a
-  // frozen "almost empty" caption fail elsewhere in the check.
-  assert.equal(/8\s*%/.test('This frame is almost empty.'), false,
-    'a caption that says "almost empty" without naming the measured share ' +
-    'does NOT open the exemption');
-});
-
 test('an all-black control is caught, not mistaken for a drawn outline', () => {
   // THE REGRESSION THAT PROMPTED THIS GUARD, and the reason `coloured === 0`
   // is not enough. A canvas read from a context without `preserveDrawingBuffer`
@@ -454,4 +414,58 @@ test('the waived frame is still judged by the unrelaxed predicate', () => {
     + 'weaken it, it files an exception');
   assert.ok(divergingProblem(erhoHaze, 'Erho in mode 1', outline),
     'the lobe-hue predicate is likewise unrelaxed for the waived frame');
+});
+
+test('judgeFrameDecision: the waived label turns a failing frame into KNOWN', () => {
+  // THE DECISION ITSELF, not the table. The three tests above call knownIssue()
+  // and the predicates; none of them calls the function that APPLIES the
+  // waiver. A mutation that made the waiver always apply (M2) or never apply
+  // (M3) left every one of them green. This test calls it.
+  const found = ['the frame is the outline only', 'no lobe hue reached the frame'];
+  const r = judgeFrameDecision('Erho in mode 1', found);
+  assert.equal(r.verdict, 'known',
+    'the waived label is accepted, so the run does not fail on this frame');
+  assert.ok(r.reason, 'the verdict carries the reason for the log');
+  assert.match(r.reason, /sign-mixed|neutral haze/i, 'and it is the real reason');
+  assert.deepEqual(r.problems, [],
+    'a waived frame contributes NOTHING to the problem list -- that is what '
+    + 'lets the run continue');
+});
+
+test('judgeFrameDecision: another label appends its problems and fails', () => {
+  // The other half, and the half M2 breaks. A frame with a different label is
+  // judged normally even when the measurements are identical to the waived
+  // frame's.
+  const found = ['the frame is the outline only', 'no lobe hue reached the frame'];
+  for (const what of ['Ez', '|E|', 'Erho in mode 2', 'the rotated frame',
+                      'erho in mode 1', 'Erho in mode 1 ']) {
+    const r = judgeFrameDecision(what, found);
+    assert.equal(r.verdict, 'failed', `"${what}" must fail -- it is not waived`);
+    assert.deepEqual(r.problems, found,
+      `"${what}" keeps ALL of its problems; nothing is swallowed`);
+  }
+  // The count matters: a mutation that appended only the first problem would
+  // still return 'failed' and pass a truthiness check, so pin the list.
+  const r = judgeFrameDecision('Ez', ['a', 'b', 'c']);
+  assert.equal(r.problems.length, 3, 'every problem is carried, not just one');
+});
+
+test('judgeFrameDecision: a clean frame passes, and a waiver cannot invent one', () => {
+  // The no-problems branch. A mutation that always waives (M2) would also have
+  // to be careful here: 'passed' and 'known' must stay distinct, or the log
+  // would print KNOWN on frames that are simply correct.
+  const clean = judgeFrameDecision('Erho in mode 1', []);
+  assert.equal(clean.verdict, 'passed',
+    'a frame with no problems is passed even when its label is waived -- the '
+    + 'waiver only ever downgrades a FAILURE, it never upgrades a pass to KNOWN');
+  assert.equal(clean.reason, undefined, 'and it carries no reason');
+  const cleanOther = judgeFrameDecision('Ez', []);
+  assert.equal(cleanOther.verdict, 'passed', 'a clean unwaived frame passes');
+});
+
+test('judgeFrameDecision: undefined/non-array problems is treated as clean', () => {
+  // Defensive: the caller always passes an array, but the decision must not
+  // read undefined as "a problem" -- that would fail every frame whose
+  // predicate returned nothing.
+  assert.equal(judgeFrameDecision('Ez', undefined).verdict, 'passed');
 });
