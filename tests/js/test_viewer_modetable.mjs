@@ -1,0 +1,249 @@
+// The end of a finished job, driven through the real viewer: does the mode
+// table get built, does the viewer un-hide, and does a throw inside render
+// surface instead of vanishing?
+//
+// WHY THIS FILE EXISTS. A production regression shipped: buildModeTable (the
+// last function in web/static/viewer.js) was deleted by an edit, finish() at
+// :101 still called it, and the throw landed in tick()'s `.catch(() => {})`.
+// The result was invisible in the worst way -- on EVERY finished job the
+// viewer never appeared and the mode table was empty, with no console error,
+// because the catch swallowed the ReferenceError. The post-deploy render check
+// caught it only by timing out on `#viewer:not([hidden])`; a browser probe
+// read status 200 "done", 0 rows, viewer hidden for 85 s.
+//
+// So this file tests two things, both of them BEHAVIOUR rather than a name:
+//   1. driving render({status:'done', modes:[...]}) actually builds the rows
+//      and un-hides the viewer;
+//   2. a throw inside render/finish is REPORTED (console.error + the page's
+//      failure text), not swallowed -- the could-not-ask pattern.
+//
+// The real viewer.js is loaded, not a double. It is an ES module with no
+// exports whose last line is `if (root) init(root);`, so it cannot simply be
+// imported and inspected. It is evaluated in a vm context whose document
+// deliberately has NO `#job` element, which makes that call a no-op; the test
+// then reaches `init`/`render` by running the page's own init against its own
+// `#job`. WebGL (loadFieldData) is stubbed at the boundary, because the claim
+// here is about the table and the failure path, not about three.js -- and the
+// test asserts loadFieldData was reached, so stubbing it cannot hide a
+// failure to get there.
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import vm from 'node:vm';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const viewerSrc = readFileSync(join(here, '..', '..', 'web', 'static', 'viewer.js'), 'utf8');
+
+// --- A DOM just large enough for the finished-job path ---------------------
+class El {
+  constructor(tag = 'div', id = '') {
+    this.tagName = tag.toUpperCase();
+    this.id = id;
+    this.children = [];
+    this.hidden = false;
+    this.textContent = '';
+    this.innerHTML = '';
+    this.title = '';
+    this.style = {};
+    this.dataset = {};
+    this.tabIndex = -1;
+    this._attrs = {};
+    this._listeners = {};
+    // buildModeTable marks an unreadable mode with classList.add('unavailable'),
+    // so the stub needs the method or that row throws and the test would be
+    // measuring the stub rather than the page.
+    this.className = '';
+    this.classList = {
+      _o: this,
+      add: (c) => { this.className = (this.className + ' ' + c).trim(); },
+      contains: (c) => this.className.split(/\s+/).includes(c),
+    };
+  }
+  setAttribute(k, v) { this._attrs[k] = String(v); }
+  getAttribute(k) { return this._attrs[k] ?? null; }
+  addEventListener(t, fn) { (this._listeners[t] ||= []).push(fn); }
+  appendChild(c) { this.children.push(c); return c; }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+}
+
+function makeDocument(withJob) {
+  const ids = ['job', 'status-text', 'stage-text', 'bar', 'elapsed', 'queue-line',
+               'progress', 'failure', 'failure-text', 'viewer', 'modes-card',
+               'modes-body', 'scene', 'viewer-fallback'];
+  const byId = {};
+  for (const id of ids) byId[id] = new El('div', id);
+  // The template's own starting states (web/templates/job.html): the viewer,
+  // the modes card and the failure box start hidden, and the progress block
+  // starts visible. A stub that had them all visible would make "the viewer
+  // un-hid" and "the failure box stayed hidden" both vacuous.
+  for (const id of ['viewer', 'modes-card', 'failure', 'queue-line']) {
+    byId[id].hidden = true;
+  }
+  // The auto-init guard: `const root = document.getElementById('job');
+  // if (root) init(root);`. Present so init runs; the test grabs the root and
+  // calls init itself only when it wants a second run.
+  if (!withJob) byId.job = null;
+  return {
+    getElementById: (id) => byId[id] ?? null,
+    createElement: (t) => new El(t),
+    addEventListener: () => {},
+    _byId: byId,
+  };
+}
+
+/** Load viewer.js with no #job, so nothing auto-runs, and return its globals. */
+function loadViewer() {
+  const document = makeDocument(true);
+  const ctx = {
+    document,
+    window: { devicePixelRatio: 1, addEventListener: () => {} },
+    console,
+    Date, Math, Number, JSON, Object, Array, String, Promise, Error,
+    // A retry scheduled with the real setTimeout would keep the test process
+    // alive for 3 s per still-live tick. Record the schedule and do not run
+    // it: the tests assert the SCHEDULE (a retry happened) and the absence of
+    // a reported error, not the second fetch.
+    setTimeout: (fn) => { (ctx.__timeouts ||= []).push(fn); return 0; },
+    requestAnimationFrame: (fn) => { (ctx.__timeouts ||= []).push(fn); return 0; },
+    cancelAnimationFrame: () => {},
+    fetch: async () => { throw new Error('fetch not stubbed in this test'); },
+    WebGL2RenderingContext: class {},
+    globalThis: {},
+  };
+  ctx.globalThis = ctx;
+  vm.createContext(ctx);
+  const stripped = viewerSrc
+    // Multi-line imports: the components.js import spans several lines, so a
+    // single-line pattern would leave `export` behind and the whole module
+    // would fail to parse -- a harness error that proves nothing about the
+    // page. Match from `import` to the closing `;` across newlines.
+    .replace(/^\s*import\b[\s\S]*?;\s*$/gm, '')
+    // The module also exports formatFrequency/formatWavelength (they are
+    // tested elsewhere). A vm script has no module record, so the `export`
+    // keyword must go -- but the functions stay, because buildModeTable calls
+    // them and that call is what the test exercises.
+    .replace(/^export function /gm, 'function ')
+    .replace(/^const root = document\.getElementById\('job'\);$/m, '')
+    .replace(/^if \(root\) init\(root\);$/m, '')
+    // The WebGL boundary. loadFieldData builds a THREE.WebGLRenderer on a real
+    // canvas; a vm stub has no GL, and on the FIXED code the finished-job path
+    // now REACHES it (on the broken code it threw first), so leaving it live
+    // hangs rather than failing. Record that it was reached and return -- the
+    // claims here are about the table and the failure path, not about three.js.
+    .replace(/^function loadFieldData\(jobId, statusData\) \{$/m,
+             'function loadFieldData(jobId, statusData) {\n' +
+             '  (globalThis.__loadFieldCalls ||= []).push(jobId);\n' +
+             '  return;');
+  vm.runInContext(stripped, ctx, { filename: 'viewer.js' });
+  return ctx;
+}
+
+// --- The tests -------------------------------------------------------------
+
+test('a finished job builds the mode rows and un-hides the viewer', async () => {
+  const ctx = loadViewer();
+  const doc = ctx.document;
+  const root = new El('div', 'job');
+  root.dataset.jobId = 'JOB-1';
+  doc._byId.job = root;
+
+  const data = {
+    status: 'done',
+    modes: [
+      { index: 1, freq_hz: 12345.0, vacuum_wavelength_m: 2.4e-5, available: true },
+      { index: 2, freq_hz: 23456.0, vacuum_wavelength_m: 1.2e-5, available: false },
+    ],
+  };
+
+  // Drive the page's own poll: one status fetch that resolves to `done`.
+  ctx.fetch = async () => ({ ok: true, status: 200, json: async () => data });
+
+  // init() is not exported; run it by evaluating the module's init binding.
+  vm.runInContext('init(document.getElementById("job"))', ctx);
+  await new Promise((r) => setTimeout(r, 30));
+
+  const body = doc._byId['modes-body'];
+  assert.equal(body.children.length, 2,
+    'the finished-job path must build one row per mode; 0 rows means ' +
+    'buildModeTable was not reached (or was swallowed before it ran)');
+  assert.equal(doc._byId.viewer.hidden, false,
+    '#viewer must be un-hidden once the job is done; if it is still hidden ' +
+    'the page shows nothing and the user has no way to see the modes');
+  assert.equal(doc._byId['modes-card'].hidden, false,
+    'the modes card must be shown alongside the viewer');
+  assert.equal(Array.from(ctx.__loadFieldCalls || []).join(','), 'JOB-1',
+    'the finished-job path must reach loadFieldData with the job id -- this ' +
+    'is what the stubbed WebGL boundary cannot hide, so the table assertions ' +
+    'above are on a path that actually got that far');
+  // The unreadable mode stays visible but not selectable -- the numbering has
+  // to match the physics even when a mode has no field.
+  const unreadable = body.children[1];
+  assert.ok(unreadable.classList.contains('unavailable'),
+    'a mode with available:false must be marked unavailable');
+  assert.ok(unreadable._attrs.role === undefined,
+    'a mode with available:false must not be a selectable button');
+  // The readable mode IS selectable, so the guard above is not vacuous.
+  assert.equal(body.children[0]._attrs.role, 'button',
+    'a mode with available:true must be a selectable button');
+});
+
+test('a throw inside render is reported, not swallowed', async () => {
+  const ctx = loadViewer();
+  const doc = ctx.document;
+  const root = new El('div', 'job');
+  root.dataset.jobId = 'JOB-2';
+  doc._byId.job = root;
+
+  // A payload that makes render() throw: modes is not iterable, so
+  // buildModeTable blows up. THIS is the shape of the production bug -- a
+  // throw on the done path that the old `.catch(() => {})` ate.
+  const bad = { status: 'done', modes: { not: 'an array' } };
+  ctx.fetch = async () => ({ ok: true, status: 200, json: async () => bad });
+
+  const errors = [];
+  const realError = ctx.console.error;
+  ctx.console.error = (...a) => errors.push(a.join(' '));
+
+  vm.runInContext('init(document.getElementById("job"))', ctx);
+  await new Promise((r) => setTimeout(r, 30));
+
+  ctx.console.error = realError;
+
+  assert.ok(errors.length >= 1,
+    'a throw inside render/finish must reach console.error; silence is the ' +
+    'exact production failure (a blank page with no way to tell why)');
+  assert.equal(doc._byId.failure.hidden, false,
+    'the page must show its failure text when the viewer cannot draw');
+  assert.match(String(doc._byId['failure-text'].textContent), /modes/i,
+    'the failure text must say something about the modes');
+});
+
+test('a status fetch failure retries rather than reporting a render bug', async () => {
+  const ctx = loadViewer();
+  const doc = ctx.document;
+  const root = new El('div', 'job');
+  root.dataset.jobId = 'JOB-3';
+  doc._byId.job = root;
+
+  let calls = 0;
+  ctx.fetch = async () => { calls += 1; throw new Error('network down'); };
+
+  const errors = [];
+  const realError = ctx.console.error;
+  ctx.console.error = (...a) => errors.push(a.join(' '));
+
+  vm.runInContext('init(document.getElementById("job"))', ctx);
+  await new Promise((r) => setTimeout(r, 30));
+
+  ctx.console.error = realError;
+
+  assert.equal(calls, 1, 'the first tick fires once');
+  assert.equal(errors.length, 0,
+    'a transport failure is transient and must NOT be reported as a bug');
+  assert.equal(doc._byId.failure.hidden, true,
+    'a transient fetch failure must not put the page into a failed state');
+});

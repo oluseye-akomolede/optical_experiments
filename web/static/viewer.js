@@ -59,9 +59,42 @@ function init(root) {
 
   function tick() {
     fetch(`/jobs/${jobId}/status`, { cache: 'no-store' })
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
+      .catch((err) => {
+        // Tag a transport/parse failure so the catch below can tell it from a
+        // bug in render(), and retry only the former.
+        const e = new Error(`status fetch failed: ${err && err.message}`);
+        e.isFetchFailure = true;
+        throw e;
+      })
+      .then((r) => {
+        if (!r.ok) {
+          const e = new Error(`status ${r.status}`);
+          e.isFetchFailure = true;
+          throw e;
+        }
+        return r.json().catch((err) => {
+          const e = new Error(`status body was not JSON: ${err && err.message}`);
+          e.isFetchFailure = true;
+          throw e;
+        });
+      })
       .then(render)
-      .catch(() => { /* transient; the next tick retries */ });
+      .catch((err) => {
+        // Only a FAILURE TO ASK is transient, so only that retries. An
+        // exception thrown inside render()/finish() is a bug in this page,
+        // and swallowing it hides the whole viewer: the tick fired against
+        // the real job, the page stayed blank, and nothing was logged -- the
+        // could-not-ask shape this rig keeps meeting. Report it and stop.
+        if (err && err.isFetchFailure) {
+          setTimeout(tick, 3000);   // transient; the next tick retries
+          return;
+        }
+        console.error('viewer: render failed', err);
+        progress.hidden = true;
+        failure.hidden = false;
+        failureText.textContent = 'Something went wrong while showing the ' +
+          'modes. The computation finished, but the viewer could not draw it.';
+      });
   }
 
   function render(data) {
@@ -1246,4 +1279,40 @@ function formatSeconds(s) {
   if (s < 60) return `${s.toFixed(0)}s`;
   const m = Math.floor(s / 60);
   return `${m}m ${Math.round(s - m * 60)}s`;
+}
+
+function buildModeTable(list) {
+  const body = document.getElementById('modes-body');
+  if (!body) return;
+  body.innerHTML = '';
+  list.forEach((mode, i) => {
+    const tr = document.createElement('tr');
+    tr.dataset.index = String(mode.index);
+    tr.innerHTML = `<td>${mode.index}</td><td>${formatFrequency(mode.freq_hz)}</td>` +
+                   `<td>${formatWavelength(mode.vacuum_wavelength_m)}</td>`;
+    // A mode the index says is unreadable has no field to fetch, so it is not
+    // selectable -- clicking it would only produce a failure the user cannot
+    // act on. It stays visible so the numbering matches the physics.
+    if (mode.available === false) {
+      tr.classList.add('unavailable');
+      tr.title = 'This mode’s field data is not available.';
+    } else {
+      // The owner asked for modes to be selectable from the list. A click is
+      // the obvious affordance; the keyboard path is what makes it usable
+      // without a mouse, so the row is focusable and Enter/Space select it.
+      // `selectModeRef` is null until the first payload lands, so guarding the
+      // call keeps a stray keypress from throwing before the viewer is ready.
+      const select = () => selectModeRef?.(i);
+      tr.tabIndex = 0;
+      tr.setAttribute('role', 'button');
+      tr.addEventListener('click', select);
+      tr.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();   // Space would otherwise scroll the page
+          select();
+        }
+      });
+    }
+    body.appendChild(tr);
+  });
 }
