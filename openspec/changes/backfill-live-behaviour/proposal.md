@@ -35,8 +35,8 @@ Seven capability specs, each with ADDED requirements:
 - **results-api** -- results listed from the store not an index, list and fetch
   agreeing on one filename, opaque binary serving, the surface as its own
   artifact.
-- **mode-viewer** -- the shared colour scale and the captioned faint component,
-  the diverging signed scale, mode and component labelling.
+- **mode-viewer** -- the per-component own-peak normalisation and the captioned
+  share, the diverging signed scale, mode and component labelling.
 - **deployment-bounds** -- the `mse-power-cap` quota, thread counts matched to
   CPU limits, and the per-component images.
 
@@ -49,6 +49,22 @@ Seven capability specs, each with ADDED requirements:
 - It does not paper over an absence. Where the code has no writer for a field
   (for example `peak_rss_mb`), the spec's requirement is scoped to what is
   actually enforced; a future change adding the writer should add it here too.
+
+## Discrepancies found
+
+Places where a comment or caption claims behaviour the code does not have. These
+are recorded, not fixed here (this change does not touch running code).
+
+- **`web/static/viewer.js`, the below-floor caption branch.** The caption and
+  its comment say "the field strength that reaches the shader is the component as
+  a fraction of the mode's peak `|E|`, and the floor is applied to that SAME
+  number", and call the bar "the shared scale for every mode". Neither is true:
+  the texture build divides the component by ITS OWN peak (the loop ending
+  `scalar[i] /= peak`), so the shader always sees a component whose strongest
+  sample is `1.0`, and the floor is a contrast floor within one component. The
+  caption's *number* is a p99 against `|E|` (`componentShare`), a different
+  quantity from the array the shader draws. The requirement above states what the
+  code does; the caption text is a follow-up change.
 
 ## Follow-on
 

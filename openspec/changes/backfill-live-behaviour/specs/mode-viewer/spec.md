@@ -2,23 +2,35 @@
 
 ## ADDED Requirements
 
-### Requirement: A faint component is captioned, never auto-scaled
+### Requirement: A component is normalised by its own peak and captioned with its share
 
-The viewer SHALL draw every mode frame on ONE shared colour scale, so a
-component's brightness is comparable to the mode's other components. It SHALL
-NOT auto-scale a component up to fill the plot. A component faint on the shared
-scale SHALL be captioned in plain words, naming its measured share of the mode's
-peak `|E|`. Source: `web/static/viewer.js`.
+The viewer SHALL normalise each rendered component by ITS OWN peak before upload,
+so the value the shader sees spans `-1..1` and the drawing floor is a contrast
+floor ("within a fixed ratio of this component's strongest sample"), not an
+amplitude floor that varies with the mode. The viewer SHALL caption the component
+with its measured share of the mode's peak `|E|`, computed as a high percentile
+of the component against `|E|`, so the caption reports how small the component is
+*in this mode* rather than how it was scaled. Source: `web/static/viewer.js`,
+`web/static/components.js`.
 
 Measured on the reference job: in mode 1 (z-polarised) `Eρ` reaches only ~8% of
-the mode's peak `|E|`; in mode 2 it reaches ~96%. Sharing one scale is what makes
-that difference visible.
+the mode's peak `|E|` (its own peak is ~0.42 of `|E|`); in mode 2 it reaches ~96%
+(own peak ~0.99). Normalising by the component's own peak is what makes the two
+frames comparable; the caption's share is what makes the difference legible.
 
-#### Scenario: a component is faint
-- **WHEN** a component's share of the mode's peak is below the viewer's threshold
-- **THEN** the frame is drawn on the shared scale (not auto-scaled up)
-- **AND** the caption names the share and says the faintness is the mode's
+#### Scenario: a component is small in the mode
+- **WHEN** a component's share of the mode's peak is below the viewer's drawing
+  threshold
+- **THEN** the viewer still normalises the component by its own peak, so its
+  strongest sample is drawn
+- **AND** the caption names the share and says the smallness is the mode's
   physics, not a fault
+
+#### Scenario: a component is normalised by its own peak
+- **WHEN** the viewer builds the texture for a component
+- **THEN** the values uploaded span `-1..1`, with the component's own peak at
+  `1.0`
+- **AND** the drawing floor is applied to that own-peak-normalised value
 
 ### Requirement: A signed component is drawn with a diverging scale
 
