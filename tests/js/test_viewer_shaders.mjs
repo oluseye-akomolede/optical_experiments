@@ -105,30 +105,33 @@ test('the two ramps are both present and are different', () => {
     'RGB to black, which is what drew the black half-disc');
 });
 
-test('the component is normalised by its own peak before upload', () => {
-  // The bug this pins: the shader thresholds an absolute `t > uThreshold` and
-  // the diverging ramp is documented as taking 1.0 = the strongest sample, but
-  // the build uploaded the component raw. A mode is normalised by max|E| over
-  // the *vector*, so |E| peaks at 1 while a component need not -- measured on
-  // the live job, mode 1's Erho peaks at 0.4236 and mode 2's at 0.9936. The
-  // absolute threshold therefore threw away 63% of mode 1's Erho and 16% of
-  // mode 2's, so the same component drew at different densities for no reason
-  // but the mode's amplitude, and faint outer lobes vanished.
+test('the component is scaled by its own robust (p99) scale before upload', () => {
+  // The bug this pins, in its final form. The shader thresholds an absolute
+  // `t > uThreshold` and the diverging ramp is documented as taking 1.0 = the
+  // top of the component's own range, but the build uploaded the component raw.
+  // A mode is normalised by max|E| over the *vector*, so |E| peaks at 1 while a
+  // component need not -- measured on the live job, mode 1's Erho peaks at
+  // 0.4236 and mode 2's at 0.9936.
   //
-  // The assertion is that a divide by a peak exists between building the
-  // scalar and narrowing it to halves. It is deliberately about the *wiring*
-  // rather than the arithmetic: the peak must be computed from the scalar and
-  // must be applied before the float16 narrow, or it is normalising something
-  // the shader never sees.
+  // Dividing by the MAX fixed the amplitude problem but introduced its own: a
+  // component's largest sample can be a lone spike. Mode 1's Erho has abs max
+  // 0.4236 against a p99 of 0.0809, so max-normalising left 94% of the field
+  // under the floor and the frame drew as nothing (measured: pixel-identical to
+  // no field at all). The scale must be the p99, with the max only as a
+  // fallback when the percentile is zero.
+  //
+  // The assertion is about the *wiring*: the scale must come from the shared
+  // percentile helper (so the caption and the picture agree) and must be
+  // applied before the float16 narrow.
   const build = /const scalar = componentVolume\(([^;]*)\);([\s\S]*?)const data = new Uint16Array/.exec(source);
   assert.ok(build, 'the texture build has changed shape -- this guard needs rewriting');
-  assert.match(build[2], /peak/,
-    'the component is no longer normalised by its own peak before upload: an ' +
-    'absolute threshold on an unnormalised component silently discards the ' +
+  assert.match(build[2], /normaliseComponent\s*\(/,
+    'the component is no longer scaled by its own robust scale before upload: ' +
+    'an absolute threshold on an unscaled component silently discards the ' +
     'faint structure of weak modes');
-  assert.match(build[2], /scalar\[i\]\s*\/=\s*peak|scalar\[i\]\s*=\s*scalar\[i\]\s*\/\s*peak/,
-    'a peak is computed but never divided into the scalar -- the shader still ' +
-    'receives the raw values');
+  assert.match(build[2], /name\s*!==\s*'E'/,
+    'the build no longer distinguishes a signed component from |E|: the clamp ' +
+    'belongs on the signed ramp domain only, and |E| must not be clamped');
 });
 
 test('the raymarch step is a fraction of the box, not a physical length', () => {
@@ -364,20 +367,16 @@ test('a share below the drawing floor gets the below-floor caption', () => {
   // different failures: the caption can be perfectly wired and still tell the
   // viewer the wrong thing, and that is the defect this row arrived with.
   //
-  // The defect, measured on the owner's job: THRESHOLD (the drawing floor) is
-  // 0.12 of the mode's peak |E|. Mode 1's Er has a p99 of 8% and mode 2's Ez a
-  // p99 of 11% -- both entirely under the floor. Every sample of those
-  // components is discarded by the shader, so the frame is nearly empty. The
-  // old caption's only small-share branch said the component "draws as a faint
-  // cloud", which is a description of a DIFFERENT picture -- the faint-but-drawn
-  // one that a share between the floor and SMALL_SHARE produces. A caption that
-  // narrates a frame the viewer is not looking at is the could-not-ask shape:
-  // it reads as a measurement while the thing measured is absent.
+  // The caption's job changed with the p99-scale fix. Before it, a below-floor
+  // share meant the frame was empty and the caption had to explain the
+  // emptiness. Now the picture is drawn at the component's own scale, so the
+  // same share means the component is WEAK relative to |E| while its SHAPE is
+  // on screen. The caption must say both -- the number and the scale claim --
+  // and must NOT narrate an empty frame, because the frame is no longer empty.
   //
   // Driven rather than read. The old test matched the caption's source text,
-  // which cannot tell an `if` from an `else if` -- exactly the edit this row
-  // makes. So the function is extracted from the real file and CALLED, with the
-  // real constants, against a fake DOM.
+  // which cannot tell an `if` from an `else if`. So the function is extracted
+  // from the real file and CALLED, with the real constants, against a fake DOM.
   const threshold = Number(/const THRESHOLD = ([\d.]+);/.exec(source)[1]);
   const smallShare = Number(/const SMALL_SHARE = ([\d.]+);/.exec(source)[1]);
   assert.ok(threshold > 0 && threshold < smallShare,
@@ -398,32 +397,31 @@ test('a share below the drawing floor gets the below-floor caption', () => {
   const under = threshold - 0.005;
   paintNote(under, 'Er');
   const underText = noteEl.textContent;
-  assert.match(underText, /almost empty/i,
-    `a share of ${under} (under the ${threshold} floor) must be reported as an ` +
-    'almost-empty frame -- the shader discards every sample below the floor, ' +
-    'so the picture really is empty and the caption must say so');
-  assert.match(underText, /not a fault/i,
-    'the below-floor caption must say the emptiness is physics, not a fault, ' +
-    'or the viewer reads an empty frame as a broken one');
+  assert.match(underText, /own scale/i,
+    `a share of ${under} (under the ${threshold} floor) must say the picture ` +
+    'is drawn at the component\'s own scale -- after the p99 fix the frame ' +
+    'draws, so the caption must not narrate an empty one');
+  assert.ok(!/almost empty/i.test(underText),
+    'the below-floor caption still describes an almost-empty frame: with the ' +
+    'p99 scale the component DRAWS, so "almost empty" narrates a picture the ' +
+    'viewer is not looking at -- the could-not-ask shape');
   assert.ok(!/faint cloud/i.test(underText),
-    'the below-floor branch still uses the "faint cloud" wording, which ' +
-    'describes a drawn-but-faint picture -- the caption and the frame disagree');
+    'the below-floor branch uses the "faint cloud" wording, which narrates the ' +
+    'old drawn-but-faint picture rather than the shape-at-own-scale one');
   // The floor in the text must be the constant, not a retyped number: a caption
   // that hard-codes 12% silently lies the moment the floor moves.
   assert.ok(underText.includes(`${Math.round(threshold * 100)}%`),
     `the below-floor caption does not name the floor the shader uses ` +
     `(${Math.round(threshold * 100)}%): it was retyped, so the two can drift`);
 
-  // And a share inside the band: drawn, so faint is the right word and the
-  // below-floor text must not appear.
+  // And a share inside the band: also drawn, also at its own scale, and it must
+  // say so and name the strength.
   const band = (threshold + smallShare) / 2;
   paintNote(band, 'Er');
   const bandText = noteEl.textContent;
-  assert.match(bandText, /faint cloud/i,
+  assert.match(bandText, /own scale/i,
     `a share of ${band} (between the ${threshold} floor and SMALL_SHARE ` +
-    `${smallShare}) IS drawn, so it must keep the faint-cloud wording`);
-  assert.ok(!/almost empty/i.test(bandText),
-    'a component above the floor is being described as an almost-empty frame');
+    `${smallShare}) must also say the view is drawn at the component's own scale`);
   assert.notEqual(bandText, underText,
     'both branches produced the same caption, so the new branch is not ' +
     'reached -- the split does not exist');

@@ -24,7 +24,7 @@ import { OrbitControls } from './vendor/OrbitControls.js';
 import { GLTFLoader } from './vendor/GLTFLoader.js';
 import { wantsFetch, modeFieldUrl, storeFields } from './modecache.js';
 import { boxCentre, componentShare, componentVolume, float32ToHalf,
-         halfToFloat32, SYSTEM_NAMES,
+         halfToFloat32, normaliseComponent, SYSTEM_NAMES,
          SYSTEM_LABELS, COMPONENT_NAMES, COMPONENT_LABELS, DEFAULT_SYSTEM,
          DEFAULT_COMPONENT }
   from './components.js';
@@ -406,10 +406,11 @@ void main() {
       // standing wave's two out-of-phase lobes -- the thing the component view
       // exists to show -- would be indistinguishable from each other.
       //
-      // The value is normalised by the component's own peak before it reaches
-      // here -- see the texture build, which divides by it -- so "1.0" in the
-      // diverging ramp is the strongest sample anywhere in the picture, the two
-      // lobes are directly comparable, and uThreshold means the same contrast
+      // The value is normalised by the component's own typical strength (its
+      // p99) before it reaches here -- see the texture build, which divides by
+      // it -- so "1.0" in the diverging ramp is the top of the component's
+      // own range, the two lobes are directly comparable, and uThreshold means
+      // the same contrast
       // floor in every mode. (It did not, until the build learned to divide: an
       // absolute threshold on an unnormalised component made a faint mode draw
       // its faint structure as though there were none.) This is why the ramp
@@ -518,12 +519,14 @@ function loadFieldData(jobId, statusData) {
       uAlphaScale: { value: 4.0 },
       // Raised from 0.02. The owner's complaint was that the object read as a
       // solid block, and 0.02 admitted every sample within 2% of the component's
-      // own peak -- on a mode whose peak is set by one hot spot, that is most of
-      // the box. 0.12 keeps the shape of the mode's lobes and drops the tail that
-      // was filling the silhouette. This uniform is the ONLY haze control: the
-      // alpha ramp below is linear in the field's strength, so raising the floor
-      // is what removes the faint fill, without also dimming field that is
-      // genuinely above it.
+      // own scale -- on a mode whose scale is set by one hot spot, that is most
+      // of the box. 0.12 keeps the shape of the mode's lobes and drops the tail
+      // that was filling the silhouette. The scale is now the component's 99th
+      // percentile rather than its maximum, so the floor is a contrast floor
+      // against typical strength, not against a single spike. This uniform is
+      // the ONLY haze control: the alpha ramp below is linear in the field's
+      // strength, so raising the floor is what removes the faint fill, without
+      // also dimming field that is genuinely above it.
       uThreshold: { value: THRESHOLD },
       // Multiplied by the box's largest side once the grid is known, so the
       // emissive integral is exp(-k * t * depth) with depth in physical units.
@@ -844,17 +847,19 @@ function loadFieldData(jobId, statusData) {
       // The threshold is named here because it is a decision the reader cannot
       // recover from the picture: below it, field is not drawn at all, and the
       // alpha ramp starts at zero there, so the faintest few percent of the
-      // component's peak are invisible by construction. Saying so is what keeps
-      // "nothing here" from being read as "no field here" -- the faint-frame
-      // rule this viewer already follows for a small component.
+      // component's typical strength are invisible by construction. Saying so is
+      // what keeps "nothing here" from being read as "no field here" -- the
+      // faint-frame rule this viewer already follows for a small component.
       const floor = percent(THRESHOLD);
       const base = signed
         ? `Colour is ${label}, signed: the cool end is negative, the warm end ` +
-          'positive, and the pale middle is the zero crossing. Every mode is ' +
-          'normalised to max |E| = 1, so the scale is the same for all of them.'
-        : 'Colour is |E|, normalised to 1 and the same scale for every mode.';
+          'positive, and the pale middle is the zero crossing. Each component ' +
+          'is drawn at its own typical strength, so the bar is a scale within ' +
+          'this picture, not a shared amplitude axis.'
+        : 'Colour is |E|, drawn at this mode\'s peak, so the bar is a scale ' +
+          'within this picture.';
       note.textContent =
-        `${base} Field weaker than ${floor} of the peak is not drawn, so the ` +
+        `${base} Field weaker than ${floor} of that scale is not drawn, so the ` +
         'object’s shape stays visible through the haze. Transparent is ' +
         'outside the object.';
     }
@@ -908,41 +913,34 @@ function loadFieldData(jobId, statusData) {
 
     const share = percent(volumeShare);
     if (volumeShare < THRESHOLD) {
-      // BELOW THE DRAWING FLOOR, so this is a different case from "faint", and
-      // the caption must not call it faint. The field strength that reaches the
-      // shader is the component as a fraction of the mode's peak |E|, and the
-      // floor is applied to that SAME number: a component whose p99 sits under
-      // the floor leaves almost nothing above it, so the picture is nearly
-      // empty. Telling the reader that is "a faint cloud" would be the
-      // could-not-ask shape -- a caption describing a picture that is not on
-      // screen -- so this branch names the floor instead. The reason is still
-      // physical: a mode polarised the other way is small in this component.
-      //
-      // THRESHOLD is read from the one constant (line ~506), never retyped: a
-      // caption that restated 0.12 could silently disagree with the shader the
-      // moment the floor moved.
+      // The component's strength relative to |E| is under the drawing floor, so
+      // this really is the mode's physics and the picture is legitimately thin.
+      // This branch no longer promises the reader a faint *cloud*, and it no
+      // longer calls itself a shared scale: the view is drawn at the
+      // component's own typical strength (see buildTexture), so what the reader
+      // sees is this component's SHAPE, and this number is its strength. The
+      // two are different claims and the caption has to keep them apart.
       note.textContent =
-        `${label} reaches only ${share} of this mode's peak |E|, under the ` +
-        `${percent(THRESHOLD)} drawing floor, so this frame is almost empty ` +
-        '-- the field is below the level the picture draws at all. That is ' +
-        `the physics of this mode, not a fault. The same control is strong in ` +
-        `other modes, and the bar below is unchanged: it is the shared ` +
-        `${label} scale for every mode, not a scale for this component alone.`;
+        `${label} is weak in this mode: it reaches only ${share} of the mode's ` +
+        `peak |E|, under the ${percent(THRESHOLD)} drawing floor. The picture ` +
+        'shows the shape of this component at its own scale; its strength is ' +
+        'the percentage above. A mode polarised the other way is naturally ' +
+        'small here -- that is the physics of this mode, not a fault.';
     } else if (volumeShare < SMALL_SHARE) {
-      // Above the floor, so it IS drawn -- faintly. The whole point: name the
-      // smallness, in the picture's own terms, so a viewer does not read the
-      // faintness as a fault. The reason is physical -- a mode polarised the
-      // other way is small in this component.
+      // Above the floor and drawn. The picture gives the SHAPE at the
+      // component's own scale; the share is its STRENGTH next to |E|. Say both,
+      // so a viewer does not read the (deliberately normalised) picture as a
+      // claim about amplitude.
       note.textContent =
-        `${label} is small in this mode: it reaches only ${share} of the ` +
-        `mode's peak |E|, so this component draws as a faint cloud. The same ` +
-        `control is strong in other modes. The bar below is unchanged -- it ` +
-        `is the shared ${label} scale for every mode, not a scale for this ` +
-        'component alone.';
+        `${label} is the weaker component in this mode: it reaches ${share} of ` +
+        `the mode's peak |E|. The picture shows its shape at its own scale; ` +
+        'the percentage is its strength. A mode polarised the other way is ' +
+        'strong here.';
     } else {
       note.textContent =
-        `${label} reaches ${share} of this mode's peak |E|, so it draws on ` +
-        'the shared scale and should read as strongly as |E| does.';
+        `${label} reaches ${share} of this mode's peak |E|, so it is one of ` +
+        'this mode\'s strong components. The picture shows its shape at its ' +
+        'own scale.';
     }
   }
 
@@ -1027,44 +1025,51 @@ function loadFieldData(jobId, statusData) {
     // scratch/probe_share.mjs; harmless in production.
     window.__mseShare = volumeShare;
 
-    // Normalise the chosen component by its own peak, so the shader's "1.0 is
-    // the strongest sample in this picture" is true.
+    // Scale the chosen component by its own TYPICAL strength, so the shader's
+    // "1.0 is the strongest sample in this picture" is true of the picture the
+    // eye reads rather than of one hot spot.
     //
-    // It was not, and the picture was wrong in a way that is easy to miss
-    // because it depends on the *mode*: the solver normalises a mode by
-    // max|E| over the vector, so |E| always peaks at 1 but an individual
-    // component need not. Measured on the live job, mode 1's Erho peaks at
-    // 0.4236 and mode 2's at 0.9936, and the shader's threshold is an absolute
-    // 0.02 -- so mode 1 discarded 63% of Erho as "no field here" and mode 2
-    // discarded 16%, drawing the *same component* at visibly different densities
-    // because of nothing but the mode's amplitude. The faint outer lobes that a
-    // smoke plot exists to show were the first thing to go.
+    // Two steps, and the difference between them is the whole point.
     //
-    // Dividing by the peak is not cosmetic. It makes the threshold a contrast
-    // floor rather than an amplitude floor ("draw anything within 50x of this
-    // mode's strongest point"), it makes the diverging ramp's mid-band mean the
-    // same thing in every mode, and it is what the shader has been claiming in
-    // its own comments all along.
+    // First, the scale is the component's own, not the mode's: the solver
+    // normalises a mode by max|E| over the vector, so |E| always peaks at 1 but
+    // an individual component need not. Measured on the live job, mode 1's Erho
+    // peaks at 0.4236 and mode 2's at 0.9936, and the shader's threshold is an
+    // absolute 0.02 -- so mode 1 discarded 63% of Erho as "no field here" and
+    // mode 2 discarded 16%, drawing the *same component* at visibly different
+    // densities because of nothing but the mode's amplitude. The faint outer
+    // lobes that a smoke plot exists to show were the first thing to go.
+    //
+    // Second, and the reason a maximum is the wrong own-scale: a component's
+    // single largest sample can be a local spike on an otherwise small field.
+    // Mode 1's Erho is exactly that -- abs max 0.4236 against a 99th percentile
+    // of 0.0809, a 5x gap from one sample. Dividing by that max leaves most of
+    // the field under the threshold: only 6.4% of samples stayed over the 0.12
+    // floor and the rest of the volume, including the whole body of the mode,
+    // drew as nothing (measured: the frame was pixel-identical to no field at
+    // all, to 0.0004%). Dividing by the 99th percentile instead puts 62.8% of
+    // samples over the floor -- the shape the plot exists to show. The p99 is
+    // what the eye sees; the max is one sample. The owner chose this scale
+    // explicitly: a component view shows the component's *shape* at its own
+    // typical strength, and the caption carries its strength relative to |E|.
+    //
+    // The scale is not cosmetic. It makes the threshold a contrast floor rather
+    // than an amplitude floor ("draw anything within ~8x of this component's
+    // typical strength"), and it makes the diverging ramp's mid-band mean the
+    // same thing in every mode.
     //
     // NaN is skipped, not treated as zero: it marks outside-the-object and must
     // stay NaN so the upload keeps it transparent. A field with no finite
-    // non-zero sample (all NaN, or all zero) has no peak to divide by and is
+    // non-zero sample (all NaN, or all zero) has no scale to divide by and is
     // left as it is -- every sample is already below any threshold, so the
     // picture is correctly empty.
-    let peak = 0;
-    for (let i = 0; i < scalar.length; i += 1) {
-      const abs = Math.abs(scalar[i]);
-      if (abs > peak) peak = abs;
-    }
-    if (peak > 0 && Number.isFinite(peak)) {
-      for (let i = 0; i < scalar.length; i += 1) scalar[i] /= peak;
-    }
+    normaliseComponent(scalar, name !== 'E');
 
     // The texture is R32F rather than RGBA16F: the transform is exact in
     // float32 and only the result is narrowed, so a float16 upload would round
-    // twice. The values are the component's own, scaled by the peak above so
-    // they arrive in -1..1, and NaN is preserved as the sign-and-magnitude half
-    // pattern by the narrowing itself.
+    // twice. The values are the component's own, scaled by the p99 above (and
+    // clamped for a signed component) so they arrive in -1..1, and NaN is
+    // preserved as the sign-and-magnitude half pattern by the narrowing itself.
     const data = new Uint16Array(scalar.length);
     for (let i = 0; i < scalar.length; i += 1) {
       data[i] = float32ToHalf(scalar[i]);
@@ -1241,40 +1246,4 @@ function formatSeconds(s) {
   if (s < 60) return `${s.toFixed(0)}s`;
   const m = Math.floor(s / 60);
   return `${m}m ${Math.round(s - m * 60)}s`;
-}
-
-function buildModeTable(list) {
-  const body = document.getElementById('modes-body');
-  if (!body) return;
-  body.innerHTML = '';
-  list.forEach((mode, i) => {
-    const tr = document.createElement('tr');
-    tr.dataset.index = String(mode.index);
-    tr.innerHTML = `<td>${mode.index}</td><td>${formatFrequency(mode.freq_hz)}</td>` +
-                   `<td>${formatWavelength(mode.vacuum_wavelength_m)}</td>`;
-    // A mode the index says is unreadable has no field to fetch, so it is not
-    // selectable -- clicking it would only produce a failure the user cannot
-    // act on. It stays visible so the numbering matches the physics.
-    if (mode.available === false) {
-      tr.classList.add('unavailable');
-      tr.title = 'This mode’s field data is not available.';
-    } else {
-      // The owner asked for modes to be selectable from the list. A click is
-      // the obvious affordance; the keyboard path is what makes it usable
-      // without a mouse, so the row is focusable and Enter/Space select it.
-      // `selectModeRef` is null until the first payload lands, so guarding the
-      // call keeps a stray keypress from throwing before the viewer is ready.
-      const select = () => selectModeRef?.(i);
-      tr.tabIndex = 0;
-      tr.setAttribute('role', 'button');
-      tr.addEventListener('click', select);
-      tr.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();   // Space would otherwise scroll the page
-          select();
-        }
-      });
-    }
-    body.appendChild(tr);
-  });
 }

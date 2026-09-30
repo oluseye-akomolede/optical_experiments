@@ -35,11 +35,25 @@ spec:
           env:
             - name: MSE_URL
               value: http://mse-web.mode-search-engine.svc.cluster.local/jobs/08f832dd-26ba-410f-afe5-ad5dfd08a167
+            # The outline-only control frame: the SAME page with the field
+            # hidden. Without it the check has no control to compare a field
+            # frame against, and a missing control is a FAIL, not a skip -- so
+            # leaving this unset would make every run fail rather than run weaker.
+            - name: MSE_OUTLINE_URL
+              value: http://mse-web.mode-search-engine.svc.cluster.local/jobs/08f832dd-26ba-410f-afe5-ad5dfd08a167?field=off
             - name: OUT_DIR
               value: /out
+            # Match the thread count to the CPU limit. A container CPU limit
+            # does not change os.cpu_count(), so SwiftShader's worker pool would
+            # otherwise start one thread per HOST core and be throttled hard.
+            - {name: OMP_NUM_THREADS, value: "2"}
+            - {name: MKL_NUM_THREADS, value: "2"}
+            - {name: OPENBLAS_NUM_THREADS, value: "2"}
           resources:
-            requests: {cpu: "2", memory: 2Gi}
-            limits: {cpu: "2", memory: 2Gi}
+            # 3Gi, not 2Gi: the passing render ran at 3g, and at 2g the
+            # renderer is OOM-killed on the second frame (measured 2026-09-29).
+            requests: {cpu: "2", memory: 3Gi}
+            limits: {cpu: "2", memory: 3Gi}
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
