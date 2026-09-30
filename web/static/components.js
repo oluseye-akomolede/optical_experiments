@@ -171,23 +171,21 @@ export function componentVolume(vec, positions, centre, system, name) {
  * How strong the chosen component is in this mode, relative to the mode's own
  * peak |E|, as a fraction in 0..1.
  *
- * The plot draws every component on ONE shared scale per mode -- the mode's
- * max |E| -- so that a component is directly comparable with the same
- * component in the next mode, and with |E| in this one. That is the right
- * scale, but it has a consequence the picture alone cannot explain: a
- * component that is genuinely small in this mode draws as a very faint cloud,
- * and a faint cloud is exactly what a rendering bug looks like.
- *
- * It is not a rendering bug, and the two must be told apart. Measured on the
- * live job: mode 1 is the z-polarised (1,1,0) mode, whose Erho reaches only 8%
- * of its own peak |E| and draws as almost nothing, while mode 2's Erho reaches
- * 98% and draws strongly. The same control, two opposite pictures, both
- * correct.
+ * This is a STRENGTH number, not a drawing instruction. The plot draws each
+ * component at its own typical strength -- the 99th percentile of
+ * |component|, clamped -- so that the picture shows the component's SHAPE in
+ * this mode. The component's strength next to |E| is what this function
+ * returns, and it is what the caption states; the two are deliberately
+ * different claims, because normalising the picture by this number would
+ * flatten every component to the same brightness and hide the very strength
+ * the caption reports.
  *
  * The comparison is a high percentile rather than the maximum because a
- * component's single largest sample can be a local spike on an otherwise small
- * field: mode 1's Erho has a maximum of 42% of |E| contributed by one corner
- * sample, while its 99th percentile is 8%. The p99 is what the eye sees.
+ * component's single largest sample can be a local spike on an otherwise
+ * small field: mode 1's Erho has a maximum of 42% of |E| contributed by one
+ * sample, while its 99th percentile is 8%. The p99 is what the eye sees. The
+ * viewer uses the same percentile for the drawing scale, so the shape on
+ * screen and the strength in the caption come from one definition.
  *
  * Returns null when the answer would be meaningless -- no finite samples, no
  * non-zero peak to compare against -- rather than a fabricated 0 or 1. A
@@ -213,13 +211,76 @@ export function componentShare(vec, positions, centre, system, name) {
     comps.push(Math.abs(c));
   }
   if (!mags.length) return null;
-  const peak = percentile(mags, 0.99);
+  const peak = percentileOf(mags, 0.99);
   if (!peak) return null;
-  return percentile(comps, 0.99) / peak;
+  return percentileOf(comps, 0.99) / peak;
 }
 
-/** Linear-interpolated percentile of an unsorted array. 0..1, inclusive. */
-function percentile(values, q) {
+/**
+ * The scale a component is drawn at: the 99th percentile of |sample| over the
+ * finite samples, with the maximum as a fallback when the percentile is zero
+ * or non-finite (an almost-all-NaN or almost-all-zero field, where one live
+ * sample can leave the percentile at 0). Returns 0 when there is nothing
+ * finite to scale by, which the caller reads as "draw nothing".
+ *
+ * A percentile, not the maximum, because a component's single largest sample
+ * can be a local spike on an otherwise small field -- mode 1's Erho has an abs
+ * max of 0.4236 against a p99 of 0.0809. Dividing by the max leaves most of
+ * the field under the drawing floor and the picture nearly empty; dividing by
+ * the p99 shows the shape. See componentShare for the same percentile used as
+ * a strength number.
+ */
+export function robustScale(samples) {
+  const finiteAbs = [];
+  for (let i = 0; i < samples.length; i += 1) {
+    const abs = Math.abs(samples[i]);
+    if (Number.isFinite(abs)) finiteAbs.push(abs);
+  }
+  let scale = percentileOf(finiteAbs, 0.99);
+  if (!(scale > 0) || !Number.isFinite(scale)) {
+    scale = 0;
+    for (let i = 0; i < finiteAbs.length; i += 1) {
+      if (finiteAbs[i] > scale) scale = finiteAbs[i];
+    }
+  }
+  return scale;
+}
+
+/**
+ * Scale a component volume for drawing, in place.
+ *
+ * Divides every finite sample by robustScale and clamps a signed component to
+ * [-1, 1] (the diverging ramp's domain); |E| is a magnitude in 0..1 by
+ * construction and is left unclamped so a real over-unity value is not hidden.
+ * NaN stays NaN -- it marks outside-the-object and must reach the upload
+ * transparent. When there is no scale to divide by, the array is left as it is
+ * (the picture is legitimately empty), and the returned scale is 0 so the
+ * caller can say so.
+ */
+export function normaliseComponent(samples, signed) {
+  const scale = robustScale(samples);
+  if (!(scale > 0) || !Number.isFinite(scale)) return 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    let v = samples[i] / scale;
+    if (signed) {
+      if (v > 1) v = 1;
+      else if (v < -1) v = -1;
+    }
+    samples[i] = v;
+  }
+  return scale;
+}
+
+/**
+ * Linear-interpolated percentile of an unsorted array. 0..1, inclusive.
+ *
+ * Exported because the viewer needs the same definition for a component's
+ * drawing scale that this file uses for its caption strength: the picture and
+ * the number under it must come from one implementation, or a "typical
+ * strength" the eye can see and a "typical strength" the caption states can
+ * drift apart.
+ */
+export function percentileOf(values, q) {
   const sorted = values.slice().sort((a, b) => a - b);
   if (!sorted.length) return null;
   const at = q * (sorted.length - 1);

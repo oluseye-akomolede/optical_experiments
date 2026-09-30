@@ -389,6 +389,66 @@ export function outlineOnlyProblem(field, outline, minShare = 1 / 64) {
   return null;
 }
 
+// Frames the check KNOWS are wrong and has been told not to fail on, named one
+// by one. The owner accepted mode 1's `Erho` haze on 2026-09-30 as a minor
+// cosmetic nit, so the check stops failing THE RUN on it -- while still saying
+// out loud that the frame is wrong.
+//
+// This is deliberately not the `accountForEmptyFrame` exemption that used to
+// live at the call site. That one was GATED ON THE PAGE'S OWN CAPTION: a frame
+// that drew nothing was forgiven whenever the caption explained it. A caption is
+// not a control, and the gate made the check's verdict depend on the page's
+// prose -- so any other component that drew nothing while printing a plausible
+// caption would be forgiven too. That is why it was removed (see the spec delta).
+//
+// A waiver here is the opposite shape: it is keyed on the check's OWN name for
+// the frame (`'Erho in mode 1'`, the very string the verdict prints), it is
+// listed in source, and it excuses exactly the frame it names. A second empty
+// frame -- a different component, or the same component in mode 2 -- carries a
+// different name and is judged normally, so it still FAILS.
+export const KNOWN_ISSUE_FRAMES = new Map([
+  ['Erho in mode 1',
+   'the field is sign-mixed, so along a view ray the two lobes blend to a ' +
+   'near-neutral haze: the frame draws (lit and framed) but paints almost no ' +
+   'hue, and the lobe-hue predicate reads it as the outline. Mode 1 is ' +
+   "z-polarised, so Eρ is ~8% of the mode's peak -- the caption's faint " +
+   'frame. Owner accepted as a cosmetic nit, 2026-09-30.'],
+]);
+
+/**
+ * The known-issue reason for `what`, or null.
+ *
+ * `what` is the check's own label for the frame, so a verdict that reaches the
+ * log and a waiver that excuses it are keyed on the same string. A near-miss
+ * label -- one that is not in the table -- gets no waiver.
+ */
+export function knownIssue(what) {
+  return KNOWN_ISSUE_FRAMES.has(what) ? KNOWN_ISSUE_FRAMES.get(what) : null;
+}
+
+/**
+ * Decide a frame's verdict from the problems its measurements found.
+ *
+ * This is the ONLY place a waiver is granted, and it is granted on the frame's
+ * own label alone -- `problems` is never inspected for a caption, a share, or a
+ * size. It returns:
+ *   - `{ verdict: 'passed',  problems: [] }`      nothing was wrong
+ *   - `{ verdict: 'known',   problems: [] , reason }` named waiver, run continues
+ *   - `{ verdict: 'failed',  problems }`          real problems, run fails
+ *
+ * `check.mjs` does the logging; the DECISION lives here so it can be tested
+ * without a browser. Splitting it out matters: tests that only called
+ * `knownIssue()` pinned the table, not the decision, so a mutation making the
+ * waiver always apply (M2) or never apply (M3) left every test green.
+ */
+export function judgeFrameDecision(what, problems) {
+  const found = problems || [];
+  if (!found.length) return { verdict: 'passed', problems: [] };
+  const reason = knownIssue(what);
+  if (reason) return { verdict: 'known', problems: [], reason };
+  return { verdict: 'failed', problems: found };
+}
+
 export function divergingNote(sample, what, outline) {
   const lobes = [];
   if (sample.warm > 0) lobes.push(`${sample.warm} warm`);

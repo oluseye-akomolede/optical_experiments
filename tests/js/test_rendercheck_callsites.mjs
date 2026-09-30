@@ -41,24 +41,23 @@ const between = (startMarker, endMarker) => {
   return source.slice(start, end);
 };
 
-test('the below-the-floor frame is NOT routed to the lobe-hue judgement', () => {
-  // The measured case: mode 1's Erho, share 0.0826 < THRESHOLD 0.12. The check
-  // must not ask a frame the viewer drew empty on purpose for its hue.
+test('the Erho frame IS routed to the lobe-hue judgement, like every component frame', () => {
+  // The fix's whole point. Mode 1's Erho used to draw empty because the viewer
+  // scaled by the component's MAX; at a p99 scale it draws, so it must carry
+  // hue and the check must ask. The exemption that used to skip this is gone --
+  // it forgave a real defect (the frame was pixel-identical to no field).
   const block = between('const erhoCaptionText = await erhoCaption(page);',
                         'await page.click(\'#modes-body tr:nth-child(2)\')');
-  assert.doesNotMatch(block, /diverging\(\s*erho\s*,/,
-    'the mode-1 Erho frame is routed to diverging(): that frame is below the ' +
-    'viewer\'s own drawing floor (measured share 0.0826 vs 0.12), so it ' +
-    'carries no hue BY DESIGN and this call fails a correct page -- it ' +
-    'produced two of the three failures on the last run');
+  assert.match(block, /diverging\(\s*erho\s*,/,
+    'the mode-1 Erho frame is no longer judged for its hue. After the p99 fix ' +
+    'it draws, so a frame with no lobe hue is a defect -- this is the predicate ' +
+    'that catches it');
 });
 
 test('the below-the-floor frame is still required to differ from the outline', () => {
-  // The question that DOES apply to that frame, and the reason dropping the
-  // hue judgement does not make the check blind to a field that never drew:
-  // the frame must still carry the field's hue somewhere, or it is the outline.
-  // Without this, removing the diverging call would remove the only thing
-  // standing between a dead field and a green run.
+  // The question that applies however the component is scaled: the frame must
+  // carry the field's hue somewhere, or it is the outline. This is what stands
+  // between a dead field and a green run.
   const block = between('const erhoCaptionText = await erhoCaption(page);',
                         'await page.click(\'#modes-body tr:nth-child(2)\')');
   assert.match(block, /fieldVsOutline\(\s*erho\s*,/,
@@ -67,31 +66,68 @@ test('the below-the-floor frame is still required to differ from the outline', (
     'strength of its caption alone');
 });
 
-test('the empty-frame exemption is gated on the caption, not unconditional', () => {
-  // The final form of the fix, and the part that must not silently widen. The
-  // below-floor frame IS allowed to match the outline-only control -- that is
-  // its designed picture -- but ONLY when the page's own caption has accounted
-  // for it (`erhoNamesTheTest`: names the measured 8% share AND calls the
-  // emptiness physics). An unconditional exemption would make the check blind
-  // to a page whose field never drew; a gate on the caption keeps that case
-  // failing, because such a page prints no caption. Pinned here because the
-  // argument is one word long and easy to delete.
+test('the empty-frame exemption is GONE, not merely gated', () => {
+  // The exemption let a frame matching the outline-only control pass when the
+  // caption explained it. It was the wrong shape: a caption is not a control,
+  // and the frame it forgave was a real defect. It must not creep back, in any
+  // gated form.
   const block = between('const erhoCaptionText = await erhoCaption(page);',
                         'await page.click(\'#modes-body tr:nth-child(2)\')');
-  const call = /fieldVsOutline\(\s*erho\s*,\s*[^)]*\)/.exec(block);
-  assert.ok(call, 'the mode-1 Erho field-versus-outline call has gone');
-  assert.match(call[0], /accountForEmptyFrame\s*:\s*erhoNamesTheTest/,
-    'the empty-frame exemption is no longer gated on erhoNamesTheTest -- if ' +
-    'it is unconditional the check accepts a page whose field never drew, and ' +
-    'if the gate is dropped entirely the check fails a correct below-floor ' +
-    'frame again (measured: the last of three failures on a correct run)');
+  assert.doesNotMatch(block, /accountForEmptyFrame/,
+    'accountForEmptyFrame is back in the mode-1 Erho block: a frame whose ' +
+    'field never drew would pass again on the strength of a caption');
+  // Strip comments first: the check's own comments explain WHY the exemption
+  // was removed, and a rule that forbade the mention would force the next
+  // reader to delete the reason (same trap as page.screenshot above).
+  const code = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  assert.doesNotMatch(code, /accountForEmptyFrame/,
+    'accountForEmptyFrame is back in the check\'s CODE -- the exemption was ' +
+    'removed because it forgave a real defect (mode 1\'s Erho was pixel-' +
+    'identical to no field at all)');
+  // What REPLACED it is the owner-accepted, name-keyed known issue. It is not a
+  // caption gate: the frame is passed to the same verdict function as any other,
+  // and the waiver is looked up by the frame's OWN LABEL inside that verdict.
+  assert.match(block, /diverging\(\s*erho\s*,\s*'Erho in mode 1'\s*\)/,
+    'the mode-1 Erho frame is no longer routed to the lobe-hue verdict under ' +
+    'its own label -- the known-issue waiver is keyed on that exact label, so ' +
+    'the two must not drift apart');
+  assert.match(block, /fieldVsOutline\(\s*erho\s*,\s*'Erho in mode 1'\s*\)/,
+    'the mode-1 Erho frame is no longer compared against the outline under its ' +
+    'own label, so the known-issue waiver would never be reached for it');
+  // And the gate must NOT read the caption: the verdict closures stop reading
+  // `erhoCaptionText`, which is the caption-gate shape the removed exemption had.
+  assert.doesNotMatch(block, /knownIssue\s*\(\s*erhoCaptionText/,
+    'the known-issue waiver is being read from the page caption -- that is the ' +
+    'caption gate again, and it would waive any frame the page explains');
+  // The routing must be UNCONDITIONAL. The regex matches above would still match
+  // a call nested inside a guard -- `if (captionSays...) { diverging(erho, ...) }`
+  // matches `/diverging\(\s*erho\s*,/` just as well -- so a caption gate could
+  // creep back under these assertions and never redden them. That gap is real
+  // (measured: a bracketed `if (...) { diverging(erho, ...); ... }` around the
+  // two calls left all 96 tests green). What closes it is requiring the two
+  // calls to be reached from the block body, with no statement between the
+  // closing brace of the caption `else` and the first verdict call.
+  const verdictStart = block.search(/\b(?:diverging|fieldVsOutline)\s*\(\s*erho\s*,/);
+  assert.ok(verdictStart > 0, 'the mode-1 Erho verdict calls are missing');
+  const before = block.slice(0, verdictStart);
+  const lastClose = before.lastIndexOf('}');
+  const leadIn = before.slice(lastClose + 1);
+  assert.equal(/\bif\b|\belse\b|\?/.test(leadIn), false,
+    'a statement between the caption check and the mode-1 Erho verdict calls ' +
+    'can only be a gate -- the routing must be unconditional, or an exemption ' +
+    'has crept back in a form these assertions would otherwise miss: ' +
+    JSON.stringify(leadIn.trim()));
+  const afterCalls = block.slice(verdictStart);
+  assert.equal((afterCalls.match(/\bif\b|\belse\b|\?/g) || []).length, 0,
+    'the statements following the mode-1 Erho verdict calls include a branch -- ' +
+    'the calls are inside a conditional, which is the gate shape');
 });
 
 test('the frame that DOES draw is still judged for its hue', () => {
-  // The control case. Removing a judgement for the below-floor frame must not
-  // quietly remove it for the frames that carry the field's real colour --
-  // mode 2's Erho (share 0.98) and the rotated frame. A fix that disabled the
-  // hue judgement everywhere would pass the test above and disable the check.
+  // The control case: mode 2's Erho (share 0.98) and the rotated frame must
+  // keep their hue judgement.
   assert.match(source, /diverging\(\s*erho2\s*,/,
     'mode 2\'s Erho is no longer judged for its hue -- that frame DOES draw ' +
     '(measured share 0.9824) and the black-lobe defect is caught here');
@@ -100,24 +136,23 @@ test('the frame that DOES draw is still judged for its hue', () => {
     'picture from a new camera and DOES draw');
 });
 
-test('the caption assertion accepts either true caption, not just "small"', () => {
-  // Mode 1's Erho sits in the viewer's BELOW-FLOOR branch, whose wording is
-  // "almost empty ... not a fault". The middle branch says "is small". Both are
-  // true of a component at 8%; requiring the word "small" fails the live page.
+test('the caption assertion requires the share AND the own-scale wording', () => {
+  // After the fix the caption states two different things: the component's
+  // STRENGTH (its share of |E|) and the fact that the picture shows SHAPE at
+  // the component's own scale. The predicate must require both, or a caption
+  // that names only the number would pass while leaving the shape/strength
+  // distinction to the reader.
   const block = between('const erhoCaptionText = await erhoCaption(page);',
                         'await page.click(\'#modes-body tr:nth-child(2)\')');
   const naming = /const erhoNamesTheTest =([\s\S]*?);/.exec(block);
   assert.ok(naming, 'erhoNamesTheTest has gone -- the caption is no longer named');
-  assert.match(naming[1], /not a fault/,
-    'the caption assertion does not accept the below-floor wording ("not a ' +
-    'fault"), which is the caption the live page actually shows for mode 1\'s ' +
-    'Erho -- requiring "small" fails a correct page');
-  assert.match(naming[1], /small/,
-    'the caption assertion no longer accepts the "small" wording, so a caption ' +
-    'in the middle band would now fail');
+  assert.match(naming[1], /own scale/,
+    'the caption assertion no longer requires the "own scale" wording, so a ' +
+    'caption that only states the share would pass -- the shape/strength ' +
+    'distinction is the point of the caption after the fix');
   assert.match(naming[1], /8\\?s\*%/,
     'the caption assertion no longer requires the component\'s real share, so ' +
-    'any caption mentioning a fault would pass');
+    'any caption mentioning its own scale would pass');
 });
 
 test('a missing control frame fails the run instead of skipping the comparison', () => {

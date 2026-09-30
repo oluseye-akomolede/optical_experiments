@@ -19,6 +19,7 @@ import assert from 'node:assert/strict';
 
 import { componentOf, componentShare, componentVolume, boxCentre, SYSTEMS,
          SYSTEM_NAMES, COMPONENT_NAMES, SYSTEM_LABELS, COMPONENT_LABELS,
+         normaliseComponent, robustScale,
          DEFAULT_SYSTEM, DEFAULT_COMPONENT }
   from '../../web/static/components.js';
 
@@ -296,3 +297,98 @@ test('an all-zero field has no share either', () => {
   for (let i = 0; i < n; i += 1) pos[i * 3] = i;
   assert.equal(componentShare(vec, pos, C, 'cartesian', 'Ex'), null);
 });
+
+// ---------------------------------------------------------------------------
+// normaliseComponent / robustScale: the scale a component is DRAWN at.
+//
+// The picture is normalised by the component's own p99, not its maximum. The
+// failure this guards is the one that shipped: dividing by the max, so a field
+// with one local spike on an otherwise small body had ~94% of its samples left
+// under the drawing floor and drew as nothing -- pixel-identical to no field at
+// all. Mode 1's Erho is exactly this shape.
+// ---------------------------------------------------------------------------
+
+test('one spike at 5x p99 does not suppress the rest of the field', () => {
+  // The lead's case, verbatim. 1000 samples: one at 5.0, the rest at 1.0. The
+  // p99 lands within the 1.0 body, so the scale is ~1.0 and the body draws at
+  // ~1.0/scale, well above the 0.12 floor. Divide by the max (5.0) instead and
+  // every body sample lands at 0.2 -- still over the floor here, so make the
+  // spike sharper to separate the two scales properly: 20x.
+  const n = 1000;
+  const samples = new Float32Array(n);
+  for (let i = 0; i < n; i += 1) samples[i] = 1.0;
+  samples[0] = 20.0;
+  const scale = normaliseComponent(samples, true);
+  // p99 of [1.0 x999, 20.0] is 1.0; the spike is clamped to 1 but the BODY must
+  // stay near 1.0, not be crushed to 1/20 = 0.05.
+  assert.ok(scale < 1.5, `scale must track the p99 body (~1), got ${scale}`);
+  let overFloor = 0;
+  let bodySum = 0;
+  for (let i = 1; i < n; i += 1) {
+    if (Math.abs(samples[i]) > 0.12) overFloor += 1;
+    bodySum += Math.abs(samples[i]);
+  }
+  assert.equal(overFloor, n - 1,
+               'the whole body must stay over the drawing floor');
+  assert.ok(bodySum / (n - 1) > 0.9,
+            `the body must draw at full scale; mean ${bodySum / (n - 1)}`);
+  assert.equal(samples[0], 1.0, 'the spike is clamped to 1, not left at 20');
+});
+
+test('dividing by the MAX would have emptied that same field (the shipped bug)', () => {
+  // The positive control for the test above: do it the old way and show the
+  // body is crushed. Without this, "the body survives" could pass for a reason
+  // that has nothing to do with choosing the p99.
+  const n = 1000;
+  const samples = new Float32Array(n);
+  for (let i = 0; i < n; i += 1) samples[i] = 1.0;
+  samples[0] = 20.0;
+  let max = 0;
+  for (const v of samples) if (Math.abs(v) > max) max = Math.abs(v);
+  let overFloor = 0;
+  for (let i = 1; i < n; i += 1) {
+    if (Math.abs(samples[i] / max) > 0.12) overFloor += 1;
+  }
+  assert.equal(overFloor, 0,
+               'max-normalisation must crush the body under the floor -- if ' +
+               'this ever passes with overFloor > 0 the test has lost its point');
+});
+
+test('NaN stays NaN through the normalisation and does not move the scale', () => {
+  // NaN marks outside-the-object; it must reach the upload transparent. It also
+  // must not be counted as a zero sample, which would drag the percentile down.
+  const n = 100;
+  const samples = new Float32Array(n);
+  for (let i = 0; i < n; i += 1) samples[i] = i < 50 ? NaN : 2.0;
+  const scale = normaliseComponent(samples, true);
+  assert.ok(Math.abs(scale - 2.0) < 1e-6, `scale from the finite half, got ${scale}`);
+  for (let i = 0; i < 50; i += 1) {
+    assert.ok(Number.isNaN(samples[i]), 'NaN must stay NaN');
+  }
+  assert.ok(Math.abs(samples[60] - 1.0) < 1e-6, 'finite 2.0 / 2.0 = 1.0');
+});
+
+test('a signed component is clamped to [-1, 1]; |E| is not', () => {
+  const n = 100;
+  const signed = new Float32Array(n).fill(1.0);
+  signed[0] = 100.0; signed[1] = -100.0;
+  normaliseComponent(signed, true);
+  assert.equal(signed[0], 1.0, 'positive spike clamps to 1');
+  assert.equal(signed[1], -1.0, 'negative spike clamps to -1');
+  const mag = new Float32Array(n).fill(1.0);
+  mag[0] = 100.0;
+  normaliseComponent(mag, false);
+  assert.ok(mag[0] > 1, '|E| is not clamped -- a real over-unity value shows');
+});
+
+test('an all-NaN field has no scale, and says so with 0', () => {
+  const samples = new Float32Array(8).fill(NaN);
+  assert.equal(normaliseComponent(samples, true), 0);
+  for (const v of samples) assert.ok(Number.isNaN(v), 'left untouched');
+});
+
+test('an all-zero field has no scale', () => {
+  const samples = new Float32Array(8);
+  assert.equal(normaliseComponent(samples, true), 0);
+});
+
