@@ -40,7 +40,7 @@ import { chromium } from 'playwright-core';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { decodePng, divergingNote, divergingProblem, drawProblem,
-         framingProblem, outlineOnlyProblem }
+         framingProblem, knownIssue, outlineOnlyProblem }
   from './pixels.mjs';
 
 const url = process.env.MSE_URL;
@@ -67,6 +67,34 @@ function fail(message) {
 function ok(message) {
   notes.push(message);
   console.log(`ok   ${message}`);
+}
+
+// A frame the check KNOWS is wrong and has been told not to fail the run on.
+// It prints "KNOWN", never "ok": a waived frame and a correct frame must not
+// read the same in the log, or the waiver becomes a quiet pass. It is recorded
+// in its own list, so report.json carries the named issue even though the run
+// exits 0.
+const knowns = [];
+function known(what, reason) {
+  knowns.push(`${what}: ${reason}`);
+  console.log(`KNOWN ${what} -- accepted defect, not failing the run: ${reason}`);
+}
+
+// The single place a lobe verdict is decided, so a waiver can only be granted
+// by the frame's own name. Every hue-consuming verdict -- the diverging ones and
+// the field-versus-outline ones -- routes through here; nothing else may append
+// to the problem list for a frame.
+//
+// A relaxed predicate (a wider hue margin, a smaller floor) is NEVER granted:
+// the measurement is still printed in full, and the frame is still on the record
+// as wrong. A named waiver does not weaken the check, it files an exception.
+function judgeFrame(what, problemsOf) {
+  const found = problemsOf();
+  if (!found.length) return 'passed';
+  const reason = knownIssue(what);
+  if (reason) { known(what, reason); return 'known'; }
+  found.forEach(fail);
+  return 'failed';
 }
 
 // A pixel summary that can be compared between two frames without keeping the
@@ -474,29 +502,36 @@ try {
   // as nothing. The caption was half right (the field is faint) and half wrong
   // (drawing as nothing is not the physics). A caption is not a control.
   //
-  // The viewer now scales each component by its own p99, so mode 1's Erho draws
-  // and this frame is judged like every other: it must differ from the outline.
-  // There is no exemption left to grant.
+  // The viewer now scales each component by its own p99, so the max-normalisation
+  // defect (a spiked field leaving 94% of its samples under the floor) is fixed.
+  // Mode 1's Erho still draws as a near-neutral haze for a different reason --
+  // the field is sign-mixed, so its two lobes blend along a ray -- and the owner
+  // accepted that frame on 2026-09-30 as a cosmetic nit. It is filed as a NAMED
+  // known issue in `pixels.mjs` (`KNOWN_ISSUE_FRAMES`), keyed on this frame's own
+  // label, and printed as "KNOWN" rather than "ok". There is no caption-gated
+  // exemption left: a second empty frame has a different label and still FAILS.
   let outline = null;
   const pendingOutlineVerdicts = [];
   const fieldVsOutline = (sample, what) => pendingOutlineVerdicts.push(() => {
-    const problem = outlineOnlyProblem(sample, outline);
-    if (problem) {
-      fail(`${what}: ${problem}`);
-    } else if (outline) {
-      // The hue, not the lit count: the count is the object's box and is the
-      // same in every frame (measured, 91637 with the field on and off); the
-      // field's whole contribution is the hue it paints over that box.
-      ok(`${what} differs from the outline-only control ` +
-         `(${sample.warm + sample.cool} lobe-coloured px vs ` +
-         `${outline.warm + outline.cool} in the control)`);
-    }
-    // With no control frame at all, `outline` is null, `outlineOnlyProblem`
-    // returns its "the control is missing or unreadable" message, and this
-    // FAILS -- a missing control is a FAIL, never a silent skip. That is
-    // deliberate: a check that quietly drops its strongest predicate is the
-    // "could not ask looks like nothing there" shape, and this predicate is the
-    // one that catches a plot that never drew.
+    judgeFrame(what, () => {
+      const problem = outlineOnlyProblem(sample, outline);
+      if (problem) return [`${what}: ${problem}`];
+      if (outline) {
+        // The hue, not the lit count: the count is the object's box and is the
+        // same in every frame (measured, 91637 with the field on and off); the
+        // field's whole contribution is the hue it paints over that box.
+        ok(`${what} differs from the outline-only control ` +
+           `(${sample.warm + sample.cool} lobe-coloured px vs ` +
+           `${outline.warm + outline.cool} in the control)`);
+      }
+      // With no control frame at all, `outline` is null, `outlineOnlyProblem`
+      // returns its "the control is missing or unreadable" message, and this
+      // FAILS -- a missing control is a FAIL, never a silent skip. That is
+      // deliberate: a check that quietly drops its strongest predicate is the
+      // "could not ask looks like nothing there" shape, and this predicate is the
+      // one that catches a plot that never drew.
+      return [];
+    });
   });
 
   const magnitude = await shoot('01-magnitude.png');
@@ -533,8 +568,12 @@ try {
   }
 
   const diverging = (sample, what) => pendingOutlineVerdicts.push(() => {
-    const problem = divergingProblem(sample, what, outline);
-    if (problem) fail(problem); else ok(divergingNote(sample, what, outline));
+    judgeFrame(what, () => {
+      const problem = divergingProblem(sample, what, outline);
+      if (problem) return [problem];
+      ok(divergingNote(sample, what, outline));
+      return [];
+    });
   });
 
   // The component caption's text, or '' when it is hidden or absent. Both are
@@ -564,9 +603,10 @@ try {
   // misled, and so is the reverse.
   //
   // The caption is read and checked for the component's real share, and the
-  // draw is judged like any other frame. After the p99-scale fix, mode 1's Erho
-  // draws; before it, this frame was forgiven via `accountForEmptyFrame`, which
-  // hid a real defect. See the note above `fieldVsOutline`.
+  // draw is judged like any other frame. The old caption-gated empty-frame
+  // escape hatch used to forgive this frame, which hid a real defect; now it
+  // draws and its remaining neutral haze is the owner-accepted known issue. See
+  // the note above `fieldVsOutline`.
   const erhoCaptionText = await erhoCaption(page);
   // The caption must name the component's real share. Mode 1's Erho is measured
   // at 8.26%, and it says the view is drawn at the component's own scale -- the
@@ -590,8 +630,10 @@ try {
   }
 
   // After the fix this frame must draw, and it must differ from the
-  // outline-only control exactly as every other frame does. There is no
-  // below-floor exemption any more: mode 1's Erho at a p99 scale paints hue.
+  // outline-only control exactly as every other frame does. The old caption-
+  // gated empty-frame escape hatch is gone; the one exception that remains is
+  // the owner-accepted known issue filed by this frame's own name in
+  // `pixels.mjs`.
   const erhoDrawProblem = drawProblem(erho, 'Erho');
   if (erhoDrawProblem) {
     fail(erhoDrawProblem);
@@ -600,9 +642,10 @@ try {
   }
   // The lobe-hue predicate applies here as it does to every component frame.
   // It used to be skipped for this one because the frame was below the floor
-  // and drew no hue by design -- a consequence of the max-normalisation bug,
-  // not of the physics. With the p99 scale the component draws, so the check
-  // that a field frame carries lobe hue is asked here too.
+  // and drew no hue by design -- a consequence of the max-normalisation bug.
+  // After the p99 fix the frame DRAWS, but its sign-mixed field still blends to
+  // near-neutral haze, so this predicate still finds almost no hue. That is the
+  // accepted known issue, filed by name -- the predicate runs here unchanged.
   diverging(erho, 'Erho in mode 1');
   fieldVsOutline(erho, 'Erho in mode 1');
 
@@ -767,7 +810,7 @@ try {
 
   writeFileSync(join(outDir, 'report.json'), JSON.stringify({
     url, gl, magnitude, ez, erho, erho2, rotated, outline, problems, notes,
-    consoleErrors,
+    knowns, consoleErrors,
   }, null, 2));
 } catch (error) {
   fail(`the check itself threw: ${error && error.stack ? error.stack : error}`);
@@ -784,6 +827,13 @@ if (problems.length) {
   console.error(`\n${problems.length} problem(s):`);
   problems.forEach((p) => console.error(`  - ${p}`));
   process.exitCode = 1;
+} else if (knowns.length) {
+  // Exit 0, but the accepted defect is named on the way out. A run with only
+  // known issues is a PASS -- that is what the waiver means -- and it says so in
+  // the same breath as naming what was waived.
+  console.log(`\nall render checks passed; screenshots in ${outDir}`);
+  console.log(`${knowns.length} known issue(s) accepted (not failing the run):`);
+  knowns.forEach((k) => console.log(`  - KNOWN ${k}`));
 } else {
   console.log(`\nall render checks passed; screenshots in ${outDir}`);
 }

@@ -86,6 +86,43 @@ test('the empty-frame exemption is GONE, not merely gated', () => {
     'accountForEmptyFrame is back in the check\'s CODE -- the exemption was ' +
     'removed because it forgave a real defect (mode 1\'s Erho was pixel-' +
     'identical to no field at all)');
+  // What REPLACED it is the owner-accepted, name-keyed known issue. It is not a
+  // caption gate: the frame is passed to the same verdict function as any other,
+  // and the waiver is looked up by the frame's OWN LABEL inside that verdict.
+  assert.match(block, /diverging\(\s*erho\s*,\s*'Erho in mode 1'\s*\)/,
+    'the mode-1 Erho frame is no longer routed to the lobe-hue verdict under ' +
+    'its own label -- the known-issue waiver is keyed on that exact label, so ' +
+    'the two must not drift apart');
+  assert.match(block, /fieldVsOutline\(\s*erho\s*,\s*'Erho in mode 1'\s*\)/,
+    'the mode-1 Erho frame is no longer compared against the outline under its ' +
+    'own label, so the known-issue waiver would never be reached for it');
+  // And the gate must NOT read the caption: the verdict closures stop reading
+  // `erhoCaptionText`, which is the caption-gate shape the removed exemption had.
+  assert.doesNotMatch(block, /knownIssue\s*\(\s*erhoCaptionText/,
+    'the known-issue waiver is being read from the page caption -- that is the ' +
+    'caption gate again, and it would waive any frame the page explains');
+  // The routing must be UNCONDITIONAL. The regex matches above would still match
+  // a call nested inside a guard -- `if (captionSays...) { diverging(erho, ...) }`
+  // matches `/diverging\(\s*erho\s*,/` just as well -- so a caption gate could
+  // creep back under these assertions and never redden them. That gap is real
+  // (measured: a bracketed `if (...) { diverging(erho, ...); ... }` around the
+  // two calls left all 96 tests green). What closes it is requiring the two
+  // calls to be reached from the block body, with no statement between the
+  // closing brace of the caption `else` and the first verdict call.
+  const verdictStart = block.search(/\b(?:diverging|fieldVsOutline)\s*\(\s*erho\s*,/);
+  assert.ok(verdictStart > 0, 'the mode-1 Erho verdict calls are missing');
+  const before = block.slice(0, verdictStart);
+  const lastClose = before.lastIndexOf('}');
+  const leadIn = before.slice(lastClose + 1);
+  assert.equal(/\bif\b|\belse\b|\?/.test(leadIn), false,
+    'a statement between the caption check and the mode-1 Erho verdict calls ' +
+    'can only be a gate -- the routing must be unconditional, or an exemption ' +
+    'has crept back in a form these assertions would otherwise miss: ' +
+    JSON.stringify(leadIn.trim()));
+  const afterCalls = block.slice(verdictStart);
+  assert.equal((afterCalls.match(/\bif\b|\belse\b|\?/g) || []).length, 0,
+    'the statements following the mode-1 Erho verdict calls include a branch -- ' +
+    'the calls are inside a conditional, which is the gate shape');
 });
 
 test('the frame that DOES draw is still judged for its hue', () => {

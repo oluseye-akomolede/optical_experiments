@@ -18,7 +18,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { drawProblem, framingProblem, divergingProblem, divergingNote,
-         freshClip, outlineOnlyProblem }
+         freshClip, knownIssue, outlineOnlyProblem }
   from '../../dockerfiles/rendercheck/pixels.mjs';
 
 // A frame summary shaped like the one check.mjs builds. `sum` defaults to a
@@ -395,4 +395,63 @@ test('the screenshot clip tracks the canvas and is not scroll-corrected', async 
     'lands back on the stale position, off by the full scroll amount');
   assert.notEqual(wrong.y, after.y,
     'the doubled correction must land somewhere other than the true canvas');
+});
+
+// --- the known-issue waiver --------------------------------------------------
+//
+// The owner accepted mode 1's Erho haze on 2026-09-30, so the check stops
+// FAILING THE RUN on that frame. The danger of any exemption is the shape the
+// removed `accountForEmptyFrame` had: a gate that widened into silence, so a
+// real defect passed. These tests pin the waiver as narrow -- it names one frame
+// and only that frame -- and pin that it is keyed on the check's own label, not
+// on anything the page says.
+test('the accepted known issue is named by the frame label the check uses', () => {
+  // The string here is deliberately the EXACT one the verdict prints
+  // (`diverging(erho, 'Erho in mode 1')`), because a waiver keyed on anything
+  // else -- a substring, a component name, a regex over the whole log -- could
+  // widen to frames it was not meant for.
+  const reason = knownIssue('Erho in mode 1');
+  assert.ok(reason, 'mode 1 Erho is the owner-accepted known issue');
+  assert.match(reason, /sign-mixed|neutral haze/i,
+    'the reason names the mechanism that produced the frame');
+  assert.match(reason, /2026-09-30/,
+    'the reason records when the owner accepted it');
+});
+
+test('the waiver covers only that frame: a second empty frame still fails', () => {
+  // A second empty frame is the thing the waiver must never swallow. Each of
+  // these has a DIFFERENT label from the waived one, and a different label is
+  // the whole of the gate.
+  const otherLabels = [
+    'Ez',                       // another component, mode 1
+    '|E|',                      // the magnitude frame
+    'Erho in mode 2',           // the same component, another mode
+    'the rotated frame',        // the same component, another camera
+  ];
+  for (const what of otherLabels) {
+    assert.equal(knownIssue(what), null,
+      `"${what}" is not the waived frame -- it must be judged normally`);
+  }
+  // And a near-miss spelling gets no waiver either: the match is exact, so a
+  // label that merely resembles the waived one is not excused.
+  assert.equal(knownIssue('Erho in mode 1 '), null,
+    'a trailing space is a different label and must not inherit the waiver');
+  assert.equal(knownIssue('erho in mode 1'), null,
+    'the waiver is case-sensitive -- a lookalike label is not the named frame');
+  assert.equal(knownIssue('Erho'), null,
+    'the bare component name is NOT the waived frame; using it would waive the '
+    + 'component everywhere it appears, including the modes where it draws');
+});
+
+test('the waived frame is still judged by the unrelaxed predicate', () => {
+  // The waiver lives at the CALL SITE, not in the predicate. So the predicate
+  // must still report the empty frame at full strength: the measurement is
+  // printed and filed, and no threshold was moved to make the frame pass.
+  const outline = frame({ coloured: 91637, warm: 0, cool: 0, sum: 22458710 });
+  const erhoHaze = frame({ coloured: 91637, warm: 0, cool: 0, sum: 22458710 });
+  assert.ok(outlineOnlyProblem(erhoHaze, outline),
+    'the raw predicate still reports the haze frame -- the waiver does not '
+    + 'weaken it, it files an exception');
+  assert.ok(divergingProblem(erhoHaze, 'Erho in mode 1', outline),
+    'the lobe-hue predicate is likewise unrelaxed for the waived frame');
 });

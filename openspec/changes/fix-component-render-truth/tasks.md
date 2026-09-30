@@ -45,10 +45,25 @@
   `OMP/MKL/OPENBLAS_NUM_THREADS=2`, and say the image tag must equal the
   deployed web sha.
 
-## 6. Verify
+## 6. File mode 1's Erho as a named known issue (owner-accepted 2026-09-30)
 
-- [x] 6.1 `node --test tests/js/*.mjs` — all pass (not `tests/js/`, which runs
+- [x] 6.1 Add `KNOWN_ISSUE_FRAMES` + `knownIssue(what)` to `pixels.mjs`,
+  keyed on the check's own frame label, with the acceptance date and the
+  mechanism in the reason line.
+- [x] 6.2 Route every lobe verdict through one `judgeFrame(what, problemsOf)`
+  in `check.mjs`; a waived frame prints `KNOWN` (never `ok`), is recorded in
+  `knowns`, and does not set the exit code.
+- [x] 6.3 Tests: the waived frame is still judged by the unrelaxed predicate;
+  the waiver covers only the named frame (a second empty frame still fails);
+  the callsite is unconditional, so a caption-gated form cannot creep back.
+- [x] 6.4 Revert-check: restore the caption gate around the mode-1 Erho calls
+  and confirm test 38 reddens; make `knownIssue` unconditional and confirm
+  test 68 reddens. Both restored clean afterwards.
+
+## 7. Verify
+
+- [x] 7.1 `node --test tests/js/*.mjs` — all pass (not `tests/js/`, which runs
   nothing and exits 0).
-- [ ] 6.2 Run the render check against a page with the fixed viewer and confirm
+- [ ] 7.2 Run the render check against a page with the fixed viewer and confirm
   the `Erho` mode-1 frame now differs from the outline control.
-- [ ] 6.3 `openspec validate fix-component-render-truth --strict`.
+- [x] 7.3 `openspec validate fix-component-render-truth --strict`.
