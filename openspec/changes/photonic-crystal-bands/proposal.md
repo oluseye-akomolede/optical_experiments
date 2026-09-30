@@ -32,9 +32,21 @@ The requirements cover: the request and its validation (every refusal naming its
 own limit), the lattice/cell/mesh contract (conforming circle, periodic pairing
 by coordinate, not index), the two scalar operators and their polarisation
 labels, the k-path, the sparse solve, the band gap and its midgap ratio, the
-storage shape, and the two validation controls the change is judged by — the
-empty lattice (exact at Γ; O(h²) elsewhere) and the Joannopoulos alumina-rod TM
-gap, each with its tolerance stated as a scenario.
+storage shape, and the three validation controls the change is judged by — the
+empty lattice (Control A, exact at Γ; O(h²) elsewhere), the 1-D layered cell
+against its transfer-matrix oracle (Control B), and the MPB tutorial's
+triangular rod-lattice TM gap (Control C), each with its tolerance stated as a
+scenario.
+
+The benchmark originally named here — the Joannopoulos square lattice of alumina
+rods, `eps = 8.9`, TM gap 0.302–0.443 — was **dropped**: the plan records that
+source as unreachable, and its numbers as quoted from memory and never read. It
+is replaced by the MPB Scheme tutorial's "Triangular Lattice" result, which was
+read directly (`r = 0.2 a`, `eps = 12`, resolution 32, TM gap
+`0.275065617068082 → 0.446289918847647`, 47.47%). One hazard that cost a
+debugging round is recorded with the test: MPB prints the mirror's **permittivity**
+(`eps = 12`) where `pc.py` takes **refractive index** (`eps_by_tri = n_rod**2`),
+so the benchmark must be passed as `n = sqrt(12)`.
 
 ## What this does NOT do
 

@@ -55,13 +55,34 @@ validated. Boxes ticked are done and verified on this branch.
   ODE shooting FIRST (worst rel < 1e-10)
 - [x] 5.4 Control B — the polarisations differ at eps != 1 (so the control can
   fail)
-- [ ] 5.5 Control C — Joannopoulos alumina-rod TM gap, `eps = 8.9`, `r = 0.2 a`,
-  gap expected 0.302–0.443; tolerance and quoted source stated before running.
-  **NOT IMPLEMENTED** — this is the one control the brief asks for that has no
-  test; it must be added before the capability is called validated.
+- [x] 5.5 Control C — the published benchmark: MPB's triangular rod lattice
+  (TM, `r = 0.2 a`, `eps = 12`, resolution 32), gap `0.275066 → 0.446290`
+  (47.47%), matched to within 1% of midgap. Source read directly
+  (mpb.readthedocs.io Scheme Tutorial, "Triangular Lattice"); tolerance stated
+  before the run. Includes a can-fail precondition (`r = 0.3` moves the gap
+  outside the bar). The row's original figure (Joannopoulos alumina, `eps = 8.9`,
+  0.302–0.443) was DROPPED: the plan records that source as unreachable and the
+  figure as from memory, so it is not a benchmark — see §4 of the plan and the
+  spec's "a benchmark's quoted figures" requirement.
+- [x] 5.6 Control C found a CALLER bug on its first run, not a solver bug. MPB
+  quotes the mirror's permittivity (`eps = 12`), but `pc.py`'s cell parameters
+  are refractive index (`unit_cell_mesh`: `eps_by_tri = n_rod ** 2`, pc.py:347).
+  Passing `12` straight in made the gap read `0.0819 → 0.1523` (19.5%) — low by
+  `sqrt(12)` and FLAT under refinement (div 16/24/32 → 0.08218/0.08196/0.08187),
+  the signature of a units slip. Passed correctly (`n = sqrt(12)`) the solver
+  reproduces MPB to 0.12% / 0.02%. Fixed in the test: the conversion is named in
+  `MPB_TRI_N_ROD`, with the hazard recorded in the docstring and the proposal.
+- [x] 5.7 The decisive split, as a permanent test:
+  `test_uniform_cell_scales_as_one_over_sqrt_eps` runs the WHOLE cell at one
+  permittivity (no rods), so no per-element sampling is in play, and requires
+  band 1 to scale as `1/sqrt(eps)` against the eps=1 value measured in the same
+  run. Uniform-wrong ⇒ assembly/normalisation fault; uniform-right-but-rods-wrong
+  ⇒ per-element eps sampling. Verified it reddens on an assembly mutation
+  (`eps_by_tri ** 0.5` on the mass) and on passing eps as index; both restored.
 
 ## 6. Change bookkeeping
 
 - [x] 6.1 proposal, tasks, spec delta present
 - [ ] 6.2 `openspec validate photonic-crystal-bands --strict` passes (this run)
-- [ ] 6.3 Control C added, or the capability's validation claim narrowed to match
+- [x] 6.3 Control C added (5.5), so the capability's validation claim now rests
+  on three controls, not two.

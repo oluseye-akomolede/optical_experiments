@@ -223,8 +223,10 @@ bound of 1e-3 at the production mesh, with the convergence order measured in
 [1.8, 2.2] — asserting equality at X and M would assert something false, since
 the scheme is second order. Control B, the 1-D layered cell, SHALL match the
 exact transfer-matrix band edges, and the oracle SHALL be validated against an
-independent ODE shooting solve BEFORE any mesh is compared to it. Every
-dispersion claim SHALL be measured against that oracle.
+independent ODE shooting solve BEFORE any mesh is compared to it. Control C, a
+published benchmark, SHALL be a NUMERIC-vs-NUMERIC comparison against a printed
+result whose source was read, with the tolerance stated before the run. Every
+dispersion claim SHALL be measured against one of these.
 
 #### Scenario: Control A's exact landmark and its relative bounds
 - **WHEN** the empty lattice is solved at the production mesh
@@ -243,13 +245,28 @@ dispersion claim SHALL be measured against that oracle.
 - **AND** a deliberately wrong admittance fails that same check
 - **AND** the s and p polarisations coincide at eps = 1 and differ at eps = 4
 
-#### Scenario: a published benchmark gap is a required control (NOT YET IMPLEMENTED)
-- **WHEN** the Joannopoulos square lattice of alumina rods (`eps = 8.9`,
-  `r = 0.2 a`, TM) is solved
-- **THEN** its band gap is expected between `w a / (2 pi c) = 0.302` and
-  `0.443`, with the tolerance set before the run and the source quoted
-- **AND** this control SHALL be added as a test before the capability is called
-  validated; it is currently absent, so no dispersion claim rests on it
+#### Scenario: Control C reproduces a published benchmark gap
+- **WHEN** the MPB tutorial's triangular rod lattice (TM, `r = 0.2 a`,
+  `eps = 12`, rods in air, resolution 32) is solved
+- **THEN** its TM 1–2 gap, taken as `bandGaps` takes it (max of band 1 over k,
+  min of band 2), matches the tutorial's printed
+  `0.275065617068082 → 0.446289918847647` (47.47%) to within 1% of the midgap
+- **AND** the source is the MPB Scheme tutorial's "Triangular Lattice" section,
+  read directly, and the tolerance is stated before the run
+- **AND** the benchmark can FAIL: `r = 0.3` moves the gap centre outside that bar
+
+### Requirement: A benchmark's quoted figures SHALL come from a source that was read
+
+A published number used as a control SHALL be taken from a source that was
+actually read in the work, and the change SHALL name it. A figure carried from
+memory, or from a host that could not be reached, SHALL NOT be stated as a
+target.
+
+#### Scenario: an unreachable or remembered figure is not a benchmark
+- **WHEN** a candidate benchmark's source cannot be read, or the figure is from
+  memory
+- **THEN** that figure is not used as a control, and the omission is recorded
+  rather than quietly retargeted
 
 ## Out of scope
 

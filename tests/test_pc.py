@@ -994,3 +994,178 @@ def test_control_B_can_fail_because_the_polarisations_differ():
     assert abs(s0 - p0) < 1e-9, (
         f"at ky=0 the polarisations must coincide; they differ by {abs(s0 - p0):.3e}"
     )
+
+
+# The published benchmark's parameters, read from the source rather than quoted
+# from memory. MPB's Scheme tutorial, "Triangular Lattice":
+#   https://mpb.readthedocs.io/en/latest/Scheme_Tutorial/
+# The triangular section changes ONLY the lattice -- its own prose says "All of
+# the other parameters (geometry, num-bands, and grid-size) can remain the same
+# as in the previous subsection" -- so the cylinder is the square section's
+# `(radius 0.2)` with `(epsilon 12)`, rods in air, at `(set! resolution 32)`.
+# (The tutorial's later `(radius 0.3)` block is the anisotropic-dielectric
+# example, a different structure; it is NOT this benchmark.)
+MPB_TRI_R = 0.2
+# MPB states the mirror's permittivity as `(epsilon 12)`, but pc.py's cell
+# parameters are REFRACTIVE INDEX, not permittivity: unit_cell_mesh does
+# `eps_by_tri = n_rod ** 2` (pc.py:347). So the benchmark's eps=12 must be
+# passed as n = sqrt(12). Passing 12 here is a factor-of-12-in-eps error that
+# shows up as a frequency low by sqrt(12) -- and it is flat under refinement, so
+# it looks like a solver bug when it is a caller's units slip. Measured: n=12
+# gives 0.0819->0.1523 (19.5%, red); n=sqrt(12) gives 0.2747->0.4462 (47.55%,
+# green). Keep this conversion named and visible.
+MPB_TRI_N_ROD = float(np.sqrt(12.0))
+MPB_TRI_DIVISIONS = 32        # the tutorial's own resolution, so we compare like
+# The tutorial's printed result, verbatim: "Gap from band 1
+# (0.275065617068082) to band 2 (0.446289918847647), 47.4729292989213%".
+MPB_TRI_GAP_LOWER = 0.275065617068082
+MPB_TRI_GAP_UPPER = 0.446289918847647
+# Tolerance, stated BEFORE running (plan §4): 1% of the midgap frequency. MPB at
+# resolution 32 is itself a discretised computation, so this is numeric-vs-
+# numeric and 1% of midgap is the honest bar -- far looser than the 1e-10 the
+# analytic oracle earns. A disagreement outside the bar is to be EXPLAINED, not
+# tuned away.
+CONTROL_C_TOL_REL = 0.01
+
+
+def _gap_12(bands):
+    """The 1-2 gap with the product's own rule: max of band 1 over k, min of
+    band 2.
+
+    This mirrors ``bandGaps`` in ``web/static/bands.js`` (max of band n over the
+    row, min of band n+1), which is the definition the tutorial's printed number
+    is for. Python cannot import that JS, so the rule is restated here -- and
+    ``tests/js/test_bands.mjs`` pins the JS side, so if one drifts the other test
+    still guards its own copy.
+    """
+    lower = float(np.max(bands[:, 0]))
+    upper = float(np.min(bands[:, 1]))
+    return (lower, upper) if upper > lower else None
+
+
+@pytest.mark.heavy
+def test_uniform_cell_scales_as_one_over_sqrt_eps():
+    """The decisive split: is eps handled right in ASSEMBLY?
+
+    Control C compares against a published number, which is the right yardstick
+    but a blunt instrument -- it cannot say WHERE a wrong number comes from. This
+    control removes every structural complication and asks one question: with the
+    whole cell at one permittivity (no rods, so no per-element sampling and no
+    membership test in play at all), does the band frequency scale as
+    ``1/sqrt(eps)``?
+
+    It must, and exactly. A homogenised cell's eigenproblem is
+    ``K u = lam eps M u`` (TM puts eps on the mass), so ``lam = lam_0 / eps`` and
+    the returned ``sqrt(lam)/2 pi`` is the empty-lattice value over ``sqrt(eps)``.
+    ``lam_0`` is not taken on faith: it is measured in the same run at eps=1, so
+    this control cannot pass by hard-coding a lucky constant.
+
+    This is the control that separates the two candidate faults:
+
+      * if the UNIFORM cell is wrong, the defect is in assembly or in the output
+        normalisation (eps on the wrong matrix, or applied twice);
+      * if the uniform cell is right but the rods are wrong, it is in how eps is
+        sampled per element (which triangles are inside the rod).
+
+    It is worth its runtime because it is the only test that can name which half
+    is broken. Run at eps=1/4/12; eps=12 is MPB's mirror permittivity, so the
+    benchmark and this control share a point.
+    """
+    lattice = "square"
+    _, k_pts = pc.high_symmetry_path(lattice, points_per_segment=12)
+    n_pts = 48
+
+    # lam_0 measured here, not assumed: the eps=1 run IS the empty lattice.
+    b1 = _bands(lattice, n_pts, 0.2, 1.0, 1.0, k_pts, 6, "TM")
+    f0 = float(np.max(b1[:, 0]))          # the folded light line at M
+    assert abs(f0 - 0.7071067811865476) <= 1e-3, (
+        f"eps=1 uniform cell gives band 1 max {f0:.6f}, not the M-point "
+        f"1/sqrt(2)=0.707107; the reference the ratios are taken against is wrong"
+    )
+
+    for eps in (4.0, 12.0):
+        b = _bands(lattice, n_pts, 0.2, float(np.sqrt(eps)),
+                   float(np.sqrt(eps)), k_pts, 6, "TM")
+        got = float(np.max(b[:, 0]))
+        want = f0 / np.sqrt(eps)
+        rel = abs(got - want) / want
+        assert rel <= 1e-3, (
+            f"uniform cell at eps={eps:g}: band 1 max {got:.6f} vs the required "
+            f"{want:.6f} (= {f0:.6f}/sqrt({eps:g})); relative difference "
+            f"{rel:.3e}. eps is NOT scaling as 1/sqrt(eps), so the fault is in "
+            f"assembly or normalisation, not in per-element eps sampling."
+        )
+
+
+@pytest.mark.heavy
+def test_control_C_published_triangular_rod_gap():
+    """CONTROL C -- the published benchmark: MPB's triangular rod lattice.
+
+    This is the one control the brief asks for that had no test. It is a
+    NUMERIC-vs-NUMERIC comparison against a printed result from a real code, so
+    it catches the class of error the analytic controls cannot: a consistent
+    sign or convention slip that still converges nicely.
+
+    It earned its keep on its first run, though not on the solver: passing MPB's
+    eps=12 straight into the index parameter (`n_rod ** 2` in unit_cell_mesh)
+    made the gap read 0.0819->0.1523 -- low by sqrt(12) and FLAT under
+    refinement, the signature of a units error rather than discretisation. The
+    conversion is now named in MPB_TRI_N_ROD; the solver is correct.
+
+    The measured quantity is the TM 1-2 gap, taken the way the PRODUCT takes it
+    (max of band 1 over k, min of band 2), so the control and the display cannot
+    disagree about what a gap is.
+    """
+    lattice = "triangular"
+    _, k_pts = pc.high_symmetry_path(lattice, points_per_segment=8)
+    bands = _bands(lattice, MPB_TRI_DIVISIONS, MPB_TRI_R, MPB_TRI_N_ROD, 1.0,
+                   k_pts, 6, "TM")
+
+    g12 = _gap_12(bands)
+    assert g12 is not None, (
+        "the triangular rod lattice shows no TM 1-2 gap at all; the tutorial's "
+        "47.47% gap is the whole point of the structure"
+    )
+    lower, upper = g12
+
+    mid = 0.5 * (MPB_TRI_GAP_LOWER + MPB_TRI_GAP_UPPER)
+    for name, got, want in (("lower", lower, MPB_TRI_GAP_LOWER),
+                            ("upper", upper, MPB_TRI_GAP_UPPER)):
+        rel = abs(got - want) / want
+        assert rel <= CONTROL_C_TOL_REL, (
+            f"Control C ({name} edge): computed {got:.6f} vs MPB's {want:.6f} in "
+            f"wa/(2 pi c); relative difference {rel:.3e} exceeds the pre-stated "
+            f"{CONTROL_C_TOL_REL:.0%} bar. The tolerance is 1% of the midgap "
+            f"({mid:.6f}); explain the difference, do not tune it away."
+        )
+
+    # The gap RATIO is the number the tutorial prints as a percentage, so assert
+    # it too: two edges can each sit inside 1% and still compose a ratio that
+    # moved, and the ratio is what the caption shows.
+    ratio = (upper - lower) / mid
+    assert abs(ratio - 0.4747292989213) <= CONTROL_C_TOL_REL, (
+        f"Control C (midgap ratio): computed {ratio:.6f} vs MPB's 0.474729; "
+        f"outside the {CONTROL_C_TOL_REL:.0%} bar"
+    )
+
+
+@pytest.mark.heavy
+def test_control_C_can_fail_because_the_radius_moves_the_gap():
+    """The precondition that makes Control C meaningful.
+
+    A benchmark that cannot fail proves nothing. Doubling-check the rod radius
+    (r = 0.2 -> 0.3) changes the structure, so the gap centre must move well
+    outside the 1% bar. If it did not, the benchmark could not tell the radii
+    apart and would pass a wrong radius.
+    """
+    _, k_tri = pc.high_symmetry_path("triangular", points_per_segment=8)
+    big_r = _bands("triangular", MPB_TRI_DIVISIONS, 0.3, MPB_TRI_N_ROD, 1.0,
+                   k_tri, 6, "TM")
+    g_big = _gap_12(big_r)
+    assert g_big is not None, "r=0.3 should still show a 1-2 gap"
+    mid = 0.5 * (MPB_TRI_GAP_LOWER + MPB_TRI_GAP_UPPER)
+    moved = abs(0.5 * (g_big[0] + g_big[1]) - mid) / mid
+    assert moved > CONTROL_C_TOL_REL, (
+        f"r=0.3 moves the 1-2 gap center by only {moved:.3e}; the benchmark "
+        f"cannot distinguish the radii and would pass a wrong radius"
+    )
