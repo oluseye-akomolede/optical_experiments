@@ -86,3 +86,35 @@ validated. Boxes ticked are done and verified on this branch.
 - [ ] 6.2 `openspec validate photonic-crystal-bands --strict` passes (this run)
 - [x] 6.3 Control C added (5.5), so the capability's validation claim now rests
   on three controls, not two.
+
+## 7. Routing fix (review REJECT: pc jobs could not be solved as wired)
+
+Review proved on real Postgres that `_handle_pc_upload` created the row
+`target = CLUSTER`, while the only pc solver is on the Jetson worker
+(`claim_jetson` selects `target = 'jetson'`), and `next_queued` had no kind
+filter — so `run_tick` handed the pc row to the cavity launcher, which built a
+CAVITY Job for it and sent the row to `stage = meshing`.
+
+- [x] 7.1 `_handle_pc_upload` creates the row `target = DB.JETSON`; there is no
+  cluster pc path in this change
+- [x] 7.2 `next_queued` skips `kind = 'pc'` (the pc row is filtered at the
+  queue, so the launcher is never handed one on the normal path)
+- [x] 7.3 `Launcher.create` raises `JobLaunchError` naming the kind when handed a
+  non-cavity job; `run_tick` passes the row's `kind` so the guard is fed the real
+  value, not a guess
+- [x] 7.4 `real_solve`'s dispatch is explicit: `cavity` → cavity, `pc` → pc,
+  anything else → a named failure (the silent `else` is gone). Worker-side pc
+  tests added to `tests/test_worker.py` (there were none)
+- [x] 7.5 `docs/photonic-crystal-plan.md` states there is no cluster fallback for
+  pc yet
+- [x] 7.6 Schema rollback written into the proposal (§ Rollback) and
+  `db/002_rollback_pc.sql`, qualifier `mse` read from `db/001_schema.sql`,
+  `DROP COLUMN IF EXISTS` so a re-run is a clean no-op
+- [x] 7.7 CROSSING test on real Postgres (`tests/pc_routing_check.py`): creates
+  the pc row via the real route's store call, asserts `claim_jetson` returns it
+  and `next_queued(cluster)` does not. Red on the unfixed branch as
+  `claim_jetson -> None` (read against the predicted symptom); green after. A
+  second, explicitly `target = cluster` pc row pins the kind filter, which is
+  only load-bearing for a pc row the queue could otherwise see
+- [x] 7.8 Spec delta gains "A pc job SHALL be routed to the Jetson worker, and
+  the cluster SHALL refuse it", with the four scenarios above

@@ -392,7 +392,7 @@ class FakeLauncher:
         return {n: r for n, r in self.failed.items() if n in self.active}
 
     def create(self, job_id, units, n_index, n_modes,
-               min_feature_m=None, scale=1.0):
+               min_feature_m=None, scale=1.0, kind=None):
         if self.quota_full:
             raise JOBS.QuotaExceeded("exceeded quota: count/jobs.batch")
         if self.fail_with is not None:
@@ -401,6 +401,13 @@ class FakeLauncher:
         self.created.append({"job_id": str(job_id), "units": units,
                              "n_index": n_index, "n_modes": n_modes,
                              "min_feature_m": min_feature_m, "scale": scale,
+                             # The kind the tick read off the row and handed
+                             # the launcher. Recorded so a test can assert the
+                             # real launcher is FED the kind -- the refusal in
+                             # Launcher.create is dead code if run_tick never
+                             # passes it, and that is a coverage gap a fake
+                             # without this parameter would hide.
+                             "kind": kind,
                              # recorded so a test can assert the OPTIONAL flag is
                              # absent, not merely falsy -- the real manifest omits
                              # --min-feature rather than passing a zero, and that
@@ -2374,8 +2381,14 @@ def test_a_pc_form_queues_a_pc_job_with_its_request_stored(tmp_path,
     # est_tets is the node count the cap was checked against, recorded for the
     # same reason a cavity row records its element estimate.
     assert job["est_tets"] > 0
-    # A pc job runs on the cluster: it has no GPU path.
-    assert job["target"] == DB.CLUSTER
+    # A pc job runs on the JETSON, and this assertion used to say the opposite.
+    # It read "A pc job runs on the cluster: it has no GPU path" -- which was
+    # true of the *estimate* (a pc solve is small) and false of the *solver*:
+    # the only pc solver is the Jetson worker, which claims target='jetson'. The
+    # row was created target='cluster', the cluster launcher built a CAVITY Job
+    # for it, and the band diagram was never produced. The route now creates the
+    # row for the machine that can actually solve it.
+    assert job["target"] == DB.JETSON
 
 
 def test_a_pc_form_with_a_file_is_refused_not_solved(tmp_path, monkeypatch):

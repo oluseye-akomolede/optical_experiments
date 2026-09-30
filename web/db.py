@@ -590,14 +590,21 @@ class JobStore:
         a jetson row reaching the launcher would occupy that slot while the app
         waited for a GPU worker that is not coming. Jetson rows are claimed by
         the worker API instead -- see ``claim_jetson``.
+
+        Filtered by kind as well, and this is not belt-and-braces. The cluster
+        has no pc solver: ``launcher.create`` builds a CAVITY Job from whatever
+        row it is handed, so a ``kind='pc'`` row reaching here would be
+        cavity-solved and its band diagram would never be produced. The kind
+        filter is what makes the cluster queue unable to see a pc row at all,
+        independent of which target the row carries.
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT job_id, original_filename, units, n_index, n_modes, est_tets, "
-                "min_feature_m, scale, materials "
-                "FROM mse.jobs WHERE status = %s AND target = %s "
+                "min_feature_m, scale, materials, kind "
+                "FROM mse.jobs WHERE status = %s AND target = %s AND kind <> %s "
                 "ORDER BY created_at LIMIT 1",
-                (QUEUED, target),
+                (QUEUED, target, PC),
             )
             row = cur.fetchone()
         if not row:
@@ -605,7 +612,7 @@ class JobStore:
         return {"job_id": str(row[0]), "original_filename": row[1],
                 "units": row[2], "n_index": row[3], "n_modes": row[4],
                 "est_tets": row[5], "min_feature_m": row[6], "scale": row[7],
-                "materials": row[8]}
+                "materials": row[8], "kind": row[9]}
 
     def jetson_waiting(self, older_than_seconds: float) -> list[dict]:
         """Jetson rows nobody has claimed for longer than the wait window.

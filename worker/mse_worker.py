@@ -1374,6 +1374,21 @@ def real_solve(job: dict, store_in, store_out, stage: StageReporter | None = Non
         return {"job_id": str(job["job_id"]), "kind": "pc", "bands": bands,
                 "modes": []}
 
+    if job.get("kind") not in (None, "cavity"):
+        # Every other kind is a NAMED failure, not a cavity solve. This used to
+        # be a silent else: anything that was not `pc` fell through to the
+        # cavity path, so a row carrying a kind the worker does not implement
+        # would be solved as if it were a cavity -- the same shape of defect as
+        # the cluster launching a pc row as a cavity Job, on the other machine.
+        # `None` is allowed because it means the claim did not say, which is how
+        # a cavity row created before `kind` existed arrives.
+        raise WorkerError(
+            f"the worker does not implement kind={job.get('kind')!r}; it solves "
+            f"kind='cavity' and kind='pc'. Refusing rather than falling through "
+            f"to the cavity solver, which would produce a result for a job the "
+            f"worker did not understand."
+        )
+
     if str(_SOLVER_DIR) not in sys.path:
         sys.path.insert(0, str(_SOLVER_DIR))
     import mse_maxwell_solver as SOLVER  # noqa: PLC0415 - deliberately late

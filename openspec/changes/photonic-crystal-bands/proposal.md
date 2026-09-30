@@ -48,6 +48,24 @@ debugging round is recorded with the test: MPB prints the mirror's **permittivit
 (`eps = 12`) where `pc.py` takes **refractive index** (`eps_by_tri = n_rod**2`),
 so the benchmark must be passed as `n = sqrt(12)`.
 
+## Rollback
+
+This change adds two columns to `mse.jobs`: `kind` (default `'cavity'`) and
+`pcs` (nullable text). To roll the schema back, in order:
+
+```sql
+ALTER TABLE mse.jobs DROP COLUMN IF EXISTS pcs;
+ALTER TABLE mse.jobs DROP COLUMN IF EXISTS kind;
+```
+
+The schema qualifier is `mse`, read from `db/001_schema.sql` — the same file that
+creates these columns. `db/002_rollback_pc.sql` is that script, kept with
+the schema so it can be run from this change's own directory. Dropping `kind`
+loses the discriminator that separates a cavity row from a pc row, so any pc row
+still present becomes indistinguishable from a cavity row; roll back only after
+the pc rows are gone or drained. No data is moved; the cavity path uses neither
+column.
+
 ## What this does NOT do
 
 3-D slabs, dispersion/loss, defects and waveguides, non-circular rods, radius

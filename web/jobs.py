@@ -363,14 +363,30 @@ class K8sJobLauncher:
     # -- mutation ----------------------------------------------------------
     def create(self, job_id, units: str, n_index: float, n_modes: int,
                min_feature_m: float | None = None, scale: float = 1.0,
-               materials: dict | None = None) -> str:
+               materials: dict | None = None, kind: str | None = None) -> str:
         """Create the Job and return its name.
 
         ``materials`` is passed for the FLAG only -- it decides whether the
         solver is told to look for the table. The table itself was written to
         object storage by the upload, before this is called, so a Job can never
         be launched pointing at a table that has not been stored yet.
+
+        ``kind`` is a REFUSAL, not a dispatch: this launcher builds exactly one
+        Job shape, the cavity solver, and a ``kind='pc'`` row must never be
+        turned into one. ``next_queued`` already skips pc rows, so reaching here
+        with one means that filter was bypassed -- a second caller, a direct
+        call, a row whose kind changed after it was queued. Failing loudly names
+        the kind, because the alternative is a band diagram that quietly comes
+        back as a cavity solve of nothing. When ``kind`` is None the caller did
+        not say, which is every existing cavity caller; the guard is explicit
+        only about the kinds it can recognise as not-its-own.
         """
+        if kind is not None and kind != "cavity":
+            raise JobLaunchError(
+                f"the cluster launcher runs cavity jobs only; it was handed "
+                f"kind={kind!r}. A pc job is solved on the Jetson worker "
+                f"(target=jetson), not here."
+            )
         manifest = self.manifest(job_id, units, n_index, n_modes,
                                  min_feature_m=min_feature_m, scale=scale,
                                  materials=materials)

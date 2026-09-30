@@ -1188,3 +1188,86 @@ def test_the_reader_agrees_with_the_key_scheme_the_writer_uses(tmp_path):
     for name in got:
         assert store._path(W._key("j1", name)).is_file(), name
     assert got == ["mode_01.bin", "mode_01.vtu", "modes.json", "surface.glb"]
+
+
+# ---------------------------------------------------------------------------
+# real_solve dispatches on the KIND, and refuses the ones it cannot run
+# ---------------------------------------------------------------------------
+def _install_fake_pc_solve(monkeypatch, calls):
+    """Put a fake ``pc_solve`` module in front of the lazy import.
+
+    ``real_solve`` does ``from pc_solve import solve_pc`` inside the pc branch,
+    so the module is looked up in ``sys.modules`` at call time. Injecting a fake
+    there intercepts the dispatch without importing the real solver, which needs
+    numpy and would put a tier-2 dependency in a tier-1 test.
+    """
+    import types
+
+    fake = types.ModuleType("pc_solve")
+
+    def solve_pc(job):
+        calls.append(job)
+        return {"lattice": "triangular", "bands": [[0.1, 0.2]],
+                "labels": ["G", "X"], "k_points": [[0.0, 0.0], [0.5, 0.0]]}
+
+    fake.solve_pc = solve_pc
+    monkeypatch.setitem(sys.modules, "pc_solve", fake)
+
+
+def test_real_solve_sends_a_pc_job_to_the_pc_solver(monkeypatch, tmp_path):
+    """A claim with kind='pc' runs ``solve_pc`` and returns a pc summary.
+
+    This is the dispatch the worker makes from the claim's kind. Without it --
+    or with the branch keyed on anything else -- a pc job would be handed to the
+    cavity solver, which is the same defect as the cluster launching one, on the
+    other machine.
+    """
+    calls = []
+    _install_fake_pc_solve(monkeypatch, calls)
+
+    class _Stage:
+        stage = None
+
+    out = W.real_solve({"job_id": "pc-1", "kind": "pc"}, None, None, _Stage())
+    assert len(calls) == 1, "solve_pc must be called exactly once"
+    assert out["kind"] == "pc"
+    assert out["modes"] == [], "a pc job produces no modes"
+    assert "bands" in out and out["bands"] is not None
+
+
+def test_real_solve_refuses_an_unknown_kind_by_name(monkeypatch, tmp_path):
+    """A kind the worker does not implement is a NAMED failure, not a cavity solve.
+
+    This used to be a silent else: anything that was not 'pc' fell through to
+    the cavity path. A row carrying a kind the worker has never heard of would
+    then be solved as a cavity and report a result for a job it did not
+    understand. The refusal must name the kind.
+    """
+    calls = []
+    _install_fake_pc_solve(monkeypatch, calls)
+
+    with pytest.raises(W.WorkerError) as excinfo:
+        W.real_solve({"job_id": "x-1", "kind": "hologram"}, None, None, None)
+    assert "hologram" in str(excinfo.value), (
+        "the refusal must name the kind it could not run, or the owner cannot "
+        "tell what was refused")
+    assert calls == [], "an unknown kind must never reach the pc solver either"
+
+
+def test_real_solve_treats_a_missing_kind_as_cavity(monkeypatch, tmp_path):
+    """``kind is None`` means the claim did not say, which is a cavity row.
+
+    A row created before ``kind`` existed arrives with no kind. The refusal
+    above must not fire for it, or every pre-existing job would start failing.
+    The cavity path is reached (and fails on its own missing max_tets), which is
+    how this test knows the refusal did not intercept it.
+    """
+    calls = []
+    _install_fake_pc_solve(monkeypatch, calls)
+    with pytest.raises(W.WorkerError) as excinfo:
+        W.real_solve({"job_id": "c-1"}, None, None, None)
+    # Reached the cavity path, which refuses the absent element cap -- NOT the
+    # kind guard, which would have named the kind.
+    assert "max_tets" in str(excinfo.value)
+    assert calls == []
+

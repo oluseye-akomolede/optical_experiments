@@ -642,3 +642,42 @@ def test_build_app_can_be_told_not_to_start_the_ticker(monkeypatch):
     monkeypatch.setenv("MSE_NO_TICK", "1")
     assert module.build_app() == "the-app"
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# The cluster launcher refuses a pc row rather than cavity-solving it
+# ---------------------------------------------------------------------------
+# ``next_queued`` skips kind='pc', so in the healthy path the launcher never
+# sees one. This guard exists for the paths that bypass the filter -- a second
+# caller, a direct call, a row whose kind changed after it was queued -- and it
+# is asserted because a guard nobody feeds is a guard that quietly rots.
+def test_the_launcher_refuses_a_pc_job_by_name():
+    """A pc row handed to the cluster launcher is a NAMED refusal.
+
+    The cluster builds exactly one Job shape, the cavity solver. Turning a
+    kind='pc' row into one would produce a cavity solve of a band diagram, so
+    the launcher fails loudly and names the kind instead.
+    """
+    launcher = JOBS.K8sJobLauncher("ns", "img", "secret", dry_run=True)
+    with pytest.raises(JOBS.JobLaunchError) as excinfo:
+        launcher.create(JOB_ID, "mm", 1.0, 6, kind=DB.PC)
+    assert DB.PC in str(excinfo.value), (
+        "the refusal must name the kind it will not run")
+    assert "jetson" in str(excinfo.value).lower(), (
+        "the refusal must say where a pc job DOES run, or the reader is told "
+        "no without being told where")
+
+
+def test_the_launcher_still_accepts_a_cavity_job_and_a_nameless_one():
+    """Cavity rows launch, and so does a row that did not carry a kind.
+
+    The guard fires only for a kind the launcher recognises as not-its-own. A
+    cavity row, and a row from before ``kind`` existed (``kind=None``), must go
+    through -- otherwise the refusal would stop every existing job.
+    """
+    launcher = JOBS.K8sJobLauncher("ns", "img", "secret", dry_run=True)
+    assert launcher.create(JOB_ID, "mm", 1.0, 6, kind=DB.CAVITY)
+    assert launcher.create(JOB_ID, "mm", 1.0, 6, kind=None)
+    # No kind at all is the same as kind=None: the existing callers do not pass
+    # it, and a signature that broke them would be a change nobody asked for.
+    assert launcher.create(JOB_ID, "mm", 1.0, 6)

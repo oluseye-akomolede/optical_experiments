@@ -214,6 +214,43 @@ be refused, not solved, and the refusal SHALL distinguish "the wrong kind" from
 - **THEN** every request field the row carries is used
 - **AND** the k-path comes from the lattice, not from a value on the row
 
+### Requirement: A pc job SHALL be routed to the Jetson worker, and the cluster SHALL refuse it
+
+The pc solver SHALL run on the Jetson worker only. A pc job SHALL therefore be
+created with `target = jetson`, so the worker that can solve it is the worker
+that claims it. The cluster queue SHALL NOT hand a pc row to the launcher: the
+launcher builds exactly one Job shape, the cavity solver, so a pc row reaching
+it would be cavity-solved and the row's `kind` would be lost. The cluster side
+SHALL refuse a pc row by NAMING its kind, at both the queue and the launcher, so
+a routing mistake is a loud failure rather than a band diagram that never
+appears.
+
+#### Scenario: the pc upload creates the row for the Jetson, not the cluster
+- **WHEN** a valid pc form is uploaded
+- **THEN** the created row's `target` is `jetson`
+- **AND** its `kind` is `pc`
+- **AND** the cluster worker never sees it
+
+#### Scenario: the cluster queue skips a pc row
+- **WHEN** a pc row with `target = cluster` is queued (a row that should not
+  exist, but which the queue must not solve if it does)
+- **THEN** `next_queued(cluster)` does not return it
+- **AND** a cavity row for the cluster is still returned, so the filter removes
+  only pc rows
+
+#### Scenario: the cluster launcher refuses a pc row by name
+- **WHEN** the cluster launcher is handed a job whose `kind` is `pc`
+- **THEN** it raises, and the refusal names the kind and the Jetson
+- **AND** it does not create a cavity Job for it
+
+#### Scenario: the crossing is proven on the real store, not a double
+- **WHEN** a pc row is created through the real upload route's store call on
+  real Postgres
+- **THEN** `claim_jetson` returns it
+- **AND** `next_queued(cluster)` does not
+- **AND** the check is red against the unfixed branch, failing as
+  `claim_jetson -> None` because the row was created `target = cluster`
+
 ### Requirement: The validation controls SHALL be analytic or published, stated with their tolerances before running
 
 Control A, the empty lattice (`n_rod = n_bg = 1`), SHALL reproduce the folded

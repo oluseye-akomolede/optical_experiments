@@ -527,7 +527,8 @@ def run_tick(store, jobs_db, launcher, log=print) -> dict:
         name = launcher.create(job["job_id"], job["units"], job["n_index"],
                                job["n_modes"],
                                min_feature_m=job.get("min_feature_m"),
-                               scale=job.get("scale", 1.0) or 1.0)
+                               scale=job.get("scale", 1.0) or 1.0,
+                               kind=job.get("kind"))
     except JOBS.QuotaExceeded:
         # The quota counts finished Jobs, so a 403 here is "wait", not "fail".
         result["waited"] = True
@@ -1023,9 +1024,17 @@ def _handle_pc_upload(app, store, jobs_db):
     Everything numeric is validated by :mod:`pc_form`, which refuses by name and
     counts the cell through the solver's own mesher. This function's job is the
     part that needs the database: write the row and start it. It is a job like
-    any other -- `kind='pc'`, no target beyond the cluster (a pc solve is small
-    and CPU-bound; it has no GPU path), and the same claim/solve/store journey
-    the cavity jobs take.
+    any other -- `kind='pc'` and the same claim/solve/store journey the cavity
+    jobs take -- with ONE difference that is a routing fact, not a preference:
+    it is created ``target=JETSON``.
+
+    The pc solver exists nowhere but the Jetson worker. There is no cluster pc
+    path in this change, so a pc row created ``target=cluster`` would be handed
+    by ``run_tick`` to ``launcher.create``, which builds a CAVITY Job, and the
+    band diagram would come back as a cavity solve of nothing. The route, the
+    queue and the launcher all agree on this: the row is created for the Jetson,
+    ``next_queued`` skips ``kind='pc'``, and ``launcher.create`` refuses one
+    outright rather than trusting the filter upstream.
     """
     uploaded = request.files.get("meshfile")
     if uploaded is not None and uploaded.filename:
@@ -1053,7 +1062,7 @@ def _handle_pc_upload(app, store, jobs_db):
              f"{planned['n_bands']} bands, {planned['polarisation']}")
 
     jobs_db.create_job(job_id, label, CFG.DEFAULT_UNITS, 1.0,
-                       planned["divisions"], target=DB.CLUSTER,
+                       planned["divisions"], target=DB.JETSON,
                        est_tets=planned["nodes"], kind=DB.PC,
                        pcs=request_json)
 

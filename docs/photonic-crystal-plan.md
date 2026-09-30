@@ -219,9 +219,14 @@ measurement, not by preference. (This claim is only strengthened by the larger
 mesh: it is a lower bound on a dense solve, and the sparse route is what the
 measured consequence for a dense one was derived to rule out.)
 
-**Where it runs: a job kind through the existing queue.** `kind = 'pc'`, claimed
-by the Jetson worker on CPU, with the **cluster Job as the same fallback the 3-D
-jobs use**. It is **not** inline in the web pod, and the reason is worth stating
+**Where it runs: a job kind through the existing queue.** `kind = 'pc'`, created
+`target = 'jetson'` and claimed by the Jetson worker on CPU. There is **no
+cluster fallback for a pc job yet**: the cluster `launcher` builds cavity Jobs
+only, so the cluster queue skips pc rows (`next_queued`) and the launcher refuses
+one if it is handed it anyway. A pc row routed to the cluster would be
+cavity-solved and its band diagram never produced, so the route does not take
+that path and neither queue offers it. It *is* **not** inline in the web pod, and
+the reason is worth stating
 precisely because the *clean* median (0.2 s/k, ≈ 12 s a path) looks affordable:
 
 - the web pod is `cpu: 500m` (`manifests/mse/deployment.yaml:114`) — **half a
