@@ -95,6 +95,43 @@ function makeDocument(withJob) {
   };
 }
 
+/**
+ * Remove one anchor from the source, and FAIL if it did not match exactly once.
+ *
+ * A bare `.replace(re, '')` that matches zero times is silent, and the harness
+ * then tests a file it only *thinks* it edited: the guard is armed against text
+ * that is not there. Reformatting viewer.js (quote style, spacing) must not be
+ * able to disarm the harness with no signal. Use this for single-line,
+ * once-only anchors; a multi-occurrence strip (the imports) asserts its own
+ * postcondition instead.
+ */
+function stripOnce(src, re, what) {
+  const count = (src.match(new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g')) || []).length;
+  if (count !== 1) {
+    throw new Error(
+      `viewer.js strip "${what}" matched ${count} times, expected exactly 1: ` +
+      `the harness would test text it did not edit`);
+  }
+  return src.replace(re, '');
+}
+
+/**
+ * Remove every import statement, and FAIL if any survived.
+ *
+ * The imports span several lines, so a single-line pattern would leave `export`
+ * behind and the module would fail to parse -- a harness error that proves
+ * nothing about the page. There are several, so this is not a "matched once"
+ * strip: assert the postcondition instead.
+ */
+function stripImports(src) {
+  const out = src.replace(/^\s*import\b[\s\S]*?;\s*$/gm, '');
+  if (/^\s*import\b/m.test(out)) {
+    throw new Error('viewer.js strip "imports" left an import behind: the ' +
+      'harness would test text it did not edit');
+  }
+  return out;
+}
+
 /** Load viewer.js with no #job, so nothing auto-runs, and return its globals. */
 function loadViewer() {
   const document = makeDocument(true);
@@ -116,28 +153,39 @@ function loadViewer() {
   };
   ctx.globalThis = ctx;
   vm.createContext(ctx);
-  const stripped = viewerSrc
-    // Multi-line imports: the components.js import spans several lines, so a
-    // single-line pattern would leave `export` behind and the whole module
-    // would fail to parse -- a harness error that proves nothing about the
-    // page. Match from `import` to the closing `;` across newlines.
-    .replace(/^\s*import\b[\s\S]*?;\s*$/gm, '')
-    // The module also exports formatFrequency/formatWavelength (they are
-    // tested elsewhere). A vm script has no module record, so the `export`
-    // keyword must go -- but the functions stay, because buildModeTable calls
-    // them and that call is what the test exercises.
-    .replace(/^export function /gm, 'function ')
-    .replace(/^const root = document\.getElementById\('job'\);$/m, '')
-    .replace(/^if \(root\) init\(root\);$/m, '')
-    // The WebGL boundary. loadFieldData builds a THREE.WebGLRenderer on a real
-    // canvas; a vm stub has no GL, and on the FIXED code the finished-job path
-    // now REACHES it (on the broken code it threw first), so leaving it live
-    // hangs rather than failing. Record that it was reached and return -- the
-    // claims here are about the table and the failure path, not about three.js.
-    .replace(/^function loadFieldData\(jobId, statusData\) \{$/m,
-             'function loadFieldData(jobId, statusData) {\n' +
-             '  (globalThis.__loadFieldCalls ||= []).push(jobId);\n' +
-             '  return;');
+  let stripped = stripImports(viewerSrc);
+  // The module also exports formatFrequency/formatWavelength (they are tested
+  // elsewhere). A vm script has no module record, so the `export` keyword must
+  // go -- but the functions stay, because buildModeTable calls them and that
+  // call is what the test exercises. Two occurrences, so assert the
+  // postcondition rather than a single match.
+  stripped = stripped.replace(/^export function /gm, 'function ');
+  if (/^export\b/m.test(stripped)) {
+    throw new Error('viewer.js strip "export keyword" left an export behind: ' +
+      'the harness would test text it did not edit');
+  }
+  // The auto-init guard. Removed so nothing runs at load. NOTE: the tests call
+  // init() themselves, so these two lines are not what is under test -- a
+  // mutation to them cannot redden anything, which is why what matters is that
+  // the ANCHORS still match (stripOnce throws otherwise), not the lines.
+  stripped = stripOnce(stripped, /^const root = document\.getElementById\('job'\);$/m,
+                       'root binding');
+  stripped = stripOnce(stripped, /^if \(root\) init\(root\);$/m, 'init call');
+  // The WebGL boundary. loadFieldData builds a THREE.WebGLRenderer on a real
+  // canvas; a vm stub has no GL, and on the FIXED code the finished-job path
+  // now REACHES it (on the broken code it threw first), so leaving it live
+  // hangs rather than failing. Replace the body's first step with a recording
+  // stub -- the claims here are about the table and the failure path, not
+  // about three.js.
+  const loadFieldCall = /^function loadFieldData\(jobId, statusData\) \{$/m;
+  if ((stripped.match(new RegExp(loadFieldCall.source, 'gm')) || []).length !== 1) {
+    throw new Error('viewer.js strip "loadFieldData body" did not match exactly once');
+  }
+  stripped = stripped.replace(
+    loadFieldCall,
+    'function loadFieldData(jobId, statusData) {\n' +
+    '  (globalThis.__loadFieldCalls ||= []).push(jobId);\n' +
+    '  return;');
   vm.runInContext(stripped, ctx, { filename: 'viewer.js' });
   return ctx;
 }
@@ -246,4 +294,43 @@ test('a status fetch failure retries rather than reporting a render bug', async 
     'a transport failure is transient and must NOT be reported as a bug');
   assert.equal(doc._byId.failure.hidden, true,
     'a transient fetch failure must not put the page into a failed state');
+});
+
+test('a running-status payload schedules a re-poll and leaves the viewer hidden', async () => {
+  const ctx = loadViewer();
+  const doc = ctx.document;
+  const root = new El('div', 'job');
+  root.dataset.jobId = 'JOB-4';
+  doc._byId.job = root;
+
+  // A payload that is NOT done: the job is still computing, so the page must
+  // poll again rather than draw or fail. Deleting render()'s
+  // `setTimeout(tick, 3000)` would stop the page ever noticing the job
+  // finished -- the viewer would stay blank forever -- and no other test
+  // drives a non-done payload, so nothing else can catch it.
+  const data = { status: 'running', progress: 0.4 };
+  let calls = 0;
+  ctx.fetch = async () => { calls += 1; return { ok: true, status: 200, json: async () => data }; };
+
+  const errors = [];
+  const realError = ctx.console.error;
+  ctx.console.error = (...a) => errors.push(a.join(' '));
+
+  vm.runInContext('init(document.getElementById("job"))', ctx);
+  await new Promise((r) => setTimeout(r, 30));
+
+  ctx.console.error = realError;
+
+  assert.equal(calls, 1, 'the first tick fires once');
+  const scheduled = ctx.__timeouts || [];
+  assert.ok(scheduled.length >= 1,
+    'a running job must schedule a re-poll; without it the page never sees the ' +
+    'job finish and the viewer stays blank forever');
+  assert.equal(doc._byId.viewer.hidden, true,
+    'the viewer must stay hidden while the job is still running');
+  assert.equal(doc._byId['modes-card'].hidden, true,
+    'the modes card must stay hidden while the job is still running');
+  assert.equal(doc._byId.failure.hidden, true,
+    'a running job is not a failure and must not show the failure text');
+  assert.equal(errors.length, 0, 'a running job must not report an error');
 });
