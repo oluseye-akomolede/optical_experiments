@@ -196,14 +196,18 @@ void main() {
 // `cameraPosition` is three.js's world-space camera, but everything else in the
 // fragment shader is in the box's own 0..1 space. Translating the camera by the
 // box's centre and dividing by its size is the inverse of the mesh's own
-// transform, so the ray is marched in the same frame as `vLocal`. Skipping this
-// works only for a box at the origin with unit scale -- with a real grid the
-// camera sits offset and the ray misses or grazes the volume.
+// transform; the final + 0.5 then moves -0.5..0.5 to 0..1, exactly as the
+// vertex shader does, so the ray is marched in the same frame as `vLocal`.
+// Without the + 0.5 the eye sits half a box off on every axis and the plot
+// smears into a box-shaped haze outside the object (2026-09-29). Every step
+// is needed for every box, even one at the origin with unit scale. This
+// assumes the mesh has no rotation and no parent transform (fitVolume sets
+// only scale and position); adding either means inverting it here too.
 const CAMERA_LOCAL = `
 uniform vec3 uBoxCentre;
 uniform vec3 uBoxSize;
 vec3 cameraLocal() {
-  return (cameraPosition - uBoxCentre) / max(uBoxSize, vec3(1e-12));
+  return (cameraPosition - uBoxCentre) / max(uBoxSize, vec3(1e-12)) + 0.5;
 }
 `;
 
@@ -555,6 +559,21 @@ function loadFieldData(jobId, statusData) {
   const volume = new THREE.Mesh(boxGeometry, volumeMaterial);
   volume.visible = false;
   scene.add(volume);
+
+  // `?field=off` keeps the field hidden so only the object's outline draws.
+  //
+  // Two uses. It is how the render check captures its outline-only CONTROL
+  // frame: the field-versus-outline predicate needs a frame containing the
+  // outline and nothing else, taken from the same page, and a control frame
+  // captured this way cannot be guessed at the way a colour threshold would be
+  // (see outlineOnlyProblem in dockerfiles/rendercheck/pixels.mjs). It is also
+  // the answer to "is my outline right?" when the field is obscuring it.
+  //
+  // Read once, here, from the page URL. It is a display switch only: it
+  // changes nothing about what is fetched or computed, so a job page with it
+  // set is the same job with the field layer turned off.
+  const FIELD_OFF = new URLSearchParams(window.location.search).get('field')
+    === 'off';
 
   let manifest = null;
   let modes = [];
@@ -1021,6 +1040,13 @@ function loadFieldData(jobId, statusData) {
     const centre = boxCentre(grid);
     const scalar = componentVolume(vec, positions, centre, system, name);
     volumeShare = componentShare(vec, positions, centre, system, name);
+    // Debug hook: the caption's own number, readable from the page's DevTools
+    // console. One line, read-only, no behaviour -- added so a question about
+    // the caption ("is this component really under the floor in this mode?")
+    // can be answered by measuring the number the caption is built from
+    // instead of inferring it from the text. Used by
+    // scratch/probe_share.mjs; harmless in production.
+    window.__mseShare = volumeShare;
 
     // Normalise the chosen component by its own peak, so the shader's "1.0 is
     // the strongest sample in this picture" is true.
@@ -1102,7 +1128,10 @@ function loadFieldData(jobId, statusData) {
     // picture it is drawing, because the negative half of a signed component
     // gets the cool end of the ramp rather than being folded onto the warm end.
     volumeMaterial.uniforms.uSigned.value = (name !== 'E');
-    volume.visible = true;
+    // `?field=off` holds the field hidden here even though the texture is
+    // built and bound: the texture work still happens, so this is a display
+    // switch and not a second code path that could drift from the real one.
+    volume.visible = !FIELD_OFF;
     paintLegend();
   }
 

@@ -453,3 +453,39 @@ test('a share below the drawing floor gets the below-floor caption', () => {
     }
   }
 });
+
+test('the camera and the ray start are in the same 0..1 box frame', () => {
+  // The owner's "is this mode shape correct?" defect (2026-09-29). The vertex
+  // shader maps the unit cube's -0.5..0.5 to 0..1 (vLocal = position + 0.5),
+  // but cameraLocal() only undid the mesh transform and stopped at -0.5..0.5.
+  // Every ray was therefore aimed from an eye shifted by half a box on all
+  // three axes: the plot smeared into a box-shaped haze reaching outside the
+  // object, and the mode's shape read wrong although the field data was clean.
+  //
+  // Both mappings are read out of the shader source and evaluated, not
+  // restated here, so a wrong offset in either one fails this test. GLSL's
+  // vec3 arithmetic below is componentwise, so evaluating each expression on
+  // one scalar component at a time is exact.
+  const vert = /vLocal = ([^;]*);/.exec(source);
+  const cam = /vec3 cameraLocal\(\) \{\s*return ([^;]*);/.exec(source);
+  assert.ok(vert, 'the vertex shader no longer sets vLocal in one expression');
+  assert.ok(cam, 'cameraLocal() no longer returns one expression');
+  const vLocalOf = new Function('position', `return ${vert[1]};`);
+  const cameraLocalOf = new Function(
+    'cameraPosition', 'uBoxCentre', 'uBoxSize', 'vec3', 'max',
+    `return ${cam[1]};`);
+  const id = (x) => x;
+  // A box that is neither at the origin nor unit sized, and points inside,
+  // on, and well outside it -- where the camera actually sits.
+  const centre = 3.25, size = 0.02;
+  for (const world of [centre, centre - size / 2, centre + size / 2,
+                       centre + 7 * size, centre - 40 * size]) {
+    const position = (world - centre) / size;   // the mesh's inverse transform
+    const expected = vLocalOf(position);
+    const got = cameraLocalOf(world, centre, size, id, Math.max);
+    assert.ok(Math.abs(got - expected) < 1e-9,
+      `a camera at world ${world} maps to ${got} in the ray-march frame, but ` +
+      `the box surface at that point is at vLocal ${expected}: the eye and ` +
+      'the ray start are in different frames, so every ray is mis-aimed');
+  }
+});
