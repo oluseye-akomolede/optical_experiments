@@ -51,8 +51,10 @@
   keyed on the check's own frame label, with the acceptance date and the
   mechanism in the reason line.
 - [x] 6.2 Route every lobe verdict through one `judgeFrame(what, problemsOf)`
-  in `check.mjs`; a waived frame prints `KNOWN` (never `ok`), is recorded in
-  `knowns`, and does not set the exit code.
+  in `check.mjs`, delegating its decision to `judgeFrameDecision` in
+  `pixels.mjs`; a waived frame prints `KNOWN` (never `ok`), is recorded in
+  `knowns`, and does not set the exit code. (See 8.1: the rule moved so it is
+  testable off-browser.)
 - [x] 6.3 Tests: the waived frame is still judged by the unrelaxed predicate;
   the waiver covers only the named frame (a second empty frame still fails);
   the callsite is unconditional, so a caption-gated form cannot creep back.
@@ -67,3 +69,17 @@
 - [ ] 7.2 Run the render check against a page with the fixed viewer and confirm
   the `Erho` mode-1 frame now differs from the outline control.
 - [x] 7.3 `openspec validate fix-component-render-truth --strict`.
+
+## 8. Reviewer follow-up (34cba6e review)
+
+- [x] 8.1 Pin the decision, not just the table: move `judgeFrame`'s rule into
+  `pixels.mjs` as `judgeFrameDecision(what, problems)` and test all three
+  branches. `check.mjs` cannot be imported (it is a top-level script that
+  launches Chromium), so the rule has to live where it is testable.
+- [x] 8.2 Revert-check the decision: M2 (waiver always applies) reddens the
+  other-label test; M3 (waiver never applies) reddens the waived-label test.
+  Both restored clean, 25/25.
+- [x] 8.3 Delete the fossil test "a below-floor frame is forgiven only when the
+  caption accounts for it" -- it asserted the removed caption gate over literal
+  strings and called none of the code.
+- [x] 8.4 `manifests/mse/rendercheck-job.yaml`: tag `4846b0b` -> `34cba6e`.
