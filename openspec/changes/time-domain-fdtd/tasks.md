@@ -35,8 +35,11 @@
   the lead's. The pulse-band refusal is `fdtd.check_metal_band`; the job form
   must call it at queue time.]
 - [ ] 2.4 Benchmark V4 (gold slab against analytic Fresnel, same model).
-- [ ] 2.5 `drawn` profile: ≤ 10 000 samples plus a duration, resampled to dt,
+- [x] 2.5 `drawn` profile: ≤ 10 000 samples plus a duration, resampled to dt,
   then mean removed; refused when > 1% of its spectral energy is above f_res.
+  [Solver side: `Source(profile="drawn")`, `fdtd.resolvable_frequency`,
+  `fdtd.drawn_energy_above`; `simulate` refuses on the dielectric index as a
+  backstop. The queue-time refusal (with the metals' |n|) is the form's, 5.1.]
 
 ## 3. Geometry, estimate and caps (phase 3)
 

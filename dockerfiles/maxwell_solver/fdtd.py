@@ -75,12 +75,15 @@ MU0 = 1.0 / (EPS0 * C0 * C0)         # H/m
 ETA0 = math.sqrt(MU0 / EPS0)         # ohm
 
 BOUNDARIES = ("metal", "open")
-PROFILES = ("cw", "pulse")
+PROFILES = ("cw", "pulse", "drawn")
 KINDS = ("point", "plane")
 DIRECTIONS = ("+x", "-x", "+y", "-y", "+z", "-z")
 COMPONENTS = ("x", "y", "z")
 
 SAFETY = 0.99                        # fraction of the Courant limit
+MAX_DRAWN_SAMPLES = 10_000           # the spec's cap on a drawn waveform
+CELLS_PER_WAVELENGTH = 10            # sets the resolvable frequency f_res
+DRAWN_ENERGY_LIMIT = 0.01            # spectral energy allowed above f_res
 # CPML grading, chosen by measuring the 10-cell layer's reflection on the
 # 1-D reduction of this update (scripts/fdtd_cpml_reflection.py), over 0-75
 # degrees and 10-40 cells per wavelength. Worst reflected amplitude: order 2 at
@@ -181,6 +184,49 @@ def pulse_profile(t: float, frequency: float, bandwidth: float,
             * math.sin(2.0 * math.pi * frequency * offset))
 
 
+def _drawn_waveform(samples, duration: float, step: float) -> np.ndarray:
+    """The drawing at times ``0, step, 2 step, ...`` before ``duration``, mean
+    removed. The samples span ``[0, duration]`` evenly, both ends included,
+    joined by straight lines; after ``duration`` the waveform is zero."""
+    times = np.arange(int(math.ceil(duration / step))) * step
+    times = times[times < duration]
+    grid = np.linspace(0.0, duration, len(samples))
+    values = np.interp(times, grid, samples)
+    return values - values.mean()
+
+
+def resolvable_frequency(spacings, n_max: float = 1.0) -> float:
+    """f_res = c / (10 |n|_max Delta_max): the highest frequency the grid
+    carries at ten cells per wavelength in its densest material, with
+    Delta_max its largest cell spacing (per axis a scalar or primal lengths)."""
+    largest = max(float(np.max(np.asarray(h, dtype=float))) for h in spacings)
+    return C0 / (CELLS_PER_WAVELENGTH * float(n_max) * largest)
+
+
+def drawn_energy_above(samples, duration: float, dt: float,
+                       f_res: float) -> float:
+    """The fraction of a drawn waveform's spectral energy above ``f_res``.
+
+    Measured on the drawing as the grid would get it (mean removed, zero
+    outside ``duration``, so its end steps count), sampled at the finer of dt
+    and the drawing's own spacing: a drawing finer than dt is not decimated
+    before it is judged, so detail dt would alias cannot hide.
+    """
+    samples = np.asarray(samples, dtype=float)
+    step = min(float(dt), float(duration) / (len(samples) - 1))
+    values = _drawn_waveform(samples, duration, step)
+    padded = np.zeros(4 * len(values) + 2)
+    padded[1:1 + len(values)] = values     # the zero before t = 0 is real too
+    power = np.abs(np.fft.rfft(padded)) ** 2
+    freqs = np.fft.rfftfreq(len(padded), step)
+    total = float(power.sum())
+    if not total > 0.0:
+        raise FDTDError(
+            "the drawn waveform is flat: with its mean removed nothing is left "
+            "to drive the grid")
+    return float(power[freqs > f_res].sum()) / total
+
+
 class Source:
     """A soft current on one E component at one cell, or a plane wave.
 
@@ -194,12 +240,19 @@ class Source:
     inside the box the grid carries the incident wave plus whatever the
     geometry scatters, outside it only the scattered part. ``amplitude`` is the
     incident E amplitude in V/m. A plane source has no cell.
+
+    ``profile="drawn"``: ``samples`` (at most 10 000 dimensionless amplitudes,
+    spanning ``[0, duration]`` evenly) times ``amplitude``. ``simulate`` binds
+    it to its dt (``bind``): resampled to dt, mean removed, zero after
+    ``duration``; between steps the value is read off straight lines.
+    ``frequency`` is still the run's reference frequency.
     """
 
     def __init__(self, cell=None, *, frequency: float, profile: str = "pulse",
                  bandwidth: float | None = None, amplitude: float = 1.0,
                  component: str = "z", kind: str = "point",
-                 direction: str | None = None, box=None):
+                 direction: str | None = None, box=None,
+                 samples=None, duration: float | None = None):
         if kind not in KINDS:
             raise FDTDError(f"source kind must be one of {KINDS}, got {kind!r}")
         if profile not in PROFILES:
@@ -217,8 +270,32 @@ class Source:
                     f"bandwidth must be positive, got {bandwidth!r}")
         elif bandwidth is not None:
             raise FDTDError(
-                f"a cw source has no bandwidth, got {bandwidth!r}; the tone is "
-                f"at the frequency alone")
+                f"a {profile} source has no bandwidth, got {bandwidth!r}; only "
+                f"a pulse has one")
+        self.samples = None
+        self.duration = None
+        self._table = None
+        self._table_dt = None
+        if profile == "drawn":
+            if samples is None or duration is None:
+                raise FDTDError("a drawn source needs samples and a duration")
+            values = np.asarray(samples, dtype=float)
+            if values.ndim != 1 or not 2 <= len(values) <= MAX_DRAWN_SAMPLES:
+                raise FDTDError(
+                    f"a drawn waveform is a list of 2 to {MAX_DRAWN_SAMPLES} "
+                    f"samples, got shape {values.shape}")
+            if not np.all(np.isfinite(values)):
+                raise FDTDError("a drawn waveform's samples must be finite")
+            if not (math.isfinite(duration) and duration > 0):
+                raise FDTDError(
+                    f"a drawn waveform's duration must be positive seconds, "
+                    f"got {duration!r}")
+            self.samples = values
+            self.duration = float(duration)
+        elif samples is not None or duration is not None:
+            raise FDTDError(
+                f"samples and a duration belong to profile='drawn', not "
+                f"{profile!r}")
         self.direction = None
         self.axis = None
         self.box = None
@@ -265,7 +342,32 @@ class Source:
         self.component = component
         self.kind = kind
 
+    def bind(self, dt: float):
+        """Resample a drawn waveform to ``dt`` (see the class); a no-op for
+        the other profiles, which are formulas in t."""
+        if self.profile != "drawn" or self._table_dt == dt:
+            return
+        if self.duration < 2.0 * dt:
+            raise FDTDError(
+                f"the drawn waveform lasts {self.duration:.4g} s, under two "
+                f"time steps ({dt:.4g} s each): nothing of it would be left "
+                f"once its mean is removed")
+        self._table = _drawn_waveform(self.samples, self.duration, dt)
+        self._table_dt = dt
+
     def value(self, t: float) -> float:
+        if self.profile == "drawn":
+            if self._table is None:
+                raise FDTDError(
+                    "a drawn source is resampled to the run's dt; bind(dt) it "
+                    "first (simulate does)")
+            position = t / self._table_dt
+            if position < 0.0 or position >= len(self._table):
+                return 0.0          # after its last step it ramps to zero
+            k = int(position)
+            after = self._table[k + 1] if k + 1 < len(self._table) else 0.0
+            return self.amplitude * float(
+                self._table[k] + (position - k) * (after - self._table[k]))
         if self.profile == "cw":
             return self.amplitude * cw_profile(t, self.frequency)
         return self.amplitude * pulse_profile(t, self.frequency, self.bandwidth)
@@ -274,6 +376,8 @@ class Source:
         """When a pulse is done, or ``inf`` for a source that never stops."""
         if self.profile == "cw":
             return math.inf
+        if self.profile == "drawn":
+            return self.duration
         sigma = 1.0 / (math.pi * self.bandwidth)
         return 10.0 * sigma          # the envelope's centre plus 5 sigma
 
@@ -1092,6 +1196,22 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
         stable_dt = getattr(term, "stable_dt", None)
         if stable_dt is not None:
             dt = min(dt, stable_dt(dt, finest))
+
+    # A drawn waveform is judged and resampled at the dt the run really uses.
+    # The guard here sees only the dielectric index; the queue-time check,
+    # which knows the metals' |n| at the run's frequencies, is the one that
+    # stops a job before it is queued.
+    if source.profile == "drawn":
+        f_res = resolvable_frequency(primal, math.sqrt(float(eps.max())))
+        above = drawn_energy_above(source.samples, source.duration, dt, f_res)
+        if above > DRAWN_ENERGY_LIMIT:
+            raise FDTDError(
+                f"{above:.1%} of the drawn waveform's spectral energy is above "
+                f"{f_res:.4g} Hz, the highest frequency this grid resolves at "
+                f"{CELLS_PER_WAVELENGTH} cells per wavelength (the limit is "
+                f"{DRAWN_ENERGY_LIMIT:.0%}); smooth its edges, lengthen it, "
+                f"or refine the grid")
+        source.bind(dt)
 
     # A cell the update never touches is not a place you can drive: the curl for
     # it is never evaluated, so a source there would be silently ignored and

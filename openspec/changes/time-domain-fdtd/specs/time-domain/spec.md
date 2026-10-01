@@ -282,6 +282,29 @@ refused before it is queued, naming f_res.
   spectral energy above f_res
 - **THEN** the form shows the refusal, naming f_res, and no job is queued
 
+#### Scenario: the drawing is read the way it was drawn
+- **WHEN** a drawn waveform of N samples and duration T is resampled
+- **THEN** the samples span [0, T] evenly, both ends included, joined by
+  straight lines; the grid reads them at the run's own steps (after any
+  dispersive dt reduction), and the waveform's sum over those steps is zero
+
+#### Scenario: detail finer than dt is judged, not decimated away
+- **WHEN** a drawing's sample spacing is finer than dt
+- **THEN** its spectral energy above f_res is measured at the drawing's own
+  spacing, so detail that reading at dt would alias cannot pass the check
+
+#### Scenario: a drawing with nothing left is refused
+- **WHEN** a drawing is constant (nothing remains once its mean is removed) or
+  lasts under two time steps
+- **THEN** it is refused with a message saying so, not run as a silent source
+
+#### Scenario: the solver repeats the check as a backstop
+- **WHEN** a drawn source reaches the solver
+- **THEN** the solver refuses it, naming f_res, if more than 1% of its energy
+  is above f_res computed from the dielectric index alone; the queue-time
+  check, which knows the metals' |n|, is the one that keeps the job out of the
+  queue
+
 ### Requirement: The scene's physical size SHALL come from the owner's units and scale
 
 A `td` request SHALL take its physical size from the same `units` and `scale`

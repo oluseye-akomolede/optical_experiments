@@ -11,6 +11,7 @@ mode spectrum.
 from __future__ import annotations
 
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -821,3 +822,124 @@ def test_a_cpml_that_does_not_fit_the_grid_is_refused():
     with pytest.raises(fdtd.FDTDError, match="CPML"):
         fdtd.simulate(np.ones((12, 12, 12), dtype=np.float32), pulse(),
                       n_steps=10, dx=DX, boundary="open", pml_cells=6)
+
+
+# ------------------------------------------------------------------- drawn
+
+#: A slow carrier, so a smooth drawing of it sits far below the 1 m grid's
+#: resolvable frequency c / 10 m (30 MHz, against 8 MHz here).
+SLOW = F0 / 3.0
+
+
+def drawn(samples, duration, **kwargs):
+    options = dict(cell=(6, 6, 6), frequency=SLOW, profile="drawn",
+                   samples=samples, duration=duration)
+    options.update(kwargs)
+    return fdtd.Source(**options)
+
+
+def test_a_drawn_waveform_is_resampled_to_dt_with_its_mean_removed():
+    """Samples span [0, duration] evenly; the grid reads them at whole steps,
+    mean removed, and zero after the duration. A duration that is not a whole
+    number of steps and a lopsided drawing, so an off-by-one step count or a
+    mean taken before resampling shows."""
+    samples = np.array([0.0, 3.0, 1.0, 2.0, 0.5])
+    duration = 37.3 * DT
+    source = drawn(samples, duration, amplitude=2.0)
+    source.bind(DT)
+    steps = np.arange(38) * DT                    # 0 .. 37 DT, all < duration
+    expected = np.interp(steps, np.linspace(0.0, duration, 5), samples)
+    expected -= expected.mean()
+    got = np.array([source.value(t) for t in steps])
+    np.testing.assert_allclose(got, 2.0 * expected, rtol=1e-12, atol=1e-12)
+    assert abs(got.sum()) < 1e-9 * np.abs(got).sum()
+    # the plane-wave feed reads between steps: straight lines, to zero at the end
+    assert source.value(10.5 * DT) == pytest.approx(0.5 * (got[10] + got[11]))
+    assert source.value(37.5 * DT) == pytest.approx(0.5 * got[37])
+    assert source.value(38 * DT) == 0.0 and source.value(-DT) == 0.0
+    assert source.end_time() == duration
+
+
+def test_a_drawn_pulse_drives_the_grid_like_the_pulse_itself():
+    """Drawing the pulse profile at 10 000 points must give the pulse's own run:
+    simulate binds the drawing to the dt it uses, on the same time axis."""
+    bandwidth = SLOW / 2.0
+    reference = fdtd.Source((6, 6, 6), frequency=SLOW, profile="pulse",
+                            bandwidth=bandwidth)
+    duration = reference.end_time()
+    times = np.linspace(0.0, duration, fdtd.MAX_DRAWN_SAMPLES)
+    samples = [fdtd.pulse_profile(t, SLOW, bandwidth) for t in times]
+    grid = np.ones((12, 12, 12), dtype=np.float32)
+    n_steps = steps_for(1.3 * duration)
+    want = fdtd.simulate(grid, reference, n_steps, probes=[(4, 7, 8, "z")],
+                         dx=DX)["traces"][0]
+    got = fdtd.simulate(grid, drawn(samples, duration), n_steps,
+                        probes=[(4, 7, 8, "z")], dx=DX)["traces"][0]
+    assert np.abs(want).max() > 0
+    assert np.abs(got - want).max() < 1e-3 * np.abs(want).max()
+
+
+def test_an_under_resolved_drawing_is_refused_naming_f_res():
+    """f_res = c / (10 |n|_max Delta_max). The grid is graded to 1.1 m and has
+    one eps = 4 node, so a check that used the finest spacing, or vacuum's
+    index, names a different frequency. A half-on, half-off drawing three
+    resolvable periods long puts well over 1% of its energy above f_res."""
+    spacings = (np.linspace(0.9, 1.1, 11), 1.0, 1.0)
+    grid = np.ones((12, 12, 12), dtype=np.float32)
+    grid[3, 3, 3] = 4.0
+    f_res = C / (10 * 2.0 * 1.1)
+    square = [1.0] * 50 + [0.0] * 50
+    with pytest.raises(fdtd.FDTDError, match=re.escape(f"{f_res:.4g} Hz")):
+        fdtd.simulate(grid, drawn(square, 3.0 / f_res), 10,
+                      spacings=spacings)
+    # the control: a smooth drawing on the same grid runs
+    duration = 6.0 / SLOW
+    t = np.linspace(0.0, duration, 400)
+    smooth = np.sin(2 * np.pi * SLOW * t) * np.sin(np.pi * t / duration) ** 2
+    run = fdtd.simulate(grid, drawn(smooth, duration), 200,
+                        probes=[(4, 7, 8, "z")], spacings=spacings)
+    assert np.abs(run["traces"]).max() > 0
+
+
+def test_a_drawing_finer_than_dt_is_judged_before_it_is_decimated():
+    """+1/-1 every quarter step: read at whole steps it is constant, so judging
+    the dt-resampled drawing would see nothing above f_res."""
+    samples = np.tile([1.0, -1.0], 200)
+    duration = (len(samples) - 1) * DT / 4.0
+    f_res = fdtd.resolvable_frequency((DX, DX, DX))
+    assert fdtd.drawn_energy_above(samples, duration, DT, f_res) > 0.5
+
+
+def test_a_drawing_with_nothing_left_after_its_mean_is_refused():
+    with pytest.raises(fdtd.FDTDError, match="flat"):
+        fdtd.drawn_energy_above([2.0, 2.0, 2.0], 50 * DT, DT, F0)
+    source = drawn([0.0, 1.0, 0.0], 1.5 * DT)
+    with pytest.raises(fdtd.FDTDError, match="two time steps"):
+        source.bind(DT)
+
+
+def test_a_drawn_waveform_is_at_most_ten_thousand_samples():
+    drawn(np.zeros(fdtd.MAX_DRAWN_SAMPLES), 1e-6)
+    with pytest.raises(fdtd.FDTDError, match="10000"):
+        drawn(np.zeros(fdtd.MAX_DRAWN_SAMPLES + 1), 1e-6)
+    with pytest.raises(fdtd.FDTDError, match="duration"):
+        drawn([0.0, 1.0], 0.0)
+    with pytest.raises(fdtd.FDTDError, match="drawn"):
+        fdtd.Source((6, 6, 6), frequency=F0, profile="cw", samples=[0, 1],
+                    duration=1e-6)
+
+
+def test_a_drawn_waveform_is_zero_mean_on_the_steps_the_run_takes():
+    """What binding to the run's own dt buys: the soft current's sum over the
+    steps the grid really takes is zero, so no static field is left. A
+    lopsided (all-positive) drawing on a graded grid, whose dt is not the
+    uniform-grid one."""
+    duration = 60.0 / SLOW
+    t = np.linspace(0.0, duration, 3000)
+    bump = np.sin(np.pi * t / duration) ** 2 * (1.5 + np.sin(2 * np.pi * SLOW * t))
+    source = drawn(bump, duration)
+    run = fdtd.simulate(np.ones((10, 10, 10), dtype=np.float32), source, 5,
+                        spacings=(np.linspace(0.8, 1.0, 9), 1.0, 1.0))
+    values = np.array([source.value(k * run["dt"])
+                       for k in range(int(duration / run["dt"]) + 2)])
+    assert abs(values.sum()) < 1e-9 * np.abs(values).sum()
