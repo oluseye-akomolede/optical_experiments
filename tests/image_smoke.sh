@@ -58,7 +58,8 @@ build_and_import() {
     # (the baked .pyc's top level is `if __name__ == "__main__": sys.exit(main())`,
     # identical to the source). The web image has no ENTRYPOINT, so the same
     # form works there -- which is why only the solver leg ever failed.
-    docker run --rm --network none --entrypoint python "$tag" -c "$import_expr"
+    docker run --rm --cpus=2 --memory=2g --network none \
+        --entrypoint python "$tag" -c "$import_expr"
     log "$name: import OK"
 }
 
@@ -91,7 +92,8 @@ web_multipart() {
     log "multi-part refusals inside web"
 
     set +e
-    docker run --rm -i --network none --entrypoint python "$tag" - \
+    docker run --rm -i --cpus=2 --memory=2g --network none \
+        --entrypoint python "$tag" - \
         > /tmp/web_multipart_leg.txt 2>&1 <<'PROBE'
 import sys
 
@@ -375,7 +377,8 @@ solver_geometry() {
     # measured, the whole probe ran as a no-op and the leg then failed on its
     # missing first line, which reads exactly like a broken probe and was not.
     set +e
-    docker run --rm -i --network none --entrypoint python "$tag" - \
+    docker run --rm -i --cpus=2 --memory=2g --network none \
+        --entrypoint python "$tag" - \
         > /tmp/geometry_leg.txt 2>&1 <<'PROBE'
 import sys
 

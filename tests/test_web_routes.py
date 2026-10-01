@@ -2452,6 +2452,47 @@ def test_an_unknown_lattice_is_refused_by_name(tmp_path, monkeypatch):
         flashes
 
 
+def test_a_pc_radius_too_big_for_its_cell_is_refused_not_a_500(
+        tmp_path, monkeypatch):
+    """A refusal raised by the GEOMETRY still reaches the owner as a refusal.
+
+    The rod has to fit inside the cell, and that bound is lattice-dependent:
+    r/a = 0.45 is ordinary for the square cell and impossible for the triangular
+    one, whose inradius is sin(60)/2 = 0.4330. The form does not restate the
+    bound -- it would be a second copy to drift from the geometry's -- so the
+    geometry raises its own ``PCError``, and ``_handle_pc_upload`` catches only
+    ``PCRequestError``. Without the translation in ``plan_request`` this POST
+    never reached the owner as a refusal: it was an unhandled exception, HTTP
+    500 on the deployed app.
+
+    Red surfaces here as the ``PCError`` escaping the test client rather than as
+    a 500 status, because this app is built with ``TESTING`` on and Flask
+    re-raises instead of rendering under that flag. Same defect, one flag apart;
+    the deployed app is where it is a 500.
+
+    Both halves are asserted, since either alone is a different bug: the status
+    (a 500 says the refusal never reached the owner) and the words (a refusal
+    naming the wrong box sends them to the wrong field). ``db.jobs == {}`` is the
+    third -- a refusal that still wrote the row would cost a worker a claim.
+    """
+    monkeypatch.setenv("MSE_GPU_MIN_TETS", str(10 ** 9))
+    app, _store, db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+    resp = client.post("/",
+                       data=pc_form(lattice="triangular", r_over_a="0.45"),
+                       content_type="multipart/form-data")
+    assert resp.status_code == 302, resp.data
+    assert db.jobs == {}, "an impossible request was queued anyway"
+    with client.session_transaction() as session:
+        flashes = [str(m) for m in session.get("_flashes", [])]
+    assert any("triangular cell" in m for m in flashes), flashes
+    # ...and it is ON THE PAGE, not only in the session: base.html renders the
+    # flashes, so this GET is what the owner actually reads. Reading _flashes
+    # above does not consume them, so the same client still has them here.
+    page = client.get("/").get_data(as_text=True)
+    assert "triangular cell" in page
+
+
 def test_the_cavity_form_still_uploads_with_no_mode_field(tmp_path,
                                                           monkeypatch):
     """A form from before the selector existed still takes the cavity path.

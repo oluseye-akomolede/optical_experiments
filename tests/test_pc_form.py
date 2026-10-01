@@ -196,25 +196,34 @@ def test_one_step_under_the_node_cap_through_the_form_is_accepted():
 # The field refusals: each names the box the owner has to fix
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("field, value, needle", [
-    ("lattice", "hexagonal", "hexagonal"),
-    ("polarisation", "TMz", "TMZ"),
+@pytest.mark.parametrize("field, value, needle, extra", [
+    ("lattice", "hexagonal", "hexagonal", {}),
+    ("polarisation", "TMz", "TMZ", {}),
     # "less than 0.5" and "more than 0" are BOTH substrings of the radius
     # refusal's one sentence, so asserting on either would pass if the message
     # had the bounds backwards or swapped -- the needle has to be the fact that
     # distinguishes them. An earlier draft used "0.5" alone, and a mutation that
     # replaced "rod radius" with "background index" stayed GREEN: the assertion
     # was never checking which field the sentence was about.
-    ("r_over_a", "0.7", "rod radius must be more than 0 and less than 0.5"),
-    ("r_over_a", "0", "got 0.0"),
-    ("n_rod", "-1", "rod refractive index must be positive, got -1.0"),
-    ("n_bg", "0", "background refractive index must be positive, got 0.0"),
-    ("divisions", "3", "at least 4 parts per edge, got 3"),
-    ("divisions", "999", str(pc_form.MAX_DIVISIONS)),
-    ("n_bands", "0", "at least 1, got 0"),
-    ("n_bands", "999", str(pc_form.MAX_BANDS)),
+    ("r_over_a", "0.7", "rod radius must be more than 0 and less than 0.5", {}),
+    ("r_over_a", "0", "got 0.0", {}),
+    # A radius that is ordinary for one lattice and impossible for the other.
+    # The rod must fit inside the cell, and the triangular cell's inradius is
+    # sin(60)/2 = 0.4330 -- so the form's own flat ``0 < r < 0.5`` check passes
+    # 0.45 and the GEOMETRY is what refuses. Its refusal is a ``PCError``, which
+    # the route does not catch, so before the translation in ``plan_request``
+    # this request was a 500 rather than a refusal. The needle is the phrase
+    # naming WHICH cell was too small; ``extra`` carries the lattice, which is
+    # the only row here whose refusal depends on a second field.
+    ("r_over_a", "0.45", "triangular cell", {"lattice": "triangular"}),
+    ("n_rod", "-1", "rod refractive index must be positive, got -1.0", {}),
+    ("n_bg", "0", "background refractive index must be positive, got 0.0", {}),
+    ("divisions", "3", "at least 4 parts per edge, got 3", {}),
+    ("divisions", "999", str(pc_form.MAX_DIVISIONS), {}),
+    ("n_bands", "0", "at least 1, got 0", {}),
+    ("n_bands", "999", str(pc_form.MAX_BANDS), {}),
 ])
-def test_a_bad_field_is_refused_naming_that_field(field, value, needle):
+def test_a_bad_field_is_refused_naming_that_field(field, value, needle, extra):
     """Every refusal quotes the offending value AND the field it belongs to.
 
     Parametrised because the failure mode being prevented is a refusal that
@@ -234,7 +243,7 @@ def test_a_bad_field_is_refused_naming_that_field(field, value, needle):
     all, and the normalisation is the interesting part.
     """
     with pytest.raises(pc_form.PCRequestError) as excinfo:
-        pc_form.plan_request(_with(**{field: value}))
+        pc_form.plan_request(_with(**{**extra, field: value}))
     assert needle in str(excinfo.value), (
         f"refusing {field}={value!r} must mention {needle!r}")
 

@@ -76,10 +76,17 @@ MAX_BANDS = 20
 #: before the cap is consulted.
 MAX_DIVISIONS = 70
 
-#: lattice names the solver accepts. Read from the solver's own table at import
-#: time (see :func:`_geometry_module`) rather than retyped, so a third lattice added
-#: there is accepted here without an edit -- and, more to the point, a lattice
-#: REMOVED there cannot linger as a name this module still offers.
+#: lattice names the solver accepts. RETYPED here rather than read from the
+#: solver's own table (``pc_geometry.LATTICES``), and the cost is drift: a
+#: lattice added or removed there is not reflected here. The comment on this
+#: constant used to claim the opposite -- "read from the solver's own table at
+#: import time ... so a lattice REMOVED there cannot linger" -- which was never
+#: true of this line. It is retyped because :func:`_geometry_module` is
+#: deliberately a LATE import (tier-1 tests stay cheap) and this constant is read
+#: at parse time by the form; making it derived would import the geometry at
+#: module import. Drift is survivable rather than silent: a name offered here but
+#: absent there reaches the geometry and comes back as its own refusal, which
+#: :func:`plan_request` translates to a :class:`PCRequestError`.
 LATTICE_CHOICES = ("square", "triangular")
 
 #: polarisations, in the PhC's own naming (the out-of-plane field). ``TM`` is
@@ -270,7 +277,7 @@ def k_point_count(lattice: str, points_per_segment: int = 10) -> int:
 
 
 def cell_size(request: dict) -> int:
-    """``(nodes, triangles)`` for this request's unit cell, WITHOUT solving.
+    """The node count for this request's unit cell, WITHOUT solving.
 
     Builds the cell through the solver's own ``unit_cell_mesh`` and counts what
     it returns. The count is the cap's operand, so it must be the mesh the worker
@@ -332,11 +339,24 @@ def plan_request(form) -> dict:
     Raises :class:`PCRequestError` with the limit or the field named. It does NOT
     enqueue; the caller writes the row, so this function stays testable without a
     database.
+
+    A refusal raised by the GEOMETRY (``pc_geometry.PCError``) is translated to
+    :class:`PCRequestError`, message unchanged. The geometry owns the
+    lattice-dependent bounds -- the rod must fit inside the cell, so r/a < 0.5
+    for the square but < sin(60)/2 = 0.4330 for the triangular rhombus -- and
+    that is exactly why the form does not restate them: a second copy would
+    drift. But the route catches only :class:`PCRequestError`, so an
+    untranslated geometry refusal escapes the view as a 500, which is what a
+    triangular form with r/a = 0.45 did before this.
     """
     request = parse_request(form)
-    nodes = cell_size(request)
-    k_points = k_point_count(request["lattice"], points_per_segment=10)
-    check_caps(request, nodes, k_points)
+    geometry = _geometry_module()
+    try:
+        nodes = cell_size(request)
+        k_points = k_point_count(request["lattice"], points_per_segment=10)
+        check_caps(request, nodes, k_points)
+    except geometry.PCError as exc:
+        raise PCRequestError(str(exc)) from exc
     return {
         **request,
         "nodes": nodes,
