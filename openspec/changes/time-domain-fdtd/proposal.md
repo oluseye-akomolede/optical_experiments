@@ -69,6 +69,16 @@ spectra.
   - The estimate (cells, steps, memory, run time) is shown before submit, as the
     cavity tool already does.
 
+- **Scene scale and target range (owner, 15:58Z):** the owner sets the scene's
+  physical size with the same `units` + `scale` controls the cavity tool already
+  has; the physical size is size × scale × unit. The design range is features of
+  10 nm inside objects up to 1 µm, for plasmonic devices and photonic crystals.
+  A graded tensor-product grid keeps an axis-aligned film of that ratio (100:1) under the 8 M-cell cap. A curved
+  10 nm shell refines nearly every plane (~400 cells per axis, ~64 M cells), so
+  the cap is set in phase 1 from the measured Jetson cost per cell-step, not
+  guessed; until then the estimate refuses such a run by its count. All solver arithmetic is SI, and tests include a nanometre-scale
+  grid so float32 coefficients are checked at the scale actually used.
+
 ## Validation (each phase ships with its benchmark)
 
 - **V1, metal box with a pulse:** the spectrum peaks are within 1% of the analytic
@@ -99,6 +109,12 @@ spectra.
    must be listed, so that a missing file cannot 404 a page that does not need it.
 5. Web form, field-movie playback, trace and spectrum plots, and the in-browser
    check against a real finished `td` job.
+
+6. Periodic boundaries (owner, 16:00Z: "1"): one repeating cell with
+   wrap-around faces, including a Bloch phase for a chosen wave vector. The core
+   stays real float32, and a Bloch phase uses two real runs in quadrature, so
+   phase 1 does not change. Benchmark V6: band frequencies at chosen k-points match
+   the existing photonic-crystal solver for the same 2-D crystal, within 1%.
 
 ## Out of scope
 

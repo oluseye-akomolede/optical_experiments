@@ -91,3 +91,31 @@ before it is queued, naming that frequency.
   grid's resolvable frequency
 - **THEN** the form shows the warning, naming the frequency, before any job is
   queued
+
+### Requirement: The scene's physical size SHALL come from the owner's units and scale
+
+A `td` request SHALL take its physical size from the same `units` and `scale`
+form fields the cavity tool uses (size × scale × unit), and the estimate SHALL
+be computed from that physical size.
+
+#### Scenario: a 10 nm flat film in a 1 µm scene fits
+- **WHEN** a 1 µm scene holding an axis-aligned 10 nm gold film is requested at a
+  visible-band pulse
+- **THEN** the estimate is below 8 M cells on the graded grid, and the run is
+  accepted
+
+#### Scenario: a curved thin shell is estimated, not assumed
+- **WHEN** a curved object of 1 µm with a 10 nm coating is requested
+- **THEN** the estimate reports the cell count the graded grid actually needs, and
+  a request above the cap is refused naming that count
+
+### Requirement: A periodic cell SHALL reproduce the crystal's bands
+
+A `td` request MAY declare periodic faces with a Bloch wave vector k. The run
+SHALL then model an infinite crystal of that cell.
+
+#### Scenario: benchmark V6
+- **WHEN** a pulse is run in one cell of a 2-D crystal extruded along z, with
+  Bloch-periodic faces at a chosen k
+- **THEN** the spectrum's peaks are within 1% of the photonic-crystal band solver's
+  frequencies at that k
