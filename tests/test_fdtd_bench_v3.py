@@ -95,3 +95,33 @@ def test_the_default_pairs_are_the_twelve_transverse_ones():
     for pair in bench.ALL_PAIRS:
         direction, component = pair.split(":")
         assert component != direction[1]
+
+
+def test_periodic_axes_have_no_box_faces_and_no_cpml():
+    """On the periodic x and y axes every sample is inside the box, and the
+    physical region (what the leak search covers) is the whole axis, not
+    the axis minus a CPML that is not there."""
+    periodic = (True, True, False)
+    box = ((0, 0, 7), (SHAPE[0] - 1, SHAPE[1] - 1, 11))
+    for component in "xyz":
+        out = bench.scattered_mask(SHAPE, box, PML, component, periodic)
+        inside = bench.incident_mask(SHAPE, box, component, periodic)
+        assert not (out & inside).any()
+        physical = np.zeros(SHAPE, bool)
+        physical[:, :, PML:SHAPE[2] - PML] = True
+        assert ((out | inside) == physical).all(), component
+        assert inside[0, 0, 7] and inside[-1, -1, 7], component
+    # along z (not periodic) the half rule still holds for E_z
+    z_inside = bench.incident_mask(SHAPE, box, "z", periodic)
+    assert z_inside[3, 3, 10] and not z_inside[3, 3, 11]
+
+
+def test_a_periodic_layout_spans_the_axes_across_travel():
+    shape, box, boundary, periodic = bench.layout("-y:z", 30, 12, 6, 4)
+    assert shape == (4, 30, 4)
+    assert periodic == (True, False, True)
+    assert boundary == ("periodic", "open", "periodic")
+    assert box == ((0, 12, 0), (3, 18, 3))
+    cube = bench.layout("+x:y", 30, 12, 6, 0)
+    assert cube == ((30, 30, 30), ((12,) * 3, (18,) * 3), "open",
+                    (False, False, False))

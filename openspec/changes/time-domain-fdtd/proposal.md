@@ -109,7 +109,9 @@ spectra.
 - **V4, gold film reflectance:** at normal incidence, a gold slab's reflectance
   (≥ 10 skin depths thick) over the pulse band matches the analytic Fresnel
   result for the same Lorentz-Drude model within 0.02 absolute, and the
-  material table matches a published Rakić dataset within 2%.
+  material table matches a published Rakić dataset within 1e-3 at 12
+  wavelengths per metal. The slab runs on periodic transverse faces so it is
+  infinite, as the Fresnel result assumes.
 - **V5, thin film between plates:** the resonances of a dielectric film of index
   n filling the gap between two PEC plates match the parallel-plate lateral modes
   f = (c/2n)·√((m/a)² + (p/b)²) within 1%, on a graded grid whose film is far
@@ -121,7 +123,8 @@ spectra.
 1. Solver core: Yee update, PEC, CPML, point source with both profiles, probes.
    Benchmarks V1 and V2.
 2. Plane-wave TF/SF source (V3), dispersive metals with the material library (V4),
-   and the drawn waveform.
+   and the drawn waveform. Periodic faces at k = 0 (a boundary per axis, solver
+   API only) move here from phase 6, because V4 needs an infinite slab.
 3. Graded-grid builder, sub-cell averaging, coatings, and the voxeliser from the
    upload's regions (V5), plus the estimate and caps.
 4. Worker job kind `td`, result files, and routes. Every reader of each output
@@ -130,7 +133,9 @@ spectra.
    check against a real finished `td` job.
 
 6. Periodic boundaries (owner, 16:00Z: "1"): one repeating cell with
-   wrap-around faces, including a Bloch phase for a chosen wave vector. The core
+   wrap-around faces, including a Bloch phase for a chosen wave vector. (The
+   k = 0 wrap itself lands in phase 2; phase 6 adds the Bloch phase and the
+   form option.) The core
    stays real float32. Away from k = 0 and the zone edge the Bloch faces mix the
    real and imaginary parts every step, so the cos and sin fields are stepped
    together with cross-coupled face updates; phase 6 adds a face hook to the

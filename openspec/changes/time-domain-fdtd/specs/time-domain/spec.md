@@ -121,6 +121,49 @@ reflection from the grid edge is shown as part of the simulation.
 - **AND** a run with no incident wave in the box, or with a non-finite result,
   fails the benchmark
 
+### Requirement: Periodic faces at k = 0 SHALL repeat the cell
+
+The solver SHALL take a boundary per axis, `(bx, by, bz)`, each `metal`, `open`
+or `periodic` (a single kind still applies to all three). A `periodic` axis
+models the cell repeated forever along it with k = 0: the curl differences wrap
+from the last sample to the first. Node `n-1` of a periodic axis is the same
+point as node 0, one period on: the period is the sum of the axis's `n-1`
+spacings, the wrap's dual width is the mean of the last and first primal
+spacings, and `eps_r`, the conductor mask and every metal region SHALL hold the
+same material on those two node slabs, or the run is refused naming the axis.
+A point source on node 0 of a periodic axis is refused, naming node `n-1`. The
+slot at index `n-1` of a half-position sample along a periodic axis is a ghost:
+it is never written for E and never reported as a field value. Per-axis
+boundaries are a solver API; the form keeps `metal | open` until phase 6, and a
+Bloch phase (k ≠ 0) is phase 6.
+
+#### Scenario: the wrap is the cell repeated
+- **WHEN** a point source on uniformly spaced periodic x and y axes is moved by
+  a shift that crosses the seam on both axes
+- **THEN** every E component's peak field is the unshifted one rolled by that
+  shift, within 1e-6 of the peak, where the field varies across the period by
+  more than 1e-2 of the peak
+- **AND** an off-by-one in the wrap (the wrong source slab, the wrong copy, or
+  a periodic axis updated only over its interior) fails it
+
+#### Scenario: a closed periodic box conserves energy
+- **WHEN** a pulse runs in a box periodic on all three axes, graded on each
+- **THEN** after the source ends the conserved energy varies by less than 1e-5
+  of its mean, and a wrong wrap width fails it
+
+#### Scenario: a plane wave across periodic faces
+- **WHEN** a plane wave travels along an `open` axis with both other axes
+  `periodic` and its box spanning them (node 0 to node `n-1`)
+- **THEN** every E component's peak is uniform across the periodic axes within
+  1e-6 of the incident peak, every ghost slot reads 0, and the field outside
+  the two injecting faces stays below 1e-3 of the incident
+- **AND** benchmark V3 passes in that setup
+  (`scripts/fdtd_bench_v3.py --periodic-transverse N`)
+- **AND** a plane wave is refused with a message when its travel axis is not
+  `open`, when its two transverse axes are not both `open` or both
+  `periodic`, when any axis is `metal`, or when its box does not span a
+  periodic axis
+
 ### Requirement: The plane-wave source SHALL be a clean total-field/scattered-field box
 
 A `plane` source SHALL use a TF/SF box with a 1-D auxiliary incident grid that
@@ -133,7 +176,9 @@ face, on either side, SHALL be that medium (objects sit wholly inside the core
 or wholly outside), and a box that breaks either clearance SHALL be refused
 with a message naming the axis or the offending node. The 1-D line is padded
 beyond the 3-D grid and closed by its own CPML, so its own end reflections
-never reach the box.
+never reach the box. With both transverse axes periodic, the box spans them,
+the clearance applies along the travel axis only, and the wave enters through
+the two faces normal to its direction.
 
 #### Scenario: a plane wave leaves nothing outside its box
 - **WHEN** a plane-wave pulse in any of the six directions, with either
@@ -244,7 +289,9 @@ refused before it is queued.
 
 #### Scenario: benchmark V4
 - **WHEN** a pulse reflects at normal incidence from a gold slab at least 10
-  skin depths thick, with at least 4 cells per skin depth
+  skin depths thick, with at least 4 cells per skin depth, on an `open` travel
+  axis with periodic transverse faces (so the slab is infinite, as the Fresnel
+  result assumes)
 - **THEN** the reflectance, measured as |scattered/incident|² at a
   scattered-field probe, is within 0.02 (absolute) of the analytic Fresnel
   reflectance for the same model, over the band where the incident spectrum is

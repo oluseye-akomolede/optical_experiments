@@ -34,7 +34,9 @@
   region (lead runs it). [Code and tier-1 tests done; the Jetson re-measure is
   the lead's. The pulse-band refusal is `fdtd.check_metal_band`; the job form
   must call it at queue time.]
-- [ ] 2.4 Benchmark V4 (gold slab against analytic Fresnel, same model).
+- [ ] 2.4 Benchmark V4 (gold slab against analytic Fresnel, same model), on
+  periodic transverse faces (6.1a), since a finite plate inside the TF/SF box
+  diffracts at its edges and cannot meet the 0.02 gate.
 - [x] 2.5 `drawn` profile: ≤ 10 000 samples plus a duration, resampled to dt,
   then mean removed; refused when > 1% of its spectral energy is above f_res.
   [Solver side: `Source(profile="drawn")`, `fdtd.resolvable_frequency`,
@@ -80,8 +82,11 @@
 
 ## 6. Periodic boundaries (phase 6)
 
-- [ ] 6.1 Periodic faces (wrap the curl differences), plus a Bloch phase for a
-  given k: cos and sin fields stepped together through a core face hook.
+- [x] 6.1a Periodic faces at k = 0 (wrap the curl differences), a boundary per
+  axis in the solver API, and a plane wave across periodic transverse faces.
+  Built in phase 2 for V4 (lead, 22:15Z). The form option stays in phase 6.
+- [ ] 6.1b A Bloch phase for a given k: cos and sin fields stepped together
+  through a core face hook.
 - [ ] 6.2 Benchmark V6 against the existing pc band solver: an extruded 2-D
   crystal, TM and TE, kz = 0, frequencies at chosen k-points within 1%, every
   band present.

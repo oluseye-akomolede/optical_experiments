@@ -75,6 +75,9 @@ MU0 = 1.0 / (EPS0 * C0 * C0)         # H/m
 ETA0 = math.sqrt(MU0 / EPS0)         # ohm
 
 BOUNDARIES = ("metal", "open")
+# Per axis, the solver also takes "periodic" (k = 0 wrap-around faces). The
+# form offers only BOUNDARIES until phase 6.
+AXIS_BOUNDARIES = ("metal", "open", "periodic")
 PROFILES = ("cw", "pulse", "drawn")
 KINDS = ("point", "plane")
 DIRECTIONS = ("+x", "-x", "+y", "-y", "+z", "-z")
@@ -892,7 +895,7 @@ class _PlaneWave:
 
     def __init__(self, source: Source, shape, primal, dual, eps_host,
                  pec_host, inv_eps, dt: float, pml_cells: int, xp,
-                 metal_host=None):
+                 metal_host=None, periodic=(False, False, False)):
         self.source = source
         self.xp = xp
         f32 = xp.float32
@@ -905,8 +908,19 @@ class _PlaneWave:
         # The corrections are the plain curl update's, so the faces must sit
         # in the untouched interior, and the spec keeps them 3 cells clear of
         # the CPML: the first CPML-free E node is ``pml_cells``.
+        # A periodic axis has no faces: the box must span it, node 0 to node
+        # n-1, and the wave enters only through the two faces normal to its
+        # direction of travel.
+        for axis in range(3):
+            if periodic[axis] and (low[axis], high[axis]) != (0, shape[axis] - 1):
+                raise FDTDError(
+                    f"the plane wave's box {source.box} must span the periodic "
+                    f"axis {axis} from node 0 to node {shape[axis] - 1}: a "
+                    f"periodic axis has no faces to inject through")
         first = int(pml_cells) + BOX_CLEARANCE
         for axis in range(3):
+            if periodic[axis]:
+                continue
             last = shape[axis] - 1 - int(pml_cells) - BOX_CLEARANCE
             if not (first <= low[axis] and high[axis] <= last):
                 raise FDTDError(
@@ -921,13 +935,16 @@ class _PlaneWave:
         # that medium: an object there would sit across the injection layer
         # (and the spec keeps objects 3 cells clear). Objects wholly inside
         # the inner region, or wholly outside, are what the box is for.
-        outer = tuple(slice(low[a] - BOX_CLEARANCE, high[a] + BOX_CLEARANCE + 1)
+        outer = tuple(slice(None) if periodic[a] else
+                      slice(low[a] - BOX_CLEARANCE, high[a] + BOX_CLEARANCE + 1)
                       for a in range(3))
         shell = np.ones(shape, dtype=bool)
         near = np.zeros(shape, dtype=bool)
         near[outer] = True
-        if all(high[a] - low[a] > 2 * BOX_CLEARANCE for a in range(3)):
-            inner = tuple(slice(low[a] + BOX_CLEARANCE, high[a] - BOX_CLEARANCE + 1)
+        if all(periodic[a] or high[a] - low[a] > 2 * BOX_CLEARANCE
+               for a in range(3)):
+            inner = tuple(slice(None) if periodic[a] else
+                          slice(low[a] + BOX_CLEARANCE, high[a] - BOX_CLEARANCE + 1)
                           for a in range(3))
             shell[inner] = False
         shell &= near
@@ -1005,6 +1022,12 @@ class _PlaneWave:
             return (axis == component) == (family == "E")
 
         def inside(family, component, axis):
+            if periodic[axis]:
+                # every real sample: n-1 at half positions (slot n-1 is a
+                # ghost -- refilled for H, unused for E), n at nodes
+                if position_is_half(family, component, axis):
+                    return 0, shape[axis] - 1
+                return 0, shape[axis]
             if position_is_half(family, component, axis):
                 return low[axis], high[axis]            # half indices lo..hi-1
             return low[axis], high[axis] + 1            # whole indices lo..hi
@@ -1052,9 +1075,11 @@ class _PlaneWave:
                      xp.asarray(coefficient, dtype=f32), name, span, along))
 
         add("H", q, a)      # H_q across the faces normal to a
-        add("H", a, q)      # H_a across the faces normal to q
         add("E", p, a)      # E_p across the faces normal to a
-        add("E", a, p)      # E_a across the faces normal to p
+        if not periodic[q]:
+            add("H", a, q)  # H_a across the faces normal to q
+        if not periodic[p]:
+            add("E", a, p)  # E_a across the faces normal to p
 
     def _apply(self, family: str, fields: dict):
         for entry_family, component, region, coefficient, name, span, along \
@@ -1100,6 +1125,30 @@ class _PlaneWave:
                                / self.feed_width_e)
 
 
+def _axis_boundaries(boundary) -> tuple:
+    """``boundary`` as one kind per axis: a single kind applies to all three."""
+    sides = (boundary,) * 3 if isinstance(boundary, str) else tuple(boundary)
+    if len(sides) != 3 or any(side not in AXIS_BOUNDARIES for side in sides):
+        raise FDTDError(
+            f"boundary must be one of {BOUNDARIES}, or one kind per axis "
+            f"(x, y, z) from {AXIS_BOUNDARIES}; got {boundary!r}")
+    return sides
+
+
+def _set_slab(values, axis: int, index: int, slab) -> None:
+    """Write ``slab`` into ``values`` at ``index`` along ``axis``."""
+    where = [slice(None)] * 3
+    where[axis] = index
+    values[tuple(where)] = slab
+
+
+def _take(values, axis: int, index: int):
+    """The slab of ``values`` at ``index`` along ``axis``."""
+    where = [slice(None)] * 3
+    where[axis] = index
+    return values[tuple(where)]
+
+
 def simulate(eps_r, source: Source, n_steps: int, probes=(),
              *, spacings=None, dx: float = 1.0,
              boundary: str = "metal", pec=None, pml_cells: int = DEFAULT_PML_CELLS,
@@ -1116,7 +1165,15 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     ``boundary="metal"`` closes the outer faces with a PEC wall;
     ``boundary="open"`` puts a CPML of ``pml_cells`` on each face instead (the
     open box is still PEC-backed at the outermost layer, which is how a PML is
-    terminated in practice). ``ade_terms`` are polarisation-current terms (see
+    terminated in practice). ``boundary`` may also be one kind per axis,
+    ``(bx, by, bz)``, where an axis can additionally be ``"periodic"``: wrap-
+    around faces at k = 0, the cell repeated forever along that axis. On a
+    periodic axis node ``n-1`` IS node 0 (the period is the sum of the axis's
+    ``n-1`` spacings), so ``eps_r``, ``pec`` and every metal region must agree
+    on those two slabs; the solver updates node ``n-1`` and copies it to node
+    0. A plane wave may run with periodic transverse axes (the slab-under-a-
+    plane-wave case, e.g. V4), and then enters through the two box faces
+    normal to its direction only. ``ade_terms`` are polarisation-current terms (see
     ``PolarisationTerm``), e.g. ``LorentzDrude("Au", mask)``. A term with a
     ``stable_dt`` can shrink dt below the Courant step (a metal's explicit ADE
     needs it); ``"dt"`` in the result is the step actually used.
@@ -1151,8 +1208,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     shape = tuple(int(s) for s in eps.shape)
     nx, ny, nz = shape
 
-    if boundary not in BOUNDARIES:
-        raise FDTDError(f"boundary must be one of {BOUNDARIES}, got {boundary!r}")
+    sides = _axis_boundaries(boundary)
+    periodic = tuple(side == "periodic" for side in sides)
     if int(n_steps) < 1:
         raise FDTDError(f"n_steps must be at least 1, got {n_steps!r}")
     n_steps = int(n_steps)
@@ -1230,6 +1287,13 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                         f"the cell {cell} is on the last {component}-node of "
                         f"axis {axis}, where the update never touches it; the "
                         f"live range on its own axis is 0..{shape[axis] - 2}")
+            elif periodic[axis]:
+                if index == 0:
+                    raise FDTDError(
+                        f"the cell {cell} is on node 0 of the periodic axis "
+                        f"{axis}, which is a copy of node {shape[axis] - 1} "
+                        f"(the same point, one period on); put the source on "
+                        f"node {shape[axis] - 1}")
             elif index in (0, shape[axis] - 1):
                 raise FDTDError(
                     f"the cell {cell} is in the outer layer of axis {axis}, "
@@ -1237,12 +1301,26 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                     f"the update never touches it; move it inward")
 
     if source.kind == "plane":
-        if boundary == "metal":
+        travel = source.axis
+        transverse = [sides[axis] for axis in range(3) if axis != travel]
+        if "metal" in sides:
             raise FDTDError(
                 "a plane wave cannot run with boundary 'metal': a plane wave "
                 "is an infinite wave arriving from outside, and a closed metal "
                 "box has no outside -- the walls would reflect it back into "
-                "the box for the whole run. Use boundary 'open'")
+                "the box for the whole run. Use boundary 'open' (or periodic "
+                "faces across the direction of travel)")
+        if sides[travel] != "open":
+            raise FDTDError(
+                f"a plane wave travelling {source.direction} needs an open "
+                f"boundary along {COMPONENTS[travel]}, got "
+                f"{sides[travel]!r}: on a periodic axis the wave would leave "
+                f"through one face and come back in through the other forever")
+        if len(set(transverse)) != 1:
+            raise FDTDError(
+                f"a plane wave needs both axes across its direction of travel "
+                f"open or both periodic, got {tuple(sides)}; mixing them is "
+                f"not supported")
     else:
         live(source.component, source.cell)
     if source.kind == "point" and mask is not None and bool(mask[source.cell]):
@@ -1281,33 +1359,74 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             metal_host = (np.asarray(region, dtype=bool) if metal_host is None
                           else metal_host | np.asarray(region, dtype=bool))
 
+    # On a periodic axis the first and last node slabs are one point; a
+    # material that differs there would be two different answers for it.
+    if any(periodic):
+        eps_host = np.asarray(_host_result(eps, xp))
+        mask_host = (None if mask is None
+                     else np.asarray(_host_result(mask, xp)))
+        for axis in range(3):
+            if not periodic[axis]:
+                continue
+            for what, values in (("eps_r", eps_host), ("the conductor mask",
+                                 mask_host), ("a metal region", metal_host)):
+                if values is None:
+                    continue
+                if not np.array_equal(_take(values, axis, 0),
+                                      _take(values, axis, shape[axis] - 1)):
+                    raise FDTDError(
+                        f"{what} differs between node 0 and node "
+                        f"{shape[axis] - 1} on the periodic axis {axis}; on a "
+                        f"periodic axis those two nodes are the same point, "
+                        f"so they must hold the same material")
+
     plane = None
     if source.kind == "plane":
         plane = _PlaneWave(
             source, shape, primal, dual, np.asarray(_host_result(eps, xp)),
             None if mask is None else np.asarray(_host_result(mask, xp)),
-            inv_eps, dt, pml_cells, xp, metal_host=metal_host)
+            inv_eps, dt, pml_cells, xp, metal_host=metal_host,
+            periodic=periodic)
 
     P = [xp.asarray(p, dtype=f32) for p in primal]      # n-1 primal lengths
-    D = [xp.asarray(d, dtype=f32) for d in dual]        # n-1 dual lengths
 
     # CPML: one sigma(x) per axis, sampled per family. The E update's derivative
     # along an axis sits at the primal nodes, the H update's at the cell
     # centres; both read the SAME profile at their own positions.
     bc: dict = {}
-    if boundary == "open":
-        for axis in range(3):
+    for axis in range(3):
+        if sides[axis] == "open":
             bc[(axis, "primal")] = _pml_profiles(
                 primal[axis], int(pml_cells), dt, xp, "node")
             bc[(axis, "dual")] = _pml_profiles(
                 primal[axis], int(pml_cells), dt, xp, "cell")
 
+    # The E update's range per axis at the INTEGER positions: 1..n-2 between
+    # two walls, 1..n-1 on a periodic axis (node n-1 is node 0, whose lower
+    # neighbour is the half sample n-2 and whose upper one is the ghost half
+    # sample n-1, refilled from half sample 0 before every E update). ``lower``
+    # is the same range shifted down one, ``span`` the dual widths there.
+    nodes, lower, span = [], [], []
+    for axis in range(3):
+        n = shape[axis]
+        if periodic[axis]:
+            nodes.append(slice(1, n))
+            lower.append(slice(0, n - 1))
+            wrap = 0.5 * (primal[axis][-1] + primal[axis][0])
+            span.append(xp.asarray(np.append(dual[axis][1:], wrap), dtype=f32))
+        else:
+            nodes.append(slice(1, n - 1))
+            lower.append(slice(0, n - 2))
+            span.append(xp.asarray(dual[axis][1:], dtype=f32))
+    sx, sy, sz = nodes
+    lx, ly, lz = lower
+
     psi: dict = {}
     coef: dict = {}
 
     def corrected(raw, key: tuple, axis: int, family: str):
-        """The CPML-corrected derivative, or ``raw`` on a metal boundary."""
-        if boundary != "open":
+        """The CPML-corrected derivative, or ``raw`` off an open axis."""
+        if sides[axis] != "open":
             return raw
         b1d, c1d = bc[(axis, family)]
         if family == "primal":
@@ -1349,6 +1468,14 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
         # the sum reduces to the usual one.
         node = [_node_thickness(p) for p in primal]
         wide = [_dual_thickness(p) for p in primal]
+        for axis in range(3):
+            if periodic[axis]:
+                # Node 0 is a copy of node n-1, counted once with the full
+                # width around it; the ghost half sample n-1 is a copy of
+                # half sample 0 and not counted at all.
+                node[axis][-1] = 0.5 * (primal[axis][-1] + primal[axis][0])
+                node[axis][0] = 0.0
+                wide[axis][-1] = 0.0
 
         def volumes(dual_axes):
             axes = [wide[a] if a in dual_axes else node[a] for a in range(3)]
@@ -1392,6 +1519,16 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             plane.correct_h(h_field)          # uses the incident E at n
             plane.advance_h(step)             # incident H to n+1/2
 
+        # Periodic axes: the H samples at HALF positions along the axis have
+        # one more beyond the last, the ghost slot n-1, which is half sample 0
+        # one period on. The E update at node n-1 reads it.
+        for axis in range(3):
+            if periodic[axis]:
+                for component, values in h_field.items():
+                    if COMPONENTS.index(component) != axis:
+                        _set_slab(values, axis, shape[axis] - 1,
+                                  _take(values, axis, 0))
+
         if energy is not None:
             # The quadratic the scheme conserves exactly pairs E and H ACROSS
             # the half step they are staggered by:
@@ -1432,26 +1569,28 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                 prepare(field, dt, step)
 
         # ---- E from the curl of H (H at n+1/2, E advances to n+1) --------
-        # Ex at (i+1/2, j, k): live for j in [1, ny-2], k in [1, nz-2]
-        term_y = (Hz[:-1, 1:-1, 1:-1] - Hz[:-1, :-2, 1:-1]) / _along(D[1][1:], 1)
-        term_z = (Hy[:-1, 1:-1, 1:-1] - Hy[:-1, 1:-1, :-2]) / _along(D[2][1:], 2)
+        # Each integer-position axis runs over ``nodes`` (1..n-2, or 1..n-1
+        # when periodic); see where they are built.
+        # Ex at (i+1/2, j, k)
+        term_y = (Hz[:-1, sy, sz] - Hz[:-1, ly, sz]) / _along(span[1], 1)
+        term_z = (Hy[:-1, sy, sz] - Hy[:-1, sy, lz]) / _along(span[2], 2)
         term_y = corrected(term_y, ("Ex", "y"), 1, "primal")
         term_z = corrected(term_z, ("Ex", "z"), 2, "primal")
-        Ex[:-1, 1:-1, 1:-1] += dt * inv_eps[:-1, 1:-1, 1:-1] * (term_y - term_z)
+        Ex[:-1, sy, sz] += dt * inv_eps[:-1, sy, sz] * (term_y - term_z)
 
-        # Ey at (i, j+1/2, k): live for i in [1, nx-2], k in [1, nz-2]
-        term_z = (Hx[1:-1, :-1, 1:-1] - Hx[1:-1, :-1, :-2]) / _along(D[2][1:], 2)
-        term_x = (Hz[1:-1, :-1, 1:-1] - Hz[:-2, :-1, 1:-1]) / _along(D[0][1:], 0)
+        # Ey at (i, j+1/2, k)
+        term_z = (Hx[sx, :-1, sz] - Hx[sx, :-1, lz]) / _along(span[2], 2)
+        term_x = (Hz[sx, :-1, sz] - Hz[lx, :-1, sz]) / _along(span[0], 0)
         term_z = corrected(term_z, ("Ey", "z"), 2, "primal")
         term_x = corrected(term_x, ("Ey", "x"), 0, "primal")
-        Ey[1:-1, :-1, 1:-1] += dt * inv_eps[1:-1, :-1, 1:-1] * (term_z - term_x)
+        Ey[sx, :-1, sz] += dt * inv_eps[sx, :-1, sz] * (term_z - term_x)
 
-        # Ez at (i, j, k+1/2): live for i in [1, nx-2], j in [1, ny-2]
-        term_x = (Hy[1:-1, 1:-1, :-1] - Hy[:-2, 1:-1, :-1]) / _along(D[0][1:], 0)
-        term_y = (Hx[1:-1, 1:-1, :-1] - Hx[1:-1, :-2, :-1]) / _along(D[1][1:], 1)
+        # Ez at (i, j, k+1/2)
+        term_x = (Hy[sx, sy, :-1] - Hy[lx, sy, :-1]) / _along(span[0], 0)
+        term_y = (Hx[sx, sy, :-1] - Hx[sx, ly, :-1]) / _along(span[1], 1)
         term_x = corrected(term_x, ("Ez", "x"), 0, "primal")
         term_y = corrected(term_y, ("Ez", "y"), 1, "primal")
-        Ez[1:-1, 1:-1, :-1] += dt * inv_eps[1:-1, 1:-1, :-1] * (term_x - term_y)
+        Ez[sx, sy, :-1] += dt * inv_eps[sx, sy, :-1] * (term_x - term_y)
 
         if plane is not None:
             plane.correct_e(field)            # uses the incident H at n+1/2
@@ -1480,23 +1619,34 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             Ex *= keep
             Ey *= keep
             Ez *= keep
-        if boundary == "metal":
-            # The six faces, TANGENTIAL E only: two components per face, and in
-            # this layout those are exactly the layers the update above never
-            # touches. The normal component of E is not constrained by a PEC
-            # wall, and pinning it would be a different boundary condition.
+        # The metal faces, TANGENTIAL E only: two components per face, and in
+        # this layout those are exactly the layers the update above never
+        # touches. The normal component of E is not constrained by a PEC
+        # wall, and pinning it would be a different boundary condition.
+        if sides[0] == "metal":
             Ey[0, :, :] = 0.0       # x faces: Ey, Ez
             Ez[0, :, :] = 0.0
             Ey[-1, :, :] = 0.0
             Ez[-1, :, :] = 0.0
+        if sides[1] == "metal":
             Ex[:, 0, :] = 0.0       # y faces: Ex, Ez
             Ez[:, 0, :] = 0.0
             Ex[:, -1, :] = 0.0
             Ez[:, -1, :] = 0.0
+        if sides[2] == "metal":
             Ex[:, :, 0] = 0.0       # z faces: Ex, Ey
             Ey[:, :, 0] = 0.0
             Ex[:, :, -1] = 0.0
             Ey[:, :, -1] = 0.0
+
+        # Periodic axes: node 0 is node n-1, which the update just advanced
+        # (with every correction, term, source and conductor applied to it).
+        for axis in range(3):
+            if periodic[axis]:
+                for component, values in field.items():
+                    if COMPONENTS.index(component) != axis:
+                        _set_slab(values, axis, 0,
+                                  _take(values, axis, shape[axis] - 1))
 
         # ---- probes and energy -------------------------------------------
         for index, (cell, component) in enumerate(probe_list):
