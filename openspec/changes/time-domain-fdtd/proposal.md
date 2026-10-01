@@ -76,7 +76,10 @@ spectra.
   A graded tensor-product grid keeps an axis-aligned film of that ratio (100:1) under the 8 M-cell cap. A curved
   10 nm shell refines nearly every plane (~400 cells per axis, ~64 M cells), so
   the cap is set in phase 1 from the measured Jetson cost per cell-step, not
-  guessed; until then the estimate refuses such a run by its count. All solver arithmetic is SI, and tests include a nanometre-scale
+  guessed. Measured 2026-10-01 (cupy, 1.73 M cells × 7 088 steps × 3 runs):
+  1.21e8 cell-steps/s. At the caps, 8 M × 20 000 = 1.6e11 cell-steps ≈ 22 min,
+  inside the 30-minute bench timeout, so the 8 M-cell cap stands; a 64 M-cell
+  shell would take about 3 hours at 20 000 steps and stays refused by its count. All solver arithmetic is SI, and tests include a nanometre-scale
   grid so float32 coefficients are checked at the scale actually used.
 
 ## Validation (each phase ships with its benchmark)
