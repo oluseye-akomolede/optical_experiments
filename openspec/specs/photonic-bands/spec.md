@@ -1,7 +1,7 @@
 # photonic-bands Specification
 
 ## Purpose
-TBD - created by archiving change photonic-crystal-bands. Update Purpose after archive.
+2-D photonic-crystal band diagrams: the web form plans a square or triangular lattice of rods (numpy only, no solver code in the web image), the Jetson worker solves the unit cell along the high-symmetry k-path without fetching an input or uploading result files, and the job page draws the bands as `bands[k][band]` with a gap table.
 
 ## Requirements
 
