@@ -4,8 +4,9 @@
 
 ### Requirement: A time-domain run SHALL use a stable Yee time step
 
-The solver SHALL step E and H on a uniform Yee grid with
-dt = 0.99·dx/(c·√3), so it never violates the 3-D Courant limit.
+The solver SHALL step E and H on a graded tensor-product Yee grid with
+dt = 0.99/(c·√(1/dx_min²+1/dy_min²+1/dz_min²)), so it never violates the 3-D
+Courant limit of the smallest cell.
 
 #### Scenario: a closed metal box conserves energy
 - **WHEN** a pulse is launched in a lossless PEC box and the source has ended
@@ -57,3 +58,36 @@ that exceeded it.
 - **WHEN** the requested frequency and size give more than 8 M cells
 - **THEN** the page shows the refusal with the cell count, and the server
   does not respond 500
+
+### Requirement: Dispersive metals SHALL follow their published model
+
+Gold, silver, aluminium, copper and chromium SHALL be modelled by Drude-Lorentz
+fits from a cited source, and stepped with auxiliary differential equations.
+
+#### Scenario: benchmark V4
+- **WHEN** a pulse reflects at normal incidence from a gold slab
+- **THEN** the reflectance across the pulse band is within 2% of the analytic
+  Fresnel reflectance for the same Drude-Lorentz model
+
+### Requirement: Thin layers SHALL be resolved, not lost
+
+The grid SHALL place at least 4 cells across every layer thinner than the
+coarse cell, or across the metal skin depth where that is thinner, with a
+neighbour spacing ratio of at most 1.3.
+
+#### Scenario: benchmark V5
+- **WHEN** a dielectric film far thinner than the coarse cell sits between two
+  metal plates
+- **THEN** its resonances are within 1% of the analytic planar-cavity frequencies
+
+### Requirement: A drawn waveform SHALL be checked against the grid
+
+A `drawn` source SHALL be resampled to dt. A waveform with significant spectral
+energy above the grid's resolvable frequency SHALL be refused or warned about
+before it is queued, naming that frequency.
+
+#### Scenario: an under-resolved drawing is caught before queueing
+- **WHEN** a drawn waveform has a sharp edge whose spectrum extends past the
+  grid's resolvable frequency
+- **THEN** the form shows the warning, naming the frequency, before any job is
+  queued

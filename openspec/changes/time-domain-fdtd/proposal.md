@@ -25,9 +25,21 @@ spectra.
   Meep and no conda. Meep would add a conda stack and run on 6 CPU cores. The Yee
   update is about 100 lines and checkable against analytic results and against
   our own cavity solver.
-- **Geometry:** the upload is voxelised onto a uniform grid, and each cell takes the
-  refractive index of the region it falls in (the multi-material regions that
-  already exist). Materials are lossless and non-dispersive in this change.
+- **Geometry:** the upload is voxelised onto a **graded (non-uniform, tensor-product)
+  grid**. Per-axis spacings dx_i, dy_j and dz_k are fine only where the geometry
+  needs it (thin coatings and films) and coarse elsewhere, with a neighbour ratio
+  of at most 1.3. Each cell takes the material of the region it falls in.
+  Interfaces that cut a cell use sub-cell averaging, so layers thinner than one
+  cell are not lost.
+- **Materials (owner, 15:54Z: "an object coated in gold or a thin film wedged
+  between two conducting plates"):**
+  - dielectrics by refractive index, as today;
+  - perfect conductors;
+  - **dispersive, lossy metals** (gold, silver, aluminium, copper and chromium),
+    using published Drude-Lorentz fits (Rakić et al. 1998) and stepped by
+    auxiliary differential equations.
+  - A **coating** is a material plus a thickness applied to a region's surface.
+  - A film between plates is three regions with three materials.
 - **Boundaries (form choice):**
   - `metal`: the uploaded shape is a metal cavity, as in today's cavity tool.
     This is the default.
@@ -42,13 +54,17 @@ spectra.
   - **Time profile:**
     - `cw`: steady state at frequency f, with a smooth turn-on over several periods.
     - `pulse`: Gaussian, with centre frequency f and a bandwidth.
-  - Arbitrary user-drawn waveforms are out of scope.
+    - `drawn`: the owner draws amplitude against time in the browser, or pastes
+      samples. It is resampled to dt. Before queueing, the run warns or refuses
+      if the waveform's spectrum has significant energy above the grid's
+      resolvable frequency (10 cells per wavelength in the finest material).
 - **Outputs:**
   - the probe time trace at the source and at up to 4 user probe points;
   - the spectrum of each trace, which shows the resonances for a pulse;
   - a field movie of |E| (≤ 64³ samples, ≤ 60 frames), which the 3-D viewer plays.
 - **Limits:**
-  - The cell size is the smaller of the user's value and λ_min / (10·n_max).
+  - The cell size is λ_min / (10·|n|_max) in each material, refined further to resolve each
+    thin layer (≥ 4 cells across it, or the metal skin depth where that is thinner).
   - The run is refused, before it is queued, above 8 M cells or 20 000 steps.
   - The estimate (cells, steps, memory, run time) is shown before submit, as the
     cavity tool already does.
@@ -64,12 +80,21 @@ spectra.
   residual energy is < 1e-4 of the peak, so the PML absorbs, and the
   scattered-field region stays < 1e-3 of the incident amplitude.
 
+- **V4, gold film reflectance:** at normal incidence, a gold slab's reflectance
+  over the pulse band matches the analytic Fresnel result for the same
+  Drude-Lorentz model, within 2%.
+- **V5, thin film between plates:** the resonances of a dielectric film between
+  two metal plates match the analytic planar-cavity frequencies within 1%, on a
+  graded grid whose film is far thinner than the coarse cell.
+
 ## Phases
 
 1. Solver core: Yee update, PEC, CPML, point source with both profiles, probes.
    Benchmarks V1 and V2.
-2. Plane-wave TF/SF source. Benchmark V3.
-3. Voxeliser from the upload's regions, plus the estimate and caps.
+2. Plane-wave TF/SF source (V3), dispersive metals with the material library (V4),
+   and the drawn waveform.
+3. Graded-grid builder, sub-cell averaging, coatings, and the voxeliser from the
+   upload's regions (V5), plus the estimate and caps.
 4. Worker job kind `td`, result files, and routes. Every reader of each output
    must be listed, so that a missing file cannot 404 a page that does not need it.
 5. Web form, field-movie playback, trace and spectrum plots, and the in-browser
@@ -77,5 +102,6 @@ spectra.
 
 ## Out of scope
 
-Dispersive or lossy materials, user-drawn waveforms, flux and transmission
-monitors, non-uniform grids, and multi-GPU runs.
+Nonlinear and magnetic materials, flux and transmission monitors, and multi-GPU
+runs. The coarse cell is still capped (8 M cells), so a very large object
+with a very thin coating may be refused. The estimate says so before queueing.

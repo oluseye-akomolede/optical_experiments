@@ -1,9 +1,13 @@
 ## 1. Solver core (phase 1)
 
 - [ ] 1.1 `dockerfiles/maxwell_solver/fdtd.py`: a Yee update on an array module `xp` (numpy | cupy),
-  float32. PEC is applied by zeroing tangential E outside or at the conductor
-  mask. A CPML of 10 cells is used on open faces. The time step is
-  dt = 0.99·dx / (c·√3).
+  float32, on a **graded tensor-product grid**: per-axis primal and dual spacing
+  arrays (a uniform grid is just the special case). PEC is applied by zeroing
+  tangential E on the conductor mask. A CPML of 10 cells is used on open faces.
+  The time step is dt = 0.99 / (c·√(1/dx_min² + 1/dy_min² + 1/dz_min²)).
+  The E update carries an **auxiliary polarisation-current hook** (a list of
+  per-material ADE terms, empty in phase 1), so dispersive metals add terms
+  without changing the core.
 - [ ] 1.2 Point source: a soft E-component current, with `cw` (smooth ramp) and
   `pulse` (Gaussian) profiles.
 - [ ] 1.3 Probes return float32 traces. The spectrum is computed by rfft of a
@@ -15,14 +19,22 @@
   versus the cavity solver) and V2 (CW 1/r). These run on the Jetson bench
   (tier 2), and the lead runs them.
 
-## 2. Plane-wave source (phase 2)
+## 2. Plane-wave source, dispersive metals, drawn waveform (phase 2)
 
 - [ ] 2.1 A TF/SF box with a 1-D auxiliary incident-field grid along the axis.
   It is refused with `metal`.
 - [ ] 2.2 Benchmark V3.
+- [ ] 2.3 Drude-Lorentz ADE terms, plus a material library (Au, Ag, Al, Cu, Cr;
+  Rakić 1998), with the source cited in the code.
+- [ ] 2.4 Benchmark V4 (gold slab against analytic Fresnel, same model).
+- [ ] 2.5 `drawn` profile: resample samples to dt, and warn or refuse on energy
+  above the grid's resolvable frequency.
 
 ## 3. Geometry, estimate and caps (phase 3)
 
+- [ ] 3.0 Graded-grid builder (≥ 4 cells per thin layer or skin depth, neighbour
+  ratio ≤ 1.3), sub-cell averaging at cut cells, and coatings (material +
+  thickness on a region's surface). Benchmark V5.
 - [ ] 3.1 Voxelise the upload's regions to an index map. Cells outside the shape
   are metal (`metal`) or vacuum plus a gap (`open`).
 - [ ] 3.2 Estimate cells, steps, memory and run time from the form. Refuse above
