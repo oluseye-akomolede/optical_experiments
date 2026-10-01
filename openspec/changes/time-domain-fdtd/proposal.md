@@ -71,7 +71,8 @@ spectra.
     names the limit, the value and the lever to change.
   - The Jetson's memory is shared with other teams' jobs, so the worker checks
     free memory before starting a `td` job and leaves it queued ("Jetson busy")
-    when it is short.
+    when it is short, for at most an hour; a `td` job is never moved to the
+    cluster, and it is stopped after 45 minutes of run time.
   - The estimate (cells, steps, memory, run time) is shown before submit, as the
     cavity tool already does.
 

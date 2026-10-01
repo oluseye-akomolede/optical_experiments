@@ -34,7 +34,7 @@
   region (lead runs it).
 - [ ] 2.4 Benchmark V4 (gold slab against analytic Fresnel, same model).
 - [ ] 2.5 `drawn` profile: ≤ 10 000 samples plus a duration, resampled to dt,
-  mean removed; refused when > 1% of its spectral energy is above f_res.
+  then mean removed; refused when > 1% of its spectral energy is above f_res.
 
 ## 3. Geometry, estimate and caps (phase 3)
 
@@ -57,7 +57,9 @@
 - [ ] 4.2 Worker routing to the Jetson. Check every path that can change the
   routing field (reroute, reaper and release). At most one GPU job runs beside
   a `td` job; check free memory first and leave the job queued ("Jetson busy")
-  when it is short.
+  when it is short, for at most 60 minutes; never reroute a `td` job to the
+  cluster; fail readably on a device OOM mid-run and after 45 minutes of run
+  time.
 - [ ] 4.3 Result files: `trace.bin`, `spectrum.json` and `frames/<n>.bin`. List
   every reader of each output, and give each its route, its 404 rule and a test.
 

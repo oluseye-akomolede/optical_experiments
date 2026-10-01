@@ -59,8 +59,9 @@ reflection from the grid edge is shown as part of the simulation.
 
 #### Scenario: benchmark V2
 - **WHEN** a CW point source runs in open vacuum to steady state
-- **THEN** at three or more probe distances r ≥ 2λ from the source, the field
-  amplitude follows 1/r within 5%
+- **THEN** at three or more probe distances r ≥ 2λ from the source, broadside
+  to the dipole (perpendicular to its polarisation, where the far field is
+  largest), the field amplitude follows 1/r within 5%
 
 #### Scenario: benchmark V3
 - **WHEN** a plane-wave pulse crosses empty open space and leaves the grid
@@ -111,12 +112,28 @@ that exceeded it, and the form lever that reduces it.
 The worker SHALL run at most one GPU job at a time when one of them is `td`.
 Before starting a `td` job it SHALL check free device memory against the job's
 estimate; when memory is short it SHALL leave the job queued with a status
-saying the Jetson is busy, not fail it.
+saying the Jetson is busy, not fail it. A `td` job SHALL wait at most 60
+minutes as "Jetson busy" and then fail with a readable message. A `td` job
+SHALL never be rerouted to the cluster by the unclaimed-GPU fallback, which
+cannot run it. A device out-of-memory error during the run (another team's job
+started after the check) SHALL fail the job with a readable message, not a
+generic error. A `td` job SHALL be stopped after 45 minutes of run time (the
+30-minute estimate limit plus a margin) and fail with a message naming that
+limit.
 
 #### Scenario: a busy Jetson delays, not fails
 - **WHEN** a `td` job's estimate exceeds the Jetson's free memory at start
 - **THEN** the job stays queued with a "Jetson busy" status and runs once
   memory is free
+
+#### Scenario: a Jetson that stays busy fails readably
+- **WHEN** free memory stays short for 60 minutes
+- **THEN** the job fails with a message saying the Jetson stayed busy, and it was
+  never moved to the cluster queue
+
+#### Scenario: memory taken mid-run fails readably
+- **WHEN** the device runs out of memory during a `td` run
+- **THEN** the job fails with a message naming the memory shortage
 
 ### Requirement: Dispersive metals SHALL follow their published model
 
@@ -154,15 +171,17 @@ neighbour spacing ratio of at most 1.3.
 
 #### Scenario: benchmark V5
 - **WHEN** a dielectric film of index n, far thinner than the coarse cell,
-  fills the gap between two PEC plates of lateral size a × b with PEC side walls
+  fills the gap between two PEC plates of lateral size a × b with PEC side walls,
+  driven by a source with E normal to the plates
 - **THEN** its resonances are within 1% of the parallel-plate lateral modes
-  f = (c/2n)·√((m/a)² + (p/b)²), which depend on n and not on the film thickness
+  f = (c/2n)·√((m/a)² + (p/b)²) with m, p ≥ 1, which depend on n and not on the
+  film thickness, and every such mode in the pulse band appears
 
 ### Requirement: A drawn waveform SHALL be checked against the grid
 
 A `drawn` source SHALL be a list of at most 10 000 dimensionless amplitude
-samples with a duration in seconds. It SHALL be resampled to dt, its mean
-SHALL be removed (the form says so), and it is zero after its duration; the
+samples with a duration in seconds. It SHALL be resampled to dt and then its
+mean SHALL be removed (the form says so), and it is zero after its duration; the
 run's own duration sets the step count. The grid's resolvable frequency is
 f_res = c / (10·|n|_max·Δ_max), where Δ_max is the largest cell spacing. A
 drawn waveform with more than 1% of its spectral energy above f_res SHALL be
