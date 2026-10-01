@@ -76,6 +76,16 @@ cavity solver.
 With boundary `open`, a 10-cell CPML SHALL absorb waves leaving the grid, so no
 reflection from the grid edge is shown as part of the simulation.
 
+#### Scenario: the layer's reflection is measured, not assumed
+- **WHEN** a pulse meets the 10-cell layer, measured on the exact 1-D reduction
+  of the solver's update with the solver's own layer coefficients
+  (`scripts/fdtd_cpml_reflection.py`)
+- **THEN** the reflected amplitude is below 1e-3 of the incident at normal
+  incidence, and below 5e-3 from 0 to 75 degrees at 10 to 40 cells per
+  wavelength
+- **AND** the same measurement with no layer (a bare wall) reads a reflection
+  above 0.5, so an instrument that sees nothing cannot pass the layer
+
 #### Scenario: benchmark V2
 - **WHEN** a CW point source runs in open vacuum to steady state
 - **THEN** at three or more probe distances r ≥ 2λ from the source, broadside

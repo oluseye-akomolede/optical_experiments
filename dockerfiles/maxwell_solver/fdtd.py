@@ -80,8 +80,17 @@ DIRECTIONS = ("+x", "-x", "+y", "-y", "+z", "-z")
 COMPONENTS = ("x", "y", "z")
 
 SAFETY = 0.99                        # fraction of the Courant limit
-PML_ORDER = 3
-PML_REFLECTION = 1e-6                # target reflection at the CPML face
+# CPML grading, chosen by measuring the 10-cell layer's reflection on the
+# 1-D reduction of this update (scripts/fdtd_cpml_reflection.py), over 0-75
+# degrees and 10-40 cells per wavelength. Worst reflected amplitude: order 2 at
+# R = 1e-12 (this setting) 3.6e-3, at 75 degrees and 40 cells/wavelength;
+# order 3 at 1e-12 7.5e-3; order 2 at 1e-8 4.2e-3; order 3 at 1e-6 (the old
+# setting) 1.5e-2. The price is normal incidence: 3.0e-4 here against the old
+# setting's 2.6e-5 (20 cells/wavelength). Grazing incidence on a fine grid is
+# what kappa = 1, alpha = 0 cannot fix by grading alone. R here is a knob on
+# sigma_max, not the reflection you get.
+PML_ORDER = 2
+PML_REFLECTION = 1e-12
 DEFAULT_PML_CELLS = 10
 
 
@@ -347,45 +356,61 @@ def _along(values, axis: int):
 # CPML
 # --------------------------------------------------------------------------
 
-def _slab_sigma(widths: np.ndarray, from_low: bool) -> np.ndarray:
-    """Cubic conductivity ramp through one slab, from its absorbing face.
+def _pml_sigma(primal: np.ndarray, pml: int, family: str) -> np.ndarray:
+    """The CPML conductivity at each sample of one family along one axis.
 
-    ``widths`` are the LOCAL cell widths of the nodes in the slab, so a graded
-    grid gets its ramp measured in the cells it actually has. ``from_low`` says
-    which end is the outer face.
+    ONE profile sigma(x) per slab, as a function of physical depth into it,
+    sampled where each family actually sits: ``family="node"`` at the primal
+    nodes (the E update's derivative along this axis), ``"cell"`` at the cell
+    centres (the H update's). The slab is the outer ``pml`` primal cells, so a
+    graded grid gets its ramp measured in the cells it actually has.
+
+    Sampling one profile matters: when E took a ramp measured over its node
+    thicknesses ((pml - 1/2) cells) and H one over pml cells, the two halves of
+    the update saw two different layers, and a 10-cell CPML reflected 2.7% of a
+    normally incident pulse at 20 cells per wavelength (order 3, R = 1e-6);
+    one profile with the same grading reflects 2.6e-5 (measured on the 1-D
+    reduction, scripts/fdtd_cpml_reflection.py).
     """
-    ordered = widths if from_low else widths[::-1]
-    # distance from the outer face to each node's centre
-    distance = np.cumsum(ordered) - 0.5 * ordered
-    total = float(widths.sum())
-    sigma_max = ((PML_ORDER + 1) * math.log(1.0 / PML_REFLECTION)
-                 / (2.0 * ETA0 * total))
-    ramp = sigma_max * ((total - distance) / total) ** PML_ORDER
-    return ramp if from_low else ramp[::-1]
+    nodes = np.concatenate(([0.0], np.cumsum(primal)))
+    if family == "node":
+        x = nodes
+    elif family == "cell":
+        x = nodes[:-1] + 0.5 * primal
+    else:
+        raise FDTDError(f"internal: CPML family {family!r}")
+    length = float(nodes[-1])
+    sigma = np.zeros(x.size)
+    for thickness, depth in (
+            (float(primal[:pml].sum()), nodes[pml] - x),
+            (float(primal[-pml:].sum()), x - (length - float(primal[-pml:].sum())))):
+        sigma_max = ((PML_ORDER + 1) * math.log(1.0 / PML_REFLECTION)
+                     / (2.0 * ETA0 * thickness))
+        inside = depth > 0
+        sigma[inside] = np.maximum(
+            sigma[inside], sigma_max * (depth[inside] / thickness) ** PML_ORDER)
+    return sigma
 
 
-def _pml_profiles(width: np.ndarray, pml: int, dt: float, xp):
-    """``(b, c)`` per node along one axis, from a conductivity ramp.
+def _pml_profiles(primal: np.ndarray, pml: int, dt: float, xp, family: str):
+    """``(b, c)`` per sample of ``family`` (see ``_pml_sigma``) along one axis.
 
-    ``width`` is the cell width at each node of the family being corrected
-    (``_node_thickness`` for E, the primal spacing for H), so the ramp and its
-    total thickness follow the grid. ``sigma_max`` comes from the slab's own
-    thickness, and the ramp reaches it at the outer face and falls to zero at the
-    inner interface -- graded that way round, the layer absorbs more the deeper
-    the wave gets, and the return trip is suppressed twice over.
+    The ramp is zero at the inner interface and reaches sigma_max at the outer
+    face, so the layer absorbs more the deeper the wave gets, and the return
+    trip is suppressed twice over. ``"node"`` profiles have one entry per
+    primal node (the end nodes are walls the caller drops), ``"cell"`` ones
+    one per primal cell.
     """
-    n = width.size
+    n = primal.size + (1 if family == "node" else 0)
     if pml <= 0:
         b = np.ones(n)
         return xp.asarray(b, dtype=xp.float32), xp.asarray(b - 1.0, dtype=xp.float32)
-    if n <= 2 * pml:
+    if primal.size + 1 <= 2 * pml:
         raise FDTDError(
-            f"a CPML of {pml} cells does not fit in {n} nodes on an axis: the "
-            f"interior would be empty (it needs more than {2 * pml} nodes). "
-            f"Give more cells, or a smaller pml_cells")
-    sigma = np.zeros(n, dtype=np.float64)
-    sigma[:pml] = _slab_sigma(width[:pml], from_low=True)
-    sigma[n - pml:] = _slab_sigma(width[n - pml:], from_low=False)
+            f"a CPML of {pml} cells does not fit in {primal.size + 1} nodes on "
+            f"an axis: the interior would be empty (it needs more than "
+            f"{2 * pml} nodes). Give more cells, or a smaller pml_cells")
+    sigma = _pml_sigma(primal, pml, family)
     b = np.exp(-sigma * dt / EPS0)
     return (xp.asarray(b, dtype=xp.float32),
             xp.asarray(b - 1.0, dtype=xp.float32))     # kappa = 1, alpha = 0
@@ -545,8 +570,8 @@ class _PlaneWave:
         length = line.size + 1
         self.P1 = xp.asarray(line, dtype=f32)
         self.D1 = xp.asarray(_dual_spacing(line)[1:], dtype=f32)  # nodes 1..L-2
-        self.bh, self.ch = _pml_profiles(line, INCIDENT_PML_CELLS, dt, xp)
-        be, ce = _pml_profiles(_node_thickness(line), INCIDENT_PML_CELLS, dt, xp)
+        self.bh, self.ch = _pml_profiles(line, INCIDENT_PML_CELLS, dt, xp, "cell")
+        be, ce = _pml_profiles(line, INCIDENT_PML_CELLS, dt, xp, "node")
         self.be, self.ce = be[1:-1], ce[1:-1]
         self.E1 = xp.zeros(length, dtype=f32)
         self.H1 = xp.zeros(length - 1, dtype=f32)
@@ -838,16 +863,16 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     P = [xp.asarray(p, dtype=f32) for p in primal]      # n-1 primal lengths
     D = [xp.asarray(d, dtype=f32) for d in dual]        # n-1 dual lengths
 
-    # CPML: one profile per (axis, family). The E update is evaluated at primal
-    # nodes, so its ramp is measured in the cells around primal nodes; the H
-    # update sits at dual nodes, whose cells are the primal lengths.
+    # CPML: one sigma(x) per axis, sampled per family. The E update's derivative
+    # along an axis sits at the primal nodes, the H update's at the cell
+    # centres; both read the SAME profile at their own positions.
     bc: dict = {}
     if boundary == "open":
         for axis in range(3):
             bc[(axis, "primal")] = _pml_profiles(
-                _node_thickness(primal[axis]), int(pml_cells), dt, xp)
+                primal[axis], int(pml_cells), dt, xp, "node")
             bc[(axis, "dual")] = _pml_profiles(
-                primal[axis], int(pml_cells), dt, xp)
+                primal[axis], int(pml_cells), dt, xp, "cell")
 
     psi: dict = {}
     coef: dict = {}
