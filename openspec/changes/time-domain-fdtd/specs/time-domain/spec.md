@@ -91,6 +91,14 @@ reflection from the grid edge is shown as part of the simulation.
   energy over the physical region (CPML excluded) is below 1e-4 of the peak
   energy, AND throughout the run the scattered-field region's field stays below
   1e-3 of the incident peak amplitude
+- **AND** it is checked for every direction and transverse polarisation on a
+  grid graded along the propagation axes, since the 1-D line takes that axis's
+  spacings
+- **AND** the scattered-field region is judged at every sample of every E
+  component, each at its own Yee position against the box faces, from a
+  running maximum of |E| rather than from probes
+- **AND** a run with no incident wave in the box, or with a non-finite result,
+  fails the benchmark
 
 ### Requirement: The plane-wave source SHALL be a clean total-field/scattered-field box
 

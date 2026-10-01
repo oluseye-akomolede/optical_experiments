@@ -25,7 +25,7 @@
   on the same dt and graded spacings; ≥ 3 cells to objects and to the CPML.
   Refused with `metal` and for a longitudinal polarisation. All profiles are
   zero-mean.
-- [ ] 2.2 Benchmark V3.
+- [x] 2.2 Benchmark V3 (`scripts/fdtd_bench_v3.py`; the Jetson run is the lead's).
 - [ ] 2.3 Lorentz-Drude ADE terms (Rakić 1998, ε∞ = 1, parameters in eV), stored
   on the metal's bounding box only, plus a material library (Au, Ag, Al, Cu, Cr)
   with the source cited in the code, a refusal outside each fit's range, and a

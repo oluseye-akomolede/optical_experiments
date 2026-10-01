@@ -688,7 +688,8 @@ class _PlaneWave:
 def simulate(eps_r, source: Source, n_steps: int, probes=(),
              *, spacings=None, dx: float = 1.0,
              boundary: str = "metal", pec=None, pml_cells: int = DEFAULT_PML_CELLS,
-             xp=None, record_energy: bool = False, ade_terms=()) -> dict:
+             xp=None, record_energy: bool = False, energy_region=None,
+             record_peak: bool = False, ade_terms=()) -> dict:
     """Run the grid and return the probe traces.
 
     ``eps_r`` ``(nx, ny, nz)`` is the relative permittivity of each node and it
@@ -704,7 +705,7 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     ``PolarisationTerm``); phase 1 runs with none.
 
     Returns ``{"traces": (n_probes, n_steps) float32, "dt", "steps",
-    "spacings", "energy"}``, and every one of them is HOST numpy whatever ``xp``
+    "spacings", "energy", "peak"}``, and every one of them is HOST numpy whatever ``xp``
     was: the arrays live on the device for the whole run and cross back in a
     single transfer at the end, so a consumer never has to know which backend
     ran (and never pays a per-element transfer of its own). ``energy`` is the
@@ -712,7 +713,15 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     asked for it -- it builds six float64 weight arrays and reduces six arrays
     every step, and each ``float(xp.sum(...))`` is a device sync, so it is a
     diagnostic: free on the numpy path, six syncs a step on cupy. Cheap on a
-    24^3 test grid, not on a production one.
+    24^3 test grid, not on a production one. ``energy_region``, three slices of
+    node indices, restricts that sum to a sub-box (V3 measures the physical
+    region with the CPML left out).
+
+    ``record_peak`` adds ``"peak"``: per E component, the largest ``|E_c|``
+    each sample reached over the whole run, as a full-shape array. It is a
+    running maximum kept on the device (no sync a step), so a check that a
+    region stayed quiet "throughout the run" reads every cell of it rather
+    than a handful of probes.
     """
     xp = np if xp is None else xp
     f32 = xp.float32
@@ -866,6 +875,19 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
 
     traces = xp.zeros((len(probe_list), n_steps), dtype=f32)
     energy: list[float] | None = [] if record_energy else None
+    peak = ({c: xp.zeros(shape, dtype=f32) for c in COMPONENTS}
+            if record_peak else None)
+    if energy_region is None:
+        region = (slice(None),) * 3
+    else:
+        region = tuple(energy_region)
+        if len(region) != 3 or not all(isinstance(s, slice) for s in region):
+            raise FDTDError(
+                f"energy_region is three slices of node indices, got "
+                f"{energy_region!r}")
+        if any(len(range(*s.indices(n))) == 0 for s, n in zip(region, shape)):
+            raise FDTDError(f"energy_region {energy_region!r} is empty on this "
+                            f"{shape} grid")
     dt_over_mu0 = dt / MU0
 
     if energy is not None:
@@ -877,14 +899,14 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
 
         def volumes(dual_axes):
             axes = [wide[a] if a in dual_axes else node[a] for a in range(3)]
-            return xp.asarray(_outer(axes), dtype=xp.float64)
+            return xp.asarray(_outer(axes), dtype=xp.float64)[region]
 
         # Each component is dual along its own axis if it is E, and along the
         # other two if it is H.
         e_weights = {c: volumes({a}) for a, c in enumerate(COMPONENTS)}
         h_weights = {c: volumes({(a + 1) % 3, (a + 2) % 3})
                      for a, c in enumerate(COMPONENTS)}
-        eps64 = xp.asarray(eps, dtype=xp.float64)
+        eps64 = xp.asarray(eps, dtype=xp.float64)[region]
 
     for step in range(n_steps):
         t = step * dt
@@ -940,14 +962,14 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             # run then reports a conserved zero for an energetic box.
             e_total = 0.0
             for component, values in (("x", Ex), ("y", Ey), ("z", Ez)):
-                wide_values = values.astype(xp.float64)
+                wide_values = values[region].astype(xp.float64)
                 e_total += float(xp.sum(
                     eps64 * e_weights[component] * wide_values * wide_values))
             h_total = 0.0
             for index, (component, values) in enumerate(
                     (("x", Hx), ("y", Hy), ("z", Hz))):
-                now = values.astype(xp.float64)
-                before = h_before[index].astype(xp.float64)
+                now = values[region].astype(xp.float64)
+                before = h_before[index][region].astype(xp.float64)
                 h_total += float(xp.sum(h_weights[component] * now * before))
             energy.append(0.5 * (EPS0 * e_total + MU0 * h_total))
 
@@ -1021,9 +1043,16 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             else:
                 value = field[component][cell]
             traces[index, step] = value
+        if peak is not None:
+            for component in COMPONENTS:
+                xp.maximum(peak[component], xp.abs(field[component]),
+                           out=peak[component])
 
+    if peak is not None:
+        peak = {c: _host_result(values, xp) for c, values in peak.items()}
     return {"traces": _host_result(traces, xp), "dt": dt, "steps": n_steps,
-            "spacings": [np.array(p) for p in primal], "energy": energy}
+            "spacings": [np.array(p) for p in primal], "energy": energy,
+            "peak": peak}
 
 
 def _host_result(value, xp):

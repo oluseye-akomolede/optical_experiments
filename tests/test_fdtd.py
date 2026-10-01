@@ -212,6 +212,43 @@ class _DeviceXp:
         return _device(value)           # the transfer, the way cupy.asnumpy is
 
 
+def test_an_energy_region_sums_only_its_own_cells():
+    """A sub-box the wave has not reached holds exactly zero while the whole
+    grid already holds energy; the whole grid spelled as slices is None."""
+    eps = np.ones((12, 10, 8), dtype=np.float32)
+    source = pulse(cell=(3, 5, 4))
+    far = (slice(9, 12), slice(None), slice(None))
+    whole = fdtd.simulate(eps, source, 30, record_energy=True)["energy"]
+    spelled = fdtd.simulate(eps, source, 30, record_energy=True,
+                            energy_region=(slice(None),) * 3)["energy"]
+    region = fdtd.simulate(eps, source, 30, record_energy=True,
+                           energy_region=far)["energy"]
+    assert spelled == whole
+    late = max(range(30), key=lambda n: whole[n])
+    assert whole[late] > 0 and region[late] < whole[late]
+    first = next(n for n in range(30) if whole[n] > 0)
+    assert region[first] == 0.0, "energy appeared where no wave can be yet"
+    assert max(region) > 0, "the wave never reached the far region"
+    for bad in ((slice(None),) * 2, (slice(None), slice(4, 4), slice(None))):
+        with pytest.raises(fdtd.FDTDError, match="energy_region"):
+            fdtd.simulate(eps, source, 2, record_energy=True,
+                          energy_region=bad)
+
+
+def test_record_peak_is_the_running_maximum_of_every_sample():
+    """At a probed sample the peak is the largest |trace| value, not the last
+    value; every component comes back full-shape."""
+    eps = np.ones((12, 10, 8), dtype=np.float32)
+    probes = [(5, 5, 4, "z"), (7, 4, 3, "x"), (4, 6, 5, "y")]
+    run = fdtd.simulate(eps, pulse(cell=(6, 5, 4)), steps_for(4.0 / F0),
+                        probes=probes, record_peak=True)
+    traces = np.abs(np.asarray(run["traces"]))
+    for (i, j, k, c), trace in zip(probes, traces):
+        assert run["peak"][c].shape == eps.shape
+        assert run["peak"][c][i, j, k] == trace.max() > trace[-1], c
+    assert fdtd.simulate(eps, pulse(cell=(6, 5, 4)), 2)["peak"] is None
+
+
 def test_the_traces_come_back_on_the_host_whatever_xp_built_them():
     """The result is host float32 even when the arrays lived on a device.
 
