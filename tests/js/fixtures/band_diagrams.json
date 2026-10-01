@@ -1,0 +1,68 @@
+{
+  "_about": [
+    "Band-diagram fixtures, shared by the JS reader tests and by",
+    "tests/test_band_fixtures.py, which runs every one through the server's",
+    "own validator (web/worker_api.py::_band_payload).",
+    "",
+    "Two properties every entry must keep, both checked by that Python test:",
+    "  1. it passes _band_payload -- so a reader can never again be tested on a",
+    "     shape the server does not send;",
+    "  2. it is NON-SQUARE: len(bands) (the k-points) != len(bands[0]) (the",
+    "     bands). A square fixture is read the same way [k][band] or [band][k],",
+    "     which is how both readers shipped transposed with green tests.",
+    "",
+    "Orientation is the wire's: bands[k][band]. The server stores it that way --",
+    "pc_solve.solve_pc builds one vector of n_bands per k-point, and",
+    "_band_payload pins len(k_points) == len(bands) -- so the outer index is the",
+    "k-point and the inner index is the band number."
+  ],
+
+  "flat_empty_lattice": {
+    "polarisation": "TM",
+    "labels": ["Γ", "X", "M"],
+    "k_points": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]],
+    "bands": [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+  },
+
+  "gap_between_1_and_2": {
+    "polarisation": "TM",
+    "labels": ["Γ", "X", "M"],
+    "k_points": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]],
+    "bands": [[0.0, 3.0], [2.0, 4.0], [2.0, 4.0]]
+  },
+
+  "negative_band": {
+    "polarisation": "TE",
+    "labels": ["Γ", "X", "M"],
+    "k_points": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]],
+    "bands": [[-1.0, 0.0], [1.0, 5.0], [2.0, 3.0]]
+  },
+
+  "touching_bands": {
+    "polarisation": "TM",
+    "labels": ["Γ", "X", "M"],
+    "k_points": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]],
+    "bands": [[0.0, 1.0], [3.0, 4.5], [3.0, 4.5]]
+  },
+
+  "three_bands_two_gaps": {
+    "polarisation": "TM",
+    "labels": ["Γ", "X", "M", "Γ"],
+    "k_points": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.0]],
+    "bands": [[0.0, 2.0, 5.0], [1.0, 2.5, 5.0], [1.0, 3.0, 5.0], [0.0, 2.0, 6.0]]
+  },
+
+  "single_band": {
+    "polarisation": "TM",
+    "labels": ["Γ", "X", "M"],
+    "k_points": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]],
+    "bands": [[1.0], [2.0], [3.0]]
+  },
+
+  "jetson_tm_slice": {
+    "polarisation": "TM",
+    "labels": ["Γ", "X", "M"],
+    "k_points": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]],
+    "bands": [[0.0, 0.44], [0.25, 0.421], [0.281, 0.5]]
+  }
+}

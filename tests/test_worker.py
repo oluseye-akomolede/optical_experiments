@@ -1193,13 +1193,20 @@ def test_the_reader_agrees_with_the_key_scheme_the_writer_uses(tmp_path):
 # ---------------------------------------------------------------------------
 # real_solve dispatches on the KIND, and refuses the ones it cannot run
 # ---------------------------------------------------------------------------
-def _install_fake_pc_solve(monkeypatch, calls):
+def _install_fake_pc_solve(monkeypatch, calls, error=None):
     """Put a fake ``pc_solve`` module in front of the lazy import.
 
     ``real_solve`` does ``from pc_solve import solve_pc`` inside the pc branch,
     so the module is looked up in ``sys.modules`` at call time. Injecting a fake
     there intercepts the dispatch without importing the real solver, which needs
     numpy and would put a tier-2 dependency in a tier-1 test.
+
+    ``error`` makes the solve RAISE instead of return, for the test that a pc
+    job whose solve fails ends FAILED. A refusal from the real ``pc_solve`` is a
+    ``PCSolveError``, a plain ``Exception``, which ``classify`` sends to the
+    terminal ``/failed`` by its default; a ``WorkerError`` is used here because
+    its message passes through ``_owner_message`` verbatim, so the sentence the
+    owner reads is checkable.
     """
     import types
 
@@ -1207,17 +1214,23 @@ def _install_fake_pc_solve(monkeypatch, calls):
 
     def solve_pc(job):
         calls.append(job)
-        # A diagram the app's ``/done`` will actually accept: one band vector
-        # per k-point, every vector the same length (see ``_band_payload``). The
+        if error is not None:
+            raise error
+        # A diagram the app's ``/done`` will actually accept: ``bands[k][band]``
+        # -- one vector of n_bands per k-point, every vector the same length
+        # (see ``_band_payload``, which pins len(k_points) == len(bands)). An
         # earlier version had two k-points and ONE band row, which the real
         # validator refuses with a 400 -- invisible while this fake was only
-        # ever handed to ``real_solve`` directly and never put on the wire. The
-        # end-to-end test below is what caught it; a double that models an
-        # output the route rejects does not model the solver.
+        # ever handed to ``real_solve`` directly and never put on the wire.
+        #
+        # It is also NON-SQUARE -- three k-points by two bands. A square diagram
+        # reads the same in either orientation, which is how the JS readers
+        # shipped transposed against fixtures written in their own shape; a
+        # double for a pc result must have a shape that can tell them apart.
         return {"lattice": "triangular",
-                "labels": ["G", "X"],
-                "k_points": [[0.0, 0.0], [0.5, 0.0]],
-                "bands": [[0.1, 0.2], [0.3, 0.4]]}
+                "labels": ["G", "X", "M"],
+                "k_points": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]],
+                "bands": [[0.1, 0.3], [0.2, 0.4], [0.25, 0.45]]}
 
     fake.solve_pc = solve_pc
     monkeypatch.setitem(sys.modules, "pc_solve", fake)
@@ -1378,9 +1391,11 @@ def test_a_pc_job_runs_claim_to_done_over_the_real_routes(tmp_path, server,
 
     # The diagram landed, and the request it was solved from is still there.
     bands = row["pcs"]["bands"]
-    assert bands["labels"] == ["G", "X"]
-    assert bands["k_points"] == [[0.0, 0.0], [0.5, 0.0]]
-    assert bands["bands"] == [[0.1, 0.2], [0.3, 0.4]]
+    assert bands["labels"] == ["G", "X", "M"]
+    assert bands["k_points"] == [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]]
+    assert bands["bands"] == [[0.1, 0.3], [0.2, 0.4], [0.25, 0.45]]
+    assert len(bands["bands"]) != len(bands["bands"][0]), (
+        "a square fixture would read the same transposed; this one must not")
     assert row["pcs"]["lattice"] == "square", (
         "the real store merges pcs, so the request must survive")
 
@@ -1393,4 +1408,59 @@ def test_a_pc_job_runs_claim_to_done_over_the_real_routes(tmp_path, server,
     # The work dir is cleaned up like any finished job's.
     assert not (worker.config.work_root / job["job_id"]).exists()
     assert worker.lock.releases >= 1
+
+
+def test_a_pc_solve_that_raises_ends_the_job_failed_not_done(tmp_path, server,
+                                                             monkeypatch):
+    """A pc job whose solve RAISES ends FAILED -- and stops being claimable.
+
+    The pc route is the new one, so it is the one most likely to have a failure
+    path nobody has walked. The two verbs are not interchangeable: ``/failed``
+    is TERMINAL in the app (the row stops being claimable and the owner reads
+    the message), while ``/release`` hands the job straight back to the oldest
+    claimable row -- which is the worker that just gave up on it. A pc job put
+    on the release path loops forever without ever saying why, and that is a
+    worse outcome than a wrong answer, because nothing is written down.
+
+    ``classify`` sends an unrecognised exception to ``/failed`` by its default,
+    which is right for a deterministic solver refusal (``pc_solve.PCSolveError``
+    is a plain ``Exception`` and lands there). That is an argument, though, so
+    this drives it: the raise is injected at the ``pc_solve`` boundary and
+    everything else -- claim, lease, report, store, the app's own routes -- is
+    the real thing.
+
+    Red-first, by making the fake RETURN instead of raise (pass ``error=None``):
+    the row then ends DONE and the first assertion fails. The test discriminates
+    a job that failed from one that quietly succeeded, which is the whole point.
+    """
+    calls = []
+    _install_fake_pc_solve(monkeypatch, calls,
+                           error=W.WorkerError("the pc solver refused this cell"))
+    job = queued_job(server.jobs_db, n_modes=12, kind=DB.PC,
+                     pcs=dict(PC_REQUEST))
+    worker = make_worker(server, tmp_path, solve=W.real_solve)
+
+    assert worker.claim_loop(max_jobs=1) == 1
+
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.FAILED, (
+        f"a pc job whose solve raised ended {row['status']!r}, not failed; a "
+        f"released pc job is handed to the oldest claimable row -- the worker "
+        f"that just failed it -- and loops")
+    assert len(calls) == 1, "the solve ran once and was not retried here"
+
+    # Terminal means the lease is gone AND the row is out of the queue, so a
+    # second worker polling finds nothing. Asserted through the app's own claim
+    # query rather than by reading the status twice.
+    assert row.get("lease_owner") is None
+    assert server.jobs_db.claim_jetson("some-other-worker", 60) is None, (
+        "a failed pc job is still claimable")
+
+    # The owner reads a sentence, not a traceback.
+    assert row["message"] == "the pc solver refused this cell"
+
+    # No bands were invented for a solve that never finished: a half-written
+    # diagram would draw as a real one.
+    assert not (row.get("pcs") or {}).get("bands")
+    assert server.store.keys_under(job["job_id"]) == []
 

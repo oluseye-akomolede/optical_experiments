@@ -13,9 +13,15 @@
 // through a browser instead of through this process. The node shapes here are
 // deliberately dull: they exist so a renderer that produced no elements, or the
 // wrong number, fails rather than passing on an empty document.
+//
+// ORIENTATION. The wire shape is bands[k][band]; see test_bands.mjs for the
+// full note. Every fixture comes from ./fixtures/band_diagrams.json and is
+// non-square, so the path count (one per BAND) and the point count (one per
+// k-point) are different numbers and a transposed renderer cannot agree.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 function makeElement(tag) {
   return {
@@ -42,30 +48,46 @@ globalThis.document = { createElementNS: (_ns, tag) => makeElement(tag) };
 
 const { drawBandDiagram } = await import('../../web/static/bandplot.js');
 
+const FIXTURES = JSON.parse(
+  readFileSync(new URL('./fixtures/band_diagrams.json', import.meta.url), 'utf8'),
+);
+const f = (name) => {
+  if (!(name in FIXTURES) || name === '_about') {
+    throw new Error(`no such band fixture: ${name}`);
+  }
+  return FIXTURES[name];
+};
+
 function diagram(over = {}) {
-  return {
-    polarisation: 'TM',
-    labels: ['Γ', 'X', 'M'],
-    k_points: [[0, 0], [0.5, 0], [0.5, 0.5]],
-    bands: [[0, 1, 2], [3, 4, 5]],
-    ...over,
-  };
+  return { ...f('gap_between_1_and_2'), ...over };
 }
 
-function tags(root) {
-  return root.children.map((c) => c.tagName);
-}
-
-test('a diagram with bands draws one path per band', () => {
-  drawBandDiagram(svg, [diagram()]);
+test('a diagram draws one path per BAND, over the k-points', () => {
+  const d = diagram();
+  drawBandDiagram(svg, [d]);
   const paths = svg.children.filter((c) => c.tagName === 'path');
-  // Two bands -> two paths. A renderer that packed all bands into one path
-  // would draw the same picture and make a per-band test impossible.
-  assert.equal(paths.length, 2);
+  // Two bands -> two paths, and three k-points -> three points per path. The
+  // fixture is 3x2 so those are different numbers: a renderer that drew one
+  // path per ROW would produce three two-point paths. That is the transposition
+  // the shipped renderer had, and it drew 30 four-point paths on a real job.
+  assert.equal(d.bands.length, 3, 'the fixture is 3 k-points ...');
+  assert.equal(d.bands[0].length, 2, '... by 2 bands');
+  assert.equal(paths.length, 2, 'one path per band, not per k-point');
   // Each path is a real polyline: three k-points -> M plus two L commands.
   for (const p of paths) {
     assert.match(p.attributes.d, /^M[-\d.]+,[-\d.]+ L[-\d.]+,[-\d.]+ L[-\d.]+,[-\d.]+$/);
   }
+});
+
+test('a band path visits the k-points left to right', () => {
+  // The x of the points along one path must INCREASE: the path is sampled
+  // along k, so a renderer that walked the other axis would draw a two-point
+  // stub (and, before the fix, did).
+  drawBandDiagram(svg, [diagram()]);
+  const first = svg.children.filter((c) => c.tagName === 'path')[0];
+  const xs = first.attributes.d.split(' ').map((cmd) => Number(cmd.slice(1).split(',')[0]));
+  assert.equal(xs.length, 3);
+  assert.ok(xs[0] < xs[1] && xs[1] < xs[2], `x not increasing along k: ${xs}`);
 });
 
 test('the tick labels are the high-symmetry points, in path order', () => {
@@ -82,7 +104,7 @@ test('a gap between bands is shaded exactly once', () => {
   // physical claim of the feature, so its presence is asserted directly rather
   // than left to the picture -- and its height must be positive, since a rect
   // of zero height is an invisible gap that reads as "no gap".
-  drawBandDiagram(svg, [diagram({ bands: [[0, 2, 2], [3, 4, 5]] })]);
+  drawBandDiagram(svg, [diagram()]);
   const shaded = svg.children.filter((c) => c.tagName === 'rect'
     && c.attributes['fill-opacity'] === '0.12');
   assert.equal(shaded.length, 1);
@@ -91,7 +113,7 @@ test('a gap between bands is shaded exactly once', () => {
 });
 
 test('bands that touch produce no shaded rect', () => {
-  drawBandDiagram(svg, [diagram({ bands: [[0, 3, 3], [1, 4, 5]] })]);
+  drawBandDiagram(svg, [f('touching_bands')]);
   const shaded = svg.children.filter((c) => c.tagName === 'rect'
     && c.attributes['fill-opacity'] === '0.12');
   assert.equal(shaded.length, 0,
@@ -99,14 +121,16 @@ test('bands that touch produce no shaded rect', () => {
 });
 
 test('an empty diagram draws nothing and does not throw', () => {
-  const before = svg.children.length;
   drawBandDiagram(svg, []);
   assert.equal(svg.children.length, 0, 'a stale frame survived an empty draw');
   // And the negative control for the control: the same svg, given a real
   // diagram afterwards, must populate -- proving the emptiness above was the
-  // input's doing and not a renderer that never draws anything.
+  // input's doing and not a renderer that never draws anything. Compared
+  // against ZERO, not against the previous test's leftover element count:
+  // that count came from a different fixture, so it varied with whether the
+  // previous fixture happened to have a shaded gap.
   drawBandDiagram(svg, [diagram()]);
-  assert.ok(svg.children.length > before);
+  assert.ok(svg.children.length > 0, 'the renderer drew nothing for a real diagram');
 });
 
 test('the shared frame is fixed once, so ticks and marks cannot disagree', () => {

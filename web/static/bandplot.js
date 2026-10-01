@@ -11,7 +11,8 @@
 // TM and TE are different eigenvalue problems and overlaying them would invite
 // reading a crossing as a degeneracy.
 
-import { kPathAxis, bandRange, bandGaps, plotScale } from './bands.js';
+import { kPathAxis, bandRange, bandGaps, plotScale,
+         kPointCount, bandCount } from './bands.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const PAD = { top: 18, right: 16, bottom: 40, left: 52 };
@@ -101,20 +102,29 @@ export function drawBandDiagram(svg, diagrams, { width = 640, height = 380 } = {
   // The bands, one <path> per band per series. A single path per band keeps the
   // element count proportional to bands, not to k-points, which matters because
   // the production path is ~30 k-points x 20 bands x 2 polarisations.
+  //
+  // Orientation: ``bands[k][band]``, so a path walks the OUTER index (the
+  // k-points, one point per entry of ``k_points``) and holds the band number
+  // fixed. Iterating the outer array instead draws one path per k-point -- on a
+  // real 30x4 diagram, 30 two-to-four-point stubs that look like a plot.
   list.forEach((diagram, series) => {
     const axis = axes[series];
     const colour = `var(${SERIES[series % SERIES.length]})`;
-    diagram.bands.forEach((row) => {
-      const d = row.map((value, i) => {
+    const nK = kPointCount(diagram);
+    const nB = bandCount(diagram);
+    for (let band = 0; band < nB; band += 1) {
+      let d = '';
+      for (let i = 0; i < nK; i += 1) {
+        const value = diagram.bands[i][band];
         const x = scale.x(axis.lengths[i] ?? 0);
         const y = scale.y(value);
-        return `${i === 0 ? 'M' : 'L'}${x.toFixed(2)},${y.toFixed(2)}`;
-      }).join(' ');
+        d += `${i === 0 ? 'M' : 'L'}${x.toFixed(2)},${y.toFixed(2)} `;
+      }
       svg.appendChild(el('path', {
-        d, fill: 'none', stroke: colour, 'stroke-width': '1.6',
+        d: d.trim(), fill: 'none', stroke: colour, 'stroke-width': '1.6',
         'stroke-linejoin': 'round',
       }));
-    });
+    }
   });
 
   svg.appendChild(axisLabel('k-path', width / 2, height - 6));

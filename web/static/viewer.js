@@ -31,7 +31,7 @@ import { boxCentre, componentShare, componentVolume, float32ToHalf,
 import { surfaceScaleFromGrid, boundsOf as boundsOfPositions }
   from './surface.js';
 import { drawBandDiagram } from './bandplot.js';
-import { bandGaps } from './bands.js';
+import { bandGaps, bandCount } from './bands.js';
 
 const root = document.getElementById('job');
 if (root) init(root);
@@ -1327,7 +1327,10 @@ function renderBands(payload) {
       caption.textContent = 'This job finished without a band diagram.';
     } else {
       const pol = diagrams.map((d) => d.polarisation).filter(Boolean).join(' and ');
-      const nBands = diagrams[0].bands ? diagrams[0].bands.length : 0;
+      // The band count, not ``bands.length``: the stored diagram is
+      // ``bands[k][band]``, so the outer length is the K-POINT count and this
+      // caption said "30 bands" for a 30x4 diagram.
+      const nBands = bandCount(diagrams[0]);
       caption.textContent = `${nBands} bands` + (pol ? `, ${pol} polarisation` : '')
         + `, ω in units of a/(2πc).`;
     }

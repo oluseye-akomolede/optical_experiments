@@ -60,6 +60,39 @@ export function kPathAxis(kPoints, labels) {
 }
 
 /**
+ * How many k-points a stored diagram has: the LENGTH OF ``bands``.
+ *
+ * The wire shape is ``bands[k][band]`` -- one vector of ``n_bands`` per
+ * k-point, which is what ``worker/pc_solve.solve_pc`` builds and what
+ * ``web/worker_api.py::_band_payload`` pins (``len(k_points) == len(bands)``).
+ * So the OUTER index is the k-point. Both readers here shipped reading the
+ * other axis, which draws a real 30x4 diagram as 30 two-to-four-point stubs
+ * and finds no gap in a diagram whose whole point is the gap.
+ *
+ * The counts are exported rather than recomputed at each call site so the
+ * orientation is stated once: a reader that wants "how many bands" asks
+ * :func:`bandCount` and cannot get it wrong locally.
+ */
+export function kPointCount(diagram) {
+  const bands = diagram && diagram.bands;
+  return Array.isArray(bands) ? bands.length : 0;
+}
+
+/**
+ * How many bands a stored diagram has: the length of ONE k-point's vector.
+ *
+ * Zero for an absent or empty diagram, so a caller may use it as a loop bound
+ * without a guard of its own. Note this is ``bands[0].length``, NOT
+ * ``bands.length`` -- the latter is the k-point count above, and swapping them
+ * is the transposition this pair exists to prevent.
+ */
+export function bandCount(diagram) {
+  const bands = diagram && diagram.bands;
+  if (!Array.isArray(bands) || bands.length === 0) return 0;
+  return Array.isArray(bands[0]) ? bands[0].length : 0;
+}
+
+/**
  * The y-range of the plot: the extremes over every band at every k-point.
  *
  * The scale is SHARED across both polarisations when two are plotted -- the
@@ -104,23 +137,26 @@ export function bandRange(diagrams) {
  * 1-based number (the gap "between band 1 and band 2" is index 1). An empty
  * array means no gap -- an honest absence, and the caller must say so rather
  * than leave the panel blank, since a blank panel reads as a loading state.
+ *
+ * Orientation: ``bands[k][band]``. A band's extremes are taken DOWN one column,
+ * over the k-points; reading the array row-wise instead compares two adjacent
+ * k-points of the same two bands, which is a different and meaningless number.
  */
 export function bandGaps(diagram) {
-  if (!diagram || !Array.isArray(diagram.bands) || diagram.bands.length < 2) {
-    return [];
-  }
-  const bands = diagram.bands;
-  const nK = bands[0].length;
+  const bands = diagram && diagram.bands;
+  if (!Array.isArray(bands) || bands.length === 0) return [];
+  const nK = kPointCount(diagram);      // down the array: the k-points
+  const nB = bandCount(diagram);        // across one row: the bands
   // Column-wise extremes: the max of band n over k, the min of band n+1 over k.
   // Guarded per value so a short or ragged row cannot make Math.max return NaN
   // and silently erase every gap.
   const gaps = [];
-  for (let n = 0; n + 1 < bands.length; n += 1) {
+  for (let n = 0; n + 1 < nB; n += 1) {
     let lower = -Infinity;
     let upper = Infinity;
     for (let i = 0; i < nK; i += 1) {
-      const a = bands[n][i];
-      const b = bands[n + 1][i];
+      const a = bands[i][n];
+      const b = bands[i][n + 1];
       if (Number.isFinite(a) && a > lower) lower = a;
       if (Number.isFinite(b) && b < upper) upper = b;
     }

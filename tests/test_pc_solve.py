@@ -52,8 +52,15 @@ class _StubSolver:
 
     def high_symmetry_path(self, lattice, points_per_segment=10):
         self.calls.append(("path", lattice, points_per_segment))
-        return (["G", "X"],
-                np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]]))
+        # FOUR k-points, and the job asks for THREE bands, so the payload below
+        # is not square. The wire shape is bands[k][band]; a square fixture is
+        # read the same either way, which is exactly how the two JS readers
+        # shipped transposed with green tests. This is the file that pins the
+        # shape against the real solver, so it must be able to see the
+        # difference. (The real square-lattice path returns more than four
+        # points; four is the smallest that is not three.)
+        return (["G", "X", "M", "G"],
+                np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.0]]))
 
     def bands_from_mesh(self, lattice, divisions, r_over_a, n_rod, n_bg,
                         k_points, n_bands, polarisation="TM"):
@@ -119,11 +126,21 @@ def test_the_k_path_comes_from_the_lattice_not_the_row():
 
 
 def test_the_payload_bands_are_the_solver_s_own_arrays():
-    """The numbers are passed through, not recomputed or re-derived."""
+    """The numbers are passed through, not recomputed or re-derived.
+
+    The shape is ``bands[k][band]``: four k-points (rows, from the path) by
+    three bands (columns, from ``n_bands``). Pinned as a literal list rather
+    than a transposable comparison, so an implementation that swapped the axes
+    cannot pass by producing a same-size array.
+    """
     stub = _StubSolver()
     out = pc_solve.solve_pc(_job(), solver=stub)
-    assert out["bands"] == [[0.0, 1.0, 2.0], [1.0, 2.0, 3.0], [2.0, 3.0, 4.0]]
-    assert len(out["bands"][0]) == stub.n_bands
+    assert out["bands"] == [[0.0, 1.0, 2.0], [1.0, 2.0, 3.0],
+                            [2.0, 3.0, 4.0], [3.0, 4.0, 5.0]]
+    assert len(out["bands"]) == len(out["k_points"]) == 4, "one row per k-point"
+    assert len(out["bands"][0]) == stub.n_bands == 3
+    assert len(out["bands"]) != len(out["bands"][0]), (
+        "the fixture must be non-square or it cannot see a transposition")
 
 
 def test_the_payload_is_json_ready():
