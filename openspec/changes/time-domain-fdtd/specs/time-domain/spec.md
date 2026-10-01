@@ -91,3 +91,15 @@ before it is queued, naming that frequency.
   grid's resolvable frequency
 - **THEN** the form shows the warning, naming the frequency, before any job is
   queued
+
+### Requirement: The scene's physical size SHALL come from the owner's units and scale
+
+A `td` request SHALL take its physical size from the same `units` and `scale`
+form fields the cavity tool uses (size × scale × unit), and the estimate SHALL
+be computed from that physical size.
+
+#### Scenario: a 1 µm gold-coated object with a 10 nm coat fits
+- **WHEN** a 1 µm object with a 10 nm gold coating is requested at a visible-band
+  pulse
+- **THEN** the estimate is below 8 M cells on the graded grid, and the run is
+  accepted

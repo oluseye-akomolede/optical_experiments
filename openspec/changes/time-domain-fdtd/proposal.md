@@ -69,6 +69,14 @@ spectra.
   - The estimate (cells, steps, memory, run time) is shown before submit, as the
     cavity tool already does.
 
+- **Scene scale and target range (owner, 15:58Z):** the owner sets the scene's
+  physical size with the same `units` + `scale` controls the cavity tool already
+  has; the physical size is size × scale × unit. The design range is features of
+  10 nm inside objects up to 1 µm, for plasmonic devices and photonic crystals.
+  At that ratio (100:1) a graded grid stays under the 8 M-cell cap, while a uniform
+  one would not. All solver arithmetic is SI, and tests include a nanometre-scale
+  grid so float32 coefficients are checked at the scale actually used.
+
 ## Validation (each phase ships with its benchmark)
 
 - **V1, metal box with a pulse:** the spectrum peaks are within 1% of the analytic
