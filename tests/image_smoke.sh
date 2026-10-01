@@ -66,6 +66,7 @@ web() {
     build_and_import "web" "dockerfiles/web/Dockerfile" "$TAG_BASE-web:local" \
         'import app; app.build_app; import config, meshing, jobs, worker_api; print("web import ok")'
     web_multipart "$TAG_BASE-web:local"
+    web_pc_plan "$TAG_BASE-web:local"
 }
 
 # The multi-part refusal leg: the SPLIT must actually run in the WEB image.
@@ -223,6 +224,106 @@ PROBE
         fail "the multi-part probe failed in the web image (exit $rc)"
     fi
     log "web: multi-part refusals OK"
+}
+
+# The photonic-crystal form leg: the form's own plan must RUN in the web image.
+#
+# This is the leg that was missing, and its absence shipped a 500. The image
+# built, pushed, deployed, and died on the FIRST pc submission:
+#
+#     /opt/app/pc.py:37 ModuleNotFoundError: No module named 'scipy'
+#
+# web/pc_form.py imported the SOLVER to get the unit cell's node count, and the
+# solver imports scipy -- which the leg above asserts this image does not have.
+# Every test was green because the checkout installs scipy for the solver, so
+# the form's import resolved here and nowhere else. Same shape as the multi-part
+# leg above, one layer up: the venv is a more capable environment than the
+# container, and the difference is exactly where the defect lived.
+#
+# run PC.plan_request on a REAL small form, in the image, and report the numbers
+# it decides on -- not an import probe. `import pc_form` alone would have passed
+# on the broken image because pc_form itself imports fine; the import of `pc`
+# happens inside plan_request.
+web_pc_plan() {
+    local tag="$1" out rc
+    log "the pc form's plan inside web"
+
+    set +e
+    docker run --rm -i --network none --cpus=2 --memory=2g \
+        --entrypoint python "$tag" - \
+        > /tmp/web_pc_plan_leg.txt 2>&1 <<'PROBE'
+import importlib.util
+import sys
+
+import pc_form
+
+failures = []
+
+
+def check(name, ok, detail=None):
+    print(("PASS  " if ok else "FAIL  ") + name
+          + (("  " + detail) if detail else ""), flush=True)
+    if not ok:
+        failures.append(name)
+
+
+print("PROBE-START", flush=True)
+
+# The form the route actually hands in: every value a string, as request.form
+# gives it. div 8 is deliberately tiny -- this leg asks whether the form RUNS
+# here, not how big a cell the box can take.
+form = {
+    "lattice": "square",
+    "r_over_a": "0.2",
+    "n_rod": "3.5",
+    "n_bg": "1.0",
+    "n_bands": "6",
+    "divisions": "8",
+    "polarisation": "TM",
+}
+try:
+    planned = pc_form.plan_request(form)
+except Exception as exc:  # noqa: BLE001 - the failure IS the result here
+    check("PC.plan_request runs in the web image", False,
+          "%s: %s" % (type(exc).__name__, exc))
+else:
+    check("PC.plan_request runs in the web image", True)
+    check("and it derives a node count", planned["nodes"] > 0,
+          "nodes=%s" % planned["nodes"])
+    check("and it derives the k-point count", planned["k_points"] == 30,
+          "k_points=%s" % planned["k_points"])
+    check("and it carries no triangle count (the web side does not triangulate)",
+          "triangles" not in planned, str(sorted(planned)))
+
+# The premise of the fix, asserted rather than commented: the web image has no
+# scipy and no solver module, which is WHY the form must reach only the numpy
+# geometry. If a future image gains scipy this leg stops proving anything, and
+# that should be visible here rather than silent.
+check("the web image still has no scipy",
+      importlib.util.find_spec("scipy") is None)
+check("the solver module pc is not in the image at all",
+      importlib.util.find_spec("pc") is None)
+
+print("PROBE-END", flush=True)
+if failures:
+    print("PC PLAN LEG FAILED: %d case(s): %s" % (len(failures), failures),
+          flush=True)
+sys.exit(1 if failures else 0)
+PROBE
+    rc=$?
+    set -e
+
+    cat /tmp/web_pc_plan_leg.txt >&2
+    if ! grep -q "^PROBE-START" /tmp/web_pc_plan_leg.txt; then
+        fail "the pc form probe did not reach its first line in the web image"
+    fi
+    if ! grep -q "^PROBE-END" /tmp/web_pc_plan_leg.txt; then
+        fail "the pc form probe stopped before its last line; its output is above"
+    fi
+    if [ "$rc" -ne 0 ]; then
+        fail "the pc form probe failed in the web image (exit $rc)"
+    fi
+    log "web: the pc form's plan OK"
 }
 
 solver() {
