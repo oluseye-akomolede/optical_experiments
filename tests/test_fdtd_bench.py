@@ -89,3 +89,49 @@ def test_v2_falloff_is_flat_for_1_over_r_and_off_for_a_steeper_power():
     # drift the 5% gate must see, read from the nearest probe in full.
     steep = bench2.falloff(radii, [2.0 / r ** 1.1 for r in radii])
     assert abs(steep[-1] - 3.0 ** -0.1) < 1e-12
+
+
+def test_v2_by_default_gates_only_probes_the_spec_puts_in_the_far_field():
+    """The spec's V2 probes sit at r >= 2 wavelengths; the default must too.
+
+    Read against the spec's own floor, so a default of 1 wavelength (where the
+    near field still bends r * |E|) cannot pass as the spec's benchmark.
+    """
+    spec = (ROOT / "openspec" / "changes" / "time-domain-fdtd" / "specs"
+            / "time-domain" / "spec.md").read_text()
+    assert "r ≥ 2λ" in spec
+    args = bench2.build_parser().parse_args([])
+    assert args.r_min >= 2.0, f"V2's default --r-min is {args.r_min}, under 2"
+    assert args.r_max > args.r_min
+
+
+VERDICT = dict(worst=0.4, n_peaks=5, found=5, excitable=5, ungated=0,
+               tolerance=1.0, dispersion=0.002)
+
+
+def test_a_clean_v1_run_passes_and_exits_zero():
+    verdict, line, code = bench.v1_verdict([], False, **VERDICT)
+    assert (verdict, code) == ("PASS", 0)
+    assert line.startswith("V1 PASS")
+
+
+def test_a_widened_v1_run_is_not_reported_as_a_spec_pass():
+    """Spec: "a widened run does not report a spec pass" -- not in the word,
+    not in the exit code, even when every peak is inside the widened gate."""
+    verdict, line, code = bench.v1_verdict(
+        [], True, **dict(VERDICT, tolerance=1.6))
+    assert "PASS" not in line.replace("NOT A SPEC PASS", "")
+    assert "NOT A SPEC PASS" in line
+    assert verdict != "PASS"
+    assert code != 0
+    failed = bench.v1_verdict(["worst error 2% is over 1.6%"], True,
+                              **dict(VERDICT, tolerance=1.6))
+    assert failed[0] == "FAIL" and failed[2] == 1
+
+
+def test_the_v1_verdict_counts_the_modes_left_ungated():
+    for ungated in (0, 2):
+        _verdict, line, _code = bench.v1_verdict(
+            [], False, **dict(VERDICT, ungated=ungated))
+        assert (f"{ungated} mode(s) under the {bench.EXCITABLE} coupling "
+                f"threshold, not gated") in line

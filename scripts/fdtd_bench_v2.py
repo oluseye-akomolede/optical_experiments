@@ -7,9 +7,10 @@ field is pure Ez and its amplitude falls as
 
     |E| ~ (1/r) * sqrt(1 - 1/(kr)^2 + 1/(kr)^4)
 
-so beyond a wavelength it is 1/r to within 1.3% (the near-field factor printed
-in the table). The gate is the proposal's: in the far field, r * |Ez(r)| stays
-within 5% of its value at the nearest far-field probe. The reference is that
+so beyond a wavelength it is 1/r to within 1.3%, and from the spec's 2
+wavelengths (the default --r-min) to within 0.32% (the near-field factor is
+printed in the table). The gate is the spec's: at r >= 2 wavelengths, r * |Ez(r)|
+stays within 5% of its value at the nearest probe. The reference is that
 nearest probe rather than a median, so a steady drift across the range is read
 in full instead of being split either side of a middle value.
 
@@ -24,7 +25,7 @@ a falloff.
 A SILENT PROBE IS A FAILURE, not a pass: a NaN or zero amplitude fails the run,
 because a flat r * |E| of zero would otherwise be perfectly 1/r.
 
-DEFAULTS (20 cells per wavelength, probes from 1 to 3 wavelengths): a 149^3
+DEFAULTS (20 cells per wavelength, probes from 2 to 3 wavelengths): a 149^3
 grid, ~3.3e6 cells and ~600 steps, so about 2e9 cell-steps. At the Orin's
 measured 1.2e8 cell-steps/s that is under a minute. The cost line prints the
 real figure. NOT for the VM: a tiny smoke (--cells-per-wavelength 6 --r-max 1.5
@@ -87,13 +88,14 @@ def falloff(radii, amplitudes):
     return [r * a / reference for r, a in zip(radii, amplitudes)]
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--frequency", type=float, default=1e9,
                         help="Hz; the result is scale-free, this only sets units")
     parser.add_argument("--cells-per-wavelength", type=float, default=20.0)
-    parser.add_argument("--r-min", type=float, default=1.0,
-                        help="nearest gated probe, in wavelengths")
+    parser.add_argument("--r-min", type=float, default=2.0,
+                        help="nearest gated probe, in wavelengths; the spec's "
+                             "V2 is r >= 2")
     parser.add_argument("--r-max", type=float, default=3.0,
                         help="farthest probe, in wavelengths")
     parser.add_argument("--margin", type=int, default=4,
@@ -105,7 +107,11 @@ def main(argv=None) -> int:
     parser.add_argument("--tolerance", type=float, default=5.0,
                         help="percent; the proposal's V2 gate")
     parser.add_argument("--xp", default="numpy", choices=("numpy", "cupy"))
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
 
     xp = np
     if args.xp == "cupy":

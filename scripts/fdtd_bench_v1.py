@@ -53,8 +53,10 @@ failure, not a smaller count. Peaks are matched to modes one-to-one (closest
 pair first), because nearest-mode matching let two peaks claim the same mode --
 measured on the default box, the 012 line at -0.30% was labelled 111 at +0.26%
 and the run reported 4 of 5 modes when all 5 were there. The tolerance widens
-only to 2 x the grid's own dispersion floor, and says so when it does; the
-default 20 cells per wavelength keeps that floor (0.40%) inside 1%.
+only to 2 x the grid's own dispersion floor, and says so when it does; a
+widened run reports NOT A SPEC PASS and exits 2 even if every peak is inside
+the wider gate (FAIL exits 1, PASS 0). The default 20 cells per wavelength
+keeps that floor (0.40%) inside 1%.
 
 MEASURED. Orin at the old default of 16 cells per wavelength: 5.7 s wall, 44 MB
 peak RSS. The VM at 20 (numpy, 2 threads): 9.7 s, 7500 cells x 6847 steps x 3
@@ -212,6 +214,33 @@ def excitable_modes(labels, box, dx, cell, probe):
     return sorted(key for key, triples in labels.items()
                   if max(coupling(t, box, dx, cell, probe) for t in triples)
                   >= EXCITABLE)
+
+
+def v1_verdict(failures, widened, *, worst, n_peaks, found, excitable,
+               ungated, tolerance, dispersion):
+    """``(verdict, line, exit code)`` for the run's summary.
+
+    PASS / exit 0 only for a run that met the spec's own gate. A run whose
+    tolerance was widened to the grid's dispersion floor did not test that
+    gate, so even with every peak inside the wider one it is NOT A SPEC PASS
+    and exits 2 (FAIL exits 1). The modes under the coupling threshold are
+    counted in the same line, so a run that found 5 of 5 also says how many it
+    never asked about.
+    """
+    if failures:
+        verdict, code = "FAIL", 1
+    elif widened:
+        verdict, code = "NOT A SPEC PASS", 2
+    else:
+        verdict, code = "PASS", 0
+    line = (f"V1 {verdict}: worst error {worst:.2f}% over {n_peaks} peak(s), "
+            f"{found} of {excitable} excitable mode(s) found, "
+            f"{ungated} mode(s) under the {EXCITABLE} coupling threshold, not "
+            f"gated; tolerance {tolerance:.3g}% (dispersion floor "
+            f"{dispersion:.3%})"
+            + (" -- WIDENED past the spec's gate, so the spec's gate was not "
+               "tested" if widened else ""))
+    return verdict, line, code
 
 
 def match_peaks(peaks, keys):
@@ -515,11 +544,11 @@ def main(argv=None) -> int:
                         for k in missing))
     if stray:
         failures.append(f"{stray} peak(s) matched no analytic mode")
-    verdict = "FAIL" if failures else "PASS"
-    print(f"\nV1 {verdict}: worst error {worst:.2f}% over {len(peaks)} peak(s), "
-          f"{len(matched & set(excitable))} of {len(excitable)} excitable mode(s) "
-          f"found, tolerance {tolerance:.3g}% (dispersion floor {dispersion:.3%})"
-          + (" -- WIDENED past the spec's gate" if widened else ""))
+    verdict, line, code = v1_verdict(
+        failures, widened, worst=worst, n_peaks=len(peaks),
+        found=len(matched & set(excitable)), excitable=len(excitable),
+        ungated=len(weak), tolerance=tolerance, dispersion=dispersion)
+    print("\n" + line)
     for failure in failures:
         print(f"  {failure}")
     if worst > tolerance:
@@ -566,7 +595,7 @@ def main(argv=None) -> int:
         else:
             cavity_ok = False
 
-    return 0 if verdict == "PASS" and cavity_ok else 1
+    return code if cavity_ok else 1
 
 
 if __name__ == "__main__":
