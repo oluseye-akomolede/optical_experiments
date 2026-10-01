@@ -411,10 +411,15 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     ``PolarisationTerm``); phase 1 runs with none.
 
     Returns ``{"traces": (n_probes, n_steps) float32, "dt", "steps",
-    "spacings", "energy"}``. ``energy`` is the cell-volume-weighted total per
-    step, or ``None`` unless ``record_energy`` asked for it -- it builds six
-    float64 weight arrays and reduces six arrays every step, cheap on a 24^3
-    test grid and not on a production one.
+    "spacings", "energy"}``, and every one of them is HOST numpy whatever ``xp``
+    was: the arrays live on the device for the whole run and cross back in a
+    single transfer at the end, so a consumer never has to know which backend
+    ran (and never pays a per-element transfer of its own). ``energy`` is the
+    cell-volume-weighted total per step, or ``None`` unless ``record_energy``
+    asked for it -- it builds six float64 weight arrays and reduces six arrays
+    every step, and each ``float(xp.sum(...))`` is a device sync, so it is a
+    diagnostic: free on the numpy path, six syncs a step on cupy. Cheap on a
+    24^3 test grid, not on a production one.
     """
     xp = np if xp is None else xp
     f32 = xp.float32
@@ -691,8 +696,21 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                 value = field[component][cell]
             traces[index, step] = value
 
-    return {"traces": traces, "dt": dt, "steps": n_steps,
+    return {"traces": _host_result(traces, xp), "dt": dt, "steps": n_steps,
             "spacings": [np.array(p) for p in primal], "energy": energy}
+
+
+def _host_result(value, xp):
+    """Move a finished result array back to host numpy, once, at the end.
+
+    The caller chose ``xp``; a cupy array is device-resident for the whole run
+    and only crosses to the host here. cupy's arrays refuse ``np.asarray`` on
+    purpose (that refusal is what stops a stray per-element transfer from
+    looking free), so the copy comes from ``xp.asnumpy`` -- and numpy, which has
+    no such function, needs no copy at all.
+    """
+    to_host = getattr(xp, "asnumpy", None)
+    return np.asarray(value if to_host is None else to_host(value))
 
 
 def _outer(axes):

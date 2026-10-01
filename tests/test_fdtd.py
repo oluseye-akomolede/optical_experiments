@@ -106,6 +106,133 @@ def test_the_time_step_uses_the_smallest_spacing_on_every_axis():
         assert run["dt"] != pytest.approx(fdtd.SAFETY * value, rel=1e-6)
 
 
+# ------------------------------------------------------- the return contract
+
+
+def _device(value):
+    return value._array if isinstance(value, _DeviceArray) else value
+
+
+class _DeviceArray:
+    """A host array that refuses to become a numpy array, like cupy's.
+
+    cupy arrays raise on ``np.asarray``, and that refusal is deliberate: it is
+    what stops an accidental per-element device transfer from silently costing a
+    sync each time. A WRAPPER is needed rather than an ndarray subclass -- numpy
+    does not consult ``__array__`` for subclasses, it just reinterprets the
+    buffer and hands back a base-class view without raising (measured; the first
+    version of this fake was a subclass and the control below caught it).
+
+    ``__array_ufunc__ = None`` makes numpy return NotImplemented for a binary
+    operation with one of these on either side, so the reflected methods below
+    are used instead of an attempted conversion.
+    """
+
+    __array_ufunc__ = None
+
+    def __init__(self, array):
+        self._array = array
+
+    def __array__(self, *args, **kwargs):
+        raise TypeError("Implicit conversion to a NumPy array is not allowed. "
+                        "Use .get() or xp.asnumpy() to fetch it to the host.")
+
+    def __getattr__(self, name):        # .shape, .reshape, .astype, ...
+        # Dunders are NOT delegated. __getattr__ would otherwise hand numpy the
+        # underlying array's __array_interface__/__array_struct__, and numpy
+        # takes the buffer protocol when it sees one -- it then never reaches
+        # __array__ at all, so the refusal below would silently do nothing.
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self._array, name)
+
+    def __getitem__(self, key):
+        value = self._array[_device(key)]
+        return _DeviceArray(value) if isinstance(value, np.ndarray) else value
+
+    def __setitem__(self, key, value):
+        self._array[_device(key)] = _device(value)
+
+    def __sub__(self, other):  return _DeviceArray(self._array - _device(other))
+    def __rsub__(self, other): return _DeviceArray(_device(other) - self._array)
+    def __mul__(self, other):  return _DeviceArray(self._array * _device(other))
+    def __rmul__(self, other): return _DeviceArray(_device(other) * self._array)
+    def __truediv__(self, other):
+        return _DeviceArray(self._array / _device(other))
+    def __rtruediv__(self, other):
+        return _DeviceArray(_device(other) / self._array)
+    def __gt__(self, other):   return _DeviceArray(self._array > _device(other))
+
+    def __iadd__(self, other):
+        self._array += _device(other)
+        return self
+
+    def __isub__(self, other):
+        self._array -= _device(other)
+        return self
+
+
+class _DeviceXp:
+    """The numpy surface ``simulate`` uses, handing back arrays that refuse.
+
+    Only the calls the entry point makes on its default path, so it cannot
+    quietly become a second numpy with its own behaviour.
+    """
+
+    float32 = np.float32
+    float64 = np.float64
+
+    @staticmethod
+    def asarray(value, dtype=None):
+        return _DeviceArray(np.asarray(_device(value), dtype=dtype))
+
+    @staticmethod
+    def zeros(shape, dtype=None):
+        return _DeviceArray(np.zeros(shape, dtype=dtype))
+
+    @staticmethod
+    def all(value):
+        return np.all(_device(value))
+
+    @staticmethod
+    def sqrt(value):
+        return np.sqrt(_device(value))
+
+    @staticmethod
+    def asnumpy(value):
+        return _device(value)           # the transfer, the way cupy.asnumpy is
+
+
+def test_the_traces_come_back_on_the_host_whatever_xp_built_them():
+    """The result is host float32 even when the arrays lived on a device.
+
+    Found on the Jetson: with xp=cupy the traces came back device-resident, so
+    the bench's ``np.asarray(trace)`` raised "Implicit conversion to a NumPy
+    array is not allowed". The control at the top is the load-bearing half --
+    if this fake does not actually refuse, the assertions below would pass no
+    matter what ``simulate`` returned.
+    """
+    xp = _DeviceXp()
+    with pytest.raises(TypeError, match="Implicit conversion"):
+        np.asarray(xp.zeros((2, 2), dtype=np.float32))
+
+    problem = dict(eps_r=np.ones((6, 6, 6), np.float32),
+                   source=pulse(cell=(3, 3, 3)), n_steps=40)
+    device = fdtd.simulate(probes=[(3, 3, 3)], spacings=(0.9, 1.0, 1.1),
+                           xp=xp, **problem)
+    assert type(device["traces"]) is np.ndarray, (
+        f"the traces came back as {type(device['traces']).__name__}; a device "
+        f"array here is what made the bench raise on the Jetson")
+    assert device["traces"].dtype == np.float32
+    # ...and they are the SAME numbers the numpy path produces. A conversion
+    # that dropped, reordered or partially copied samples satisfies the type
+    # check above, so the values are what pins the transfer.
+    host = fdtd.simulate(probes=[(3, 3, 3)], spacings=(0.9, 1.0, 1.1),
+                         xp=np, **problem)
+    assert np.any(device["traces"] != 0.0), "the source excited nothing"
+    assert np.array_equal(device["traces"], host["traces"])
+
+
 # ---------------------------------------------------------------- energy
 
 def test_a_closed_pec_box_conserves_its_energy_after_the_source_stops():
