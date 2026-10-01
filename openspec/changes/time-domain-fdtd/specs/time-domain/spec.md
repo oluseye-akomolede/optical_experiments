@@ -297,6 +297,23 @@ refused before it is queued.
   reflectance for the same model, over the band where the incident spectrum is
   at least 1e-2 of its peak
 
+#### Scenario: the V4 bench judges only what it measured
+- **WHEN** the V4 bench runs
+- **THEN** it takes the incident spectrum from a reference run with the same
+  metal term over an empty region (so both runs share one time step), and
+  transforms both traces without a window
+- **AND** it fails if either trace still holds more than 1e-3 of its peak in
+  its last 5% (a cut-off record), or if the ratio is not finite in the band
+- **AND** it exits 2 without running when the pulse band leaves the metal's
+  fit, and exits 2 rather than passing when the setup has fewer than 4 cells
+  per skin depth or a slab under 10 skin depths
+
+#### Scenario: a metal slab across periodic faces is uniform
+- **WHEN** a plane wave meets a metal slab that spans every periodic axis
+- **THEN** E inside the slab is the same at every transverse sample within
+  1e-6 of its peak (the metal term advances every sample the E update does,
+  including the last row of a periodic axis)
+
 ### Requirement: Thin layers SHALL be resolved, not lost
 
 The grid SHALL place at least 4 cells across every layer thinner than the
