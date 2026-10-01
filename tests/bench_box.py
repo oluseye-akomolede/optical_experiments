@@ -46,6 +46,7 @@ error, comfortably under the 3% threshold but much larger than the box's.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import resource
 import sys
@@ -186,6 +187,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--write-dir", default=None,
                         help="where --write puts the job directory (default: a "
                              "fresh temp dir, printed then left in place)")
+    parser.add_argument("--json-out", default=None,
+                        help="also write the computed modes (frequencies in Hz, "
+                             "ascending) and the verdict to this JSON file, for a "
+                             "caller that gates on them (fdtd_bench_v1.py "
+                             "--compare-cavity)")
     return parser
 
 
@@ -412,6 +418,12 @@ def main(argv=None) -> int:
         print("=" * 72)
 
     ok = worst <= args.tolerance and spurious == 0 and writing_ok
+    if args.json_out:
+        with open(args.json_out, "w") as handle:
+            json.dump({"freq_hz": [float(f) for f in freq_hz],
+                       "k_analytic_per_unit": [float(k) for k in expected],
+                       "worst_percent": worst, "spurious": spurious,
+                       "ok": bool(ok)}, handle)
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

@@ -80,6 +80,7 @@ imports the production stack, so ship the checkout, not the one file:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import resource
@@ -231,6 +232,47 @@ def match_peaks(peaks, keys):
     return assigned
 
 
+def compare_with_cavity(peaks, assigned, modes, cavity, tolerance, v1_tolerance):
+    """Gate the FDTD peaks against the cavity solver, mode by mode.
+
+    ``modes`` (analytic k, ascending, degenerate modes repeated) and ``cavity``
+    (the cavity solver's frequencies, ascending) are the same list of modes, so
+    index i of one is index i of the other; a degenerate set is compared with
+    the mean of its cavity frequencies. Only peaks that V1 matched to a chased
+    mode within its own tolerance are compared, and every such mode must have a
+    cavity frequency: a short cavity list is a failure, not fewer rows.
+
+    Returns ``(rows, problems)``: rows are (peak Hz, cavity Hz, diff %, key).
+    """
+    problems = []
+    if len(cavity) < len(modes):
+        problems.append(f"the cavity solver returned {len(cavity)} mode(s) for "
+                        f"{len(modes)} chased")
+    by_key = {}
+    for index, k in enumerate(modes[:len(cavity)]):
+        by_key.setdefault(round(float(k), 9), []).append(float(cavity[index]))
+    rows = []
+    for index, key in sorted(assigned.items()):
+        analytic = fdtd.C0 * key / (2.0 * math.pi)
+        value = peaks[index]
+        if abs(value - analytic) / analytic * 100.0 > v1_tolerance:
+            continue
+        if key not in by_key:
+            if any(round(float(k), 9) == key for k in modes):
+                problems.append(f"no cavity frequency for the mode at "
+                                f"{analytic/1e9:.4f} GHz")
+            continue
+        reference = sum(by_key[key]) / len(by_key[key])
+        diff = 100.0 * (value - reference) / reference
+        rows.append((value, reference, diff, key))
+        if abs(diff) > tolerance:
+            problems.append(f"{value/1e9:.4f} GHz is {diff:+.2f}% from the cavity "
+                            f"solver's {reference/1e9:.4f} GHz")
+    if not rows and not problems:
+        problems.append("no peak was compared")
+    return rows, problems
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--a", type=float, default=40.0, help="box side along x")
@@ -252,7 +294,11 @@ def main(argv=None) -> int:
     parser.add_argument("--xp", default="numpy", choices=("numpy", "cupy"),
                         help="cupy is the Jetson path; the same update code runs")
     parser.add_argument("--compare-cavity", action="store_true",
-                        help="also run the production cavity solver (NOT cheap)")
+                        help="also run the production cavity solver on the same "
+                             "box and gate against it (NOT cheap)")
+    parser.add_argument("--cavity-tolerance", type=float, default=1.0,
+                        help="percent; each matched peak against the cavity "
+                             "solver's frequency for the same mode (proposal V1)")
     parser.add_argument("--seed-cell", default=None,
                         help="override the source cell, 'i,j,k'")
     args = parser.parse_args(argv)
@@ -479,15 +525,47 @@ def main(argv=None) -> int:
         print("A residual the size of the dispersion line above is the grid; "
               "anything larger is not.")
 
+    cavity_ok = True
     if args.compare_cavity:
+        # The box the GRID describes, not the one requested: the walls sit
+        # (n - 1) * dx apart, and comparing against the requested box would
+        # build its difference into every row.
+        sides = [f"{side / scale:.9g}" for side in box]
+        out = Path(os.environ.get("TMPDIR", "/tmp")) / f"v1-cavity-{os.getpid()}.json"
         command = [sys.executable, str(ROOT / "tests" / "bench_box.py"),
-                   "--shape", "box", "--a", str(args.a), "--b", str(args.b),
-                   "--d", str(args.d), "--units", args.units,
-                   "--n-modes", str(args.n_modes)]
+                   "--shape", "box", "--a", sides[0], "--b", sides[1],
+                   "--d", sides[2], "--units", args.units,
+                   "--n-modes", str(args.n_modes), "--json-out", str(out)]
         print("\n" + " ".join(command), "(the production path, NOT cheap)")
-        subprocess.run(command, check=False)
+        done = subprocess.run(command, check=False)
+        try:
+            cavity = json.loads(out.read_text())["freq_hz"]
+        except (OSError, ValueError, KeyError) as exc:
+            cavity = None
+            print(f"CAVITY FAIL: the cavity solver gave no modes to compare "
+                  f"(exit {done.returncode}, {type(exc).__name__}); that is not "
+                  f"agreement")
+        if cavity is not None:
+            rows, problems = compare_with_cavity(
+                [value for value, _h, _c in peaks], assigned, modes, cavity,
+                args.cavity_tolerance, tolerance)
+            print(f"\n{'peak (GHz)':>12} {'cavity (GHz)':>13} {'diff':>9}  mode")
+            for value, reference, diff, key in rows:
+                names = ", ".join("".join(map(str, t)) for t in labels[key])
+                print(f"{value/1e9:12.4f} {reference/1e9:13.4f} {diff:+8.2f}%  {names}")
+            if done.returncode != 0:
+                problems.append(f"the cavity solver's own check failed "
+                                f"(exit {done.returncode}); its modes are not a "
+                                f"reference")
+            cavity_ok = not problems
+            print(f"CAVITY {'PASS' if cavity_ok else 'FAIL'}: {len(rows)} peak(s) "
+                  f"against the cavity solver, tolerance {args.cavity_tolerance:g}%")
+            for problem in problems:
+                print(f"  {problem}")
+        else:
+            cavity_ok = False
 
-    return 0 if verdict == "PASS" else 1
+    return 0 if verdict == "PASS" and cavity_ok else 1
 
 
 if __name__ == "__main__":

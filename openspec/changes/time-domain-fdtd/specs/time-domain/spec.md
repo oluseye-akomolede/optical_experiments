@@ -48,6 +48,14 @@ the time-domain solver agrees with the analytic cavity and with the cavity solve
 - **AND** the 1% tolerance is widened only to twice the grid's own dispersion
   error, and the output says so when it is
 
+#### Scenario: benchmark V1 against the cavity solver
+- **WHEN** the same box (the wall separation the grid actually has) is also
+  solved by the cavity solver
+- **THEN** each peak matched to a mode is within 1% of the cavity solver's
+  frequency for that mode, using the mean of a degenerate set
+- **AND** if the cavity solver fails its own check or returns fewer modes than
+  were chased, the comparison fails instead of comparing fewer rows
+
 ### Requirement: An open boundary SHALL absorb outgoing waves
 
 With boundary `open`, the CPML SHALL absorb waves leaving the grid, so no
