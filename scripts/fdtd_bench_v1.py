@@ -63,9 +63,10 @@ rate a cap can be sized from.
 
 THE CAVITY SOLVER IS NOT RUN HERE. It is the other leg of the comparison and it
 is not cheap -- it tetrahedralizes the box with TetGen and solves a sparse
-3-D eigenproblem -- so it runs as its own step (``--compare-cavity`` shells out
-to tests/bench_box.py and prints its table). By default this script only does
-the analytic comparison.
+3-D eigenproblem -- so it runs only with ``--compare-cavity``, which shells out
+to tests/bench_box.py on the box the grid describes and gates each matched
+peak at --cavity-tolerance (1%) of the cavity solver's frequency for the same
+mode. By default this script only does the analytic comparison.
 
 RUN IT ON THE JETSON (mid-size solves are tier 2, one at a time). bench_box.py
 imports the production stack, so ship the checkout, not the one file:

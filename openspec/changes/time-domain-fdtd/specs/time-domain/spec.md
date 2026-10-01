@@ -61,6 +61,14 @@ the time-domain solver agrees with the analytic cavity and with the cavity solve
 With boundary `open`, the CPML SHALL absorb waves leaving the grid, so no
 reflection from the grid edge is shown as part of the simulation.
 
+#### Scenario: benchmark V2
+- **WHEN** a CW z-directed point source radiates in open vacuum
+- **THEN** broadside to it, from 1 to 3 wavelengths, r x |Ez| stays within 5%
+  of its value at the nearest probe (amplitude from a least-squares fit at the
+  source frequency)
+- **AND** a probe that saw nothing, or whose fits over the two halves of the
+  recorded window differ by more than 1% (not yet steady), fails the benchmark
+
 #### Scenario: benchmark V3
 - **WHEN** a plane-wave pulse crosses empty open space and leaves the grid
 - **THEN** the residual field energy is below 1e-4 of the peak energy
