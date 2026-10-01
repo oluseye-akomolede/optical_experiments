@@ -59,3 +59,10 @@
   spectrum plots with axis units.
 - [ ] 5.3 Image smoke test, then an in-browser check against a real finished `td`
   job in production.
+
+## 6. Periodic boundaries (phase 6)
+
+- [ ] 6.1 Periodic faces (wrap the curl differences), plus a Bloch phase for a
+  given k by two real runs in quadrature.
+- [ ] 6.2 Benchmark V6 against the existing pc band solver: an extruded 2-D
+  crystal, with frequencies at chosen k-points within 1%.

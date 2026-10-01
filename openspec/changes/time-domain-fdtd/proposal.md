@@ -110,6 +110,12 @@ spectra.
 5. Web form, field-movie playback, trace and spectrum plots, and the in-browser
    check against a real finished `td` job.
 
+6. Periodic boundaries (owner, 16:00Z: "1"): one repeating cell with
+   wrap-around faces, including a Bloch phase for a chosen wave vector. The core
+   stays real float32, and a Bloch phase uses two real runs in quadrature, so
+   phase 1 does not change. Benchmark V6: band frequencies at chosen k-points match
+   the existing photonic-crystal solver for the same 2-D crystal, within 1%.
+
 ## Out of scope
 
 Nonlinear and magnetic materials, flux and transmission monitors, and multi-GPU

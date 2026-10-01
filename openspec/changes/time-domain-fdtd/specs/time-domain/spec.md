@@ -108,3 +108,14 @@ be computed from that physical size.
 - **WHEN** a curved object of 1 µm with a 10 nm coating is requested
 - **THEN** the estimate reports the cell count the graded grid actually needs, and
   a request above the cap is refused naming that count
+
+### Requirement: A periodic cell SHALL reproduce the crystal's bands
+
+A `td` request MAY declare periodic faces with a Bloch wave vector k. The run
+SHALL then model an infinite crystal of that cell.
+
+#### Scenario: benchmark V6
+- **WHEN** a pulse is run in one cell of a 2-D crystal extruded along z, with
+  Bloch-periodic faces at a chosen k
+- **THEN** the spectrum's peaks are within 1% of the photonic-crystal band solver's
+  frequencies at that k
