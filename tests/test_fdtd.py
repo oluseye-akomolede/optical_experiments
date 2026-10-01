@@ -68,6 +68,44 @@ def test_a_courant_safety_factor_at_or_above_one_is_refused():
             fdtd.courant_dt(DX, safety=safety)
 
 
+def test_the_time_step_uses_the_smallest_spacing_on_every_axis():
+    """Three DIFFERENT minima, so an axis mix-up cannot pass.
+
+    Each minimum is planted at a different place in an otherwise uniform array,
+    and the three axes carry different values, so taking the limit from the
+    first entry, from one axis's array reused three times, or from the wrong
+    axis all give a different number from the right one.
+    """
+    sx = np.array([0.5, 1.0, 1.0, 1.0])
+    sy = np.array([1.0, 0.4, 1.0, 1.0])
+    sz = np.array([1.0, 1.0, 0.25, 1.0])
+    expected = 1.0 / (C * math.sqrt(1 / 0.5 ** 2 + 1 / 0.4 ** 2 + 1 / 0.25 ** 2))
+    limit = fdtd.courant_limit(sx, sy, sz)
+    assert limit == pytest.approx(expected, rel=1e-12)
+    # Each one-axis answer is a different number, so nothing below can be
+    # matching by accident.
+    alone = [fdtd.courant_limit(a) for a in (0.5, 0.4, 0.25)]
+    for value in alone:
+        assert limit != pytest.approx(value, rel=1e-6)
+    assert fdtd.courant_limit(sx, sx, sx) != pytest.approx(limit, rel=1e-6)
+    # A uniform array is the same number as the scalar form, only then equally
+    # timed: the harshest axis has to be the one that sets the step.
+    assert fdtd.courant_limit(np.full(3, 0.25)) == pytest.approx(
+        fdtd.courant_limit(0.25), rel=1e-12)
+    assert fdtd.courant_dt(sx, sy, sz) == pytest.approx(
+        fdtd.SAFETY * limit, rel=1e-12)
+    # Every claim above is about the FUNCTION. A correct function called with
+    # one axis's number is still the wrong step, and nothing above would notice,
+    # so the run has to be checked too -- a dt off the tightest axis does not
+    # blow up on a short run, it just drifts.
+    run = fdtd.simulate(np.ones((5, 5, 5), np.float32), pulse(cell=(2, 2, 2)), 2,
+                        probes=[(2, 2, 2)], spacings=(sx, sy, sz),
+                        boundary="metal")
+    assert run["dt"] == pytest.approx(fdtd.SAFETY * expected, rel=1e-12)
+    for value in alone:
+        assert run["dt"] != pytest.approx(fdtd.SAFETY * value, rel=1e-6)
+
+
 # ---------------------------------------------------------------- energy
 
 def test_a_closed_pec_box_conserves_its_energy_after_the_source_stops():
@@ -81,6 +119,71 @@ def test_a_closed_pec_box_conserves_its_energy_after_the_source_stops():
     # The source is silent from here on; a lossless box has nowhere for the
     # energy to go.
     silent_from = steps_for(source.end_time() * 1.1)
+    after = energy[silent_from:]
+    assert after.size > 20, "the run ended before the source did"
+    spread = (after.max() - after.min()) / after.max()
+    assert spread < 0.01, f"energy drifted {spread:.2%} after the source stopped"
+
+
+def test_a_graded_grid_conserves_its_energy_too():
+    """The same claim on a grid whose cells are not all the same size.
+
+    One axis is graded and the NEIGHBOUR ratio is 1.04, well inside the 1.3 the
+    brief allows, so a failure here is the graded arithmetic and not a grid no
+    scheme would put up with. The energy checked is the cell-volume-weighted
+    quadratic, which on this grid is a different number from the plain sum of
+    squares -- that is the point, because the plain sum is NOT conserved here.
+    """
+    ratios = 1.04 ** np.arange(15, dtype=np.float64)
+    spacings = (ratios, DX, DX)
+    assert float(ratios[-1] / ratios[0]) > 1.5, "the axis is barely graded"
+    grid = np.ones((16, 12, 12), dtype=np.float32)
+    source = pulse(cell=(6, 6, 6))
+    run = fdtd.simulate(grid, source, steps_for(6e-7), probes=[(3, 4, 5)],
+                        spacings=spacings, boundary="metal", record_energy=True)
+
+    energy = np.asarray(run["energy"])
+    assert energy.max() > 0, "the source excited nothing"
+    silent_from = steps_for(source.end_time() * 1.1)
+    after = energy[silent_from:]
+    assert after.size > 20, "the run ended before the source did"
+    spread = (after.max() - after.min()) / after.max()
+    assert spread < 0.01, f"energy drifted {spread:.2%} after the source stopped"
+
+
+def test_a_nanometre_grid_conserves_its_energy_too():
+    """The 10 nm end of the range the product actually covers.
+
+    float32 coefficients are not scale free and this is where they break: the
+    cell volumes here are ~1e-26 m^3, so a squared sample times its volume is
+    ~1e-58, below float32's smallest normal (1.2e-38) and the sum comes out 0.
+    The run is real either way -- it is the REDUCTION that has to be float64 --
+    and the control below proves this grid really is under that floor instead of
+    assuming it, so a green result cannot come from a reduction that ignores the
+    scale.
+    """
+    spacings = (2.5e-9 * 1.1 ** np.arange(12, dtype=np.float64), 1e-8, 3e-8)
+    # np.min, not s.min(): an axis may be given as a bare scalar.
+    axis_min = [float(np.min(s)) for s in spacings]
+    f_nm = C / (12.0 * min(axis_min))
+    grid = np.ones((13, 12, 12), dtype=np.float32)
+    source = fdtd.Source((6, 6, 6), frequency=f_nm, profile="pulse",
+                         bandwidth=f_nm / 2.0)
+    dt = fdtd.courant_dt(*axis_min)
+    n_steps = int(math.ceil(1.1 * source.end_time() / dt)) + 80
+    run = fdtd.simulate(grid, source, n_steps, probes=[(3, 4, 5)],
+                        spacings=spacings, boundary="metal", record_energy=True)
+    assert run["dt"] == dt
+
+    sample = float(np.abs(run["traces"]).max())
+    smallest_volume = float(np.prod(axis_min))
+    assert np.float32(sample) ** 2 * np.float32(smallest_volume) == 0.0, (
+        f"a sample of {sample:.3g} in a cell of {smallest_volume:.3g} does not "
+        f"underflow float32, so this run is not testing the scale it claims to")
+
+    energy = np.asarray(run["energy"])
+    assert energy.max() > 0, "the source excited nothing at this scale"
+    silent_from = int(math.ceil(1.1 * source.end_time() / dt))
     after = energy[silent_from:]
     assert after.size > 20, "the run ended before the source did"
     spread = (after.max() - after.min()) / after.max()
@@ -105,22 +208,32 @@ def test_an_open_boundary_absorbs_the_pulse_while_the_metal_wall_holds_it():
     metal_energy = np.asarray(metal["energy"])
     open_energy = np.asarray(opened["energy"])
 
-    # Peak well after the start, so both runs are compared at the same point of
-    # the pulse and neither is measured while the source is still driving.
-    peak = slice(steps_for(2e-8), steps_for(1.2e-7))
-    metal_peak = metal_energy[peak].max()
-    open_peak = open_energy[peak].max()
+    # While the source is still driving, both boxes are filling up at the same
+    # rate. Unless they are, the later comparison is between two different
+    # experiments.
+    during = slice(steps_for(2e-8), steps_for(1.2e-7))
+    metal_peak = metal_energy[during].max()
+    open_peak = open_energy[during].max()
     assert open_peak > 0.5 * metal_peak, (
         "the open run never built up the same pulse, so its residual says "
         "nothing about absorption")
+    # The pulse runs to source.end_time(), so "after the source" has to be
+    # derived from it: a window picked by eye sits inside the drive and the
+    # metal box then looks like it lost half its energy between two moments of
+    # the source, not of the box.
+    after = steps_for(1.1 * source.end_time())
+    assert after > during.stop, "the source is still driving this window"
 
-    tail = slice(steps_for(3e-7), None)
-    open_residual = open_energy[tail].max() / open_peak
-    metal_residual = metal_energy[tail].max() / metal_peak
-    assert open_residual < 0.02, f"the CPML left {open_residual:.2%} of the peak"
-    assert metal_residual > 0.5, (
-        f"the metal box lost its energy too ({metal_residual:.2%} left), so the "
-        f"open result is the solver decaying, not the boundary absorbing")
+    # One instant, two boxes. Everything the metal box has it still has, because
+    # nothing left the room; at the SAME step the open box is down by five
+    # orders of magnitude. Comparing each run against its own peak instead
+    # would let both boxes decay and still agree.
+    held = metal_energy[after:].max() / metal_energy[after]
+    assert held > 0.9, f"the metal box kept only {held:.2%} of its energy"
+    left = open_energy[after:].max() / metal_energy[after:].max()
+    assert left < 0.02, (
+        f"the CPML left {left:.3%} of what the metal wall held at the same "
+        f"step, so the difference is the solver, not the boundary")
 
 
 # ---------------------------------------------------------------- sources
@@ -147,9 +260,11 @@ def test_a_cw_tone_is_quiet_before_it_starts_and_a_tone_after_the_ramp():
     assert fdtd.cw_profile(0.0, F0) == 0.0
     assert fdtd.cw_profile(-1.0, F0) == 0.0
     period = 1.0 / F0
-    # Still inside the 5-period raised-cosine ramp.
-    ramp_value = fdtd.cw_profile(2.5 * period, F0)
-    assert abs(ramp_value - math.sin(2 * math.pi * F0 * 2.5 * period)) > 0.9
+    # A quarter period in: the carrier is at its peak, so the envelope is plain
+    # to see. Half a period in would be a carrier zero crossing, where the
+    # value is near zero whether or not any envelope is applied.
+    ramp_value = fdtd.cw_profile(0.25 * period, F0)
+    assert abs(ramp_value - math.sin(2 * math.pi * F0 * 0.25 * period)) > 0.9
     # After it: a pure tone, no envelope left.
     for k in (0.0, 0.25, 0.5, 0.75):
         t = 6.0 * period + k * period
@@ -169,7 +284,11 @@ def test_a_cw_source_shows_up_at_its_own_frequency_in_a_probe():
     # 40 periods of tone, sampled into a 30-period window, so the bins are
     # finer than the tolerance below.
     n_steps = steps_for(40.0 / F0)
-    run = fdtd.simulate(grid, source, n_steps, probes=[(14, 13, 12)], dx=DX,
+    # A COMPONENT, not |E|. The magnitude of a tone is a rectified tone: its
+    # spectrum peaks at twice the frequency, not at the frequency, so an |E|
+    # probe would answer "2*f0" to a question about f0 and the run would look
+    # like a solver ringing at the wrong rate.
+    run = fdtd.simulate(grid, source, n_steps, probes=[(14, 13, 12, "z")], dx=DX,
                         boundary="open", pml_cells=5)
     trace = np.asarray(run["traces"][0])
     tail = trace[steps_for(10.0 / F0):]

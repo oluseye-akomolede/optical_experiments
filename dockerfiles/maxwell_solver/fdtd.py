@@ -1,40 +1,61 @@
-"""3-D Yee FDTD on a uniform grid: the time-domain core.
+"""Time-domain Maxwell on a graded Yee grid.
 
-WHY THIS FILE EXISTS. The owner asked for time-series simulations with a
-user-defined source (Slack, 2026-10-01), and chose a full time-stepping
-simulation on a grid. Nothing else in this directory can do it: the cavity and
-photonic-crystal solvers are EIGEN-solvers, so they show a steady state and
-never a field building up, a pulse travelling, or light scattering off an
-object. This is the engine that can.
+WHERE EACH COMPONENT LIVES. A tensor product of three per-axis node lists. Each
+axis carries a primal list (the E nodes) and a dual list (the half-nodes between
+them). A component is DUAL along its own axis and PRIMAL along the other two:
 
-SCOPE (phase 1). The solver core only: the Yee update, PEC, a CPML absorbing
-boundary, a point source with a CW and a pulse profile, and probes with their
-spectra. The plane-wave source is phase 2, and the voxeliser, the estimate, the
-job routing and the page are phases 3-5 -- there is deliberately no I/O, no
-database and no web code in this file.
+    Ex(i+1/2, j, k)     Ey(i, j+1/2, k)     Ez(i, j, k+1/2)
+    Hx(i, j+1/2, k+1/2) Hy(i+1/2, j, k+1/2) Hz(i+1/2, j+1/2, k)
 
-THE ARRAY MODULE IS THE CALLER'S CHOICE. ``xp`` is numpy for the tiny local
-tests and cupy on the Jetson, and **cupy is never imported here** -- not at
-module level, not in a helper. The same update code runs on both, which is what
-makes the local tests evidence about the GPU run rather than about a second
-implementation. numpy is imported for the default and for the Fourier window,
-nothing else.
+so each H component is the complement of the E one it curls. Two consequences
+are worth stating because both are easy to get backwards:
 
-UNITS are SI and the grid is uniform: ``dx`` in metres, ``dt`` in seconds,
-frequencies in Hz, E in V/m, H in A/m. The source is a current density in A/m2,
-so the field scale it produces is not arbitrary -- but every test here is about
-a SHAPE (a spectrum peak, a conserved energy), never about an absolute
-amplitude.
+* Two E components are tangential to every face, and in this layout they are the
+  two that lie ON that face. A PEC wall is therefore "zero the tangential E on
+  this layer", not an accident of where a slice happens to stop.
+* Every difference in an update reads a neighbour that exists. The regions used
+  below are exactly those index sets, and the untouched outer layers are exactly
+  the layers a metal wall pins.
 
-THE STAGGERING IS IN THE INDICES. Each field component is stored on its own
-lattice and the differences below are the half-cell offsets: a backward
-difference for the E update (valid at ``i >= 1``), a forward one for the H
-update (valid at ``i <= n-2``). The update regions are therefore not the whole
-array and NOTHING reads outside its slice -- there is no edge padding to get
-wrong, and a PEC face is a zero rather than a special case.
+GRADED SPACINGS. Each axis carries ``primal[i]`` (E node i to i+1) and
+``dual[i]``, the distance between the half-nodes either side of E node i, i.e.
+``(primal[i-1] + primal[i]) / 2``. A curl term divides by whichever family spans
+the two samples it differences: two E nodes differ across a primal spacing, two
+half-nodes across a dual one. A uniform grid is the special case with every
+primal spacing equal. ``_node_thickness`` gives the cell width AROUND each
+primal node (half a cell at the two ends), which is what a CPML ramp and the
+energy weight are measured in.
 
-THE TIME STEP is ``0.99 * dx / (c * sqrt(3))``, which is the spec's value and
-is below the 3-D Courant limit ``dx / (c * sqrt(3))`` on every axis at once.
+THE ENERGY THE SCHEME CONSERVES. On a graded grid the plain sum of squares is
+NOT conserved; the quadratic that is conserved is weighted by the cell width
+around each sample, and the weights are the cell VOLUMES
+
+    W(Ex) = cell_x * node_y * node_z      W(Hx) = node_x * cell_y * cell_z
+
+and their cyclic permutations, with ``cell`` the width around a dual node. Each
+weight pairing cancels the spacing in the update it belongs to, which is why the
+balance holds term by term with no assumption that the grid is uniform. On a
+uniform grid every weight is a constant and this reduces to the usual sum.
+
+And it pairs E with H across the half step they are staggered by -- it is
+``|E^n|^2`` and ``H^(n+1/2) . H^(n-1/2)``, not ``|H|^2`` at one instant. That
+distinction is not pedantry: the one-instant form ripples at ``omega*dt/2``,
+around 15% in a run at 12 cells per wavelength, which looks exactly like a
+solver losing energy.
+
+THE TIME STEP. Yee's scheme is stable only while the round trip over the cell
+diagonal fits in one step, so ``dt <= 1 / (c * sqrt(sum 1/d_min^2))`` when the
+minimum on each axis is used. Going over does not fail loudly -- it grows the
+field until it overflows and reads as a physics result -- so the limit is
+computed from the actual spacings, never assumed.
+
+UNITS. ``eps_r`` is relative permittivity; geometry is in metres. ``dx = 1.0`` by
+default, so a test can treat the grid as unit-less as long as it stays
+consistent -- and the same code has to hold at 10 nm (plasmonics) as at 1 mm.
+The energy reduction is therefore done in float64: at 10 nm the cell volumes are
+~1e-26 m^3 against field samples of ~1e-16, so a squared sample times its volume
+is ~1e-58, below float32's smallest normal (1.2e-38) -- a float32 reduction
+reports exactly zero energy from a run that is behaving perfectly.
 """
 
 from __future__ import annotations
@@ -43,139 +64,148 @@ import math
 
 import numpy as np
 
-C0 = 299792458.0                 # m/s
-EPS0 = 8.8541878128e-12          # F/m
-MU0 = 1.25663706212e-6           # H/m
-ETA0 = math.sqrt(MU0 / EPS0)     # ohm
+# --------------------------------------------------------------------------
+# constants
+# --------------------------------------------------------------------------
+
+C0 = 299792458.0                     # m/s
+EPS0 = 8.8541878128e-12              # F/m
+MU0 = 1.0 / (EPS0 * C0 * C0)         # H/m
+ETA0 = math.sqrt(MU0 / EPS0)         # ohm
 
 BOUNDARIES = ("metal", "open")
 PROFILES = ("cw", "pulse")
 COMPONENTS = ("x", "y", "z")
 
-#: The Courant safety factor. The spec pins it, so it is a module constant
-#: rather than a default someone can quietly raise.
-SAFETY = 0.99
-
-#: CPML constants (Roden & Gedney): a cubic conductivity ramp reaching
-#: ``sigma_max`` at the outer face, sized for a round-trip reflection of -120 dB.
+SAFETY = 0.99                        # fraction of the Courant limit
 PML_ORDER = 3
-PML_REFLECTION = 1e-6
+PML_REFLECTION = 1e-6                # target reflection at the CPML face
 DEFAULT_PML_CELLS = 10
 
 
 class FDTDError(Exception):
-    """A request this solver will not run, with the reason in the message."""
+    """Anything this module refuses to run, named in the message."""
 
 
 # --------------------------------------------------------------------------
-# time step
+# the time step
 # --------------------------------------------------------------------------
 
-def courant_limit(dx: float) -> float:
-    """The largest stable step for a 3-D Yee cell of side ``dx``."""
-    if not dx > 0:
-        raise FDTDError(f"dx must be positive, got {dx!r}")
-    return dx / (C0 * math.sqrt(3.0))
+def courant_limit(*spacings) -> float:
+    """The largest stable ``dt`` for these spacings (metres, scalar or array).
 
-
-def courant_dt(dx: float, safety: float = SAFETY) -> float:
-    """The step the solver uses: ``safety * dx / (c * sqrt(3))``.
-
-    The safety factor is checked here rather than trusted, because a factor at
-    or above 1 does not fail loudly -- it grows the field until it overflows,
-    which reads as a physics result.
+    A single argument is taken as all three axes, so ``courant_limit(dx)`` is
+    ``dx / (c * sqrt(3))`` -- the cell diagonal, not one edge, because the wave
+    that runs corner to corner is the one that sets the step. An array uses its
+    smallest entry, which is the tightest that axis gets.
     """
-    if not 0 < safety < 1:
+    if len(spacings) == 1:
+        spacings = spacings * 3
+    total = 0.0
+    for axis, spacing in enumerate(spacings):
+        values = np.asarray(spacing, dtype=np.float64)
+        if values.size == 0:
+            raise FDTDError(f"axis {axis} has no spacings")
+        smallest = float(values.min())
+        if not smallest > 0:
+            raise FDTDError(
+                f"axis {axis} has a spacing of {smallest!r}; spacings must be "
+                f"positive")
+        total += 1.0 / smallest ** 2
+    if total <= 0:
+        raise FDTDError("at least one spacing is needed")
+    return 1.0 / (C0 * math.sqrt(total))
+
+
+def courant_dt(*spacings, safety: float = SAFETY) -> float:
+    """The step actually used: the limit times ``safety``, which must be < 1."""
+    if not 0.0 < safety < 1.0:
         raise FDTDError(
-            f"the Courant safety factor must be in (0, 1), got {safety!r}: at "
-            f"or above 1 the update is unstable on the diagonal of the cell"
-        )
-    return safety * courant_limit(dx)
+            f"the safety factor must be inside (0, 1); {safety!r} is not. A "
+            f"factor at or above one steps past the stability limit, which "
+            f"grows the field until it overflows instead of failing here")
+    return safety * courant_limit(*spacings)
 
 
 # --------------------------------------------------------------------------
-# time profiles
+# source profiles
 # --------------------------------------------------------------------------
 
 def cw_profile(t: float, frequency: float, ramp_periods: float = 5.0) -> float:
-    """Steady state at ``frequency``, turned on smoothly over a few periods.
+    """A raised-cosine turn-on over ``ramp_periods``, then a pure tone.
 
-    The turn-on is a raised cosine over ``ramp_periods`` periods. A hard start
-    would put a step's worth of every frequency into the run, which is the one
-    thing a CW source is meant not to do.
+    The ramp is what keeps a continuous drive from putting a step's worth of
+    every frequency into the grid at t = 0.
     """
     if t <= 0.0:
         return 0.0
     ramp = ramp_periods / frequency
-    if t < ramp:
-        envelope = 0.5 * (1.0 - math.cos(math.pi * t / ramp))
-    else:
+    if t >= ramp:
         envelope = 1.0
+    else:
+        envelope = 0.5 * (1.0 - math.cos(math.pi * t / ramp))
     return envelope * math.sin(2.0 * math.pi * frequency * t)
 
 
 def pulse_profile(t: float, frequency: float, bandwidth: float,
                   start: float = 5.0) -> float:
-    """A Gaussian envelope on a carrier at ``frequency``.
+    """A Gaussian-modulated carrier; ``bandwidth`` is the envelope's 1/e width.
 
-    ``bandwidth`` is the 1/e half-width of the envelope's SPECTRUM, in Hz, so
-    the pulse has a definite meaning in the frequency domain: it is the width
-    of the feature the run is probing with. The carrier puts the spectral peak
-    at ``frequency``, and the envelope is started ``start`` standard
-    deviations before its centre so the run begins at rest.
+    The envelope's spectrum is also Gaussian, with a 1/e half-width of
+    ``bandwidth`` in Hz, so the drive covers ``frequency +/- bandwidth``.
     """
-    if bandwidth <= 0.0:
-        raise FDTDError(
-            f"a pulse needs a positive bandwidth, got {bandwidth!r}: it is the "
-            f"width of the spectrum the run is probing with"
-        )
     sigma = 1.0 / (math.pi * bandwidth)
-    t0 = start * sigma
-    return math.exp(-(((t - t0) / sigma) ** 2)) * math.sin(
-        2.0 * math.pi * frequency * (t - t0))
+    offset = t - start * sigma
+    return (math.exp(-(offset / sigma) ** 2)
+            * math.sin(2.0 * math.pi * frequency * offset))
 
 
 class Source:
     """A soft current on one E component at one cell.
 
-    ``kind="point"`` is the only kind in phase 1; ``plane`` is refused BY NAME
-    here rather than silently ignored, because a plane wave that quietly ran as
-    a dipole would look like a physics result.
+    Soft means it adds to the field there instead of pinning it, so the cell
+    still carries the wave it launched. Phase 1 has point sources only; a plane
+    wave needs a TF/SF box and is refused with the phase that adds it.
     """
 
-    def __init__(self, cell, frequency: float, *, component: str = "z",
-                 profile: str = "pulse", bandwidth: float | None = None,
-                 amplitude: float = 1.0, kind: str = "point",
-                 ramp_periods: float = 5.0):
+    def __init__(self, cell, *, frequency: float, profile: str = "pulse",
+                 bandwidth: float | None = None, amplitude: float = 1.0,
+                 component: str = "z", kind: str = "point"):
         if kind != "point":
             raise FDTDError(
-                f"source kind {kind!r} is not in this phase: only 'point' "
-                f"exists today, and the plane wave needs a TF/SF box (phase 2)"
-            )
+                f"source kind {kind!r} is not implemented; phase 1 has a point "
+                f"soft current only, and a plane wave needs the TF/SF box of "
+                f"phase 2")
+        if profile not in PROFILES:
+            raise FDTDError(f"profile must be one of {PROFILES}, got {profile!r}")
         if component not in COMPONENTS:
             raise FDTDError(
                 f"component must be one of {COMPONENTS}, got {component!r}")
-        if profile not in PROFILES:
-            raise FDTDError(f"profile must be one of {PROFILES}, got {profile!r}")
         if not frequency > 0:
             raise FDTDError(f"frequency must be positive, got {frequency!r}")
-        if profile == "pulse" and bandwidth is None:
-            raise FDTDError("a 'pulse' source needs a bandwidth")
-        if profile == "cw" and bandwidth is not None:
-            raise FDTDError("a 'cw' source has no bandwidth; it is one frequency")
+        if profile == "pulse":
+            if bandwidth is None:
+                raise FDTDError("a pulse needs a bandwidth")
+            if not bandwidth > 0:
+                raise FDTDError(
+                    f"bandwidth must be positive, got {bandwidth!r}")
+        elif bandwidth is not None:
+            raise FDTDError(
+                f"a cw source has no bandwidth, got {bandwidth!r}; the tone is "
+                f"at the frequency alone")
+        if len(tuple(cell)) != 3:
+            raise FDTDError(f"a cell is three indices, got {cell!r}")
         self.cell = tuple(int(c) for c in cell)
         self.frequency = float(frequency)
-        self.component = component
         self.profile = profile
         self.bandwidth = None if bandwidth is None else float(bandwidth)
         self.amplitude = float(amplitude)
-        self.ramp_periods = float(ramp_periods)
+        self.component = component
+        self.kind = kind
 
     def value(self, t: float) -> float:
-        """The current density at time ``t``. Exactly zero once a pulse is over."""
         if self.profile == "cw":
-            return self.amplitude * cw_profile(t, self.frequency,
-                                               self.ramp_periods)
+            return self.amplitude * cw_profile(t, self.frequency)
         return self.amplitude * pulse_profile(t, self.frequency, self.bandwidth)
 
     def end_time(self) -> float:
@@ -183,57 +213,130 @@ class Source:
         if self.profile == "cw":
             return math.inf
         sigma = 1.0 / (math.pi * self.bandwidth)
-        return 5.0 * sigma + 5.0 * sigma
+        return 10.0 * sigma          # the envelope's centre plus 5 sigma
+
+
+class PolarisationTerm:
+    """The seam for a dispersive material (phase 2: Drude-Lorentz metals).
+
+    Phase 1 runs with no terms at all. A term is anything with a callable
+    ``advance(fields, dt, step)`` returning ``{component: increment_array}``,
+    which the update adds to the named E components after the curl update and
+    before the conductor mask. Nothing else in the core needs to know which
+    materials exist.
+    """
+
+    name = "term"
+
+    def advance(self, fields, dt, step):     # pragma: no cover - the base seam
+        raise NotImplementedError(f"{self.name} must implement advance()")
+
+
+# --------------------------------------------------------------------------
+# grid helpers
+# --------------------------------------------------------------------------
+
+def _spacing_array(spacing, n: int, axis: int) -> np.ndarray:
+    """One axis's primal spacings: a scalar broadcast, or ``n-1`` lengths."""
+    values = np.asarray(spacing, dtype=np.float64)
+    if values.ndim == 0:
+        if not float(values) > 0:
+            raise FDTDError(f"the spacing on axis {axis} must be positive")
+        return np.full(n - 1, float(values))
+    if values.shape != (n - 1,):
+        raise FDTDError(
+            f"axis {axis} has {n} nodes, so its spacings must be {n - 1} "
+            f"lengths between them; got shape {values.shape}")
+    if np.any(values <= 0):
+        raise FDTDError(f"every spacing on axis {axis} must be positive")
+    return values
+
+
+def _dual_spacing(primal: np.ndarray) -> np.ndarray:
+    """The span between the half-nodes either side of each primal E node.
+
+    Element 0 is a half-cell and is never used: every primal node the E update
+    touches has index >= 1.
+    """
+    dual = np.empty(primal.size)
+    dual[0] = 0.5 * primal[0]
+    dual[1:] = 0.5 * (primal[:-1] + primal[1:])
+    return dual
+
+
+def _node_thickness(primal: np.ndarray) -> np.ndarray:
+    """The cell width around each primal node: a full cell inside, half at the end."""
+    n = primal.size + 1
+    thickness = np.empty(n)
+    thickness[0] = 0.5 * primal[0]
+    thickness[-1] = 0.5 * primal[-1]
+    thickness[1:-1] = 0.5 * (primal[:-1] + primal[1:])
+    return thickness
+
+
+def _dual_thickness(primal: np.ndarray) -> np.ndarray:
+    """The cell width around each dual node: the primal cell it sits in.
+
+    Length ``n`` like the field arrays; the last slot is a ghost (no dual node
+    there, and the field at that slot is never updated), kept so the weights can
+    be built by broadcasting against a full-shape array.
+    """
+    return np.concatenate((primal, primal[-1:]))
+
+
+def _along(values, axis: int):
+    """A 1-D profile reshaped to broadcast along one axis of a 3-D field."""
+    shape = [1, 1, 1]
+    shape[axis] = -1
+    return values.reshape(shape)
 
 
 # --------------------------------------------------------------------------
 # CPML
 # --------------------------------------------------------------------------
 
-def _pml_sigma(n: int, pml: int, dx: float) -> np.ndarray:
-    """The conductivity ramp along one axis: 0 in the interior, max at the face."""
-    sigma = np.zeros(n, dtype=np.float64)
+def _slab_sigma(widths: np.ndarray, from_low: bool) -> np.ndarray:
+    """Cubic conductivity ramp through one slab, from its absorbing face.
+
+    ``widths`` are the LOCAL cell widths of the nodes in the slab, so a graded
+    grid gets its ramp measured in the cells it actually has. ``from_low`` says
+    which end is the outer face.
+    """
+    ordered = widths if from_low else widths[::-1]
+    # distance from the outer face to each node's centre
+    distance = np.cumsum(ordered) - 0.5 * ordered
+    total = float(widths.sum())
+    sigma_max = ((PML_ORDER + 1) * math.log(1.0 / PML_REFLECTION)
+                 / (2.0 * ETA0 * total))
+    ramp = sigma_max * ((total - distance) / total) ** PML_ORDER
+    return ramp if from_low else ramp[::-1]
+
+
+def _pml_profiles(width: np.ndarray, pml: int, dt: float, xp):
+    """``(b, c)`` per node along one axis, from a conductivity ramp.
+
+    ``width`` is the cell width at each node of the family being corrected
+    (``_node_thickness`` for E, the primal spacing for H), so the ramp and its
+    total thickness follow the grid. ``sigma_max`` comes from the slab's own
+    thickness, and the ramp reaches it at the outer face and falls to zero at the
+    inner interface -- graded that way round, the layer absorbs more the deeper
+    the wave gets, and the return trip is suppressed twice over.
+    """
+    n = width.size
     if pml <= 0:
-        return sigma
+        b = np.ones(n)
+        return xp.asarray(b, dtype=xp.float32), xp.asarray(b - 1.0, dtype=xp.float32)
     if n <= 2 * pml:
         raise FDTDError(
-            f"a CPML of {pml} cells does not fit in {n} cells on an axis: the "
-            f"interior would be empty (need more than {2 * pml}). Give more "
-            f"cells, or a smaller pml_cells"
-        )
-    sigma_max = ((PML_ORDER + 1) * math.log(1.0 / PML_REFLECTION)
-                 / (2.0 * ETA0 * pml * dx))
-    for i in range(pml):
-        # Half a cell in from the sample, so the deepest sample is not the face
-        # itself and the ramp has cube growth from a half-cell, not from zero.
-        depth = (pml - i - 0.5) / pml
-        value = sigma_max * depth ** PML_ORDER
-        sigma[i] = value
-        sigma[n - 1 - i] = value
-    return sigma
-
-
-def _pml_coefficients(n: int, pml: int, dx: float, dt: float, xp):
-    """The ``(b, c)`` pair CPML updates each auxiliary field with."""
-    sigma = _pml_sigma(n, pml, dx)
+            f"a CPML of {pml} cells does not fit in {n} nodes on an axis: the "
+            f"interior would be empty (it needs more than {2 * pml} nodes). "
+            f"Give more cells, or a smaller pml_cells")
+    sigma = np.zeros(n, dtype=np.float64)
+    sigma[:pml] = _slab_sigma(width[:pml], from_low=True)
+    sigma[n - pml:] = _slab_sigma(width[n - pml:], from_low=False)
     b = np.exp(-sigma * dt / EPS0)
-    c = b - 1.0                       # kappa = 1, alpha = 0: plain conductivity
-    return (xp.asarray(b, dtype=xp.float32), xp.asarray(c, dtype=xp.float32))
-
-
-def _pml_term(raw, psi, b, c, axis: int):
-    """The CPML-corrected derivative ``d/dx`` from its stored auxiliary field.
-
-    ``psi`` is carried between steps; ``b`` and ``c`` are the 1-D profiles over
-    the derivative's own axis, already sliced to the update's extent.
-    """
-    shape = [1, 1, 1]
-    shape[axis] = -1
-    bb = b.reshape(shape)
-    cc = c.reshape(shape)
-    psi *= bb
-    psi += cc * raw
-    return raw + psi                  # kappa = 1
+    return (xp.asarray(b, dtype=xp.float32),
+            xp.asarray(b - 1.0, dtype=xp.float32))     # kappa = 1, alpha = 0
 
 
 # --------------------------------------------------------------------------
@@ -262,10 +365,10 @@ def _normalise_probes(probes):
 def spectrum(trace, dt: float, *, window: str | None = "hann", xp=None):
     """``(frequencies_hz, amplitude)`` from the rfft of a windowed trace.
 
-    The window is applied because the trace is a finite slice of a signal that
-    is still ringing when it ends; without it the discontinuity at the ends
-    lays a sinc skirt over every peak. It is built in numpy and moved to
-    ``xp``, so the same window is used on both backends.
+    The window is applied because a recorded trace is a finite slice of a signal
+    that is still ringing when it ends; without it, the discontinuity at the two
+    ends lays a sinc skirt over every peak. It is built in numpy and moved to
+    ``xp``, so both backends window identically.
     """
     if xp is None:
         xp = np
@@ -290,20 +393,28 @@ def spectrum(trace, dt: float, *, window: str | None = "hann", xp=None):
 # --------------------------------------------------------------------------
 
 def simulate(eps_r, source: Source, n_steps: int, probes=(),
-             *, dx: float = 1.0,
+             *, spacings=None, dx: float = 1.0,
              boundary: str = "metal", pec=None, pml_cells: int = DEFAULT_PML_CELLS,
-             xp=None, record_energy: bool = False) -> dict:
+             xp=None, record_energy: bool = False, ade_terms=()) -> dict:
     """Run the grid and return the probe traces.
 
-    ``eps_r`` ``(nx, ny, nz)`` is the relative permittivity per cell and it
+    ``eps_r`` ``(nx, ny, nz)`` is the relative permittivity of each node and it
     DEFINES the grid; ``pec`` is an optional boolean conductor mask of the same
-    shape. ``boundary="metal"`` closes the outer faces with a PEC wall;
-    ``boundary="open"`` puts a CPML of ``pml_cells`` on each face instead.
+    shape. ``spacings`` is a ``(sx, sy, sz)`` triple, each a scalar (uniform
+    along that axis) or ``n-1`` primal lengths; ``dx`` is the shorthand for a
+    uniform grid.
+
+    ``boundary="metal"`` closes the outer faces with a PEC wall;
+    ``boundary="open"`` puts a CPML of ``pml_cells`` on each face instead (the
+    open box is still PEC-backed at the outermost layer, which is how a PML is
+    terminated in practice). ``ade_terms`` are polarisation-current terms (see
+    ``PolarisationTerm``); phase 1 runs with none.
 
     Returns ``{"traces": (n_probes, n_steps) float32, "dt", "steps",
-    "energy"}``. ``energy`` is the total electromagnetic energy per step, or
-    ``None`` unless ``record_energy`` asked for it -- it is a full reduction of
-    six arrays, which is cheap on a 24^3 test grid and not on a production one.
+    "spacings", "energy"}``. ``energy`` is the cell-volume-weighted total per
+    step, or ``None`` unless ``record_energy`` asked for it -- it builds six
+    float64 weight arrays and reduces six arrays every step, cheap on a 24^3
+    test grid and not on a production one.
     """
     xp = np if xp is None else xp
     f32 = xp.float32
@@ -314,12 +425,23 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     if not bool(xp.all(eps > 0)):
         raise FDTDError("eps_r must be positive everywhere")
     shape = tuple(int(s) for s in eps.shape)
+    nx, ny, nz = shape
 
     if boundary not in BOUNDARIES:
         raise FDTDError(f"boundary must be one of {BOUNDARIES}, got {boundary!r}")
     if int(n_steps) < 1:
         raise FDTDError(f"n_steps must be at least 1, got {n_steps!r}")
     n_steps = int(n_steps)
+
+    if spacings is None:
+        spacings = (dx, dx, dx)
+    if len(tuple(spacings)) != 3:
+        raise FDTDError(
+            f"spacings must be one (sx, sy, sz) triple, got {spacings!r}")
+    primal = [_spacing_array(spacings[axis], shape[axis], axis)
+              for axis in range(3)]
+    dual = [_dual_spacing(p) for p in primal]
+    dt = courant_dt(*(p.min() for p in primal))
 
     mask = None
     if pec is not None:
@@ -329,24 +451,42 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                 f"the conductor mask is {tuple(mask.shape)} but the grid is "
                 f"{shape}; they must be the same shape")
 
-    if boundary == "open":
-        for axis, n in enumerate(shape):
-            if n <= 2 * int(pml_cells):
-                raise FDTDError(
-                    f"a CPML of {pml_cells} cells does not fit on axis {axis} "
-                    f"({n} cells): the absorbing layer would leave no interior")
-
-    cell = source.cell
-    for axis, index in enumerate(cell):
-        if not 0 <= index < shape[axis]:
+    terms = list(ade_terms)
+    for term in terms:
+        if not callable(getattr(term, "advance", None)):
             raise FDTDError(
-                f"the source cell {cell} is outside the grid {shape} "
-                f"(axis {axis} has {shape[axis]} cells)")
-    if mask is not None and bool(mask[cell]):
+                f"{term!r} is not a polarisation term: it has no advance()")
+
+    # A cell the update never touches is not a place you can drive: the curl for
+    # it is never evaluated, so a source there would be silently ignored and
+    # read as "the run did nothing". The live region is the update region: the
+    # component's own axis runs [0, n-2], the other two [1, n-2].
+    def live(component: str, cell):
+        own = COMPONENTS.index(component)
+        for axis, index in enumerate(cell):
+            if not 0 <= index < shape[axis]:
+                raise FDTDError(
+                    f"the cell {cell} is outside the grid {shape} "
+                    f"(axis {axis} has {shape[axis]} cells)")
+            if axis == own:
+                if index == shape[axis] - 1:
+                    raise FDTDError(
+                        f"the cell {cell} is on the last {component}-node of "
+                        f"axis {axis}, where the update never touches it; the "
+                        f"live range on its own axis is 0..{shape[axis] - 2}")
+            elif index in (0, shape[axis] - 1):
+                raise FDTDError(
+                    f"the cell {cell} is in the outer layer of axis {axis}, "
+                    f"where a {component}-polarised source is on the wall and "
+                    f"the update never touches it; move it inward")
+
+    live(source.component, source.cell)
+    if mask is not None and bool(mask[source.cell]):
         raise FDTDError(
-            f"the source cell {cell} is inside the conductor; a soft current "
-            f"there is zeroed by the PEC update on the same step and would "
-            f"excite nothing")
+            f"the source cell {source.cell} is inside the conductor; a soft "
+            f"current there is zeroed by the PEC update on the same step and "
+            f"would excite nothing")
+
     probe_list = _normalise_probes(probes)
     for probe_cell, _component in probe_list:
         for axis, index in enumerate(probe_cell):
@@ -355,9 +495,7 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                     f"the probe cell {probe_cell} is outside the grid {shape} "
                     f"(axis {axis} has {shape[axis]} cells)")
 
-    dt = courant_dt(dx)
     inv_eps = 1.0 / (EPS0 * eps)
-
     Ex = xp.zeros(shape, dtype=f32)
     Ey = xp.zeros(shape, dtype=f32)
     Ez = xp.zeros(shape, dtype=f32)
@@ -366,141 +504,198 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     Hz = xp.zeros(shape, dtype=f32)
     field = {"x": Ex, "y": Ey, "z": Ez}
 
-    nx, ny, nz = shape
+    P = [xp.asarray(p, dtype=f32) for p in primal]      # n-1 primal lengths
+    D = [xp.asarray(d, dtype=f32) for d in dual]        # n-1 dual lengths
+
+    # CPML: one profile per (axis, family). The E update is evaluated at primal
+    # nodes, so its ramp is measured in the cells around primal nodes; the H
+    # update sits at dual nodes, whose cells are the primal lengths.
+    bc: dict = {}
     if boundary == "open":
-        bx, cx = _pml_coefficients(nx, int(pml_cells), dx, dt, xp)
-        by, cy = _pml_coefficients(ny, int(pml_cells), dx, dt, xp)
-        bz, cz = _pml_coefficients(nz, int(pml_cells), dx, dt, xp)
-        # One auxiliary field per derivative that crosses a PML face. Each is
-        # shaped like the UPDATE REGION it corrects, so the index arithmetic is
-        # the update's own and an out-of-range psi cannot happen.
-        psi_Exy = xp.zeros((nx, ny - 1, nz - 1), f32)
-        psi_Exz = xp.zeros((nx, ny - 1, nz - 1), f32)
-        psi_Eyz = xp.zeros((nx - 1, ny, nz - 1), f32)
-        psi_Eyx = xp.zeros((nx - 1, ny, nz - 1), f32)
-        psi_Ezx = xp.zeros((nx - 1, ny - 1, nz), f32)
-        psi_Ezy = xp.zeros((nx - 1, ny - 1, nz), f32)
-        psi_Hxz = xp.zeros((nx, ny - 1, nz - 1), f32)
-        psi_Hxy = xp.zeros((nx, ny - 1, nz - 1), f32)
-        psi_Hyx = xp.zeros((nx - 1, ny, nz - 1), f32)
-        psi_Hyz = xp.zeros((nx - 1, ny, nz - 1), f32)
-        psi_Hzy = xp.zeros((nx - 1, ny - 1, nz), f32)
-        psi_Hzx = xp.zeros((nx - 1, ny - 1, nz), f32)
-        bx1, cx1 = bx[1:], cx[1:]
-        by1, cy1 = by[1:], cy[1:]
-        bz1, cz1 = bz[1:], cz[1:]
-        bx0, cx0 = bx[:-1], cx[:-1]
-        by0, cy0 = by[:-1], cy[:-1]
-        bz0, cz0 = bz[:-1], cz[:-1]
+        for axis in range(3):
+            bc[(axis, "primal")] = _pml_profiles(
+                _node_thickness(primal[axis]), int(pml_cells), dt, xp)
+            bc[(axis, "dual")] = _pml_profiles(
+                primal[axis], int(pml_cells), dt, xp)
+
+    psi: dict = {}
+    coef: dict = {}
+
+    def corrected(raw, key: tuple, axis: int, family: str):
+        """The CPML-corrected derivative, or ``raw`` on a metal boundary."""
+        if boundary != "open":
+            return raw
+        b1d, c1d = bc[(axis, family)]
+        if family == "primal":
+            # the outer primal nodes are pinned walls, never corrected
+            b1d, c1d = b1d[1:-1], c1d[1:-1]
+        if b1d.size != raw.shape[axis]:
+            raise FDTDError(
+                f"internal: the CPML profile for axis {axis} ({family}) has "
+                f"{b1d.size} nodes but the term has {raw.shape[axis]}")
+        entry = coef.get(key)
+        if entry is None:
+            entry = coef[key] = (_along(b1d, axis), _along(c1d, axis))
+            psi[key] = xp.zeros(raw.shape, dtype=f32)
+        store = psi[key]
+        store *= entry[0]
+        store += entry[1] * raw
+        return raw + store                    # kappa = 1
 
     traces = xp.zeros((len(probe_list), n_steps), dtype=f32)
     energy: list[float] | None = [] if record_energy else None
-    inv_dx = 1.0 / dx
     dt_over_mu0 = dt / MU0
+
+    if energy is not None:
+        # Cell volumes around each sample. These are what make the quadratic
+        # conserved on a graded grid; on a uniform grid they are all equal and
+        # the sum reduces to the usual one.
+        node = [_node_thickness(p) for p in primal]
+        wide = [_dual_thickness(p) for p in primal]
+
+        def volumes(dual_axes):
+            axes = [wide[a] if a in dual_axes else node[a] for a in range(3)]
+            return xp.asarray(_outer(axes), dtype=xp.float64)
+
+        # Each component is dual along its own axis if it is E, and along the
+        # other two if it is H.
+        e_weights = {c: volumes({a}) for a, c in enumerate(COMPONENTS)}
+        h_weights = {c: volumes({(a + 1) % 3, (a + 2) % 3})
+                     for a, c in enumerate(COMPONENTS)}
+        eps64 = xp.asarray(eps, dtype=xp.float64)
 
     for step in range(n_steps):
         t = step * dt
+        if energy is not None:
+            h_before = (Hx.copy(), Hy.copy(), Hz.copy())      # H at n-1/2
 
-        # ---- H from the curl of E (forward differences) ------------------
-        raw_z = (Ey[:, :, 1:] - Ey[:, :, :-1]) * inv_dx
-        raw_y = (Ez[:, 1:, :] - Ez[:, :-1, :]) * inv_dx
-        term_z = raw_z[:, :-1, :]
-        term_y = raw_y[:, :, :-1]
-        if boundary == "open":
-            term_z = _pml_term(term_z, psi_Hxz, bz0, cz0, 2)
-            term_y = _pml_term(term_y, psi_Hxy, by0, cy0, 1)
+        # ---- H from the curl of E (E at n, H advances to n+1/2) ----------
+        # Hx at (i, j+1/2, k+1/2): live on the full x range, y <= ny-2, z <= nz-2
+        term_z = (Ez[:, 1:, :-1] - Ez[:, :-1, :-1]) / _along(P[1], 1)   # dEz/dy
+        term_y = (Ey[:, :-1, 1:] - Ey[:, :-1, :-1]) / _along(P[2], 2)   # dEy/dz
+        term_z = corrected(term_z, ("Hx", "z"), 1, "dual")
+        term_y = corrected(term_y, ("Hx", "y"), 2, "dual")
         Hx[:, :-1, :-1] -= dt_over_mu0 * (term_z - term_y)
 
-        raw_x = (Ez[1:, :, :] - Ez[:-1, :, :]) * inv_dx
-        raw_z = (Ex[:, :, 1:] - Ex[:, :, :-1]) * inv_dx
-        term_x = raw_x[:, :, :-1]
-        term_z = raw_z[:-1, :, :]
-        if boundary == "open":
-            term_x = _pml_term(term_x, psi_Hyx, bx0, cx0, 0)
-            term_z = _pml_term(term_z, psi_Hyz, bz0, cz0, 2)
+        # Hy at (i+1/2, j, k+1/2): live on the full y range, x <= nx-2, z <= nz-2
+        term_x = (Ex[:-1, :, 1:] - Ex[:-1, :, :-1]) / _along(P[2], 2)   # dEx/dz
+        term_z = (Ez[1:, :, :-1] - Ez[:-1, :, :-1]) / _along(P[0], 0)   # dEz/dx
+        term_x = corrected(term_x, ("Hy", "x"), 2, "dual")
+        term_z = corrected(term_z, ("Hy", "z"), 0, "dual")
         Hy[:-1, :, :-1] -= dt_over_mu0 * (term_x - term_z)
 
-        raw_y = (Ex[:, 1:, :] - Ex[:, :-1, :]) * inv_dx
-        raw_x = (Ey[1:, :, :] - Ey[:-1, :, :]) * inv_dx
-        term_y = raw_y[:-1, :, :]
-        term_x = raw_x[:, :-1, :]
-        if boundary == "open":
-            term_y = _pml_term(term_y, psi_Hzy, by0, cy0, 1)
-            term_x = _pml_term(term_x, psi_Hzx, bx0, cx0, 0)
+        # Hz at (i+1/2, j+1/2, k): live on the full z range, x <= nx-2, y <= ny-2
+        term_y = (Ey[1:, :-1, :] - Ey[:-1, :-1, :]) / _along(P[0], 0)   # dEy/dx
+        term_x = (Ex[:-1, 1:, :] - Ex[:-1, :-1, :]) / _along(P[1], 1)   # dEx/dy
+        term_y = corrected(term_y, ("Hz", "y"), 0, "dual")
+        term_x = corrected(term_x, ("Hz", "x"), 1, "dual")
         Hz[:-1, :-1, :] -= dt_over_mu0 * (term_y - term_x)
 
-        # ---- E from the curl of H (backward differences) -----------------
-        raw_y = (Hz[:, 1:, :] - Hz[:, :-1, :]) * inv_dx
-        raw_z = (Hy[:, :, 1:] - Hy[:, :, :-1]) * inv_dx
-        term_y = raw_y[:, :, 1:]
-        term_z = raw_z[:, 1:, :]
-        if boundary == "open":
-            term_y = _pml_term(term_y, psi_Exy, by1, cy1, 1)
-            term_z = _pml_term(term_z, psi_Exz, bz1, cz1, 2)
-        Ex[:, 1:, 1:] += dt * inv_eps[:, 1:, 1:] * (term_y - term_z)
+        if energy is not None:
+            # The quadratic the scheme conserves exactly pairs E and H ACROSS
+            # the half step they are staggered by:
+            #     1/2 eps |E^n|^2  +  1/2 mu H^(n+1/2) . H^(n-1/2)
+            # Both E^n and the H pair are in hand RIGHT HERE, between the half
+            # step that moved H and the full step that moves E. Measured one
+            # update later, with E^(n+1), the same expression is the conserved
+            # one plus dt<E^n, curl H^(n+1/2)> -- an O(dt) term that swings with
+            # the field, and the run reads as a solver losing three quarters of
+            # its energy and getting it back. Multiplying H by itself at a
+            # single instant instead ripples at omega*dt/2, the same mistake at
+            # O(dt^2).
+            #
+            # The sum is weighted by cell volume and done in float64, because at
+            # 10 nm neither the product nor the square survives float32: a
+            # squared sample (~1e-36) times a volume (~7.5e-25) is ~1e-61, under
+            # float32's smallest normal (1.2e-38). Both factors are cast, not
+            # just the weights -- the field sample itself is only ~20 orders
+            # above that floor, so squaring it in float32 overflows to zero for
+            # any source much weaker than the one the tests drive with, and the
+            # run then reports a conserved zero for an energetic box.
+            e_total = 0.0
+            for component, values in (("x", Ex), ("y", Ey), ("z", Ez)):
+                wide_values = values.astype(xp.float64)
+                e_total += float(xp.sum(
+                    eps64 * e_weights[component] * wide_values * wide_values))
+            h_total = 0.0
+            for index, (component, values) in enumerate(
+                    (("x", Hx), ("y", Hy), ("z", Hz))):
+                now = values.astype(xp.float64)
+                before = h_before[index].astype(xp.float64)
+                h_total += float(xp.sum(h_weights[component] * now * before))
+            energy.append(0.5 * (EPS0 * e_total + MU0 * h_total))
 
-        raw_z = (Hx[:, :, 1:] - Hx[:, :, :-1]) * inv_dx
-        raw_x = (Hz[1:, :, :] - Hz[:-1, :, :]) * inv_dx
-        term_z = raw_z[1:, :, :]
-        term_x = raw_x[:, :, 1:]
-        if boundary == "open":
-            term_z = _pml_term(term_z, psi_Eyz, bz1, cz1, 2)
-            term_x = _pml_term(term_x, psi_Eyx, bx1, cx1, 0)
-        Ey[1:, :, 1:] += dt * inv_eps[1:, :, 1:] * (term_z - term_x)
+        # ---- E from the curl of H (H at n+1/2, E advances to n+1) --------
+        # Ex at (i+1/2, j, k): live for j in [1, ny-2], k in [1, nz-2]
+        term_y = (Hz[:-1, 1:-1, 1:-1] - Hz[:-1, :-2, 1:-1]) / _along(D[1][1:], 1)
+        term_z = (Hy[:-1, 1:-1, 1:-1] - Hy[:-1, 1:-1, :-2]) / _along(D[2][1:], 2)
+        term_y = corrected(term_y, ("Ex", "y"), 1, "primal")
+        term_z = corrected(term_z, ("Ex", "z"), 2, "primal")
+        Ex[:-1, 1:-1, 1:-1] += dt * inv_eps[:-1, 1:-1, 1:-1] * (term_y - term_z)
 
-        raw_x = (Hy[1:, :, :] - Hy[:-1, :, :]) * inv_dx
-        raw_y = (Hx[:, 1:, :] - Hx[:, :-1, :]) * inv_dx
-        term_x = raw_x[:, 1:, :]
-        term_y = raw_y[1:, :, :]
-        if boundary == "open":
-            term_x = _pml_term(term_x, psi_Ezx, bx1, cx1, 0)
-            term_y = _pml_term(term_y, psi_Ezy, by1, cy1, 1)
-        Ez[1:, 1:, :] += dt * inv_eps[1:, 1:, :] * (term_x - term_y)
+        # Ey at (i, j+1/2, k): live for i in [1, nx-2], k in [1, nz-2]
+        term_z = (Hx[1:-1, :-1, 1:-1] - Hx[1:-1, :-1, :-2]) / _along(D[2][1:], 2)
+        term_x = (Hz[1:-1, :-1, 1:-1] - Hz[:-2, :-1, 1:-1]) / _along(D[0][1:], 0)
+        term_z = corrected(term_z, ("Ey", "z"), 2, "primal")
+        term_x = corrected(term_x, ("Ey", "x"), 0, "primal")
+        Ey[1:-1, :-1, 1:-1] += dt * inv_eps[1:-1, :-1, 1:-1] * (term_z - term_x)
 
-        # ---- PEC: the conductor body, then the outer faces ---------------
+        # Ez at (i, j, k+1/2): live for i in [1, nx-2], j in [1, ny-2]
+        term_x = (Hy[1:-1, 1:-1, :-1] - Hy[:-2, 1:-1, :-1]) / _along(D[0][1:], 0)
+        term_y = (Hx[1:-1, 1:-1, :-1] - Hx[1:-1, :-2, :-1]) / _along(D[1][1:], 1)
+        term_x = corrected(term_x, ("Ez", "x"), 0, "primal")
+        term_y = corrected(term_y, ("Ez", "y"), 1, "primal")
+        Ez[1:-1, 1:-1, :-1] += dt * inv_eps[1:-1, 1:-1, :-1] * (term_x - term_y)
+
+        # ---- dispersive materials (phase 2 adds terms; phase 1 has none) --
+        for term in terms:
+            for name, increment in term.advance(field, dt, step).items():
+                if name not in COMPONENTS:
+                    raise FDTDError(
+                        f"the polarisation term {getattr(term, 'name', term)!r} "
+                        f"returned an increment for {name!r}; E components are "
+                        f"{COMPONENTS}")
+                field[name] += increment
+
+        # ---- source ------------------------------------------------------
+        field[source.component][source.cell] += dt * source.value(t)
+
+        # ---- PEC ---------------------------------------------------------
         if mask is not None:
             Ex[mask] = 0.0
             Ey[mask] = 0.0
             Ez[mask] = 0.0
         if boundary == "metal":
-            # TANGENTIAL components only: the normal component of E is not
-            # constrained by a PEC wall, and zeroing it would be a different
-            # boundary condition than the one the box has.
-            Ey[0, :, :] = 0.0
+            # The six faces, TANGENTIAL E only: two components per face, and in
+            # this layout those are exactly the layers the update above never
+            # touches. The normal component of E is not constrained by a PEC
+            # wall, and pinning it would be a different boundary condition.
+            Ey[0, :, :] = 0.0       # x faces: Ey, Ez
             Ez[0, :, :] = 0.0
             Ey[-1, :, :] = 0.0
             Ez[-1, :, :] = 0.0
-            Ex[:, 0, :] = 0.0
+            Ex[:, 0, :] = 0.0       # y faces: Ex, Ez
             Ez[:, 0, :] = 0.0
             Ex[:, -1, :] = 0.0
             Ez[:, -1, :] = 0.0
-            Ex[:, :, 0] = 0.0
+            Ex[:, :, 0] = 0.0       # z faces: Ex, Ey
             Ey[:, :, 0] = 0.0
             Ex[:, :, -1] = 0.0
             Ey[:, :, -1] = 0.0
 
-        # ---- the source: a soft current density on one component ---------
-        # After the PEC pass, so a source on a metal face still drives the run
-        # rather than being erased by it.
-        amplitude = source.value(t)
-        if amplitude != 0.0:
-            field[source.component][cell] += (
-                dt * inv_eps[cell] * amplitude)
-
         # ---- probes and energy -------------------------------------------
-        for index, (probe_cell, component) in enumerate(probe_list):
+        for index, (cell, component) in enumerate(probe_list):
             if component == "mag":
-                value = math.sqrt(
-                    float(Ex[probe_cell]) ** 2 + float(Ey[probe_cell]) ** 2
-                    + float(Ez[probe_cell]) ** 2)
+                value = xp.sqrt(Ex[cell] ** 2 + Ey[cell] ** 2 + Ez[cell] ** 2)
             else:
-                value = float(field[component][probe_cell])
+                value = field[component][cell]
             traces[index, step] = value
 
-        if energy is not None:
-            e2 = Ex * Ex + Ey * Ey + Ez * Ez
-            h2 = Hx * Hx + Hy * Hy + Hz * Hz
-            energy.append(0.5 * EPS0 * dx ** 3 * float(xp.sum(eps * e2, dtype=xp.float64))
-                          + 0.5 * MU0 * dx ** 3 * float(xp.sum(h2, dtype=xp.float64)))
+    return {"traces": traces, "dt": dt, "steps": n_steps,
+            "spacings": [np.array(p) for p in primal], "energy": energy}
 
-    return {"traces": traces, "dt": dt, "steps": n_steps, "energy": energy}
+
+def _outer(axes):
+    """The 3-D cell volume from three 1-D profiles, one per axis."""
+    return (axes[0][:, None, None] * axes[1][None, :, None]
+            * axes[2][None, None, :])
