@@ -252,6 +252,14 @@ def main() -> int:
                 "band diagram with no lattice/parameters"
             )
 
+    # (4) THE ABANDON PATH. A pc job nobody claims within MSE_GPU_WAIT_S must
+    #     not be moved to the cluster: there is no pc solver there, and once
+    #     target='cluster' the row is invisible to BOTH queues (next_queued
+    #     skips pc; claim_jetson needs target='jetson'), so it is stranded with
+    #     no error and, if ever seen, cavity-solved. It must STAY on the GPU
+    #     queue. This drives the real function, not a reimplementation.
+    failures.extend(_abandon_path_keeps_pc_on_the_gpu(store))
+
     if failures:
         print("\nFAILED:")
         for f in failures:
@@ -260,6 +268,75 @@ def main() -> int:
 
     print("\nok: the pc row is claimable by the Jetson and invisible to the cluster")
     return 0
+
+
+def _abandon_path_keeps_pc_on_the_gpu(store: DB.JobStore) -> list[str]:
+    """Run the real GPU-abandon path over a stale pc row and check it stays put.
+
+    Red on the unfixed branch with the predicted symptom: the row's target
+    flips to 'cluster', its message says it moved, and ``claim_jetson`` then
+    returns None -- the only pc solver is on a worker that can no longer see it.
+    """
+    import config as CFG  # noqa: PLC0415 - only needed for this phase
+    if str(ROOT / "web") not in sys.path:
+        sys.path.insert(0, str(ROOT / "web"))
+    import app as APP  # noqa: PLC0415 - imports Flask; keep it off the top
+
+    out: list[str] = []
+    job_id = _create_pc_row_through_the_route(store)
+
+    # On the GPU queue, waiting longer than the window, with an estimate small
+    # enough that the SIZE escape does not fire. pc rows are capped well under
+    # the cluster's element limit, so the size branch is unreachable for them:
+    # the kind is the only thing that can save the row.
+    wait = CFG.gpu_wait_seconds()
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE mse.jobs SET status = %s, target = %s, stage = %s, "
+            "gpu_queued_at = now() - make_interval(secs => %s), "
+            "lease_owner = NULL, lease_expires_at = NULL, message = NULL "
+            "WHERE job_id = %s",
+            (DB.QUEUED, DB.JETSON, "queued", float(wait) * 2.0, job_id),
+        )
+
+    # A launcher that is merely present: the function bails on None, and this
+    # phase is about the routing decision, not about launching anything.
+    logs: list[str] = []
+    APP._reroute_abandoned_gpu_jobs(store, object(), log=logs.append)
+
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT target, message FROM mse.jobs WHERE job_id = %s",
+                    (job_id,))
+        target, message = cur.fetchone()
+
+    moved_text = "moved to the cluster queue"
+    if target != DB.JETSON:
+        out.append(
+            f"the abandon path moved a pc row to target={target!r}: there is no "
+            "pc solver on the cluster, so it is now invisible to BOTH queues "
+            "(next_queued skips pc; claim_jetson needs target='jetson') and "
+            "stranded with no error. A pc row must stay on the GPU queue."
+        )
+    if message and moved_text in message:
+        out.append(
+            f"the row tells the owner {message!r}: nothing moved, so the "
+            "'moved to the cluster queue' message is false"
+        )
+    for line in logs:
+        if moved_text in line:
+            out.append(f"the run logged a move that did not happen: {line!r}")
+
+    # The consequence as the owner meets it: the Jetson can still claim it.
+    claimed = store.claim_jetson("pc-abandon-check", lease_seconds=60)
+    if claimed is None or claimed["job_id"] != job_id:
+        out.append(
+            "claim_jetson could not return the pc row after the abandon path "
+            "ran: the job is lost (the predicted symptom on the unfixed branch)"
+        )
+
+    if not out:
+        print("ok: a pc row past the GPU wait stays on the GPU queue")
+    return out
 
 
 if __name__ == "__main__":

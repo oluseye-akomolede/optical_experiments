@@ -118,3 +118,16 @@ CAVITY Job for it and sent the row to `stage = meshing`.
   only load-bearing for a pc row the queue could otherwise see
 - [x] 7.8 Spec delta gains "A pc job SHALL be routed to the Jetson worker, and
   the cluster SHALL refuse it", with the four scenarios above
+- [x] 7.9 The GPU-abandon path cannot strand a pc row (re-review F1):
+  `reroute_to_cluster` refuses non-cavity rows in its own SQL guard
+  (`AND kind = 'cavity'`), and `_reroute_abandoned_gpu_jobs` skips `kind='pc'`
+  without showing the "moved to the cluster queue" message. Red-first test in
+  `tests/pc_routing_check.py` drives the REAL abandon path on real Postgres:
+  a pc row past `MSE_GPU_WAIT_S` stays `target=jetson`, `claim_jetson` returns
+  it, and neither the row message nor the log says it moved. Mutations: revert
+  the loop skip alone → holds (the SQL guard is load-bearing by itself); revert
+  both → reddens with the predicted symptom (`target=cluster`, `claim_jetson`
+  `None`)
+- [x] 7.10 `docs/photonic-crystal-plan.md` — every remaining cluster-fallback
+  claim removed (:35, :196, :262, :452 all now say Jetson only; :35 was a fourth
+  site the review did not name)

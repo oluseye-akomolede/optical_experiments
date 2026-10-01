@@ -238,6 +238,18 @@ appears.
 - **AND** a cavity row for the cluster is still returned, so the filter removes
   only pc rows
 
+#### Scenario: a pc row past the GPU wait stays on the GPU queue
+- **WHEN** a pc row has waited longer than `MSE_GPU_WAIT_S` for a worker, and
+  the GPU-abandon path runs over it
+- **THEN** its `target` is still `jetson`, and `claim_jetson` still returns it
+- **AND** it is not moved to the cluster, so it is never stranded with no queue
+  that can see it
+- **AND** the row does not tell the owner it was "moved to the cluster queue",
+  because nothing moved
+- **AND** `reroute_to_cluster` refuses a non-cavity row in its own SQL guard
+  (`kind = 'cavity'`), so no caller can move one, not merely the one caller
+  that skips pc rows today
+
 #### Scenario: the cluster launcher refuses a pc row by name
 - **WHEN** the cluster launcher is handed a job whose `kind` is `pc`
 - **THEN** it raises, and the refusal names the kind and the Jetson

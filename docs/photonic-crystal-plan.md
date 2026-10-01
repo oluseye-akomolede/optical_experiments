@@ -32,7 +32,8 @@ timings taken here, not estimates:
    **≈ 12 s clean, ≈ 6.1 min under contention** — against
    `gunicorn -w 1 --threads 8` with the tick in the same
    process and `cpu: 500m`. It runs as a **job kind** (`kind = 'pc'`) claimed by
-   the worker with the cluster Job as the 3-D jobs' existing fallback; the web
+   the worker, with **no cluster fallback** — the cluster launcher builds cavity
+   Jobs only, so a pc row stays on the GPU queue; the web
    side validates, estimates, refuses with the limit named, and enqueues. The
    caps (30 k-points/polarisation, 5,000 nodes) are **set from the measurement**.
 5. **Two figures in revision 3 were simply wrong** and are corrected: the
@@ -193,7 +194,7 @@ under the capped tier-1 command on this VM. Reproduce with
 mildly optimistic — 5.7 % more nodes, and ARPACK's work grows faster than that.
 The figure to carry is the **max**: it is what the caps are sized against, and a
 6.1 min measurement understating the real worst case by a few percent does not
-change which route this is (a Jetson job with a cluster-Job fallback either way).
+change which route this is (a Jetson job with no cluster fallback either way).
 It is stated rather than silently scaled because a scaled number is a guess in
 the shape of a measurement. Re-running `benchmarks/pc_tier_timing.py` against the
 current mesh is the way to replace it.
@@ -259,8 +260,9 @@ is refused with its own number:
 - **k-points per polarisation: 30** (a Γ–X–M–Γ path at ~10 points per segment).
   At the measured **median 0.2 s/k** that is **≈ 12 s**; at the measured **max
   6.1 s/k** under contention it is **≈ 6.1 min**. Both are compatible with the
-  Jetson's existing job timeouts and the cluster-Job fallback's
-  `ttlSecondsAfterFinished`, and 6.1 min is the number the cap is sized against.
+  Jetson's existing job timeouts, and 6.1 min is the number the cap is sized
+  against. (There is no cluster-Job fallback for a pc job, so the Job's
+  `ttlSecondsAfterFinished` does not bound it — the Jetson's own timeout does.)
 - **nodes: 5,000.** Measured, the cap bites between `N = 68` (4,930 nodes,
   accepted) and `N = 69` (5,064 nodes, refused) on the square cell. Revision 4
   said "meshes up to `N ≈ 70`", which was a formula's prediction; the measured
@@ -448,8 +450,10 @@ is `materials` only), so `kind` and `pcs` are both new in this feature.
 A `pc` job is **enqueued, not solved inline** (§3): the web side validates,
 estimates, refuses with the limit named, and writes the row; the worker claims
 it, runs `dockerfiles/maxwell_solver/pc.py`, and stores the bands. This is the
-same claim → solve → store path the 3-D jobs already take, with the cluster Job
-as the existing fallback.
+same claim → solve → store path the 3-D jobs already take, but with **no
+cluster fallback**: the cluster has no pc solver, so a pc row the worker never
+claims stays on the GPU queue rather than being moved to a cluster that would
+cavity-solve it.
 
 **UI, without breaking 3-D jobs.**
 - The upload form gains a mode selector; the `pc` branch renders a lattice /

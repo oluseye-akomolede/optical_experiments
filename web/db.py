@@ -383,13 +383,23 @@ class JobStore:
         re-log) the same job twice, and so a job a worker is *actively* holding
         cannot be yanked out from under it. Returns False when nothing moved,
         which is not an error: it means someone else got there first.
+
+        Also guarded on ``kind = 'cavity'``, and that guard is load-bearing.
+        The cluster launcher builds exactly one Job shape -- the cavity solver
+        -- so a pc row moved to the cluster would be cavity-solved, its band
+        diagram never produced, and (because ``next_queued`` skips pc rows and
+        ``claim_jetson`` only sees ``target = 'jetson'``) the row would be
+        invisible to BOTH queues: stranded, with no error anywhere. There is no
+        cluster pc path in this change, so a pc row STAYS on the GPU queue,
+        where its worker may still come. The guard is in the SQL, not only in
+        the caller, so no caller can strand one.
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "UPDATE mse.jobs SET target = %s, stage = %s, message = %s, "
                 "lease_owner = NULL, lease_expires_at = NULL, gpu_queued_at = NULL "
-                "WHERE job_id = %s AND target = %s AND status = %s",
-                (CLUSTER, QUEUED, reason, str(job_id), JETSON, QUEUED),
+                "WHERE job_id = %s AND target = %s AND status = %s AND kind = %s",
+                (CLUSTER, QUEUED, reason, str(job_id), JETSON, QUEUED, CAVITY),
             )
             return cur.rowcount > 0
 
@@ -625,17 +635,22 @@ class JobStore:
         ``lease_owner IS NULL`` excludes the row a worker is actively holding --
         a slow solve is not an abandoned one, and pulling a live job's row out
         from under it would duplicate the work it is already doing.
+
+        ``kind`` is carried so the caller can tell a pc row from a cavity one:
+        the reroute path must not move a pc row to the cluster, and the caller
+        decides that, not this listing.
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT job_id, est_tets FROM mse.jobs "
+                "SELECT job_id, est_tets, kind FROM mse.jobs "
                 "WHERE target = %s AND status = %s AND lease_owner IS NULL "
                 "AND gpu_queued_at IS NOT NULL "
                 "AND gpu_queued_at < now() - make_interval(secs => %s) "
                 "ORDER BY gpu_queued_at",
                 (JETSON, QUEUED, float(older_than_seconds)),
             )
-            return [{"job_id": str(r[0]), "est_tets": r[1]} for r in cur.fetchall()]
+            return [{"job_id": str(r[0]), "est_tets": r[1], "kind": r[2]}
+                    for r in cur.fetchall()]
 
     def claim_jetson(self, owner: str, lease_seconds: float) -> dict | None:
         """Atomically take the oldest unclaimed jetson job for ``owner``.
