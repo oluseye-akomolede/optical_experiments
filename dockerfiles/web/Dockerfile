@@ -42,30 +42,34 @@ COPY dockerfiles/maxwell_solver/mse_common.py /opt/app/
 COPY dockerfiles/maxwell_solver/mse_geometry.py /opt/app/
 COPY dockerfiles/maxwell_solver/mse_parts.py /opt/app/
 # The photonic-crystal GEOMETRY, for the pc form's node count and its caps.
-# web/pc_form.py builds the unit cell through this module's unit_cell_mesh, so
-# the count the owner is refused on is the mesh the worker will build rather
-# than a second estimate that could disagree.
+# web/pc_form.py counts the cell's nodes through this module, so the count the
+# owner is refused on is the point set the worker will triangulate rather than
+# a second estimate that could disagree with it.
 #
-# It ships here for the same reason mse_geometry does, and with the same
-# caveat, stated because it is the thing to get wrong: this file ALSO defines
-# the solve (solve_bands, bands_from_mesh, bloch_reduce). They are importable
-# in this image by construction -- you cannot ship a module and not its
-# functions -- so "no solve in the web process" is enforced as a property of
-# the web modules' import graph, not by absence. tests/test_pc_form.py walks
-# every web/*.py and fails if any of them reaches a solve name.
+# pc.py -- the SOLVER -- is deliberately NOT copied here, and this line used to
+# say the opposite. The image built, pushed, and 500'd on the first pc
+# submission:
 #
-# The cost is the module's own imports. pc.py pulls numpy and scipy.sparse at
-# module level, and BOTH are already in this image: numpy directly (trimesh
-# requires it) and scipy transitively through trimesh, which
-# tests/test_web_imports.py resolves from the installed distribution rather
-# than from a guess. No new dependency, and the web image's requirements.txt is
-# untouched -- which is deliberate, because adding scipy as a DIRECT pin here
-# would freeze a version the solver image owns.
+#     /opt/app/pc.py:37 ModuleNotFoundError: No module named 'scipy'
 #
-# pc.py has no mse_ imports of its own beyond the MeshingError fallback it
-# tries and then stubs, so it is pure numpy/scipy and belongs beside the other
-# two rather than in the solver package (which this image must never import).
-COPY dockerfiles/maxwell_solver/pc.py /opt/app/
+# The comment that shipped with it claimed scipy was "already in this image,
+# transitively through trimesh". That was false: trimesh declares scipy only
+# under its ``easy`` extra, which the pinned install does not request. The
+# tests passed only because the checkout has scipy installed for the SOLVER, and
+# every pc test imports from the solver directory -- the test environment is not
+# the image, again.
+#
+# Splitting the numpy-only geometry out of pc.py is the fix, and it is
+# structural rather than a convention: the web image has no import path to a
+# module that imports scipy.sparse, because the file that does is not here at
+# all. Shipping pc.py and relying on "nothing imports it" is exactly the
+# guarantee that failed. tests/test_web_imports.py resolves each web import
+# against this COPY list, so a web module reaching for pc.py fails at commit
+# time rather than at container start.
+#
+# pc_geometry.py has no imports of its own beyond numpy, and its only mse_ import
+# is the MeshingError fallback it tries and then stubs.
+COPY dockerfiles/maxwell_solver/pc_geometry.py /opt/app/
 # The app adds this directory to sys.path for a checkout; in the image the
 # module is already here, so name it explicitly rather than relying on the
 # interpreter's default path.

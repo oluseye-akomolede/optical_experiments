@@ -43,6 +43,7 @@ would have been caught had the module not also been imported at module level.
 from __future__ import annotations
 
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -78,6 +79,22 @@ def _dockerfile_copies() -> dict[str, Path]:
     return copied
 
 
+def _requirement_name(spec: str) -> str:
+    """The importable name at the head of a PEP 508 requirement string.
+
+    Split on the first character that can only start a version specifier, an
+    extra, or a marker, rather than chaining ``.split()`` calls. The chained
+    version this replaces read ``botocore (<1.44.0,>=1.43.103)`` as
+    ``botocore (`` -- which is not a module name, so the requirement counted for
+    nothing. It passed only because the SAME package appears a second time
+    under an extra (``botocore[crt] ...; extra == "crt"``) whose parsing
+    happened to work. That is the wrong reason for a check to be green, and it
+    is the same mechanism that made this check believe the web image had scipy.
+
+    ``spec`` here has already had its marker stripped by the caller.
+    """
+    return re.split(r"[\s\[<>=!~;(]", spec.strip(), maxsplit=1)[0]
+
 def _requirement_names() -> set[str]:
     """Every import name the pinned requirements provide, TRANSITIVELY.
 
@@ -104,8 +121,16 @@ def _requirement_names() -> set[str]:
         names.add(name)
         try:
             for required in distribution(name).requires or ():
-                names.add(required.split(";")[0].split("[")[0]
-                          .split(">=")[0].split("==")[0].split("<")[0].strip())
+                spec, _, marker = required.partition(";")
+                if "extra" in marker:
+                    # An OPTIONAL extra is NOT installed by a plain pin. Counting
+                    # it is how this check came to believe the web image had
+                    # scipy -- trimesh declares `scipy; extra == "easy"` -- while
+                    # the container died on `import scipy` at the first pc
+                    # submission. A marker naming an extra means "not unless you
+                    # asked for that extra", so it is not evidence of presence.
+                    continue
+                names.add(_requirement_name(spec))
         except PackageNotFoundError:
             # Not installed in this interpreter; the name itself still counts,
             # and the parameter names a package rather than failing.

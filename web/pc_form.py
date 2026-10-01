@@ -4,7 +4,7 @@ WHY THIS FILE IS NAMED ``pc_form`` AND NOT ``pc``. The solver's module is
 ``dockerfiles/maxwell_solver/pc.py``, and a ``web/pc.py`` would win the name
 ``pc`` on ``sys.path`` -- this module imports the solver's ``pc`` for the lattice
 table and the cell mesh, so calling itself ``pc`` makes that import resolve to
-ITSELF. The symptom is not an ImportError: ``_pc_module()`` returns this module,
+ITSELF. The symptom is not an ImportError: ``_geometry_module()`` returns this module,
 whose ``high_symmetry_path`` does not exist, and the failure surfaces as a
 ``AttributeError`` on a function the reader can see defined in the file they are
 looking at. Renamed, not shadowed-and-worked-around: any fix that keeps the name
@@ -77,7 +77,7 @@ MAX_BANDS = 20
 MAX_DIVISIONS = 70
 
 #: lattice names the solver accepts. Read from the solver's own table at import
-#: time (see :func:`_pc_module`) rather than retyped, so a third lattice added
+#: time (see :func:`_geometry_module`) rather than retyped, so a third lattice added
 #: there is accepted here without an edit -- and, more to the point, a lattice
 #: REMOVED there cannot linger as a name this module still offers.
 LATTICE_CHOICES = ("square", "triangular")
@@ -109,28 +109,34 @@ class PCRequestError(Exception):
     """
 
 
-def _pc_module():
-    """``pc``: the solver's own geometry, for the count and the caps.
+def _geometry_module():
+    """``pc_geometry``: the solver's own GEOMETRY, for the count and the caps.
 
     Reaches the solver directory the way ``web/meshing.py`` reaches
     ``mse_common`` -- a late import with the path inserted -- because that is the
     established idiom and because the alternative is a copy of the lattice table
     and the cell algorithm in a second place.
 
-    What it deliberately does NOT reach is any solve. Importing this module pulls
-    ``pc``'s module-level imports (numpy and scipy.sparse); ``solve_bands``,
-    ``bands_from_mesh`` and ``bloch_reduce`` are defined in the same file and so
-    become importable with it, which is why the guard test is about the web
-    modules' import GRAPH and the job path, not about a name being absent from
-    ``dir(pc)``. Nothing here calls them, and the docker image contract test is
-    what keeps the module present in the web image at all.
+    This imports ``pc_geometry`` and NOT ``pc``, and that is the point. ``pc`` is
+    the solver: it imports ``scipy.sparse`` at module level and ``scipy.spatial``
+    for its triangulation, and the web image deliberately ships no scipy (the
+    image smoke test asserts no graph engine is present). Importing ``pc`` here
+    built, pushed, and then 500'd on the first pc submission with
+    ``ModuleNotFoundError: No module named 'scipy'``. ``pc_geometry`` is numpy
+    only, so this import cannot reach scipy even by accident -- the split is the
+    guarantee, where a convention that ``pc`` would stay numpy-only at the top of
+    the file was the thing that broke.
+
+    What it still does NOT reach is any solve: ``solve_bands``,
+    ``bands_from_mesh`` and ``bloch_reduce`` live in ``pc``, which is not
+    imported here at all.
     """
     root = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    import pc  # noqa: PLC0415 - deliberately late, so tier-1 tests stay cheap
+    import pc_geometry  # noqa: PLC0415 - deliberately late, so tier-1 tests stay cheap
 
-    return pc
+    return pc_geometry
 
 
 def _as_float(raw, field: str) -> float:
@@ -177,7 +183,7 @@ def parse_request(form) -> dict:
     path is derived from the lattice by :func:`k_point_count`, so the owner
     cannot ask for a path that is not the irreducible-zone path.
     """
-    pc = _pc_module()
+    pc = _geometry_module()
 
     lattice = ("" if form.get("lattice") is None
                else str(form.get("lattice")).strip().lower())
@@ -258,12 +264,12 @@ def k_point_count(lattice: str, points_per_segment: int = 10) -> int:
     are already counted once by that function, which is exactly why the length is
     the right thing to ask for.
     """
-    pc = _pc_module()
+    pc = _geometry_module()
     _labels, points = pc.high_symmetry_path(lattice, points_per_segment)
     return int(len(points))
 
 
-def cell_size(request: dict) -> tuple[int, int]:
+def cell_size(request: dict) -> int:
     """``(nodes, triangles)`` for this request's unit cell, WITHOUT solving.
 
     Builds the cell through the solver's own ``unit_cell_mesh`` and counts what
@@ -272,19 +278,24 @@ def cell_size(request: dict) -> tuple[int, int]:
     the two caps are re-derived from the measurement rather than adjusted by
     feel.
 
-    Triangulating is the expensive part of this call (12.5 ms at the production
-    size); it is done here because the alternative is refusing on a *predicted*
-    node count that could be wrong in the dangerous direction.
+    The node count is the whole of what this needs: it is the cap's operand and
+    the row's ``est_tets``. Triangulating to get it was pure cost -- the
+    triangles were computed, returned, and read by nobody -- and it was the
+    expensive half of the call (a Delaunay) plus the reason this module pulled
+    scipy's ``spatial`` into a web image that has no scipy at all.
+    ``unit_cell_points`` returns the same point set the solver triangulates, so
+    the count is still the SOLVER's mesh rather than a second estimate of it.
+
+    The rod/bg indices are deliberately not passed: they decide which triangles
+    are rod and which are background, and no triangle exists here.
     """
-    pc = _pc_module()
-    points, triangles, _eps, _pairs = pc.unit_cell_mesh(
+    geometry = _geometry_module()
+    points, _a1, _a2, _fill = geometry.unit_cell_points(
         request["lattice"],
         int(request["divisions"]),
         r_over_a=float(request["r_over_a"]),
-        n_rod=float(request["n_rod"]),
-        n_bg=float(request["n_bg"]),
     )
-    return int(len(points)), int(len(triangles))
+    return int(len(points))
 
 
 def check_caps(request: dict, nodes: int, k_points: int) -> None:
@@ -314,7 +325,7 @@ def plan_request(form) -> dict:
     """Validate, size and cap-check a submission; return what to enqueue.
 
     The one entry point the route calls. Returns a dict: the request, plus the
-    derived ``nodes``, ``triangles`` and ``k_points`` that were computed to decide
+    derived ``nodes`` and ``k_points`` that were computed to decide
     whether to accept -- recorded because they are the numbers the decision was
     made on, the same reason ``est_tets`` is stored on a cavity row.
 
@@ -323,13 +334,12 @@ def plan_request(form) -> dict:
     database.
     """
     request = parse_request(form)
-    nodes, triangles = cell_size(request)
+    nodes = cell_size(request)
     k_points = k_point_count(request["lattice"], points_per_segment=10)
     check_caps(request, nodes, k_points)
     return {
         **request,
         "nodes": nodes,
-        "triangles": triangles,
         "k_points": k_points,
     }
 
@@ -337,7 +347,7 @@ def plan_request(form) -> dict:
 def request_json(planned: dict) -> dict:
     """The request as it goes into ``jobs.pcs`` -- what was asked, not what came out.
 
-    Deliberately EXCLUDES the derived ``nodes``/``triangles``/``k_points``: those
+    Deliberately EXCLUDES the derived ``nodes``/``k_points``: those
     are the web side's estimate and they go in the row's own ``est_tets``-style
     place, whereas ``pcs`` is meant to be the request the worker re-derives the
     mesh from. Mixing a pre-computed count into the request would invite a future

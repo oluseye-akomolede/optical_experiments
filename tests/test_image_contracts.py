@@ -21,7 +21,9 @@ them rather than trusting this file.
 
 from __future__ import annotations
 
+import ast
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -226,45 +228,62 @@ def _web_dockerfile_copied_solver_files() -> set[str]:
 
 
 def test_the_web_image_copies_the_photonic_crystal_geometry():
-    """``pc.py`` must be in the web image, or ``web/pc_form.py`` dies at start.
+    """``pc_geometry.py`` must be in the web image, and ``pc.py`` must NOT be.
 
     This is the dispatch crashloop's shape a third time: the module builds,
-    pushes, and dies on the first request with ``ModuleNotFoundError: No module
-    named 'pc'``. The count and the caps in the pc form come from the solver's
-    own ``unit_cell_mesh``, so the file has to be here.
+    pushes, and dies on the first request with ``ModuleNotFoundError``. The
+    count and the caps in the pc form come from the solver's own point set, so
+    the geometry file has to be here.
 
-    Stated as a contract on the Dockerfile rather than left to
-    ``tests/test_web_imports.py``, because that check resolves a module by
-    asking whether the Dockerfile COPIES a file of that NAME -- it would pass
-    just as happily if ``pc.py`` were copied but were the wrong file.
+    The second assertion is the half this test used to get backwards. It
+    required ``pc.py`` -- the SOLVER -- and the image then died on the first pc
+    submission with ``ModuleNotFoundError: No module named 'scipy'``, because
+    pc.py imports scipy.sparse at module level and this image has no scipy.
+    Requiring that module WAS the defect. ``web/pc_form.py`` now imports the
+    numpy-only geometry, so the solver file's presence here is a regression and
+    is asserted absent.
     """
-    assert "pc.py" in _web_dockerfile_copied_solver_files(), (
-        "the web Dockerfile must COPY dockerfiles/maxwell_solver/pc.py; "
+    copied = _web_dockerfile_copied_solver_files()
+    assert "pc_geometry.py" in copied, (
+        "the web Dockerfile must COPY dockerfiles/maxwell_solver/pc_geometry.py; "
         "web/pc_form.py imports it for the unit-cell count."
+    )
+    assert "pc.py" not in copied, (
+        "the web Dockerfile must NOT COPY the solver pc.py. It imports scipy at "
+        "module level, the web image has no scipy, and shipping it is what 500'd "
+        "the first pc submission. The web side needs pc_geometry.py."
     )
 
 
-def test_the_photonic_crystal_geometry_adds_no_web_dependency():
-    """The COPY is free: numpy and scipy are already in this image.
+def test_the_copied_geometry_module_imports_no_graph_engine():
+    """What the COPIED FILE imports, rather than what its neighbours drag in.
 
-    ``pc.py`` imports numpy and ``scipy.sparse`` at module level, and the web
-    image installs neither directly. It does not need to -- ``trimesh`` requires
-    both, so ``tests/test_web_imports.py`` resolves them from the installed
-    distribution. This asserts the reasoning rather than the outcome, because
-    the tempting "fix" for an unresolved import is to add a pin, and pinning
-    scipy here would freeze a version the SOLVER image owns and let the two
-    images drift apart.
+    This replaces a test that read ``trimesh``'s metadata and asserted scipy was
+    among its requirements. That test passed while the image had no scipy at
+    all, because trimesh declares scipy only under its optional ``easy`` extra
+    and the parse counted an extra as an install -- so it certified the exact
+    false claim that shipped in the Dockerfile comment. A check that reads the
+    wrong thing passes for the wrong reason.
 
-    If trimesh ever drops scipy, this test fails instead of the image.
+    Reading the copied file's own imports cannot fail that way: these are the
+    bytes that go into the image.
     """
-    from importlib.metadata import distribution
-
-    required = {
-        name.split(";")[0].split("[")[0].split(">=")[0].split("==")[0]
-            .split("<")[0].strip()
-        for name in (distribution("trimesh").requires or ())
-    }
-    assert "numpy" in required and "scipy" in required, (
-        "the web image reaches numpy and scipy only through trimesh; if that "
-        "stopped being true, pc.py needs a direct requirement here"
+    path = ROOT / "dockerfiles" / "maxwell_solver" / "pc_geometry.py"
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imported.add(node.module.split(".")[0])
+    # numpy is installed directly (trimesh requires it) and the other files the
+    # web Dockerfile copies are by definition in the image -- mse_common is one,
+    # for the MeshingError fallback.
+    allowed = (set(sys.stdlib_module_names) | {"numpy"}
+               | {name[:-3] for name in _web_dockerfile_copied_solver_files()
+                  if name.endswith(".py")})
+    offenders = sorted(imported - allowed)
+    assert not offenders, (
+        f"pc_geometry.py is copied into the web image and imports {offenders}, "
+        "which the web image does not install. It must stay numpy-only: that is "
+        "what keeps the web image free of scipy, rather than a convention."
     )

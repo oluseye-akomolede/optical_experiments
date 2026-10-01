@@ -74,7 +74,10 @@ def test_a_good_request_is_accepted_and_reports_its_own_size():
     planned = pc_form.plan_request(GOOD)
     assert planned["lattice"] == "square"
     assert planned["nodes"] > 0
-    assert planned["triangles"] > planned["nodes"]  # a triangulated cell: 2:1
+    # No triangle count: the web side does not triangulate, so it has none to
+    # report and the row carries none. The count that IS here is the solver's
+    # node set -- see test_cell_size_matches_the_solvers_own_mesh.
+    assert "triangles" not in planned
     assert planned["k_points"] == 30
     assert pc_form.request_json(planned) == {
         "lattice": "square", "r_over_a": 0.2, "n_rod": 3.5, "n_bg": 1.0,
@@ -92,15 +95,18 @@ def test_the_reported_counts_are_the_meshers_own():
     cell is caught here.
     """
     sys.path.insert(0, str(SOLVER))
-    import pc  # noqa: PLC0415
+    import pc  # noqa: PLC0415 - the SOLVER module: the comparison is the point
 
-    points, triangles, _eps, _pairs = pc.unit_cell_mesh(
+    points, _triangles, _eps, _pairs = pc.unit_cell_mesh(
         "square", 16, r_over_a=0.2, n_rod=3.5, n_bg=1.0)
-    node_count, tri_count = pc_form.cell_size({
+    node_count = pc_form.cell_size({
         "lattice": "square", "divisions": 16, "r_over_a": 0.2,
         "n_rod": 3.5, "n_bg": 1.0})
+    # The web count against the SOLVER's own mesh, which is the whole contract:
+    # the cap the owner is refused on must be the mesh the worker builds. The
+    # web side now reaches it without importing the solver at all, so this is a
+    # crossing between two modules rather than a restatement of one.
     assert node_count == len(points)
-    assert tri_count == len(triangles)
 
 
 # ---------------------------------------------------------------------------
@@ -482,27 +488,31 @@ def test_the_solve_names_are_the_solvers_own():
 # The name collision
 # ---------------------------------------------------------------------------
 
-def test_the_web_module_does_not_shadow_the_solvers_pc():
-    """``web/pc.py`` would win the name ``pc`` and break this module's import.
+def test_the_web_module_does_not_shadow_the_geometry_module():
+    """``web/pc_geometry.py`` would win the name and break this module's import.
 
-    Not a style note. ``_pc_module()`` imports the solver's ``pc``; if this
-    module were named ``pc`` the import would resolve to ITSELF and the failure
-    would be ``AttributeError: module 'pc' has no attribute 'high_symmetry_path'``
-    -- naming a function the reader can see defined in the solver file. This
-    pins the filename so the rename cannot be silently reverted.
+    Not a style note. ``_geometry_module()`` imports the solver directory's
+    ``pc_geometry``; if this module were named ``pc_geometry`` the import would
+    resolve to ITSELF and the failure would be ``AttributeError: module
+    'pc_geometry' has no attribute 'high_symmetry_path'`` -- naming a function
+    the reader can see defined in the geometry file. This pins the filename so
+    the rename cannot be silently reverted.
     """
-    assert not (WEB / "pc.py").exists(), (
-        "web/pc.py shadows the solver's pc.py; this module must be pc_form.py"
+    assert not (WEB / "pc_geometry.py").exists(), (
+        "web/pc_geometry.py shadows the solver's pc_geometry.py; this module "
+        "must be pc_form.py"
     )
     assert Path(pc_form.__file__).name == "pc_form.py"
 
 
-def test_the_resolved_solver_module_is_the_solver_directory():
-    """And the positive form: ``_pc_module()`` resolves to the SOLVER's file.
+def test_the_resolved_module_is_the_numpy_only_geometry():
+    """And the positive form: ``_geometry_module()`` resolves to ``pc_geometry``.
 
     The collision test above says the bad path is absent; this says the good one
-    is what actually loads, which is what a reader wants to know and what the
-    collision would have broken.
+    is what actually loads. It asserts the FILE, not a name: the fix for the
+    scipy 500 is that the web form imports the numpy-only geometry instead of the
+    solver, and a regression to ``import pc`` would resolve to a file in the same
+    directory and pass any check that only looked at the directory.
     """
-    resolved = Path(pc_form._pc_module().__file__).resolve()
-    assert resolved == (SOLVER / "pc.py").resolve()
+    resolved = Path(pc_form._geometry_module().__file__).resolve()
+    assert resolved == (SOLVER / "pc_geometry.py").resolve()
