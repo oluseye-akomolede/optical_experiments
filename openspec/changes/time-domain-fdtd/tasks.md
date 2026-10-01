@@ -55,8 +55,9 @@
 - [ ] 4.1 DB kind `td` with a `tds` request JSON whose keys are exactly the ones
   the worker reads. A missing key is refused by name.
 - [ ] 4.2 Worker routing to the Jetson. Check every path that can change the
-  routing field (reroute, reaper and release). At most one GPU job runs beside
-  a `td` job; check free memory first and leave the job queued ("Jetson busy")
+  routing field (unclaimed-GPU fallback, abandoned-GPU reroute, reaper and
+  release), each tested with a `td` job. A `td` job runs alone on the GPU;
+  check free memory first and leave the job queued ("Jetson busy")
   when it is short, for at most 60 minutes; never reroute a `td` job to the
   cluster; fail readably on a device OOM mid-run and after 45 minutes of run
   time.

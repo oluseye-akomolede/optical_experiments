@@ -114,8 +114,9 @@ Before starting a `td` job it SHALL check free device memory against the job's
 estimate; when memory is short it SHALL leave the job queued with a status
 saying the Jetson is busy, not fail it. A `td` job SHALL wait at most 60
 minutes as "Jetson busy" and then fail with a readable message. A `td` job
-SHALL never be rerouted to the cluster by the unclaimed-GPU fallback, which
-cannot run it. A device out-of-memory error during the run (another team's job
+SHALL never be routed to the cluster, which cannot run it, by any path that can
+change its routing (the unclaimed-GPU fallback, the abandoned-GPU reroute, the
+reaper and release). A device out-of-memory error during the run (another team's job
 started after the check) SHALL fail the job with a readable message, not a
 generic error. A `td` job SHALL be stopped after 45 minutes of run time (the
 30-minute estimate limit plus a margin) and fail with a message naming that
@@ -134,6 +135,10 @@ limit.
 #### Scenario: memory taken mid-run fails readably
 - **WHEN** the device runs out of memory during a `td` run
 - **THEN** the job fails with a message naming the memory shortage
+
+#### Scenario: an overlong run is stopped
+- **WHEN** a `td` run passes 45 minutes of run time
+- **THEN** it is stopped and the job fails with a message naming the limit
 
 ### Requirement: Dispersive metals SHALL follow their published model
 
