@@ -190,6 +190,26 @@ a fabricated window.
 - **THEN** `bandGaps` returns an empty array
 - **AND** the UI says there is no gap rather than drawing an empty band
 
+#### Scenario: the outer index of `bands` is the k-point, and the fixtures can tell
+
+The shape above ("one vector of `n_bands` per point") fixes which array is
+nested inside which, and leaving it implicit is how both readers came to be
+written transposed -- reading `bands[band][k]` -- with a green suite. A square
+fixture is read the same either way, so the orientation is stated and the test
+inputs are constrained to expose it.
+
+- **WHEN** any client reads a stored diagram (`web/static/bands.js`,
+  `web/static/bandplot.js`, the caption in `web/static/viewer.js`)
+- **THEN** the outer index of `bands` is the k-point and the inner index is the
+  band number: `bands[k][band]`, one entry per `k_points` entry
+- **AND** the number of bands is `bands[0].length`, never `bands.length` (which
+  is the number of k-points)
+- **AND** the renderer draws one path per BAND, walking the k-points
+- **AND** every band fixture used by the tests is NON-SQUARE, so a reader that
+  transposed the axes cannot agree with it
+- **AND** every band fixture passes the server's own `_band_payload`, so no
+  reader is tested against a payload a job could not produce
+
 #### Scenario: the x-axis is path length, and a flat band does not break the range
 - **WHEN** the diagram is drawn
 - **THEN** the x-axis is cumulative path length, not the k-index
