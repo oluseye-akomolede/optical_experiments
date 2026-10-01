@@ -47,10 +47,21 @@ cavity solver.
   rectangular-cavity frequency, AND every analytic mode in the band that the
   source couples to (nonzero source-component field at the source cell)
   appears as a peak; a missing mode fails the benchmark
+- **AND** peaks are matched to modes one-to-one
+- **AND** the recorded window is at least 4 / (the smallest gap between
+  distinct analytic modes in the search band), so neighbouring modes don't merge
+  into one peak; if that needs more than the configured maximum record, the
+  benchmark refuses and names the pair rather than running
+- **AND** the 1% tolerance is widened only to twice the grid's own dispersion
+  error, the output says so when it is, and a widened run does not report a
+  spec pass
 
 #### Scenario: V1 agrees with the cavity solver
 - **WHEN** the V1 box is also solved by the cavity (Nedelec) solver
-- **THEN** each V1 peak is within 1% of the matching cavity-solver eigenfrequency
+- **THEN** each V1 peak is within 1% of the matching cavity-solver eigenfrequency,
+  for the box the grid actually has, using the mean of a degenerate set
+- **AND** if the cavity solver fails its own check or returns fewer modes than
+  were chased, the comparison fails instead of comparing fewer rows
 
 ### Requirement: An open boundary SHALL absorb outgoing waves
 
@@ -61,7 +72,10 @@ reflection from the grid edge is shown as part of the simulation.
 - **WHEN** a CW point source runs in open vacuum to steady state
 - **THEN** at three or more probe distances r ≥ 2λ from the source, broadside
   to the dipole (perpendicular to its polarisation, where the far field is
-  largest), the field amplitude follows 1/r within 5%
+  largest), the field amplitude follows 1/r within 5% (amplitude from a
+  least-squares fit at the source frequency)
+- **AND** a probe that saw nothing, or whose fits over the two halves of the
+  recorded window differ by more than 1% (not yet steady), fails the benchmark
 
 #### Scenario: benchmark V3
 - **WHEN** a plane-wave pulse crosses empty open space and leaves the grid
