@@ -236,9 +236,11 @@ refused before it is queued.
   its node
 
 #### Scenario: the material table matches the paper
-- **WHEN** ε(ω) is computed from the library at three photon energies per metal
-- **THEN** it matches an independently published Rakić Lorentz-Drude n, k
-  dataset (cited in the test) within 2%
+- **WHEN** ε(ω) is computed from the library at 12 wavelengths per metal,
+  spread through the published table from its shortest to its longest
+- **THEN** n + ik matches an independently published Rakić Lorentz-Drude n, k
+  dataset (cited in the test) within 1e-3 (relative) at every one, tight
+  enough that a 10% typo in a single model parameter fails
 
 #### Scenario: benchmark V4
 - **WHEN** a pulse reflects at normal incidence from a gold slab at least 10

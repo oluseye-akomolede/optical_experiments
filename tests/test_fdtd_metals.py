@@ -19,33 +19,88 @@ import fdtd  # noqa: E402
 
 #: Independently published n, k for the same model: refractiveindex.info,
 #: database/data/main/<metal>/nk/Rakic-LD.yml (CC0; tabulated from Rakić et
-#: al., Appl. Opt. 37, 5271 (1998), LD model). Rows copied verbatim: the
-#: tabulated wavelength nearest 0.4, 0.8 and 1.6 um. (wavelength um, n, k)
+#: al., Appl. Opt. 37, 5271 (1998), LD model). Rows copied verbatim: 12 per
+#: metal, evenly spaced through each table, both ends included, so the short,
+#: mid and long wavelength poles all show. (wavelength um, n, k)
 PUBLISHED = {
-    "Au": ((4.0285e-01, 1.4112, 1.7490), (7.9466e-01, 0.23010, 4.4679),
-           (1.5931e+00, 0.58993, 9.9355)),
-    "Ag": ((3.9746e-01, 0.16007, 1.7990), (8.0658e-01, 0.17457, 5.0710),
-           (1.6050e+00, 0.42174, 10.543)),
-    "Al": ((4.0143e-01, 0.45683, 4.7236), (7.9962e-01, 2.6719, 8.3382),
-           (1.6060e+00, 1.6068, 15.914)),
-    "Cu": ((3.9916e-01, 1.2496, 2.2459), (8.0344e-01, 0.24149, 4.9706),
-           (1.5842e+00, 0.48830, 10.694)),
-    "Cr": ((4.0108e-01, 1.7714, 3.5652), (8.0033e-01, 4.1450, 4.3029),
-           (1.5970e+00, 4.2397, 5.0281)),
+    "Au": ((2.4797e-01, 1.0941e+00, 1.5478e+00),
+            (3.3177e-01, 1.5422e+00, 1.6012e+00),
+            (4.4390e-01, 1.3011e+00, 1.6840e+00),
+            (5.9393e-01, 3.7366e-01, 2.7930e+00),
+            (7.9466e-01, 2.3010e-01, 4.4679e+00),
+            (1.0632e+00, 2.7776e-01, 6.4377e+00),
+            (1.4458e+00, 5.2226e-01, 9.0142e+00),
+            (1.9344e+00, 7.3408e-01, 1.2164e+01),
+            (2.5882e+00, 1.3425e+00, 1.6353e+01),
+            (3.4629e+00, 2.0620e+00, 2.1457e+01),
+            (4.6333e+00, 3.0386e+00, 2.8646e+01),
+            (6.1992e+00, 5.0974e+00, 3.8118e+01)),
+    "Ag": ((2.4797e-01, 4.4265e-01, 1.1737e+00),
+            (3.5324e-01, 2.5903e-01, 1.2030e+00),
+            (5.0321e-01, 1.3208e-01, 2.7927e+00),
+            (7.1684e-01, 1.5727e-01, 4.4272e+00),
+            (1.0212e+00, 2.2512e-01, 6.5716e+00),
+            (1.4547e+00, 3.6298e-01, 9.5296e+00),
+            (2.1134e+00, 6.6249e-01, 1.3952e+01),
+            (3.0107e+00, 1.2442e+00, 1.9905e+01),
+            (4.2888e+00, 2.4114e+00, 2.8271e+01),
+            (6.1096e+00, 4.7257e+00, 3.9914e+01),
+            (8.7034e+00, 9.2038e+00, 5.5787e+01),
+            (1.2398e+01, 1.7485e+01, 7.6626e+01)),
+    "Al": ((6.1992e-02, 6.6397e-01, 9.4537e-03),
+            (1.3196e-01, 5.1091e-02, 1.2422e+00),
+            (2.8091e-01, 2.1871e-01, 3.2452e+00),
+            (5.9303e-01, 1.1576e+00, 6.9063e+00),
+            (1.2624e+00, 1.2839e+00, 1.2255e+01),
+            (2.6873e+00, 3.6265e+00, 2.6516e+01),
+            (5.7204e+00, 1.1299e+01, 5.1800e+01),
+            (1.2177e+01, 2.8360e+01, 9.7682e+01),
+            (2.5921e+01, 7.6316e+01, 1.7444e+02),
+            (5.4722e+01, 1.6987e+02, 2.6481e+02),
+            (1.1649e+02, 3.0004e+02, 3.7233e+02),
+            (2.4797e+02, 4.7220e+02, 5.2302e+02)),
+    "Cu": ((2.0664e-01, 1.1018e+00, 1.8654e+00),
+            (2.9926e-01, 1.4041e+00, 1.6300e+00),
+            (4.3340e-01, 1.3036e+00, 2.2223e+00),
+            (6.2767e-01, 3.4872e-01, 3.4910e+00),
+            (9.0900e-01, 2.4042e-01, 5.7930e+00),
+            (1.3164e+00, 3.5714e-01, 8.7934e+00),
+            (1.9462e+00, 7.1373e-01, 1.3209e+01),
+            (2.8185e+00, 1.4185e+00, 1.9041e+01),
+            (4.0818e+00, 2.4775e+00, 2.6983e+01),
+            (5.9114e+00, 3.7308e+00, 3.8388e+01),
+            (8.5611e+00, 6.2835e+00, 5.5245e+01),
+            (1.2398e+01, 1.1985e+01, 7.9048e+01)),
+    "Cr": ((2.4797e-01, 8.5637e-01, 2.0847e+00),
+            (4.1004e-01, 1.8387e+00, 3.6256e+00),
+            (6.7804e-01, 3.6802e+00, 4.3511e+00),
+            (1.1150e+00, 4.4855e+00, 4.2849e+00),
+            (1.8438e+00, 4.0742e+00, 5.6353e+00),
+            (3.0490e+00, 3.5896e+00, 9.3608e+00),
+            (5.0418e+00, 3.7733e+00, 1.6234e+01),
+            (8.3371e+00, 5.8737e+00, 2.7472e+01),
+            (1.3786e+01, 1.2134e+01, 4.4081e+01),
+            (2.2671e+01, 2.5404e+01, 6.5421e+01),
+            (3.7489e+01, 4.7584e+01, 8.9595e+01),
+            (6.1992e+01, 7.7150e+01, 1.1506e+02)),
 }
 
 
 def test_the_library_matches_a_published_rakic_table():
-    """n + i k from the library within 2% of the published value, 3 energies
-    per metal (the spec's scenario). Both n and k enter, so a conjugated
-    convention (k < 0) or a mistyped parameter fails."""
+    """n + i k from the library within 1e-3 of the published value over 12
+    rows per metal. The library matches all 60 to 6.4e-5 (measured). The
+    gate is tight and the rows span the band because a 10% typo in one
+    parameter moves n + i k by much less than 10% except near that pole: at
+    2% over 3 rows per metal, 51 of 81 such typos passed; here 77 of 81 fail
+    (the four that pass move no row by 1e-3). Both n and k enter, so a
+    conjugated convention (k < 0) fails too."""
     assert sorted(PUBLISHED) == sorted(fdtd.METALS)
     for metal, rows in PUBLISHED.items():
         for wavelength_um, n, k in rows:
             nk = np.sqrt(complex(fdtd.permittivity(
                 metal, fdtd.C0 / (wavelength_um * 1e-6))))
             error = abs(nk - complex(n, k)) / abs(complex(n, k))
-            assert error < 0.02, (metal, wavelength_um, nk, (n, k))
+            assert error < 1e-3, (metal, wavelength_um, nk, (n, k))
 
 
 def test_a_band_outside_the_fit_is_refused_naming_it():
