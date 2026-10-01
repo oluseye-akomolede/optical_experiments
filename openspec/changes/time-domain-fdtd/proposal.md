@@ -55,9 +55,10 @@ spectra.
     - `cw`: steady state at frequency f, with a smooth turn-on over several periods.
     - `pulse`: Gaussian, with centre frequency f and a bandwidth.
     - `drawn`: the owner draws amplitude against time in the browser, or pastes
-      samples. It is resampled to dt. Before queueing, the run warns or refuses
-      if the waveform's spectrum has significant energy above the grid's
-      resolvable frequency (10 cells per wavelength in the finest material).
+      samples (at most 10 000, with a duration). It is resampled to dt and its
+      mean is removed. Before queueing, the run is refused if more than 1% of
+      the waveform's spectral energy lies above the grid's resolvable frequency
+      (10 cells per wavelength in the finest material, at the largest cell).
 - **Outputs:**
   - the probe time trace at the source and at up to 4 user probe points;
   - the spectrum of each trace, which shows the resonances for a pulse;
@@ -65,7 +66,12 @@ spectra.
 - **Limits:**
   - The cell size is λ_min / (10·|n|_max) in each material, refined further to resolve each
     thin layer (≥ 4 cells across it, or the metal skin depth where that is thinner).
-  - The run is refused, before it is queued, above 8 M cells or 20 000 steps.
+  - The run is refused, before it is queued, above 8 M cells, 20 000 steps, a
+    3.0 GB GPU memory estimate, or a 30-minute run-time estimate. The refusal
+    names the limit, the value and the lever to change.
+  - The Jetson's memory is shared with other teams' jobs, so the worker checks
+    free memory before starting a `td` job and leaves it queued ("Jetson busy")
+    when it is short.
   - The estimate (cells, steps, memory, run time) is shown before submit, as the
     cavity tool already does.
 
@@ -76,29 +82,38 @@ spectra.
   A graded tensor-product grid keeps an axis-aligned film of that ratio (100:1) under the 8 M-cell cap. A curved
   10 nm shell refines nearly every plane (~400 cells per axis, ~64 M cells), so
   the cap is set in phase 1 from the measured Jetson cost per cell-step, not
-  guessed. Measured 2026-10-01 (cupy, 1.73 M cells × 7 088 steps × 3 runs):
-  1.21e8 cell-steps/s. At the caps, 8 M × 20 000 = 1.6e11 cell-steps ≈ 22 min,
-  inside the 30-minute bench timeout, so the 8 M-cell cap stands; a 64 M-cell
-  shell would take about 3 hours at 20 000 steps and stays refused by its count. All solver arithmetic is SI, and tests include a nanometre-scale
+  guessed. Measured 2026-10-01 for an empty metal box with no CPML and no
+  dispersive metal (cupy, 1.73 M cells × 7 088 steps × 3 runs): 1.21e8
+  cell-steps/s, so 8 M × 20 000 = 1.6e11 cell-steps ≈ 22 min for that case.
+  The CPML and the metal ADE add work and memory, so phase 2 re-measures the
+  rate with an open boundary and one gold region; the run-time limit uses the
+  rate for the run's own configuration. A 64 M-cell shell stays refused by its
+  count. Estimated memory at 8 M cells (not yet measured): ~1.3 GB metal box,
+  ~1.7 GB open, ~2.9 GB open with gold if ADE storage were full-grid, which is
+  why ADE storage covers only the metal's bounding box. All solver arithmetic is SI, and tests include a nanometre-scale
   grid so float32 coefficients are checked at the scale actually used.
 
 ## Validation (each phase ships with its benchmark)
 
 - **V1, metal box with a pulse:** the spectrum peaks are within 1% of the analytic
-  rectangular-cavity frequencies, and within 1% of our cavity solver's eigenvalues
-  for the same box.
+  rectangular-cavity frequencies, every coupled mode in the band appears, and
+  the peaks are within 1% of our cavity solver's eigenvalues for the same box.
 - **V2, open vacuum with a CW point source:** in the far field the amplitude falls
   as 1/r, within 5%.
-- **V3, open plane-wave pulse through empty space:** after the pulse leaves, the
-  residual energy is < 1e-4 of the peak, so the PML absorbs, and the
-  scattered-field region stays < 1e-3 of the incident amplitude.
+- **V3, open plane-wave pulse through empty space:** three transit times after
+  the source ends, the residual energy in the physical region is < 1e-4 of the
+  peak, so the PML absorbs, and the scattered-field region stays < 1e-3 of the
+  incident amplitude.
 
 - **V4, gold film reflectance:** at normal incidence, a gold slab's reflectance
-  over the pulse band matches the analytic Fresnel result for the same
-  Drude-Lorentz model, within 2%.
-- **V5, thin film between plates:** the resonances of a dielectric film between
-  two metal plates match the analytic planar-cavity frequencies within 1%, on a
-  graded grid whose film is far thinner than the coarse cell.
+  (≥ 10 skin depths thick) over the pulse band matches the analytic Fresnel
+  result for the same Lorentz-Drude model within 0.02 absolute, and the
+  material table matches a published Rakić dataset within 2%.
+- **V5, thin film between plates:** the resonances of a dielectric film of index
+  n filling the gap between two PEC plates match the parallel-plate lateral modes
+  f = (c/2n)·√((m/a)² + (p/b)²) within 1%, on a graded grid whose film is far
+  thinner than the coarse cell. These depend on n and not on the thickness, so
+  they show the film is seen.
 
 ## Phases
 
@@ -115,12 +130,15 @@ spectra.
 
 6. Periodic boundaries (owner, 16:00Z: "1"): one repeating cell with
    wrap-around faces, including a Bloch phase for a chosen wave vector. The core
-   stays real float32, and a Bloch phase uses two real runs in quadrature, so
-   phase 1 does not change. Benchmark V6: band frequencies at chosen k-points match
-   the existing photonic-crystal solver for the same 2-D crystal, within 1%.
+   stays real float32. Away from k = 0 and the zone edge the Bloch faces mix the
+   real and imaginary parts every step, so the cos and sin fields are stepped
+   together with cross-coupled face updates; phase 6 adds a face hook to the
+   core for this. Benchmark V6: for TM and TE, band frequencies at chosen
+   k-points match the existing photonic-crystal solver for the same 2-D crystal
+   within 1%, and every band in the pulse band appears.
 
 ## Out of scope
 
 Nonlinear and magnetic materials, flux and transmission monitors, and multi-GPU
-runs. The coarse cell is still capped (8 M cells), so a very large object
+runs. The cell count is still capped (8 M cells), so a very large object
 with a very thin coating may be refused. The estimate says so before queueing.

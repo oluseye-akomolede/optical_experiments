@@ -16,10 +16,12 @@ Courant limit of the smallest cell.
 ### Requirement: The source SHALL be the one the user defined
 
 A `td` request SHALL carry the source kind (`point` | `plane`), the time profile
-(`cw` | `pulse`), the frequency, the bandwidth for a pulse, the polarisation, and
-the position for `point` or the direction for `plane`. A `plane` source with
-boundary `metal` SHALL be refused before it is queued, with a message that names
-the conflict.
+(`cw` | `pulse` | `drawn`), the frequency, the bandwidth for a pulse, the
+polarisation, and the position for `point` or the direction for `plane`. A
+`plane` source with boundary `metal` SHALL be refused before it is queued, with
+a message that names the conflict. Every source profile, including `drawn`,
+SHALL be zero-mean (no DC content), because a soft current with a net integral
+leaves a static field that no absorbing boundary removes.
 
 #### Scenario: a pulse sits at the requested frequency
 - **WHEN** a `pulse` source with centre frequency f is run
@@ -29,45 +31,115 @@ the conflict.
 - **WHEN** the form asks for `plane` with boundary `metal`
 - **THEN** the request is refused with a readable message and no job is queued
 
+#### Scenario: a source leaves no static field
+- **WHEN** any source profile is integrated over the run
+- **THEN** its integral is below 1e-3 of the integral of its absolute value
+
 ### Requirement: A metal-box pulse SHALL ring at the box's resonances
 
-A pulse in a closed metal box SHALL excite only the box's own resonances, so
-the time-domain solver agrees with the analytic cavity and with the cavity solver.
+A pulse in a closed metal box SHALL excite the box's own resonances and no
+others, so the time-domain solver agrees with the analytic cavity and with the
+cavity solver.
 
 #### Scenario: benchmark V1
 - **WHEN** a broadband pulse is run in an empty rectangular metal box
 - **THEN** each spectrum peak in the pulse band is within 1% of an analytic
-  rectangular-cavity frequency
+  rectangular-cavity frequency, AND every analytic mode in the band that the
+  source couples to (nonzero source-component field at the source cell)
+  appears as a peak; a missing mode fails the benchmark
+
+#### Scenario: V1 agrees with the cavity solver
+- **WHEN** the V1 box is also solved by the cavity (Nedelec) solver
+- **THEN** each V1 peak is within 1% of the matching cavity-solver eigenfrequency
 
 ### Requirement: An open boundary SHALL absorb outgoing waves
 
-With boundary `open`, the CPML SHALL absorb waves leaving the grid, so no
+With boundary `open`, a 10-cell CPML SHALL absorb waves leaving the grid, so no
 reflection from the grid edge is shown as part of the simulation.
+
+#### Scenario: benchmark V2
+- **WHEN** a CW point source runs in open vacuum to steady state
+- **THEN** at three or more probe distances r ≥ 2λ from the source, the field
+  amplitude follows 1/r within 5%
 
 #### Scenario: benchmark V3
 - **WHEN** a plane-wave pulse crosses empty open space and leaves the grid
-- **THEN** the residual field energy is below 1e-4 of the peak energy
+- **THEN** three grid transit times after the source ends, the residual field
+  energy over the physical region (CPML excluded) is below 1e-4 of the peak
+  energy, AND throughout the run the scattered-field region's field stays below
+  1e-3 of the incident peak amplitude
+
+### Requirement: The plane-wave source SHALL be a clean total-field/scattered-field box
+
+A `plane` source SHALL use a TF/SF box with a 1-D auxiliary incident grid that
+uses the same dt and the same graded spacings along the propagation axis. The
+box SHALL sit at least 3 cells from every object and at least 3 cells from the
+CPML. A polarisation parallel to the propagation direction SHALL be refused
+before it is queued.
+
+#### Scenario: a longitudinal polarisation is refused
+- **WHEN** the form asks for a plane wave polarised along its direction
+- **THEN** the request is refused with a readable message and no job is queued
 
 ### Requirement: A run SHALL be refused above its limits before it is queued
 
-The estimate SHALL be computed from the form. A request above 8 M cells or
-20 000 steps SHALL be refused with a message naming the limit and the value
-that exceeded it.
+The estimate SHALL be computed from the form. A request SHALL be refused,
+before it is queued, when it exceeds any of: 8 M cells; 20 000 steps; a GPU
+memory budget of 3.0 GB (fields, CPML auxiliaries and ADE storage, computed
+from the form); or an estimated run time of 30 minutes, computed from the
+measured Jetson rate for that configuration (boundary kind and whether
+dispersive metals are present). The refusal SHALL name the limit, the value
+that exceeded it, and the form lever that reduces it.
 
 #### Scenario: an oversized grid is refused readably
 - **WHEN** the requested frequency and size give more than 8 M cells
-- **THEN** the page shows the refusal with the cell count, and the server
-  does not respond 500
+- **THEN** the page shows the refusal with the cell count, the limit and the
+  lever, and the server does not respond 500
+
+#### Scenario: too many steps is refused readably
+- **WHEN** the requested duration on the grid's dt needs more than 20 000 steps
+- **THEN** the page shows the refusal with the step count, the limit and the
+  lever, and the server does not respond 500
+
+#### Scenario: too much memory is refused readably
+- **WHEN** the estimated GPU memory exceeds 3.0 GB
+- **THEN** the page shows the refusal with the byte estimate, the limit and the
+  lever, and the server does not respond 500
+
+### Requirement: The worker SHALL run a time-domain job only with the memory it needs
+
+The worker SHALL run at most one GPU job at a time when one of them is `td`.
+Before starting a `td` job it SHALL check free device memory against the job's
+estimate; when memory is short it SHALL leave the job queued with a status
+saying the Jetson is busy, not fail it.
+
+#### Scenario: a busy Jetson delays, not fails
+- **WHEN** a `td` job's estimate exceeds the Jetson's free memory at start
+- **THEN** the job stays queued with a "Jetson busy" status and runs once
+  memory is free
 
 ### Requirement: Dispersive metals SHALL follow their published model
 
-Gold, silver, aluminium, copper and chromium SHALL be modelled by Drude-Lorentz
-fits from a cited source, and stepped with auxiliary differential equations.
+Gold, silver, aluminium, copper and chromium SHALL be modelled by the
+Lorentz-Drude fits of Rakić et al., Applied Optics 37, 5271 (1998), with
+ε∞ = 1 and the paper's parameters in eV (ω_p, f_j, Γ_j, ω_j), stepped with
+auxiliary differential equations. ADE storage SHALL cover only the metal cells'
+bounding box. An E sample on a metal face SHALL take the metal. A run whose
+pulse band leaves the paper's fitted range for a metal in the scene SHALL be
+refused before it is queued.
+
+#### Scenario: the material table matches the paper
+- **WHEN** ε(ω) is computed from the library at three photon energies per metal
+- **THEN** it matches an independently published Rakić Lorentz-Drude n, k
+  dataset (cited in the test) within 2%
 
 #### Scenario: benchmark V4
-- **WHEN** a pulse reflects at normal incidence from a gold slab
-- **THEN** the reflectance across the pulse band is within 2% of the analytic
-  Fresnel reflectance for the same Drude-Lorentz model
+- **WHEN** a pulse reflects at normal incidence from a gold slab at least 10
+  skin depths thick, with at least 4 cells per skin depth
+- **THEN** the reflectance, measured as |scattered/incident|² at a
+  scattered-field probe, is within 0.02 (absolute) of the analytic Fresnel
+  reflectance for the same model, over the band where the incident spectrum is
+  at least 1e-2 of its peak
 
 ### Requirement: Thin layers SHALL be resolved, not lost
 
@@ -75,22 +147,31 @@ The grid SHALL place at least 4 cells across every layer thinner than the
 coarse cell, or across the metal skin depth where that is thinner, with a
 neighbour spacing ratio of at most 1.3.
 
+#### Scenario: the grid builder keeps its own rules
+- **WHEN** the grid builder is given layers thinner than the coarse cell
+- **THEN** every such layer has at least 4 cells across it and every neighbour
+  spacing ratio is at most 1.3
+
 #### Scenario: benchmark V5
-- **WHEN** a dielectric film far thinner than the coarse cell sits between two
-  metal plates
-- **THEN** its resonances are within 1% of the analytic planar-cavity frequencies
+- **WHEN** a dielectric film of index n, far thinner than the coarse cell,
+  fills the gap between two PEC plates of lateral size a × b with PEC side walls
+- **THEN** its resonances are within 1% of the parallel-plate lateral modes
+  f = (c/2n)·√((m/a)² + (p/b)²), which depend on n and not on the film thickness
 
 ### Requirement: A drawn waveform SHALL be checked against the grid
 
-A `drawn` source SHALL be resampled to dt. A waveform with significant spectral
-energy above the grid's resolvable frequency SHALL be refused or warned about
-before it is queued, naming that frequency.
+A `drawn` source SHALL be a list of at most 10 000 dimensionless amplitude
+samples with a duration in seconds. It SHALL be resampled to dt, its mean
+SHALL be removed (the form says so), and it is zero after its duration; the
+run's own duration sets the step count. The grid's resolvable frequency is
+f_res = c / (10·|n|_max·Δ_max), where Δ_max is the largest cell spacing. A
+drawn waveform with more than 1% of its spectral energy above f_res SHALL be
+refused before it is queued, naming f_res.
 
-#### Scenario: an under-resolved drawing is caught before queueing
-- **WHEN** a drawn waveform has a sharp edge whose spectrum extends past the
-  grid's resolvable frequency
-- **THEN** the form shows the warning, naming the frequency, before any job is
-  queued
+#### Scenario: an under-resolved drawing is refused before queueing
+- **WHEN** a drawn waveform has a sharp edge putting more than 1% of its
+  spectral energy above f_res
+- **THEN** the form shows the refusal, naming f_res, and no job is queued
 
 ### Requirement: The scene's physical size SHALL come from the owner's units and scale
 
@@ -101,8 +182,8 @@ be computed from that physical size.
 #### Scenario: a 10 nm flat film in a 1 µm scene fits
 - **WHEN** a 1 µm scene holding an axis-aligned 10 nm gold film is requested at a
   visible-band pulse
-- **THEN** the estimate is below 8 M cells on the graded grid, and the run is
-  accepted
+- **THEN** the estimate is below 8 M cells AND below 20 000 steps on the graded
+  grid, and the run is accepted
 
 #### Scenario: a curved thin shell is estimated, not assumed
 - **WHEN** a curved object of 1 µm with a 10 nm coating is requested
@@ -112,10 +193,14 @@ be computed from that physical size.
 ### Requirement: A periodic cell SHALL reproduce the crystal's bands
 
 A `td` request MAY declare periodic faces with a Bloch wave vector k. The run
-SHALL then model an infinite crystal of that cell.
+SHALL then model an infinite crystal of that cell. Except at k = 0 and the zone
+edge, the cos and sin fields SHALL be stepped together with cross-coupled face
+updates, through a face hook in the core.
 
 #### Scenario: benchmark V6
 - **WHEN** a pulse is run in one cell of a 2-D crystal extruded along z, with
-  Bloch-periodic faces at a chosen k
-- **THEN** the spectrum's peaks are within 1% of the photonic-crystal band solver's
-  frequencies at that k
+  Bloch-periodic x and y faces at a chosen k, periodic z faces with kz = 0, for
+  each polarisation (TM: E along z; TE: H along z)
+- **THEN** the spectrum's peaks are within 1% of the photonic-crystal band
+  solver's frequencies at that k for that polarisation, and every band in the
+  pulse band appears

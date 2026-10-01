@@ -21,24 +21,32 @@
 
 ## 2. Plane-wave source, dispersive metals, drawn waveform (phase 2)
 
-- [ ] 2.1 A TF/SF box with a 1-D auxiliary incident-field grid along the axis.
-  It is refused with `metal`.
+- [ ] 2.1 A TF/SF box with a 1-D auxiliary incident-field grid along the axis,
+  on the same dt and graded spacings; ≥ 3 cells to objects and to the CPML.
+  Refused with `metal` and for a longitudinal polarisation. All profiles are
+  zero-mean.
 - [ ] 2.2 Benchmark V3.
-- [ ] 2.3 Drude-Lorentz ADE terms, plus a material library (Au, Ag, Al, Cu, Cr;
-  Rakić 1998), with the source cited in the code.
+- [ ] 2.3 Lorentz-Drude ADE terms (Rakić 1998, ε∞ = 1, parameters in eV), stored
+  on the metal's bounding box only, plus a material library (Au, Ag, Al, Cu, Cr)
+  with the source cited in the code, a refusal outside each fit's range, and a
+  table check against a published Rakić n, k dataset at three energies per metal.
+  Re-measure the Jetson rate and GPU memory with an open boundary and one gold
+  region (lead runs it).
 - [ ] 2.4 Benchmark V4 (gold slab against analytic Fresnel, same model).
-- [ ] 2.5 `drawn` profile: resample samples to dt, and warn or refuse on energy
-  above the grid's resolvable frequency.
+- [ ] 2.5 `drawn` profile: ≤ 10 000 samples plus a duration, resampled to dt,
+  mean removed; refused when > 1% of its spectral energy is above f_res.
 
 ## 3. Geometry, estimate and caps (phase 3)
 
 - [ ] 3.0 Graded-grid builder (≥ 4 cells per thin layer or skin depth, neighbour
   ratio ≤ 1.3), sub-cell averaging at cut cells, and coatings (material +
-  thickness on a region's surface). Benchmark V5.
+  thickness on a region's surface). A unit check of the builder's own rules.
+  Benchmark V5 (parallel-plate lateral modes).
 - [ ] 3.1 Voxelise the upload's regions to an index map. Cells outside the shape
   are metal (`metal`) or vacuum plus a gap (`open`).
 - [ ] 3.2 Estimate cells, steps, memory and run time from the form. Refuse above
-  8 M cells or 20 000 steps, naming the limit and the lever to change.
+  8 M cells, 20 000 steps, 3.0 GB or 30 minutes, naming the limit, the value and
+  the lever to change.
 - [ ] 3.3 Every refusal type raised by the form or the geometry is caught by the
   route (no 500 responses).
 
@@ -47,7 +55,9 @@
 - [ ] 4.1 DB kind `td` with a `tds` request JSON whose keys are exactly the ones
   the worker reads. A missing key is refused by name.
 - [ ] 4.2 Worker routing to the Jetson. Check every path that can change the
-  routing field (reroute, reaper and release).
+  routing field (reroute, reaper and release). At most one GPU job runs beside
+  a `td` job; check free memory first and leave the job queued ("Jetson busy")
+  when it is short.
 - [ ] 4.3 Result files: `trace.bin`, `spectrum.json` and `frames/<n>.bin`. List
   every reader of each output, and give each its route, its 404 rule and a test.
 
@@ -63,6 +73,7 @@
 ## 6. Periodic boundaries (phase 6)
 
 - [ ] 6.1 Periodic faces (wrap the curl differences), plus a Bloch phase for a
-  given k by two real runs in quadrature.
+  given k: cos and sin fields stepped together through a core face hook.
 - [ ] 6.2 Benchmark V6 against the existing pc band solver: an extruded 2-D
-  crystal, with frequencies at chosen k-points within 1%.
+  crystal, TM and TE, kz = 0, frequencies at chosen k-points within 1%, every
+  band present.
