@@ -10,8 +10,18 @@ validated. Boxes ticked are done and verified on this branch.
   `divisions`, `polarisation`; each refusal names its own field
 - [x] 1.2 `divisions` stored as part of the request (it changes the mesh)
 - [x] 1.3 `k_points` derived from the lattice, not a form field
-- [x] 1.4 `cell_size` derives `(nodes, triangles)` from the solver's own
-  `unit_cell_mesh`, not an independent estimate
+- [x] 1.4 `cell_size` derives the node count from the solver's own geometry,
+  not an independent estimate. It SHALL reach it through numpy-only
+  `pc_geometry.unit_cell_points`; the web side never triangulates, because the
+  only consumer of a triangle count would be the form itself (the route reads
+  `planned["nodes"]` alone, and `request_json` stores neither)
+- [x] 1.4a the web image copies `pc_geometry.py` and NOT `pc.py`: `pc.py`'s
+  module-level `scipy.sparse` import 500'd a real pc submission in production
+  (rolled back 2026-10-01 05:13Z), and the image's freedom from graph engines
+  is a deliberate property
+- [x] 1.4b the image smoke test runs `PC.plan_request` on a real form INSIDE the
+  built image: red at `0f14ba7` (`ModuleNotFoundError: No module named 'scipy'`),
+  green after the split
 - [x] 1.5 `check_caps` refuses each cap with its OWN number and sentence
 - [x] 1.6 `plan_request` is the one entry point; it does not enqueue
 

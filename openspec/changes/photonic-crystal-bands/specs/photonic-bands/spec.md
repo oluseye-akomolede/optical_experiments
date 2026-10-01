@@ -263,6 +263,30 @@ appears.
 - **AND** the check is red against the unfixed branch, failing as
   `claim_jetson -> None` because the row was created `target = cluster`
 
+### Requirement: The web form SHALL reach the geometry without the solver, and the web image SHALL carry no graph engine
+
+The web process SHALL NOT import `pc.py` or `pc_solve`. The lattice and
+polarisation constants, the k-path and the node count the form is refused on
+SHALL come from a numpy-only `pc_geometry.py`, which the web image copies and
+`pc.py` imports. `pc.py` SHALL NOT be copied into the web image: it imports
+`scipy.sparse` at module level, so shipping it puts a 500 one import away, and
+the image's freedom from graph engines (`networkx`, `scipy`) is a deliberate
+property asserted by the image smoke test.
+
+#### Scenario: the geometry module imports no graph engine
+- **WHEN** `pc_geometry.py`'s top-level imports are parsed
+- **THEN** each is the standard library or numpy
+- **AND** neither `scipy` nor `networkx` appears
+
+#### Scenario: the built image plans a real request
+- **WHEN** `PC.plan_request` is run inside the built web image on a small form
+- **THEN** it returns a node count and a k-point count
+- **AND** it raises no ImportError
+
+#### Scenario: no web module reaches the solve
+- **WHEN** every `web/*.py` is inspected
+- **THEN** none of them imports `pc`, `pc_solve` or a solve name
+
 ### Requirement: The validation controls SHALL be analytic or published, stated with their tolerances before running
 
 Control A, the empty lattice (`n_rod = n_bg = 1`), SHALL reproduce the folded
