@@ -1207,8 +1207,17 @@ def _install_fake_pc_solve(monkeypatch, calls):
 
     def solve_pc(job):
         calls.append(job)
-        return {"lattice": "triangular", "bands": [[0.1, 0.2]],
-                "labels": ["G", "X"], "k_points": [[0.0, 0.0], [0.5, 0.0]]}
+        # A diagram the app's ``/done`` will actually accept: one band vector
+        # per k-point, every vector the same length (see ``_band_payload``). The
+        # earlier version had two k-points and ONE band row, which the real
+        # validator refuses with a 400 -- invisible while this fake was only
+        # ever handed to ``real_solve`` directly and never put on the wire. The
+        # end-to-end test below is what caught it; a double that models an
+        # output the route rejects does not model the solver.
+        return {"lattice": "triangular",
+                "labels": ["G", "X"],
+                "k_points": [[0.0, 0.0], [0.5, 0.0]],
+                "bands": [[0.1, 0.2], [0.3, 0.4]]}
 
     fake.solve_pc = solve_pc
     monkeypatch.setitem(sys.modules, "pc_solve", fake)
@@ -1270,4 +1279,118 @@ def test_real_solve_treats_a_missing_kind_as_cavity(monkeypatch, tmp_path):
     # kind guard, which would have named the kind.
     assert "max_tets" in str(excinfo.value)
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# A pc job has NO upload, so run_job must not fetch one: the whole loop
+# ---------------------------------------------------------------------------
+
+#: A pc request shaped exactly as ``web/pc_form.request_json`` writes one: the
+#: same seven fields, in the same units. These are the values of the job that
+#: failed in production on 2026-10-01 (square, 12 divisions, r/a 0.2, TM, 4
+#: bands), so the tests below exercise the real request and not a convenient
+#: smaller one.
+PC_REQUEST = {
+    "lattice": "square", "r_over_a": 0.2, "n_rod": 3.5, "n_bg": 1.0,
+    "n_bands": 4, "divisions": 12, "polarisation": "TM",
+}
+
+
+def test_a_pc_job_finishes_without_fetching_an_input(tmp_path, server, monkeypatch):
+    """The app has no ``input.obj`` for a pc row, and the worker must not ask.
+
+    A pc job's mesh is built inside the solve, so the app never stores an upload
+    for it and its own input route answers 404 to a worker that asks. That is
+    what production does, and it is exactly what a fake API that always served
+    an ``input.obj`` hid -- ``WorkerAPI.fetch_input`` succeeded in the test and
+    404'd in prod, so every real pc job died before ``real_solve`` could
+    dispatch on its kind.
+
+    Here the REAL route is reached over a real socket, with the store genuinely
+    empty for this job: the fetch is not stubbed away, it is the production one
+    against the production store semantics. The solve is stubbed at the
+    ``pc_solve`` boundary only (``_install_fake_pc_solve``), because a tier-1
+    run cannot build a real band diagram.
+
+    RED before the fix: ``run_job`` fetched first, the 404 arrived as an
+    ``APIError``, ``classify`` calls that TRANSIENT, and the job was RELEASED --
+    never solved, never DONE, and (after ``MAX_RELEASES``) failed with a message
+    about the network that named none of this.
+    """
+    calls = []
+    _install_fake_pc_solve(monkeypatch, calls)
+    job = queued_job(server.jobs_db, n_modes=12, kind=DB.PC,
+                     pcs=dict(PC_REQUEST))
+    # The premise, stated on the store the route reads: there is no input.
+    assert server.store.keys_under(job["job_id"]) == []
+
+    worker = make_worker(server, tmp_path, solve=W.real_solve)
+
+    assert worker.claim_loop(max_jobs=1) == 1
+
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.DONE, (
+        "a pc job needs no input, so a missing input.obj is not a reason to "
+        "fail or requeue it")
+    assert len(calls) == 1, "the pc solve must have run exactly once"
+    assert calls[0]["pcs"]["lattice"] == "square", (
+        "the request from the row must reach the solver, unaltered")
+
+
+def test_a_pc_job_runs_claim_to_done_over_the_real_routes(tmp_path, server,
+                                                         monkeypatch):
+    """The whole seam on one socket: claim -> solve -> ``/done``, for a pc job.
+
+    This is the seam that has failed twice, so it is tested end to end rather
+    than piecewise. ``tests/test_worker.py``'s ``server`` fixture runs the REAL
+    ``web/worker_api.py`` blueprint on a real port and the worker talks to it
+    through its real ``urllib`` client: the auth, the claim payload's
+    ``kind``/``pcs``, the lease and its renewal, and the ``/done`` band
+    validation are the production ones. Nothing on the ``web/`` side is faked.
+
+    The ONE stub is the ``pc_solve`` boundary -- installed in ``sys.modules``
+    where ``real_solve``'s late import finds it -- because there is no GPU here
+    and a real band diagram is a tier-2 solve.
+
+    What the assertions pin:
+
+    * the job is DONE and its lease is released,
+    * the diagram the solve produced is what the app STORED, merged onto the
+      request that was solved (the real store COALESCEs ``pcs``),
+    * nothing was uploaded -- a pc job has no result files, and a worker that
+      scanned for them would raise ``ResultDirUnavailable`` right after the
+      solve,
+    * the stage never named "uploading", a phase that does not run for a pc job.
+
+    Must fail before the fix, on the fetch, not on any of the above.
+    """
+    calls = []
+    _install_fake_pc_solve(monkeypatch, calls)
+    job = queued_job(server.jobs_db, n_modes=12, kind=DB.PC,
+                     pcs=dict(PC_REQUEST))
+    worker = make_worker(server, tmp_path, solve=W.real_solve)
+
+    assert worker.claim_loop(max_jobs=1) == 1
+
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.DONE
+    assert row.get("lease_owner") is None, "the lease is given up on success"
+
+    # The diagram landed, and the request it was solved from is still there.
+    bands = row["pcs"]["bands"]
+    assert bands["labels"] == ["G", "X"]
+    assert bands["k_points"] == [[0.0, 0.0], [0.5, 0.0]]
+    assert bands["bands"] == [[0.1, 0.2], [0.3, 0.4]]
+    assert row["pcs"]["lattice"] == "square", (
+        "the real store merges pcs, so the request must survive")
+
+    # No upload: the store holds nothing for this job, before or after.
+    assert server.store.keys_under(job["job_id"]) == []
+
+    # The stage sequence never named a phase a pc job does not run.
+    assert "uploading" not in server.jobs_db.stages_seen
+
+    # The work dir is cleaned up like any finished job's.
+    assert not (worker.config.work_root / job["job_id"]).exists()
+    assert worker.lock.releases >= 1
 

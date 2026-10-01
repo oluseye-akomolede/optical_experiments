@@ -879,8 +879,28 @@ class Worker:
         work_dir = job_dir(self.config.work_root, job_id)
         reporter = StageReporter()
 
-        self._log(f"claimed {job_id}: {job.get('n_modes')} modes, "
-                  f"units {job.get('units')}, scale {job.get('scale')}")
+        #: WHICH SOLVE this is. Read once, from the claim, and used for every
+        #: decision below that a cavity job and a pc job answer differently:
+        #: the input fetch, the result scan, the stage names, and this log
+        #: line. It is the same field ``real_solve`` dispatches on, so the
+        #: method states the kind in one place rather than testing it at each
+        #: site -- which is how the fetch came to be missing a test in the
+        #: first place.
+        is_pc = job.get("kind") == "pc"
+
+        # A pc job has no ``n_modes`` and no upload units: it is a band diagram
+        # of a unit cell, and its parameters live in ``pcs``. Logging the
+        # cavity fields would print "None modes, units None, scale None" for
+        # every pc job, which reads as a malformed claim rather than as the
+        # other kind of job it is.
+        if is_pc:
+            pcs = job.get("pcs") or {}
+            self._log(f"claimed {job_id}: pc, {pcs.get('lattice')} lattice, "
+                      f"r/a={pcs.get('r_over_a')}, {pcs.get('n_bands')} bands, "
+                      f"{pcs.get('polarisation')}")
+        else:
+            self._log(f"claimed {job_id}: {job.get('n_modes')} modes, "
+                      f"units {job.get('units')}, scale {job.get('scale')}")
         self._start_heartbeat(job_id, lease_seconds, reporter)
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -892,9 +912,7 @@ class Worker:
             # (``_done`` -> ``done_bands``) rather than as result files. Fetching
             # here would 404 -- the app has no input.obj for a pc row -- and the
             # result scan after the solve would then find no files to upload, so
-            # BOTH steps are skipped from ONE decision, made on the claim's kind,
-            # which is the same field ``real_solve`` dispatches on.
-            is_pc = job.get("kind") == "pc"
+            # BOTH steps are skipped from the one ``is_pc`` decision above.
             store = self._store_factory(work_dir, job_id)
             if not is_pc:
                 input_bytes = self.api.fetch_input(job_id)
@@ -926,10 +944,14 @@ class Worker:
                     "the queue rather than reporting a result nobody is "
                     "waiting for"
                 )
-            self._stage = "uploading"
-            reporter.stage = "uploading"
-
+            # Nothing is uploaded for a pc job, so the stage does not advance
+            # either: it stays "solving", which is what the worker actually did
+            # last, rather than naming a phase that never runs. The heartbeat
+            # reports this stage to the app, so an operator watching a pc job
+            # would otherwise see it stuck "uploading" files it never sends.
             if not is_pc:
+                self._stage = "uploading"
+                reporter.stage = "uploading"
                 for name in _result_names(store, job_id):
                     self.api.upload(job_id, name, store.read(_key(job_id, name)))
             self._done(job_id, work_dir, summary, reporter)
