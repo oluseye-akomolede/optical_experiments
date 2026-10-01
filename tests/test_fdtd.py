@@ -361,9 +361,12 @@ def test_an_open_boundary_absorbs_the_pulse_while_the_metal_wall_holds_it():
     # leaked everything would still read as held.
     held = metal_energy[after:].min() / metal_energy[after]
     assert held > 0.9, f"the metal box kept only {held:.2%} of its energy"
+    # Measured: 2.5e-5 here. With the CPML correction switched off on the
+    # dual (H) family it is 1.3e-2, on the primal (E) family 2.0e-3, and with
+    # no CPML at all 1.0, so 1e-4 fails each of those and passes the real one.
     left = open_energy[after:].max() / metal_energy[after:].max()
-    assert left < 0.02, (
-        f"the CPML left {left:.3%} of what the metal wall held at the same "
+    assert left < 1e-4, (
+        f"the CPML left {left:.3e} of what the metal wall held at the same "
         f"step, so the difference is the solver, not the boundary")
 
 
