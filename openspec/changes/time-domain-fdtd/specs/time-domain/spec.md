@@ -35,6 +35,14 @@ leaves a static field that no absorbing boundary removes.
 - **WHEN** any source profile is integrated over the run
 - **THEN** its integral is below 1e-3 of the integral of its absolute value
 
+#### Scenario: a CW source settles with no offset
+- **WHEN** a `cw` profile's running integral is averaged over whole periods
+  after its turn-on ramp
+- **THEN** the average is below 1e-4 of that integral's swing (a ramped
+  `envelope × sin` alone settles 1% off zero, which a long run's total
+  integral does not show; the profile is therefore the exact derivative of
+  `-envelope × cos(ωt)/ω`, the same pure sine once the ramp ends)
+
 ### Requirement: A metal-box pulse SHALL ring at the box's resonances
 
 A pulse in a closed metal box SHALL excite the box's own resonances and no
@@ -90,7 +98,25 @@ A `plane` source SHALL use a TF/SF box with a 1-D auxiliary incident grid that
 uses the same dt and the same graded spacings along the propagation axis. The
 box SHALL sit at least 3 cells from every object and at least 3 cells from the
 CPML. A polarisation parallel to the propagation direction SHALL be refused
-before it is queued.
+before it is queued. The box is given as two inclusive corner nodes; the
+incident wave is defined in one background medium, so every cell within 3 of a
+face, on either side, SHALL be that medium (objects sit wholly inside the core
+or wholly outside), and a box that breaks either clearance SHALL be refused
+with a message naming the axis or the offending node. The 1-D line is padded
+beyond the 3-D grid and closed by its own CPML, so its own end reflections
+never reach the box.
+
+#### Scenario: a plane wave leaves nothing outside its box
+- **WHEN** a plane-wave pulse in any of the six directions, with either
+  transverse polarisation, crosses an empty box on a graded grid
+- **THEN** just outside every face the field stays below 1e-3 of the incident
+  peak, AND a dielectric block inside the same box scatters above 1e-2 to the
+  same probes
+
+#### Scenario: a box too close to an object or the CPML is refused
+- **WHEN** an object, a conductor or the CPML lies within 3 cells of a box face
+- **THEN** the run is refused with a message naming the clearance and where it
+  is broken
 
 #### Scenario: a longitudinal polarisation is refused
 - **WHEN** the form asks for a plane wave polarised along its direction

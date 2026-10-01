@@ -1,4 +1,4 @@
-"""The time-domain solver core: the claims phase 1 has to keep.
+"""The time-domain solver core: the claims phases 1 and 2 have to keep.
 
 Every test here is a SHAPE, not an absolute amplitude (see fdtd.py on units):
 a spectrum peaks where the source put it, a closed box keeps its energy, an
@@ -499,9 +499,181 @@ def test_a_cw_source_shows_up_at_its_own_frequency_in_a_probe():
         f"the driven run rang at {peak:.4g} Hz, not {F0:.4g}")
 
 
-def test_a_plane_source_is_refused_by_name():
-    with pytest.raises(fdtd.FDTDError, match="phase 2"):
-        fdtd.Source((1, 1, 1), frequency=F0, kind="plane", bandwidth=BANDWIDTH)
+def _running_integral_offset(profile, frequency):
+    """The mean of a profile's running integral after it has settled,
+    as a fraction of that integral's swing: what a soft current leaves behind
+    as a static field."""
+    dt = (1.0 / frequency) / 400.0
+    t = np.arange(0.0, 40.0 / frequency, dt)
+    charge = np.cumsum([profile(x) for x in t]) * dt
+    tail = charge[-4000:]      # exactly the last 10 periods: whole cycles only
+    swing = (tail.max() - tail.min()) / 2.0
+    return abs(tail.mean()) / max(swing, abs(tail.mean()), 1e-300)
+
+
+def test_every_profile_is_zero_mean():
+    """A soft current with a net integral leaves a static field that no
+    absorbing boundary removes (the spec's zero-mean rule). A ramped sine is
+    not enough: its integral settles 1% off zero. The pulse has no swing left
+    after it, so its offset is measured against its own peak running value."""
+    assert _running_integral_offset(
+        lambda t: fdtd.cw_profile(t, F0), F0) < 1e-4
+    dt = (1.0 / F0) / 400.0
+    t = np.arange(0.0, 40.0 / F0, dt)
+    charge = np.cumsum([fdtd.pulse_profile(x, F0, BANDWIDTH) for x in t]) * dt
+    assert abs(charge[-1]) < 1e-6 * np.abs(charge).max()
+
+
+# ---------------------------------------------------------------- plane wave
+
+#: 24^3 with a 4-cell CPML: the box faces may sit on nodes 7..16 (3 cells clear
+#: of the CPML), which leaves a 4-node core for an object 3 cells clear of them.
+PW_N = 24
+PW_PML = 4
+PW_BOX = ((7, 7, 7), (16, 16, 16))
+PW_INSIDE = 11
+#: Graded differently on each axis, so a correction that used the wrong
+#: spacing, or a 1-D line spaced unlike the 3-D axis, does not cancel.
+PW_SPACINGS = (np.linspace(0.9, 1.1, PW_N - 1), np.full(PW_N - 1, 1.0),
+               np.linspace(1.1, 0.9, PW_N - 1))
+PW_PAIRS = [(d, c) for d in fdtd.DIRECTIONS for c in fdtd.COMPONENTS
+            if c != d[1]]
+
+
+def plane(direction="+x", component="z", **kwargs):
+    options = dict(kind="plane", direction=direction, component=component,
+                   box=PW_BOX, frequency=F0, bandwidth=BANDWIDTH)
+    options.update(kwargs)
+    return fdtd.Source(**options)
+
+
+def _plane_steps():
+    # the pulse's own length plus a crossing of the whole grid
+    sigma = 1.0 / (math.pi * BANDWIDTH)
+    return steps_for(10.0 * sigma + 1.2 * PW_N * DX / C)
+
+
+def _outside_probes(component):
+    """One probe just beyond each of the box's six faces, in the scattered
+    region and clear of the CPML, all at the box's transverse centre."""
+    low, high = PW_BOX
+    probes = []
+    for axis in range(3):
+        for index in (low[axis] - 2, high[axis] + 2):
+            cell = [PW_INSIDE] * 3
+            cell[axis] = index
+            probes.append((*cell, component))
+    return probes
+
+
+def _leakage(eps, source):
+    inside = (PW_INSIDE,) * 3 + (source.component,)
+    run = fdtd.simulate(eps, source, _plane_steps(),
+                        probes=[inside, *_outside_probes(source.component)],
+                        spacings=PW_SPACINGS, boundary="open", pml_cells=PW_PML)
+    traces = np.asarray(run["traces"])
+    incident = float(np.abs(traces[0]).max())
+    return incident, float(np.abs(traces[1:]).max()) / incident
+
+
+@pytest.mark.parametrize("direction,component", PW_PAIRS)
+def test_a_plane_wave_stays_inside_its_box(direction, component):
+    """V3's leakage bound, on a graded grid, for every direction and
+    polarisation: outside the box the incident wave cancels to < 1e-3."""
+    eps = np.ones((PW_N,) * 3, dtype=np.float32)
+    incident, leak = _leakage(eps, plane(direction, component))
+    assert incident > 0.5, f"no wave reached the box centre ({incident:.3g})"
+    assert leak < 1e-3, (
+        f"{direction} {component}: {leak:.2e} of the incident wave leaked "
+        f"out of the box")
+
+
+def test_a_plane_wave_in_a_dielectric_background_stays_inside_its_box():
+    """The 1-D line must carry the wave at the background's speed."""
+    eps = np.full((PW_N,) * 3, 2.25, dtype=np.float32)
+    incident, leak = _leakage(eps, plane("-y", "x"))
+    assert incident > 0.3
+    assert leak < 1e-3, f"{leak:.2e} leaked out of a dielectric background"
+
+
+def test_an_object_in_the_box_scatters_out_of_it():
+    """The control for the leakage tests: the same probes see a scatterer."""
+    eps = np.ones((PW_N,) * 3, dtype=np.float32)
+    eps[10:14, 10:14, 10:14] = 4.0
+    _incident, leak = _leakage(eps, plane("+x", "z"))
+    assert leak > 1e-2, f"a dielectric block scattered only {leak:.2e}"
+
+
+@pytest.mark.parametrize("direction", ["+z", "-z"])
+def test_a_plane_wave_travels_its_way_at_c_with_its_amplitude(direction):
+    """The peak passes two points on the axis in the order the direction
+    says, at c (a 1.5-cell tolerance on 7 cells: arrival is read from the
+    sampled peak), and at the amplitude asked for."""
+    eps = np.ones((PW_N,) * 3, dtype=np.float32)
+    near, far = 8, 15
+    source = plane(direction, "x", amplitude=2.0)
+    run = fdtd.simulate(eps, source, _plane_steps(),
+                        probes=[(11, 11, near, "x"), (11, 11, far, "x")],
+                        spacings=PW_SPACINGS, boundary="open", pml_cells=PW_PML)
+    traces = np.asarray(run["traces"])
+    first, second = (0, 1) if direction == "+z" else (1, 0)
+    delay = (int(np.argmax(np.abs(traces[second])))
+             - int(np.argmax(np.abs(traces[first])))) * run["dt"]
+    distance = float(np.sum(PW_SPACINGS[2][near:far]))
+    assert delay == pytest.approx(distance / C, abs=1.5 * DX / C)
+    t = np.arange(4000) * (5.0 / BANDWIDTH) / 4000
+    peak = 2.0 * max(abs(fdtd.pulse_profile(x, F0, BANDWIDTH)) for x in t)
+    assert float(np.abs(traces).max()) == pytest.approx(peak, rel=0.03)
+
+
+def test_a_plane_wave_in_a_metal_box_is_refused_naming_the_conflict():
+    eps = np.ones((PW_N,) * 3, dtype=np.float32)
+    with pytest.raises(fdtd.FDTDError, match="plane wave.*metal.*open"):
+        fdtd.simulate(eps, plane(), 10, spacings=PW_SPACINGS,
+                      boundary="metal", pml_cells=PW_PML)
+
+
+def test_a_longitudinal_plane_wave_is_refused():
+    with pytest.raises(fdtd.FDTDError, match="transverse"):
+        plane("+y", "y")
+
+
+def test_a_plane_wave_box_must_clear_the_cpml_and_every_object_by_3_cells():
+    eps = np.ones((PW_N,) * 3, dtype=np.float32)
+    with pytest.raises(fdtd.FDTDError, match="3 cells to the absorbing layer"):
+        fdtd.simulate(eps, plane(box=((6, 7, 7), (16, 16, 16))), 2,
+                      spacings=PW_SPACINGS, boundary="open", pml_cells=PW_PML)
+    with pytest.raises(fdtd.FDTDError, match="3 cells to the absorbing layer"):
+        fdtd.simulate(eps, plane(box=((7, 7, 7), (16, 17, 16))), 2,
+                      spacings=PW_SPACINGS, boundary="open", pml_cells=PW_PML)
+    for near in (9, 18):            # 2 cells inside, then 2 cells outside a face
+        blocked = eps.copy()
+        blocked[near, 11, 11] = 4.0
+        with pytest.raises(fdtd.FDTDError, match="within 3 cells"):
+            fdtd.simulate(blocked, plane(), 2, spacings=PW_SPACINGS,
+                          boundary="open", pml_cells=PW_PML)
+    conductor = np.zeros((PW_N,) * 3, dtype=bool)
+    conductor[11, 11, 5] = True
+    with pytest.raises(fdtd.FDTDError, match="conductor"):
+        fdtd.simulate(eps, plane(), 2, spacings=PW_SPACINGS, boundary="open",
+                      pml_cells=PW_PML, pec=conductor)
+    # 3 cells clear on both sides is allowed
+    clear = eps.copy()
+    clear[10, 11, 11] = clear[20, 11, 11] = 4.0
+    fdtd.simulate(clear, plane(), 2, spacings=PW_SPACINGS, boundary="open",
+                  pml_cells=PW_PML)
+
+
+def test_a_plane_source_takes_a_direction_and_a_box_not_a_cell():
+    with pytest.raises(fdtd.FDTDError, match="no cell"):
+        fdtd.Source((1, 1, 1), kind="plane", direction="+x", box=PW_BOX,
+                    frequency=F0, bandwidth=BANDWIDTH)
+    with pytest.raises(fdtd.FDTDError, match="direction"):
+        plane(direction="x")
+    with pytest.raises(fdtd.FDTDError, match="not a direction or a box"):
+        pulse(direction="+x")
+    with pytest.raises(fdtd.FDTDError, match="empty"):
+        plane(box=((7, 7, 7), (7, 16, 16)))
 
 
 def test_a_cw_source_with_a_bandwidth_is_refused():

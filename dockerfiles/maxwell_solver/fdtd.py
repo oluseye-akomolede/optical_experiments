@@ -75,6 +75,8 @@ ETA0 = math.sqrt(MU0 / EPS0)         # ohm
 
 BOUNDARIES = ("metal", "open")
 PROFILES = ("cw", "pulse")
+KINDS = ("point", "plane")
+DIRECTIONS = ("+x", "-x", "+y", "-y", "+z", "-z")
 COMPONENTS = ("x", "y", "z")
 
 SAFETY = 0.99                        # fraction of the Courant limit
@@ -136,15 +138,24 @@ def cw_profile(t: float, frequency: float, ramp_periods: float = 5.0) -> float:
 
     The ramp is what keeps a continuous drive from putting a step's worth of
     every frequency into the grid at t = 0.
+
+    The profile is the exact time derivative of ``-envelope * cos(wt) / w``,
+    so its running integral is that expression, which averages to zero once
+    the ramp is over. ``envelope * sin(wt)`` alone does not: its integral
+    settles about an offset of 1% of its swing, and a soft current with a net
+    integral leaves a static field that no absorbing boundary removes. After
+    the ramp the two are the same pure sine.
     """
     if t <= 0.0:
         return 0.0
     ramp = ramp_periods / frequency
+    omega = 2.0 * math.pi * frequency
     if t >= ramp:
-        envelope = 1.0
+        envelope, slope = 1.0, 0.0
     else:
         envelope = 0.5 * (1.0 - math.cos(math.pi * t / ramp))
-    return envelope * math.sin(2.0 * math.pi * frequency * t)
+        slope = 0.5 * math.pi / ramp * math.sin(math.pi * t / ramp)
+    return envelope * math.sin(omega * t) - slope * math.cos(omega * t) / omega
 
 
 def pulse_profile(t: float, frequency: float, bandwidth: float,
@@ -161,21 +172,26 @@ def pulse_profile(t: float, frequency: float, bandwidth: float,
 
 
 class Source:
-    """A soft current on one E component at one cell.
+    """A soft current on one E component at one cell, or a plane wave.
 
-    Soft means it adds to the field there instead of pinning it, so the cell
-    still carries the wave it launched. Phase 1 has point sources only; a plane
-    wave needs a TF/SF box and is refused with the phase that adds it.
+    ``kind="point"``: soft means it adds to the field there instead of pinning
+    it, so the cell still carries the wave it launched.
+
+    ``kind="plane"``: a plane wave travelling along ``direction`` (``"+x"``,
+    ``"-z"``, ...) with E along ``component``, which must be transverse to it.
+    It is injected through the faces of a total-field/scattered-field ``box``
+    ``((x0, y0, z0), (x1, y1, z1))`` of node indices, both corners inclusive:
+    inside the box the grid carries the incident wave plus whatever the
+    geometry scatters, outside it only the scattered part. ``amplitude`` is the
+    incident E amplitude in V/m. A plane source has no cell.
     """
 
-    def __init__(self, cell, *, frequency: float, profile: str = "pulse",
+    def __init__(self, cell=None, *, frequency: float, profile: str = "pulse",
                  bandwidth: float | None = None, amplitude: float = 1.0,
-                 component: str = "z", kind: str = "point"):
-        if kind != "point":
-            raise FDTDError(
-                f"source kind {kind!r} is not implemented; phase 1 has a point "
-                f"soft current only, and a plane wave needs the TF/SF box of "
-                f"phase 2")
+                 component: str = "z", kind: str = "point",
+                 direction: str | None = None, box=None):
+        if kind not in KINDS:
+            raise FDTDError(f"source kind must be one of {KINDS}, got {kind!r}")
         if profile not in PROFILES:
             raise FDTDError(f"profile must be one of {PROFILES}, got {profile!r}")
         if component not in COMPONENTS:
@@ -193,9 +209,45 @@ class Source:
             raise FDTDError(
                 f"a cw source has no bandwidth, got {bandwidth!r}; the tone is "
                 f"at the frequency alone")
-        if len(tuple(cell)) != 3:
-            raise FDTDError(f"a cell is three indices, got {cell!r}")
-        self.cell = tuple(int(c) for c in cell)
+        self.direction = None
+        self.axis = None
+        self.box = None
+        if kind == "point":
+            if direction is not None or box is not None:
+                raise FDTDError(
+                    "a point source has a cell, not a direction or a box; "
+                    "those belong to kind='plane'")
+            if cell is None or len(tuple(cell)) != 3:
+                raise FDTDError(f"a cell is three indices, got {cell!r}")
+            self.cell = tuple(int(c) for c in cell)
+        else:
+            if cell is not None:
+                raise FDTDError(
+                    f"a plane wave has no cell (got {cell!r}); it enters "
+                    f"through the faces of its box")
+            if direction not in DIRECTIONS:
+                raise FDTDError(
+                    f"a plane wave's direction must be one of {DIRECTIONS}, "
+                    f"got {direction!r}")
+            if component == direction[1]:
+                raise FDTDError(
+                    f"a plane wave travelling {direction} cannot be polarised "
+                    f"along {component}: E must be transverse to the direction "
+                    f"of travel")
+            if box is None or len(tuple(box)) != 2 or any(
+                    len(tuple(corner)) != 3 for corner in box):
+                raise FDTDError(
+                    f"a plane wave needs a box ((x0, y0, z0), (x1, y1, z1)), "
+                    f"got {box!r}")
+            low, high = (tuple(int(i) for i in corner) for corner in box)
+            if any(h <= l for l, h in zip(low, high)):
+                raise FDTDError(
+                    f"the plane wave's box {box!r} is empty on some axis; each "
+                    f"upper corner index must exceed the lower one")
+            self.cell = None
+            self.direction = direction
+            self.axis = COMPONENTS.index(direction[1])
+            self.box = (low, high)
         self.frequency = float(frequency)
         self.profile = profile
         self.bandwidth = None if bandwidth is None else float(bandwidth)
@@ -392,6 +444,223 @@ def spectrum(trace, dt: float, *, window: str | None = "hann", xp=None):
 # the entry point
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# plane wave: total-field / scattered-field
+# --------------------------------------------------------------------------
+
+#: Absorbing cells at each end of the 1-D incident grid. It is one line of
+#: cells, so a thick layer costs nothing and keeps its echo far below the
+#: leakage the box is checked for.
+INCIDENT_PML_CELLS = 40
+#: Cells between the TF/SF box and both the CPML and every object (the spec's 3).
+BOX_CLEARANCE = 3
+
+
+class _PlaneWave:
+    """The incident wave of a plane source and the TF/SF corrections it needs.
+
+    The incident field lives on a 1-D Yee line along the direction of travel,
+    with the SAME primal spacings along that axis and the same dt as the 3-D
+    grid, padded at both ends and closed by a CPML. For a wave with no
+    transverse variation the 3-D update collapses to exactly this 1-D update,
+    so the incident field it carries has the 3-D grid's own numerical
+    dispersion, and the corrections cancel the wave outside the box to
+    rounding rather than to a dispersion mismatch.
+
+    Only the polarisation component ``E_p`` and the one H component it drives,
+    ``H_q``, are nonzero in the incident wave. A curl term reaches across a box
+    face wherever one side of the difference is in the total-field region and
+    the other in the scattered-field region; the fix adds the incident value
+    of the far sample when the updated sample is inside (it wants a total) and
+    subtracts it when the updated sample is outside (it wants a scattered
+    field). That happens in eight places: H_q and E_p on the two faces normal
+    to the direction of travel, H_a on the two faces normal to q, and E_a on
+    the two faces normal to p (a being the direction's axis).
+
+    Box convention: the faces are the node planes ``low`` and ``high``. A
+    sample at an integer position along an axis is inside for ``low..high``,
+    one at a half position for ``low+1/2 .. high-1/2``.
+    """
+
+    def __init__(self, source: Source, shape, primal, dual, eps_host,
+                 pec_host, inv_eps, dt: float, pml_cells: int, xp):
+        self.source = source
+        self.xp = xp
+        f32 = xp.float32
+        a = source.axis
+        p = COMPONENTS.index(source.component)
+        q = 3 - a - p
+        low, high = source.box
+        self.a = a
+
+        # The corrections are the plain curl update's, so the faces must sit
+        # in the untouched interior, and the spec keeps them 3 cells clear of
+        # the CPML: the first CPML-free E node is ``pml_cells``.
+        first = int(pml_cells) + BOX_CLEARANCE
+        for axis in range(3):
+            last = shape[axis] - 1 - int(pml_cells) - BOX_CLEARANCE
+            if not (first <= low[axis] and high[axis] <= last):
+                raise FDTDError(
+                    f"the plane wave's box {source.box} is closer than "
+                    f"{BOX_CLEARANCE} cells to the absorbing layer on axis "
+                    f"{axis}: with {pml_cells} CPML cells on a "
+                    f"{shape[axis]}-node axis its faces must lie in "
+                    f"{first}..{last}")
+
+        # The 1-D line carries the wave through ONE background medium, so
+        # everything within BOX_CLEARANCE cells of a face, either side, must be
+        # that medium: an object there would sit across the injection layer
+        # (and the spec keeps objects 3 cells clear). Objects wholly inside
+        # the inner region, or wholly outside, are what the box is for.
+        outer = tuple(slice(low[a] - BOX_CLEARANCE, high[a] + BOX_CLEARANCE + 1)
+                      for a in range(3))
+        shell = np.ones(shape, dtype=bool)
+        near = np.zeros(shape, dtype=bool)
+        near[outer] = True
+        if all(high[a] - low[a] > 2 * BOX_CLEARANCE for a in range(3)):
+            inner = tuple(slice(low[a] + BOX_CLEARANCE, high[a] - BOX_CLEARANCE + 1)
+                          for a in range(3))
+            shell[inner] = False
+        shell &= near
+        background = float(eps_host[low])
+        foreign = shell & (eps_host != eps_host[low])
+        if pec_host is not None:
+            foreign |= shell & pec_host
+        if foreign.any():
+            where = tuple(int(i) for i in np.argwhere(foreign)[0])
+            what = ("a conductor" if pec_host is not None and pec_host[where]
+                    else f"relative permittivity {float(eps_host[where]):.4g} "
+                         f"against the background {background:.4g}")
+            raise FDTDError(
+                f"the plane wave's box {source.box} has an object within "
+                f"{BOX_CLEARANCE} cells of its faces ({what} at node {where}); "
+                f"the incident wave is defined in one background medium, so "
+                f"keep every object at least {BOX_CLEARANCE} cells from the box")
+
+        # ---- the 1-D incident line ---------------------------------------
+        pad = INCIDENT_PML_CELLS + 4
+        self.pad = pad
+        line = np.concatenate((np.full(pad, primal[a][0]), primal[a],
+                               np.full(pad, primal[a][-1])))
+        length = line.size + 1
+        self.P1 = xp.asarray(line, dtype=f32)
+        self.D1 = xp.asarray(_dual_spacing(line)[1:], dtype=f32)  # nodes 1..L-2
+        self.bh, self.ch = _pml_profiles(line, INCIDENT_PML_CELLS, dt, xp)
+        be, ce = _pml_profiles(_node_thickness(line), INCIDENT_PML_CELLS, dt, xp)
+        self.be, self.ce = be[1:-1], ce[1:-1]
+        self.E1 = xp.zeros(length, dtype=f32)
+        self.H1 = xp.zeros(length - 1, dtype=f32)
+        self.psi_h = xp.zeros(length - 1, dtype=f32)
+        self.psi_e = xp.zeros(length - 2, dtype=f32)
+        # The curl's sign for this (direction axis, polarisation) pair:
+        # dH_q/dt = -(sign/mu0) dE_p/da and dE_p/dt = -(sign/eps) dH_q/da.
+        sign = 1.0 if p == (a + 1) % 3 else -1.0
+        self.h_coef = -sign * dt / MU0
+        self.e_coef = -sign * dt / (EPS0 * background)
+        # A hard source two nodes outside the 3-D grid, on the side the wave
+        # comes from: the wave it launches the other way goes into the CPML.
+        if source.direction[0] == "+":
+            self.feed = INCIDENT_PML_CELLS + 2
+        else:
+            self.feed = length - 1 - (INCIDENT_PML_CELLS + 2)
+        self.dt = dt
+        self.E1[self.feed] = source.value(0.0)
+
+        # ---- the eight face corrections ----------------------------------
+        # Each entry: (family, target component, target slice, coefficient
+        # array, incident array name, incident slice, varies along a).
+        self.corrections: list = []
+
+        def position_is_half(family: str, component: int, axis: int) -> bool:
+            # E_c is half along c and whole elsewhere; H_c the reverse.
+            return (axis == component) == (family == "E")
+
+        def inside(family, component, axis):
+            if position_is_half(family, component, axis):
+                return low[axis], high[axis]            # half indices lo..hi-1
+            return low[axis], high[axis] + 1            # whole indices lo..hi
+
+        def add(family: str, c: int, d: int):
+            # the curl term of target (family, c) that differentiates along d
+            term_sign = 1.0 if d == (c + 1) % 3 else -1.0
+            for face, delta in (("low", -1.0), ("high", 1.0)):
+                if family == "H":
+                    # target at half index along d, incident E at node
+                    index = low[d] - 1 if face == "low" else high[d]
+                    incident_at = low[d] if face == "low" else high[d]
+                    width = primal[d][index]
+                    factor = -dt / MU0 * term_sign * delta / width
+                    name = "E1"
+                else:
+                    # target at node along d, incident H at half index
+                    index = low[d] if face == "low" else high[d]
+                    incident_at = low[d] - 1 if face == "low" else high[d]
+                    width = dual[d][index]
+                    factor = dt * term_sign * delta / width
+                    name = "H1"
+                region = []
+                for axis in range(3):
+                    if axis == d:
+                        region.append(slice(index, index + 1))
+                    else:
+                        region.append(slice(*inside(family, c, axis)))
+                region = tuple(region)
+                if family == "E":
+                    coefficient = factor * inv_eps[region]
+                else:
+                    coefficient = xp.full(
+                        tuple(r.stop - r.start for r in region), factor,
+                        dtype=f32)
+                if d == a:
+                    span = slice(incident_at + pad, incident_at + pad + 1)
+                    along = False
+                else:
+                    start, stop = inside(family, c, a)
+                    span = slice(start + pad, stop + pad)
+                    along = True
+                self.corrections.append(
+                    (family, COMPONENTS[c], region,
+                     xp.asarray(coefficient, dtype=f32), name, span, along))
+
+        add("H", q, a)      # H_q across the faces normal to a
+        add("H", a, q)      # H_a across the faces normal to q
+        add("E", p, a)      # E_p across the faces normal to a
+        add("E", a, p)      # E_a across the faces normal to p
+
+    def _apply(self, family: str, fields: dict):
+        for entry_family, component, region, coefficient, name, span, along \
+                in self.corrections:
+            if entry_family != family:
+                continue
+            incident = getattr(self, name)[span]
+            if along:
+                incident = _along(incident, self.a)
+            fields[component][region] += coefficient * incident
+
+    def correct_h(self, h_fields: dict):
+        """After the 3-D H update: uses the incident E at the same level, n."""
+        self._apply("H", h_fields)
+
+    def advance_h(self):
+        """The incident H from n-1/2 to n+1/2."""
+        raw = (self.E1[1:] - self.E1[:-1]) / self.P1
+        self.psi_h *= self.bh
+        self.psi_h += self.ch * raw
+        self.H1 += self.h_coef * (raw + self.psi_h)
+
+    def correct_e(self, e_fields: dict):
+        """After the 3-D E update: uses the incident H at n+1/2."""
+        self._apply("E", e_fields)
+
+    def advance_e(self, step: int):
+        """The incident E from n to n+1, and the feed at the new time."""
+        raw = (self.H1[1:] - self.H1[:-1]) / self.D1
+        self.psi_e *= self.be
+        self.psi_e += self.ce * raw
+        self.E1[1:-1] += self.e_coef * (raw + self.psi_e)
+        self.E1[self.feed] = self.source.value((step + 1) * self.dt)
+
+
 def simulate(eps_r, source: Source, n_steps: int, probes=(),
              *, spacings=None, dx: float = 1.0,
              boundary: str = "metal", pec=None, pml_cells: int = DEFAULT_PML_CELLS,
@@ -493,8 +762,16 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                     f"where a {component}-polarised source is on the wall and "
                     f"the update never touches it; move it inward")
 
-    live(source.component, source.cell)
-    if mask is not None and bool(mask[source.cell]):
+    if source.kind == "plane":
+        if boundary == "metal":
+            raise FDTDError(
+                "a plane wave cannot run with boundary 'metal': a plane wave "
+                "is an infinite wave arriving from outside, and a closed metal "
+                "box has no outside -- the walls would reflect it back into "
+                "the box for the whole run. Use boundary 'open'")
+    else:
+        live(source.component, source.cell)
+    if source.kind == "point" and mask is not None and bool(mask[source.cell]):
         raise FDTDError(
             f"the source cell {source.cell} is inside the conductor; a soft "
             f"current there is zeroed by the PEC update on the same step and "
@@ -516,6 +793,14 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     Hy = xp.zeros(shape, dtype=f32)
     Hz = xp.zeros(shape, dtype=f32)
     field = {"x": Ex, "y": Ey, "z": Ez}
+    h_field = {"x": Hx, "y": Hy, "z": Hz}
+
+    plane = None
+    if source.kind == "plane":
+        plane = _PlaneWave(
+            source, shape, primal, dual, np.asarray(_host_result(eps, xp)),
+            None if mask is None else np.asarray(_host_result(mask, xp)),
+            inv_eps, dt, pml_cells, xp)
 
     P = [xp.asarray(p, dtype=f32) for p in primal]      # n-1 primal lengths
     D = [xp.asarray(d, dtype=f32) for d in dual]        # n-1 dual lengths
@@ -604,6 +889,10 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
         term_x = corrected(term_x, ("Hz", "x"), 1, "dual")
         Hz[:-1, :-1, :] -= dt_over_mu0 * (term_y - term_x)
 
+        if plane is not None:
+            plane.correct_h(h_field)          # uses the incident E at n
+            plane.advance_h()                 # incident H to n+1/2
+
         if energy is not None:
             # The quadratic the scheme conserves exactly pairs E and H ACROSS
             # the half step they are staggered by:
@@ -660,6 +949,10 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
         term_y = corrected(term_y, ("Ez", "y"), 1, "primal")
         Ez[1:-1, 1:-1, :-1] += dt * inv_eps[1:-1, 1:-1, :-1] * (term_x - term_y)
 
+        if plane is not None:
+            plane.correct_e(field)            # uses the incident H at n+1/2
+            plane.advance_e(step)             # incident E to n+1
+
         # ---- dispersive materials (phase 2 adds terms; phase 1 has none) --
         for term in terms:
             for name, increment in term.advance(field, dt, step).items():
@@ -671,7 +964,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                 field[name] += increment
 
         # ---- source ------------------------------------------------------
-        field[source.component][source.cell] += dt * source.value(t)
+        if plane is None:
+            field[source.component][source.cell] += dt * source.value(t)
 
         # ---- PEC ---------------------------------------------------------
         if keep is not None:

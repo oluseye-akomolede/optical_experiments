@@ -21,7 +21,7 @@
 
 ## 2. Plane-wave source, dispersive metals, drawn waveform (phase 2)
 
-- [ ] 2.1 A TF/SF box with a 1-D auxiliary incident-field grid along the axis,
+- [x] 2.1 A TF/SF box with a 1-D auxiliary incident-field grid along the axis,
   on the same dt and graded spacings; ≥ 3 cells to objects and to the CPML.
   Refused with `metal` and for a longitudinal polarisation. All profiles are
   zero-mean.
