@@ -255,15 +255,20 @@ def test_a_closed_pec_box_conserves_its_energy_after_the_source_stops():
 def test_a_graded_grid_conserves_its_energy_too():
     """The same claim on a grid whose cells are not all the same size.
 
-    One axis is graded and the NEIGHBOUR ratio is 1.04, well inside the 1.3 the
-    brief allows, so a failure here is the graded arithmetic and not a grid no
-    scheme would put up with. The energy checked is the cell-volume-weighted
+    x and y are graded, with NEIGHBOUR ratios of 1.04 and 1.06, well inside the
+    1.3 the brief allows, so a failure here is the graded arithmetic and not a
+    grid no scheme would put up with. Two axes, because a divisor that is wrong
+    on one axis only is invisible wherever that axis is uniform: with y uniform,
+    an off-by-one dual length on y passed this test (measured); the nanometre
+    test below grades z for the same reason. The energy checked is the cell-volume-weighted
     quadratic, which on this grid is a different number from the plain sum of
     squares -- that is the point, because the plain sum is NOT conserved here.
     """
     ratios = 1.04 ** np.arange(15, dtype=np.float64)
-    spacings = (ratios, DX, DX)
-    assert float(ratios[-1] / ratios[0]) > 1.5, "the axis is barely graded"
+    ratios_y = 1.06 ** np.arange(11, dtype=np.float64)
+    spacings = (ratios, ratios_y, DX)
+    assert float(ratios[-1] / ratios[0]) > 1.5, "the x axis is barely graded"
+    assert float(ratios_y[-1] / ratios_y[0]) > 1.5, "the y axis is barely graded"
     grid = np.ones((16, 12, 12), dtype=np.float32)
     source = pulse(cell=(6, 6, 6))
     run = fdtd.simulate(grid, source, steps_for(6e-7), probes=[(3, 4, 5)],
@@ -278,6 +283,58 @@ def test_a_graded_grid_conserves_its_energy_too():
     assert spread < 0.01, f"energy drifted {spread:.2%} after the source stopped"
 
 
+def test_a_graded_axis_gives_the_same_run_whichever_axis_it_is():
+    """One graded problem, rotated x -> y -> z, must give the same traces.
+
+    A cyclic relabelling of the axes maps the Yee lattice onto itself (Ex at
+    (i+1/2, j, k) lands where an Ey sits) and keeps the curl's handedness, so
+    the three runs are the same physics and differ only in float32 rounding.
+    That makes every axis its own control: a divisor that is wrong on y or z
+    alone moves that run's traces and nothing else. The energy tests above do
+    not see all of those -- a wrong length still conserves a slightly
+    different quadratic, and measured, an off-by-one dual length on y and a
+    reversed primal length on z both stayed under their 1% drift.
+
+    The fixture is deliberately lopsided: steep grading on one axis only, and
+    source and probe off every diagonal, so no rotation can map the run onto
+    itself by symmetry.
+    """
+    graded = 1.25 ** np.arange(11, dtype=np.float64) / 3.0
+    shape = (12, 12, 12)
+    cell, component = (5, 6, 4), "z"
+    probes = [((3, 8, 7), "x"), ((7, 4, 6), "y"), ((8, 7, 3), "z")]
+
+    def rotate(triple, times):
+        values = tuple(triple)
+        for _ in range(times):
+            values = (values[2], values[0], values[1])   # axis a -> a+1
+        return values
+
+    def axis_name(name, times):
+        return "xyz"[("xyz".index(name) + times) % 3]
+
+    runs = []
+    for times in range(3):
+        spacings = rotate((graded, DX, DX), times)
+        source = pulse(cell=rotate(cell, times),
+                       component=axis_name(component, times))
+        rotated = [rotate(c, times) + (axis_name(n, times),) for c, n in probes]
+        run = fdtd.simulate(np.ones(shape, np.float32), source, 160, rotated,
+                            spacings=spacings, boundary="metal")
+        runs.append(np.asarray(run["traces"], dtype=np.float64))
+
+    scale = float(np.abs(runs[0]).max())
+    assert scale > 0.0, "the source excited nothing"
+    assert all(float(np.abs(r).max()) > 0.1 * scale for r in runs[0]), (
+        "a probe saw almost nothing, so it cannot tell the rotations apart")
+    for times in (1, 2):
+        gap = float(np.abs(runs[times] - runs[0]).max()) / scale
+        assert gap < 1e-4, (
+            f"grading {'xyz'[times]} instead of x moved the traces by "
+            f"{gap:.2e} of their peak; the same problem on another axis must "
+            f"give the same run")
+
+
 def test_a_nanometre_grid_conserves_its_energy_too():
     """The 10 nm end of the range the product actually covers.
 
@@ -289,7 +346,9 @@ def test_a_nanometre_grid_conserves_its_energy_too():
     assuming it, so a green result cannot come from a reduction that ignores the
     scale.
     """
-    spacings = (2.5e-9 * 1.1 ** np.arange(12, dtype=np.float64), 1e-8, 3e-8)
+    # x and z graded (z for the reason the test above grades y), y uniform.
+    spacings = (2.5e-9 * 1.1 ** np.arange(12, dtype=np.float64), 1e-8,
+                2e-8 * 1.07 ** np.arange(11, dtype=np.float64))
     # np.min, not s.min(): an axis may be given as a bare scalar.
     axis_min = [float(np.min(s)) for s in spacings]
     f_nm = C / (12.0 * min(axis_min))
