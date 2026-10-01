@@ -27,7 +27,11 @@ const page = await browser.newPage({ viewport: { width: 1024, height: 768 } });
 const errors = [];
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('pageerror', (e) => errors.push(String(e)));
-await page.goto(URL_, { waitUntil: 'load', timeout: 120000 });
+// Hold the document response: a page-level 404 is otherwise named only if
+// Chromium happens to log it, and "the job page answered 404" is the finding
+// itself when a finished pc job's page is the thing under test.
+const resp = await page.goto(URL_, { waitUntil: 'load', timeout: 120000 });
+ok(resp && resp.status() === 200, `the job page answered ${resp ? resp.status() : 'no response'}`);
 await page.waitForSelector('#bands-card:not([hidden])', { timeout: 120000 }).catch(() => {});
 await page.waitForTimeout(2000);
 

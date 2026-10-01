@@ -223,19 +223,21 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
         # that it has no measurement.
         #
         # The rule reads as a WHITELIST, and that is the point. ``kind`` is
-        # ``NOT NULL DEFAULT 'cavity'`` (db/001_schema.sql:96), so no stored
-        # row is NULL-kind and a negated ``!= PC`` guard would buy nothing --
-        # while a future non-cavity kind would be swept into reading a
-        # manifest it does not have, 404ing its own page exactly as the pc one
-        # did. Reading a manifest is the exception here; leaving it alone is
-        # the default. The ``None`` arm is not a schema state but a row read
-        # through a query that does not select the column -- there, reading
-        # the manifest is the conservative choice.
+        # ``NOT NULL DEFAULT 'cavity'`` (db/001_schema.sql:96), and every
+        # reader that can hand a job to this page selects the column --
+        # ``_job_row`` for get_job/list_jobs, ``next_queued``,
+        # ``claim_jetson`` -- so a row arriving here always has a kind. A
+        # negated ``!= PC`` guard buys nothing, while a future non-cavity kind
+        # would be swept into reading a manifest it does not have, 404ing its
+        # own page exactly as the pc one did. Reading a manifest is the
+        # exception here; leaving it alone is the default. (A kind-less row
+        # would 404 that same way under the negated form, and no query
+        # produces one, so there is no ``None`` arm to carry.)
         #
         # The payload routes keep their own 404: for an ``index.json`` or a
         # field file, a missing manifest really is a missing payload.
         achieved_m = None
-        if job.get("status") == DB.DONE and job.get("kind") in (None, DB.CAVITY):
+        if job.get("status") == DB.DONE and job.get("kind") == DB.CAVITY:
             manifest = _done_manifest(store, jobs_db, job_id)
             if manifest:
                 achieved_m = manifest.get("achieved_median_edge_m")
