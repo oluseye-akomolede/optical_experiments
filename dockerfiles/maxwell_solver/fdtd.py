@@ -449,12 +449,20 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     dt = courant_dt(*(p.min() for p in primal))
 
     mask = None
+    keep = None
     if pec is not None:
         mask = xp.asarray(pec, dtype=bool)
         if tuple(mask.shape) != shape:
             raise FDTDError(
                 f"the conductor mask is {tuple(mask.shape)} but the grid is "
                 f"{shape}; they must be the same shape")
+        # 0 inside the conductor, 1 elsewhere. The step loop MULTIPLIES by it
+        # rather than writing E[mask] = 0: a boolean-mask assignment is an
+        # indexing operation whose cost depends on the mask, and on a device
+        # backend it can need the mask's true-count on the host, a sync per
+        # component per step. A multiply is one elementwise kernel and never
+        # leaves the device.
+        keep = 1.0 - mask.astype(f32)
 
     terms = list(ade_terms)
     for term in terms:
@@ -666,10 +674,10 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
         field[source.component][source.cell] += dt * source.value(t)
 
         # ---- PEC ---------------------------------------------------------
-        if mask is not None:
-            Ex[mask] = 0.0
-            Ey[mask] = 0.0
-            Ez[mask] = 0.0
+        if keep is not None:
+            Ex *= keep
+            Ey *= keep
+            Ez *= keep
         if boundary == "metal":
             # The six faces, TANGENTIAL E only: two components per face, and in
             # this layout those are exactly the layers the update above never

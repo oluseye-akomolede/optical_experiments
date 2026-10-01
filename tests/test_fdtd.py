@@ -151,7 +151,12 @@ class _DeviceArray:
         return _DeviceArray(value) if isinstance(value, np.ndarray) else value
 
     def __setitem__(self, key, value):
-        self._array[_device(key)] = _device(value)
+        key = _device(key)
+        if isinstance(key, np.ndarray) and key.dtype == bool:
+            # A boolean-mask assignment: what a device backend may have to
+            # count on the host. The step loop must not need one.
+            raise TypeError("boolean-mask assignment inside the step loop")
+        self._array[key] = _device(value)
 
     def __sub__(self, other):  return _DeviceArray(self._array - _device(other))
     def __rsub__(self, other): return _DeviceArray(_device(other) - self._array)
@@ -169,6 +174,10 @@ class _DeviceArray:
 
     def __isub__(self, other):
         self._array -= _device(other)
+        return self
+
+    def __imul__(self, other):
+        self._array *= _device(other)
         return self
 
 
@@ -515,6 +524,36 @@ def test_a_conductor_mask_holds_the_field_at_zero_inside_it():
     outside = np.asarray(run["traces"][1])
     assert np.any(np.abs(outside) > 0), "no field anywhere, so the mask says nothing"
     assert not np.any(inside != 0.0), "the conductor is not holding E at zero"
+
+
+def test_a_conductor_mask_runs_without_a_boolean_index_and_holds_the_same_field():
+    """The masked path, through the device fake, gives the numpy run's numbers.
+
+    The fake refuses a boolean-mask assignment, so a step loop that writes
+    E[mask] = 0 raises here; the control proves the fake really refuses one.
+    The traces are then compared against the plain numpy run, so a mask that
+    stopped being applied at all cannot pass by also not raising.
+    """
+    xp = _DeviceXp()
+    with pytest.raises(TypeError, match="boolean-mask"):
+        array = xp.zeros((2, 2), dtype=np.float32)
+        array[np.array([[True, False], [False, True]])] = 0.0
+
+    mask = np.zeros((10, 10, 10), dtype=bool)
+    mask[3:5, 3:5, 3:5] = True
+    problem = dict(eps_r=np.ones((10, 10, 10), np.float32),
+                   source=pulse(cell=(6, 6, 6)), n_steps=60,
+                   probes=[(3, 3, 3, "x"), (4, 4, 3, "z"), (7, 6, 5, "z")],
+                   dx=DX, boundary="metal", pec=mask)
+    device = fdtd.simulate(xp=xp, **problem)
+    host = fdtd.simulate(xp=np, **problem)
+    unmasked = fdtd.simulate(xp=np, **dict(problem, pec=None))
+    assert np.any(host["traces"][2] != 0.0), "the source excited nothing"
+    assert not np.any(host["traces"][:2] != 0.0), "the conductor did not hold"
+    assert np.any(unmasked["traces"][:2] != 0.0), (
+        "the inside probes see nothing even without the conductor, so they "
+        "cannot show the mask working")
+    assert np.array_equal(device["traces"], host["traces"])
 
 
 def test_a_source_inside_the_conductor_is_refused():
