@@ -1,6 +1,6 @@
 ## 1. Solver core (phase 1)
 
-- [ ] 1.1 `dockerfiles/maxwell_solver/fdtd.py`: a Yee update on an array module `xp` (numpy | cupy),
+- [x] 1.1 `dockerfiles/maxwell_solver/fdtd.py`: a Yee update on an array module `xp` (numpy | cupy),
   float32, on a **graded tensor-product grid**: per-axis primal and dual spacing
   arrays (a uniform grid is just the special case). PEC is applied by zeroing
   tangential E on the conductor mask. A CPML of 10 cells is used on open faces.
@@ -8,14 +8,14 @@
   The E update carries an **auxiliary polarisation-current hook** (a list of
   per-material ADE terms, empty in phase 1), so dispersive metals add terms
   without changing the core.
-- [ ] 1.2 Point source: a soft E-component current, with `cw` (smooth ramp) and
+- [x] 1.2 Point source: a soft E-component current, with `cw` (smooth ramp) and
   `pulse` (Gaussian) profiles.
-- [ ] 1.3 Probes return float32 traces. The spectrum is computed by rfft of a
+- [x] 1.3 Probes return float32 traces. The spectrum is computed by rfft of a
   windowed trace.
-- [ ] 1.4 Tiny tests (≤ 24³ cells, numpy) cover the update's energy conservation
+- [x] 1.4 Tiny tests (≤ 24³ cells, numpy) cover the update's energy conservation
   in a closed PEC box, and that the source profile sits at the requested
   frequency.
-- [ ] 1.5 Benchmark V1 (metal box pulse versus the analytic frequencies, and
+- [x] 1.5 Benchmark V1 (metal box pulse versus the analytic frequencies, and
   versus the cavity solver) and V2 (CW 1/r). These run on the Jetson bench
   (tier 2), and the lead runs them.
 
