@@ -2543,6 +2543,56 @@ def test_the_job_page_renders_a_pc_summary_and_not_the_cavity_header(
     assert "TM polarisation" in html
 
 
+def test_a_finished_pc_page_renders_when_the_store_holds_no_job_files(tmp_path):
+    """A finished photonics page must be the page, not a 404.
+
+    ``job_page`` reads the achieved mesh edge out of the solver's
+    ``modes.json`` -- a CAVITY job's manifest. A pc job uploads no mesh and
+    writes no result files, so no manifest exists for it, and
+    ``_done_manifest`` answers a missing one with 404. That made every finished
+    photonics job's own page a "not found" the moment it finished -- the one
+    page the feature exists to show. It was found in a browser against a real
+    job, not by this suite: the pc page test above builds a QUEUED row, so the
+    ``status == DONE`` branch never ran and 591 green tests said nothing.
+
+    The store is empty on purpose and the emptiness is asserted, because that
+    IS the state a real pc job is in. A test that laid down a manifest first
+    would be testing a job that cannot exist.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    job_id = str(uuid.uuid4())
+    db.create_job(job_id, "square lattice", "mm", 1.0, 16,
+                  target=DB.CLUSTER, kind=DB.PC,
+                  pcs={"lattice": "square", "r_over_a": 0.2, "n_rod": 3.5,
+                       "n_bg": 1.0, "n_bands": 4, "divisions": 16,
+                       "polarisation": "TM"})
+    # A finished pc job's whole result is the diagram on the row -- the worker
+    # writes it through ``finish_jetson_with_bands``, into ``pcs``, not into a
+    # file. So mark it done the way the worker does and put the bands there.
+    db.jobs[job_id].update(status=DB.DONE, stage=DB.DONE,
+                           finished_at="2026-10-01T15:00:00+00:00")
+    db.jobs[job_id]["pcs"]["bands"] = {
+        "labels": ["G", "X", "M"],
+        "k_points": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]],
+        "bands": [[0.0, 0.44], [0.25, 0.421], [0.281, 0.5]],
+    }
+    assert store.keys_under(job_id) == [], (
+        "the premise is an empty job directory: a pc job writes no result "
+        "files, which is exactly why reading modes.json from the page 404s"
+    )
+
+    response = app.test_client().get(f"/jobs/{job_id}")
+    assert response.status_code == 200, (
+        f"a finished photonics page answered {response.status_code}: the page "
+        "is asking a meshed-only question of a job that has no mesh"
+    )
+    # An HTTP 200 is not evidence that an element is present, so parse the body
+    # for the two the band card is made of.
+    html = response.get_data(as_text=True)
+    assert 'id="bands-card"' in html
+    assert 'id="bands-svg"' in html
+
+
 def test_the_job_page_for_a_cavity_job_has_no_band_panel(tmp_path):
     """The other direction: a cavity job must not grow the pc branch.
 

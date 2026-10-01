@@ -211,12 +211,22 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
     @app.route("/jobs/<job_id>")
     def job_page(job_id):
         job = _require_job(jobs_db, job_id)
-        # The achieved edge lives in the manifest, so it exists only for a
-        # finished job. A missing manifest is an ABSENCE, not a failure: the
-        # page then shows the request alone, which is the truth for a job that
-        # has not meshed yet.
+        # The achieved edge lives in the solver's manifest, and only for a
+        # finished job -- an unfinished one has not meshed yet, so the page
+        # shows the request alone, which is the truth.
+        #
+        # The manifest is a CAVITY job's file. A pc job uploads no mesh and
+        # writes no result files, so for it this question has no answer at all,
+        # and ``_done_manifest`` answers a missing ``modes.json`` with 404 --
+        # which made every finished photonics job's own page a "not found" the
+        # moment it finished. A page that 404s is not a page honestly reporting
+        # that it has no measurement. The guard is the NEGATED kind, so a row
+        # predating ``kind`` (a cavity job, which is all of them) still reads
+        # its manifest. The payload routes keep their own 404: for an
+        # ``index.json`` or a field file, a missing manifest really is a
+        # missing payload.
         achieved_m = None
-        if job.get("status") == DB.DONE:
+        if job.get("status") == DB.DONE and job.get("kind") != DB.PC:
             manifest = _done_manifest(store, jobs_db, job_id)
             if manifest:
                 achieved_m = manifest.get("achieved_median_edge_m")

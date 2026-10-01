@@ -407,3 +407,59 @@ test('a pc job captions the BAND count, not the k-point count', async () => {
   assert.match(String(rows[0].innerHTML), /0\.2810[\s\S]*0\.4210/,
     `the gap row must carry the measured bounds: ${rows[0].innerHTML}`);
 });
+
+test('a pc job never asks for the mode index, and so never sees a failure', async () => {
+  const ctx = loadViewer();
+  const doc = ctx.document;
+  const root = new El('div', 'job');
+  root.dataset.jobId = 'JOB-PC';
+  doc._byId.job = root;
+
+  const data = {
+    status: 'done',
+    kind: 'pc',
+    bands: {
+      polarisation: 'TM',
+      labels: ['G', 'X', 'M'],
+      k_points: [[0, 0], [0.5, 0], [0.5, 0.5]],
+      bands: [[0.0, 0.44], [0.25, 0.421], [0.281, 0.5]],
+    },
+  };
+
+  // The real server answers /index.json with 404 for a pc job, because there
+  // is no modes.json for one. Model exactly that rather than a friendly 200: a
+  // stub that answered 200 would hide the very defect this asserts against.
+  const asked = [];
+  ctx.fetch = async (url) => {
+    asked.push(String(url));
+    if (String(url).endsWith('/index.json')) return { ok: false, status: 404 };
+    return { ok: true, status: 200, json: async () => data };
+  };
+
+  // The 2-D plotting context is a browser dependency this harness does not
+  // provide; the plot's own behaviour is covered by test_bandplot.mjs. Here it
+  // is the boundary -- what matters is WHICH urls were asked for and which
+  // cards the page opened.
+  ctx.drawBandDiagram = () => {};
+  ctx.bandCount = bandCount;
+  ctx.bandGaps = bandGaps;
+
+  vm.runInContext('init(document.getElementById("job"))', ctx);
+  await new Promise((r) => setTimeout(r, 30));
+
+  assert.deepEqual(asked.filter((u) => u.includes('/index.json')), [],
+    'a pc job must not request the mode index: the server answers it 404 ' +
+    '(there is no modes.json to index), and the viewer turns that into ' +
+    '"the results could not be loaded" over a job that in fact succeeded');
+
+  // The other half: the meshed-only payloads. A pc job has no surface and no
+  // field, so those routes 404 too -- and they must not be asked for either.
+  const meshedOnly = asked.filter((u) => u.includes('/files/') || u.includes('/field/'));
+  assert.deepEqual(meshedOnly, [],
+    `a pc job must not request cavity result files, got ${meshedOnly.join(', ')}`);
+
+  assert.equal(doc._byId['bands-card'].hidden, false,
+    'the band card must be un-hidden for a finished pc job');
+  assert.equal(doc._byId.failure.hidden, true,
+    'a successful photonics job must not show the failure banner');
+});
