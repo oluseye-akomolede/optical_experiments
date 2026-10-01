@@ -887,12 +887,24 @@ class Worker:
             work_dir.mkdir(parents=True, exist_ok=True)
             os.chmod(work_dir, 0o700)
 
-            input_bytes = self.api.fetch_input(job_id)
+            # A pc job has NO upload: its mesh is built inside the solve, and
+            # its result is the band diagram, which travels on its own route
+            # (``_done`` -> ``done_bands``) rather than as result files. Fetching
+            # here would 404 -- the app has no input.obj for a pc row -- and the
+            # result scan after the solve would then find no files to upload, so
+            # BOTH steps are skipped from ONE decision, made on the claim's kind,
+            # which is the same field ``real_solve`` dispatches on.
+            is_pc = job.get("kind") == "pc"
             store = self._store_factory(work_dir, job_id)
-            store.write(_input_key(job_id), input_bytes)
+            if not is_pc:
+                input_bytes = self.api.fetch_input(job_id)
+                store.write(_input_key(job_id), input_bytes)
 
-            self._stage = "meshing"
-            reporter.stage = "meshing"
+            # The stage names the phase the owner is shown. "meshing" would be a
+            # lie for a pc job, whose mesh is built inside the solve -- the same
+            # reason its solve branch reports "solving".
+            self._stage = "solving" if is_pc else "meshing"
+            reporter.stage = self._stage
             summary = self._solve(job, store, store, stage=reporter)
             if self.stop.is_set():
                 # SIGTERM arrived while solving. HAND IT BACK rather than
@@ -917,8 +929,9 @@ class Worker:
             self._stage = "uploading"
             reporter.stage = "uploading"
 
-            for name in _result_names(store, job_id):
-                self.api.upload(job_id, name, store.read(_key(job_id, name)))
+            if not is_pc:
+                for name in _result_names(store, job_id):
+                    self.api.upload(job_id, name, store.read(_key(job_id, name)))
             self._done(job_id, work_dir, summary, reporter)
             return "done"
         except LeaseLost:
