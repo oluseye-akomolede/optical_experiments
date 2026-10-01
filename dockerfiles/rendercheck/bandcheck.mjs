@@ -1,4 +1,5 @@
 // One-off in-browser check of the pc band card on a finished job.
+import fs from 'node:fs';
 import { createRequire } from 'node:module';
 const require = createRequire('/opt/rendercheck/check.mjs');
 const { chromium } = require('playwright-core');
@@ -60,7 +61,17 @@ if (oracleGaps.length) {
   ok(r.rows.length === 1 && /No complete gap/.test(r.rows[0].join(' ')), 'no-gap row shown');
 }
 ok(errors.length === 0, `console errors: ${JSON.stringify(errors)}`);
-await page.screenshot({ path: '/out/bands.png' }).catch(() => {});
+// The image is the artifact a human actually looks at, so whether it exists
+// is a finding, not a shrug: the old `.catch(() => {})` let a run print
+// RESULT PASS with no /out/bands.png at all. Report it either way.
+try {
+  await page.screenshot({ path: '/out/bands.png' });
+  const bytes = fs.statSync('/out/bands.png').size;
+  console.log(`PASS  screenshot /out/bands.png written, ${bytes} bytes`);
+} catch (err) {
+  ok(false, `screenshot /out/bands.png was NOT written (${err && err.message}) ` +
+    '-- if /out is not mounted for this run, that is the cause, not the page');
+}
 await browser.close();
 console.log(fails.length ? `RESULT FAIL (${fails.length})` : 'RESULT PASS');
 process.exit(fails.length ? 1 : 0);

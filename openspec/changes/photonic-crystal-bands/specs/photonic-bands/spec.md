@@ -257,6 +257,18 @@ be refused, not solved, and the refusal SHALL distinguish "the wrong kind" from
   dispatches on, so a cavity job and a pc job cannot be told apart differently
   in two places
 
+#### Scenario: a finished pc job's page renders, and the achieved-edge read stays cavity-only
+- **WHEN** a DONE job's own page is rendered
+- **THEN** the achieved mesh edge is read from the solver's manifest only for a
+  cavity job, because a pc job writes no `modes.json` and the manifest read
+  answers that absence with 404
+- **AND** a finished pc job's page answers 200 and carries the band card, so a
+  job that succeeded is never shown as "not found"
+- **AND** the rule is a whitelist on `kind`, so a kind added later is left alone
+  rather than swept into a manifest read it cannot satisfy
+- **AND** the payload routes keep their own 404: for `index.json` or a field
+  file a missing manifest is a missing payload, not a page
+
 ### Requirement: A pc job SHALL be routed to the Jetson worker, and the cluster SHALL refuse it
 
 The pc solver SHALL run on the Jetson worker only. A pc job SHALL therefore be

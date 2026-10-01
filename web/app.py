@@ -220,13 +220,22 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
         # and ``_done_manifest`` answers a missing ``modes.json`` with 404 --
         # which made every finished photonics job's own page a "not found" the
         # moment it finished. A page that 404s is not a page honestly reporting
-        # that it has no measurement. The guard is the NEGATED kind, so a row
-        # predating ``kind`` (a cavity job, which is all of them) still reads
-        # its manifest. The payload routes keep their own 404: for an
-        # ``index.json`` or a field file, a missing manifest really is a
-        # missing payload.
+        # that it has no measurement.
+        #
+        # The rule reads as a WHITELIST, and that is the point. ``kind`` is
+        # ``NOT NULL DEFAULT 'cavity'`` (db/001_schema.sql:96), so no stored
+        # row is NULL-kind and a negated ``!= PC`` guard would buy nothing --
+        # while a future non-cavity kind would be swept into reading a
+        # manifest it does not have, 404ing its own page exactly as the pc one
+        # did. Reading a manifest is the exception here; leaving it alone is
+        # the default. The ``None`` arm is not a schema state but a row read
+        # through a query that does not select the column -- there, reading
+        # the manifest is the conservative choice.
+        #
+        # The payload routes keep their own 404: for an ``index.json`` or a
+        # field file, a missing manifest really is a missing payload.
         achieved_m = None
-        if job.get("status") == DB.DONE and job.get("kind") != DB.PC:
+        if job.get("status") == DB.DONE and job.get("kind") in (None, DB.CAVITY):
             manifest = _done_manifest(store, jobs_db, job_id)
             if manifest:
                 achieved_m = manifest.get("achieved_median_edge_m")

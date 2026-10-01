@@ -408,7 +408,7 @@ test('a pc job captions the BAND count, not the k-point count', async () => {
     `the gap row must carry the measured bounds: ${rows[0].innerHTML}`);
 });
 
-test('a pc job never asks for the mode index, and so never sees a failure', async () => {
+test('a pc job never enters the cavity load path, and so never sees a failure', async () => {
   const ctx = loadViewer();
   const doc = ctx.document;
   const root = new El('div', 'job');
@@ -447,13 +447,25 @@ test('a pc job never asks for the mode index, and so never sees a failure', asyn
   vm.runInContext('init(document.getElementById("job"))', ctx);
   await new Promise((r) => setTimeout(r, 30));
 
-  assert.deepEqual(asked.filter((u) => u.includes('/index.json')), [],
-    'a pc job must not request the mode index: the server answers it 404 ' +
-    '(there is no modes.json to index), and the viewer turns that into ' +
-    '"the results could not be loaded" over a job that in fact succeeded');
+  // THE ASSERTION THAT CAN MOVE. loadViewer() replaces loadFieldData's body
+  // with a recorder, because that function builds a real THREE.WebGLRenderer.
+  // Every payload fetch lives inside it -- the surface at :711, the field at
+  // :1220, /index.json at :1253 -- so from this harness a pc job CANNOT ask
+  // for any of them, and a URL filter here could never fail. A control that
+  // cannot fail leaves the bug in. The call itself is the signal: it is
+  // undefined for a pc job, and ["JOB-PC"] the moment the pc branch stops
+  // returning. The cavity test above asserts the same signal, opposite sign.
+  assert.equal(ctx.__loadFieldCalls, undefined,
+    'a pc job must not enter loadFieldData: everything it fetches (the ' +
+    'surface, the field, /index.json) is a cavity artefact that 404s, and ' +
+    'the viewer reports that as "the results could not be loaded" over a job ' +
+    'that in fact succeeded');
 
-  // The other half: the meshed-only payloads. A pc job has no surface and no
-  // field, so those routes 404 too -- and they must not be asked for either.
+  // Intent, NOT evidence -- the two filters below only bite if the harness
+  // ever stops stubbing loadFieldData. Kept so the intended URL set is on the
+  // record; the assertion above is what carries the claim.
+  assert.deepEqual(asked.filter((u) => u.includes('/index.json')), [],
+    'a pc job must not request the mode index (no modes.json exists to index)');
   const meshedOnly = asked.filter((u) => u.includes('/files/') || u.includes('/field/'));
   assert.deepEqual(meshedOnly, [],
     `a pc job must not request cavity result files, got ${meshedOnly.join(', ')}`);
