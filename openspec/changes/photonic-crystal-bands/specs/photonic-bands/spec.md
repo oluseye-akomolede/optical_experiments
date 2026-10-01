@@ -214,6 +214,20 @@ be refused, not solved, and the refusal SHALL distinguish "the wrong kind" from
 - **THEN** every request field the row carries is used
 - **AND** the k-path comes from the lattice, not from a value on the row
 
+#### Scenario: a pc job fetches no input and uploads no result files
+- **WHEN** the worker runs a claimed pc job
+- **THEN** it does not request `input.obj` from the app, because the app stores
+  no upload for a pc row
+- **AND** it does not scan the work dir for result files, because the diagram
+  travels on the `done` route rather than as files
+- **AND** the diagram is merged into the row's `pcs` in the same transaction
+  that marks the row done
+- **AND** the stage reported to the app is never `uploading`, because no phase
+  of a pc job uploads
+- **AND** both decisions come from the claim's `kind`, the same field the solve
+  dispatches on, so a cavity job and a pc job cannot be told apart differently
+  in two places
+
 ### Requirement: A pc job SHALL be routed to the Jetson worker, and the cluster SHALL refuse it
 
 The pc solver SHALL run on the Jetson worker only. A pc job SHALL therefore be
