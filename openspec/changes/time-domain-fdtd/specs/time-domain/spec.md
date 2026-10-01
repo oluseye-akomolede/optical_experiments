@@ -98,8 +98,13 @@ A `td` request SHALL take its physical size from the same `units` and `scale`
 form fields the cavity tool uses (size × scale × unit), and the estimate SHALL
 be computed from that physical size.
 
-#### Scenario: a 1 µm gold-coated object with a 10 nm coat fits
-- **WHEN** a 1 µm object with a 10 nm gold coating is requested at a visible-band
-  pulse
+#### Scenario: a 10 nm flat film in a 1 µm scene fits
+- **WHEN** a 1 µm scene holding an axis-aligned 10 nm gold film is requested at a
+  visible-band pulse
 - **THEN** the estimate is below 8 M cells on the graded grid, and the run is
   accepted
+
+#### Scenario: a curved thin shell is estimated, not assumed
+- **WHEN** a curved object of 1 µm with a 10 nm coating is requested
+- **THEN** the estimate reports the cell count the graded grid actually needs, and
+  a request above the cap is refused naming that count

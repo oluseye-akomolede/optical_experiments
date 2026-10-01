@@ -73,8 +73,10 @@ spectra.
   physical size with the same `units` + `scale` controls the cavity tool already
   has; the physical size is size × scale × unit. The design range is features of
   10 nm inside objects up to 1 µm, for plasmonic devices and photonic crystals.
-  At that ratio (100:1) a graded grid stays under the 8 M-cell cap, while a uniform
-  one would not. All solver arithmetic is SI, and tests include a nanometre-scale
+  A graded tensor-product grid keeps an axis-aligned film of that ratio (100:1) under the 8 M-cell cap. A curved
+  10 nm shell refines nearly every plane (~400 cells per axis, ~64 M cells), so
+  the cap is set in phase 1 from the measured Jetson cost per cell-step, not
+  guessed; until then the estimate refuses such a run by its count. All solver arithmetic is SI, and tests include a nanometre-scale
   grid so float32 coefficients are checked at the scale actually used.
 
 ## Validation (each phase ships with its benchmark)
