@@ -26,12 +26,14 @@
   Refused with `metal` and for a longitudinal polarisation. All profiles are
   zero-mean.
 - [x] 2.2 Benchmark V3 (`scripts/fdtd_bench_v3.py`; the Jetson run is the lead's).
-- [ ] 2.3 Lorentz-Drude ADE terms (Rakić 1998, ε∞ = 1, parameters in eV), stored
+- [x] 2.3 Lorentz-Drude ADE terms (Rakić 1998, ε∞ = 1, parameters in eV), stored
   on the metal's bounding box only, plus a material library (Au, Ag, Al, Cu, Cr)
   with the source cited in the code, a refusal outside each fit's range, and a
   table check against a published Rakić n, k dataset at three energies per metal.
   Re-measure the Jetson rate and GPU memory with an open boundary and one gold
-  region (lead runs it).
+  region (lead runs it). [Code and tier-1 tests done; the Jetson re-measure is
+  the lead's. The pulse-band refusal is `fdtd.check_metal_band`; the job form
+  must call it at queue time.]
 - [ ] 2.4 Benchmark V4 (gold slab against analytic Fresnel, same model).
 - [ ] 2.5 `drawn` profile: ≤ 10 000 samples plus a duration, resampled to dt,
   then mean removed; refused when > 1% of its spectral energy is above f_res.

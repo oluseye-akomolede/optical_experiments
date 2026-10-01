@@ -6,7 +6,18 @@
 
 The solver SHALL step E and H on a graded tensor-product Yee grid with
 dt = 0.99/(c·√(1/dx_min²+1/dy_min²+1/dz_min²)), so it never violates the 3-D
-Courant limit of the smallest cell.
+Courant limit of the smallest cell. When a dispersive metal is in the scene,
+dt SHALL be reduced to 0.98 of the largest step at which the metal's update is
+stable (von Neumann on a homogeneous metal with the finest spacings), and the
+run SHALL report the dt it used.
+
+#### Scenario: a metal shrinks dt only as far as it must
+- **WHEN** 5 nm gold is stepped at 0.99 of the Courant dt
+- **THEN** the stability check finds a growing mode (factor above 1.1) and the
+  run uses a dt between 0.9 and 0.99 of the Courant one
+- **AND** 2 nm gold runs at the Courant dt unchanged
+- **AND** with no metal, the same check reads 1.01 of the Courant dt as
+  growing, so it can see an unstable step
 
 #### Scenario: a closed metal box conserves energy
 - **WHEN** a pulse is launched in a lossless PEC box and the source has ended
@@ -207,6 +218,22 @@ auxiliary differential equations. ADE storage SHALL cover only the metal cells'
 bounding box. An E sample on a metal face SHALL take the metal. A run whose
 pulse band leaves the paper's fitted range for a metal in the scene SHALL be
 refused before it is queued.
+
+#### Scenario: the stepped metal has the model's susceptibility
+- **WHEN** a metal's term is driven by a sinusoidal field at 20 time steps
+  per radian (Au at 1 and 3 eV, Ag and Cr at 2 eV)
+- **THEN** the polarisation it builds matches the model's χ(ω) within 1.5%
+
+#### Scenario: a face sample takes the metal and eps_inf = 1
+- **WHEN** a single metal node sits next to a dielectric
+- **THEN** each E component takes the metal at exactly the two samples whose
+  segment touches the node
+- **AND** those samples step with ε∞ = 1 whatever the neighbouring permittivity
+
+#### Scenario: a metal near a plane wave's box is refused
+- **WHEN** a metal region lies within 3 cells of a plane wave's box faces
+- **THEN** the run is refused with a message naming a dispersive metal and
+  its node
 
 #### Scenario: the material table matches the paper
 - **WHEN** ε(ω) is computed from the library at three photon energies per metal

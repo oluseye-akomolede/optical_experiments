@@ -61,6 +61,7 @@ reports exactly zero energy from a run that is behaving perfectly.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -294,6 +295,284 @@ class PolarisationTerm:
 
 
 # --------------------------------------------------------------------------
+# dispersive metals: Rakić et al. 1998 Lorentz-Drude
+# --------------------------------------------------------------------------
+
+#: Angular frequency of one electronvolt, e / hbar (CODATA 2018, exact).
+EV = 1.602176634e-19 / 1.054571817e-34
+
+
+@dataclass(frozen=True)
+class Metal:
+    """One Lorentz-Drude fit: ``eps(w) = 1 + sum_j f_j wp^2 / (w_j^2 - w^2 - i w G_j)``.
+
+    The first pole is the Drude term (``w_0 = 0``). Energies in eV, as the
+    paper gives them; ``fit_ev`` is the photon-energy range the fit covers.
+    The time convention is ``exp(-i w t)``, so a lossy metal has Im eps > 0
+    (the paper writes the complex conjugate).
+    """
+
+    name: str
+    plasma_ev: float
+    poles: tuple                    # (f_j, w_j eV, Gamma_j eV), Drude first
+    fit_ev: tuple                   # (lowest, highest) photon energy, eV
+
+
+#: A. D. Rakić, A. B. Djurišić, J. M. Elazar and M. L. Majewski, "Optical
+#: properties of metallic films for vertical-cavity optoelectronic devices",
+#: Applied Optics 37, 5271-5283 (1998), Table 1 (Lorentz-Drude model), with
+#: eps_inf = 1. Values as reproduced in Meep's materials library, which cites the
+#: paper; they reproduce refractiveindex.info's Rakić-LD tables to 4 digits
+#: (tests/test_fdtd_metals.py). ``fit_ev`` is the NARROWER of the two sources'
+#: stated ranges (Meep and refractiveindex.info disagree for Al and Cr).
+RAKIC_1998 = {
+    "Ag": Metal("Ag", 9.01, ((0.845, 0.0, 0.048), (0.065, 0.816, 3.886),
+                             (0.124, 4.481, 0.452), (0.011, 8.185, 0.065),
+                             (0.840, 9.083, 0.916), (5.646, 20.29, 2.419)),
+                (0.1, 5.0)),
+    "Au": Metal("Au", 9.03, ((0.760, 0.0, 0.053), (0.024, 0.415, 0.241),
+                             (0.010, 0.830, 0.345), (0.071, 2.969, 0.870),
+                             (0.601, 4.304, 2.494), (4.384, 13.32, 2.214)),
+                (0.2, 5.0)),
+    "Cu": Metal("Cu", 10.83, ((0.575, 0.0, 0.030), (0.061, 0.291, 0.378),
+                              (0.104, 2.957, 1.056), (0.723, 5.300, 3.213),
+                              (0.638, 11.18, 4.305)),
+                (0.1, 6.0)),
+    "Al": Metal("Al", 14.98, ((0.523, 0.0, 0.047), (0.227, 0.162, 0.333),
+                              (0.050, 1.544, 0.312), (0.166, 1.808, 1.351),
+                              (0.030, 3.473, 3.382)),
+                (0.1, 6.0)),
+    "Cr": Metal("Cr", 10.75, ((0.168, 0.0, 0.047), (0.151, 0.121, 3.175),
+                              (0.150, 0.543, 1.305), (1.149, 1.970, 2.676),
+                              (0.825, 8.775, 1.335)),
+                (0.1, 5.0)),
+}
+METALS = tuple(sorted(RAKIC_1998))
+
+
+def _metal(metal) -> Metal:
+    if isinstance(metal, Metal):
+        return metal
+    if metal not in RAKIC_1998:
+        raise FDTDError(f"unknown metal {metal!r}; the library has {METALS}")
+    return RAKIC_1998[metal]
+
+
+def permittivity(metal, frequency):
+    """The model's complex relative permittivity at ``frequency`` (Hz)."""
+    metal = _metal(metal)
+    w = 2.0 * np.pi * np.asarray(frequency, dtype=np.float64)
+    wp = metal.plasma_ev * EV
+    eps = np.ones_like(w, dtype=complex)
+    for f, w0, gamma in metal.poles:
+        eps = eps + f * wp ** 2 / ((w0 * EV) ** 2 - w ** 2 - 1j * w * gamma * EV)
+    return eps
+
+
+def check_metal_band(metal, f_low: float, f_high: float):
+    """Refuse a band that leaves the metal's fitted range, naming both."""
+    metal = _metal(metal)
+    to_ev = 2.0 * np.pi / EV
+    low_ev, high_ev = f_low * to_ev, f_high * to_ev
+    fit_low, fit_high = metal.fit_ev
+    if low_ev < fit_low or high_ev > fit_high:
+        raise FDTDError(
+            f"the pulse band {low_ev:.3g}-{high_ev:.3g} eV "
+            f"({f_low / 1e12:.4g}-{f_high / 1e12:.4g} THz) leaves the range "
+            f"Rakić et al. fitted for {metal.name}, {fit_low:g}-{fit_high:g} eV; "
+            f"move the centre frequency or narrow the bandwidth")
+
+
+def lorentz_drude_coefficients(metal, dt: float) -> list:
+    """Per pole, (alpha, xi, gamma) of ``P^{n+1} = alpha P^n + xi P^{n-1} +
+    gamma E^n``: ``P'' + G P' + w0^2 P = eps0 f wp^2 E`` central-differenced."""
+    metal = _metal(metal)
+    wp = metal.plasma_ev * EV
+    out = []
+    for f, w0, gamma in metal.poles:
+        w0, gamma = w0 * EV, gamma * EV
+        denominator = 1.0 + 0.5 * gamma * dt
+        out.append(((2.0 - (w0 * dt) ** 2) / denominator,
+                    -(1.0 - 0.5 * gamma * dt) / denominator,
+                    EPS0 * f * wp ** 2 * dt ** 2 / denominator))
+    return out
+
+
+#: A growth factor this close to 1 is rounding, not growth. The Drude pole's
+#: static mode is a near-defective eigenvalue at exactly 1, which eigvals
+#: returns up to 6e-8 high (measured over the five metals, 2-20 nm, 0.03-1 of
+#: Courant); every real instability measured is above 0.16.
+GROWTH_TOLERANCE = 1e-6
+
+
+def lorentz_drude_growth(coefficients, dt: float, spacings,
+                         samples: int = 64) -> float:
+    """The largest per-step growth factor of the update inside the metal.
+
+    Von Neumann on a homogeneous metal (eps_inf = 1): a lattice mode of the
+    curl-curl with eigenvalue S obeys ``E^{n+1} - 2E^n + E^{n-1} = -S E^n -
+    (dP^{n+1} - dP^n)/eps0`` with each pole's recursion. S runs from 0 to the
+    lattice maximum ``4 (c dt)^2 sum 1/dx_a^2`` (the finest spacing per axis
+    bounds a graded grid). The result is the spectral radius of the companion
+    matrix, maximised over S; above 1 a mode grows every step.
+
+    Exact for the scheme on a uniform metal, not a guess like ``w dt < 1``:
+    on 20 nm gold that rule refused a dt this check passes.
+    """
+    poles = len(coefficients)
+    s_max = 4.0 * (C0 * dt) ** 2 * sum(1.0 / float(h) ** 2 for h in spacings)
+    worst = 0.0
+    for s in np.linspace(0.0, s_max, samples):
+        # state: E^n, E^{n-1}, then (Q_j^n, Q_j^{n-1}) with Q = P/eps0
+        size = 2 + 2 * poles
+        m = np.zeros((size, size))
+        for j, (alpha, xi, gamma) in enumerate(coefficients):
+            row = 2 + 2 * j
+            m[row, 0] = gamma / EPS0
+            m[row, row] = alpha
+            m[row, row + 1] = xi
+            m[row + 1, row] = 1.0
+        # E^{n+1} = E^n - sum (Q^{n+1} - Q^n) + curl, where the curl term's
+        # step-to-step change is -S E^n: written first-order in E as
+        # E^{n+1} = (2 - S) E^n - E^{n-1} - sum (Q^{n+1} - 2Q^n + Q^{n-1})
+        m[0, 0] = 2.0 - s
+        m[0, 1] = -1.0
+        for j in range(poles):
+            row = 2 + 2 * j
+            m[0] -= m[row]                        # -Q_j^{n+1}
+            m[0, row] += 2.0
+            m[0, row + 1] -= 1.0
+        m[1, 0] = 1.0
+        worst = max(worst, float(np.abs(np.linalg.eigvals(m)).max()))
+    return worst
+
+
+class LorentzDrude(PolarisationTerm):
+    """A Rakić metal on a node mask, stepped with auxiliary differential equations.
+
+    Each pole carries a polarisation density obeying
+    ``P'' + G P' + w0^2 P = eps0 f wp^2 E``, central-differenced in time:
+    ``P^{n+1}`` from ``P^n``, ``P^{n-1}`` and ``E^n`` (``prepare``, before the
+    E update), then ``E^{n+1} = E^n + dt/eps0 curl H - (P^{n+1} - P^n)/eps0``
+    (``advance``, after it).
+
+    An E sample lies on the segment between two nodes; it takes the metal when
+    either node is metal, so a sample on a metal face takes the metal. Such a
+    sample must be updated with eps_inf = 1, but the core used ``eps_r`` at its
+    array index, which is shared with the other two components and may be the
+    neighbouring dielectric's; ``advance`` rescales the curl increment it sees
+    (``E* - E^n``) to eps_inf = 1 for those samples.
+
+    Storage is per E component on the bounding box of that component's metal
+    samples only: two P arrays per pole, plus E^n and the summed dP.
+    """
+
+    def __init__(self, metal, region):
+        self.metal = _metal(metal)
+        self.name = f"Lorentz-Drude {self.metal.name}"
+        self.region = np.asarray(region, dtype=bool)
+        if self.region.ndim != 3:
+            raise FDTDError(f"{self.name}: the region must be a 3-D node mask")
+        self.parts: dict = {}
+
+    def stable_dt(self, dt: float, spacings) -> float:
+        """``dt`` if the metal is stable at it, else 0.98 of the largest that is.
+
+        At the Courant dt the lattice's stiffest mode already uses (w dt)^2 =
+        3.92 of the leapfrog's 4, and the metal adds about sum f wp^2 dt^2 on
+        top, so the explicit ADE needs a smaller step: 5 nm gold at 0.99 of
+        Courant grows by 1.16 per step.
+        """
+        def growth(trial):
+            return lorentz_drude_growth(
+                lorentz_drude_coefficients(self.metal, trial), trial, spacings)
+
+        if growth(dt) <= 1.0 + GROWTH_TOLERANCE:
+            return dt
+        low, high = 0.0, 1.0                 # stable and unstable fractions
+        while high - low > 1e-4:
+            middle = 0.5 * (low + high)
+            if growth(middle * dt) <= 1.0 + GROWTH_TOLERANCE:
+                low = middle
+            else:
+                high = middle
+        return 0.98 * low * dt
+
+    def bind(self, *, shape, dt: float, inv_eps, xp, spacings=None):
+        if tuple(self.region.shape) != tuple(shape):
+            raise FDTDError(
+                f"{self.name}: the region is {self.region.shape} but the grid "
+                f"is {tuple(shape)}; they must be the same shape")
+        f32 = xp.float32
+        self.coefficients = lorentz_drude_coefficients(self.metal, dt)
+        if spacings is not None:
+            radius = lorentz_drude_growth(self.coefficients, dt, spacings)
+            if radius > 1.0 + GROWTH_TOLERANCE:
+                raise FDTDError(
+                    f"{self.name}: dt = {dt:.3g} s is unstable in the metal (a "
+                    f"step multiplies its stiffest mode by {radius:.4g}); "
+                    f"refine the grid so dt shrinks")
+        eps_host = 1.0 / (EPS0 * np.asarray(_host_result(inv_eps, xp),
+                                            dtype=np.float64))
+        live = {"x": (slice(0, -1), slice(1, -1), slice(1, -1)),
+                "y": (slice(1, -1), slice(0, -1), slice(1, -1)),
+                "z": (slice(1, -1), slice(1, -1), slice(0, -1))}
+        self.parts = {}
+        for axis, component in enumerate(COMPONENTS):
+            samples = self.region.copy()
+            low = [slice(None)] * 3
+            high = [slice(None)] * 3
+            low[axis], high[axis] = slice(0, -1), slice(1, None)
+            samples[tuple(low)] |= self.region[tuple(high)]
+            updated = np.zeros(shape, dtype=bool)
+            updated[live[component]] = True
+            samples &= updated
+            if not samples.any():
+                continue
+            where = np.argwhere(samples)
+            box = tuple(slice(int(lo), int(hi) + 1)
+                        for lo, hi in zip(where.min(0), where.max(0)))
+            keep = samples[box].astype(np.float32)
+            size = keep.shape
+            self.parts[component] = {
+                "box": box,
+                "keep": xp.asarray(keep, dtype=f32),
+                # eps_r - 1 at metal samples: rescales the curl increment
+                "rescale": xp.asarray((eps_host[box] - 1.0) * keep, dtype=f32),
+                "now": [xp.zeros(size, dtype=f32) for _ in self.metal.poles],
+                "before": [xp.zeros(size, dtype=f32) for _ in self.metal.poles],
+                "e_then": xp.zeros(size, dtype=f32),
+                "d_p": xp.zeros(size, dtype=f32),
+            }
+
+    def prepare(self, fields, dt, step):
+        """Before the E update: P to n+1 from E^n, and E^n kept."""
+        for component, part in self.parts.items():
+            e_then = part["e_then"]
+            e_then[...] = fields[component][part["box"]]
+            drive = e_then * part["keep"]
+            d_p = part["d_p"]
+            d_p *= 0.0
+            for index, (alpha, xi, gamma) in enumerate(self.coefficients):
+                now, before = part["now"][index], part["before"][index]
+                before *= xi                    # becomes P^{n+1} in place
+                before += alpha * now
+                before += gamma * drive
+                d_p += before
+                d_p -= now
+                part["now"][index], part["before"][index] = before, now
+
+    def advance(self, fields, dt, step):
+        """After the E update: the rescaled curl and the polarisation current."""
+        out = {}
+        for component, part in self.parts.items():
+            curl = fields[component][part["box"]] - part["e_then"]
+            out[component] = (part["box"],
+                              curl * part["rescale"] - part["d_p"] / EPS0)
+        return out
+
+
+# --------------------------------------------------------------------------
 # grid helpers
 # --------------------------------------------------------------------------
 
@@ -508,7 +787,8 @@ class _PlaneWave:
     """
 
     def __init__(self, source: Source, shape, primal, dual, eps_host,
-                 pec_host, inv_eps, dt: float, pml_cells: int, xp):
+                 pec_host, inv_eps, dt: float, pml_cells: int, xp,
+                 metal_host=None):
         self.source = source
         self.xp = xp
         f32 = xp.float32
@@ -551,11 +831,17 @@ class _PlaneWave:
         foreign = shell & (eps_host != eps_host[low])
         if pec_host is not None:
             foreign |= shell & pec_host
+        if metal_host is not None:
+            foreign |= shell & metal_host
         if foreign.any():
             where = tuple(int(i) for i in np.argwhere(foreign)[0])
-            what = ("a conductor" if pec_host is not None and pec_host[where]
-                    else f"relative permittivity {float(eps_host[where]):.4g} "
-                         f"against the background {background:.4g}")
+            if pec_host is not None and pec_host[where]:
+                what = "a conductor"
+            elif metal_host is not None and metal_host[where]:
+                what = "a dispersive metal"
+            else:
+                what = (f"relative permittivity {float(eps_host[where]):.4g} "
+                        f"against the background {background:.4g}")
             raise FDTDError(
                 f"the plane wave's box {source.box} has an object within "
                 f"{BOX_CLEARANCE} cells of its faces ({what} at node {where}); "
@@ -727,7 +1013,9 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     ``boundary="open"`` puts a CPML of ``pml_cells`` on each face instead (the
     open box is still PEC-backed at the outermost layer, which is how a PML is
     terminated in practice). ``ade_terms`` are polarisation-current terms (see
-    ``PolarisationTerm``); phase 1 runs with none.
+    ``PolarisationTerm``), e.g. ``LorentzDrude("Au", mask)``. A term with a
+    ``stable_dt`` can shrink dt below the Courant step (a metal's explicit ADE
+    needs it); ``"dt"`` in the result is the step actually used.
 
     Returns ``{"traces": (n_probes, n_steps) float32, "dt", "steps",
     "spacings", "energy", "peak"}``, and every one of them is HOST numpy whatever ``xp``
@@ -796,6 +1084,14 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
         if not callable(getattr(term, "advance", None)):
             raise FDTDError(
                 f"{term!r} is not a polarisation term: it has no advance()")
+    # A dispersive term can need a dt below the Courant one (see
+    # lorentz_drude_growth); every later use of dt (CPML, plane wave, terms)
+    # must see the reduced value, so this comes before all of them.
+    finest = tuple(float(p.min()) for p in primal)
+    for term in terms:
+        stable_dt = getattr(term, "stable_dt", None)
+        if stable_dt is not None:
+            dt = min(dt, stable_dt(dt, finest))
 
     # A cell the update never touches is not a place you can drive: the curl for
     # it is never evaluated, so a source there would be silently ignored and
@@ -853,12 +1149,24 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     field = {"x": Ex, "y": Ey, "z": Ez}
     h_field = {"x": Hx, "y": Hy, "z": Hz}
 
+    for term in terms:
+        bind = getattr(term, "bind", None)
+        if bind is not None:
+            bind(shape=shape, dt=dt, inv_eps=inv_eps, xp=xp,
+                 spacings=tuple(float(p.min()) for p in primal))
+    metal_host = None
+    for term in terms:
+        region = getattr(term, "region", None)
+        if region is not None:
+            metal_host = (np.asarray(region, dtype=bool) if metal_host is None
+                          else metal_host | np.asarray(region, dtype=bool))
+
     plane = None
     if source.kind == "plane":
         plane = _PlaneWave(
             source, shape, primal, dual, np.asarray(_host_result(eps, xp)),
             None if mask is None else np.asarray(_host_result(mask, xp)),
-            inv_eps, dt, pml_cells, xp)
+            inv_eps, dt, pml_cells, xp, metal_host=metal_host)
 
     P = [xp.asarray(p, dtype=f32) for p in primal]      # n-1 primal lengths
     D = [xp.asarray(d, dtype=f32) for d in dual]        # n-1 dual lengths
@@ -998,6 +1306,11 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                 h_total += float(xp.sum(h_weights[component] * now * before))
             energy.append(0.5 * (EPS0 * e_total + MU0 * h_total))
 
+        for term in terms:                    # dispersive terms see E^n
+            prepare = getattr(term, "prepare", None)
+            if prepare is not None:
+                prepare(field, dt, step)
+
         # ---- E from the curl of H (H at n+1/2, E advances to n+1) --------
         # Ex at (i+1/2, j, k): live for j in [1, ny-2], k in [1, nz-2]
         term_y = (Hz[:-1, 1:-1, 1:-1] - Hz[:-1, :-2, 1:-1]) / _along(D[1][1:], 1)
@@ -1032,7 +1345,11 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                         f"the polarisation term {getattr(term, 'name', term)!r} "
                         f"returned an increment for {name!r}; E components are "
                         f"{COMPONENTS}")
-                field[name] += increment
+                if isinstance(increment, tuple):  # (region, values)
+                    region, values = increment
+                    field[name][region] += values
+                else:
+                    field[name] += increment
 
         # ---- source ------------------------------------------------------
         if plane is None:
