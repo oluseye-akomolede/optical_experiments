@@ -135,3 +135,85 @@ def test_the_v1_verdict_counts_the_modes_left_ungated():
             [], False, **dict(VERDICT, ungated=ungated))
         assert (f"{ungated} mode(s) under the {bench.EXCITABLE} coupling "
                 f"threshold, not gated") in line
+
+
+def fake_simulate(scale=1.0):
+    """A stand-in for fdtd.simulate that rings at the box's analytic modes.
+
+    main() asks for one run per E component on a metal box; this returns, for
+    every probe, a sum of cosines at the box's (scaled) mode frequencies over
+    the grid main() built, on main()'s own dt. With scale 1 the peaks sit on the
+    analytic lines, so the run's exit code is decided by the verdict alone.
+    """
+    def simulate(grid, source, n_steps, probes, *, dx, boundary, xp):
+        assert boundary == "metal"
+        box = [(n - 1) * dx for n in grid.shape]
+        dt = bench.fdtd.courant_dt(dx, dx, dx)
+        t = np.arange(n_steps) * dt
+        frequencies = set()
+        for m in range(6):
+            for n in range(6):
+                for p in range(6):
+                    if (m == 0) + (n == 0) + (p == 0) > 1:
+                        continue
+                    frequencies.add(round(bench.fdtd.C0 / 2.0 * math.sqrt(
+                        (m / box[0]) ** 2 + (n / box[1]) ** 2
+                        + (p / box[2]) ** 2), 3))
+        # the 6 lowest distinct modes, main()'s default --n-modes: it keeps
+        # that many peaks per run, so ringing at more would crowd some out
+        trace = np.zeros(n_steps)
+        for f in sorted(frequencies)[:6]:
+            trace += np.cos(2.0 * math.pi * f * scale * t)
+        return {"traces": [trace.astype(np.float32) for _ in probes], "dt": dt}
+    return simulate
+
+
+def test_main_exits_with_the_verdicts_code(monkeypatch, capsys):
+    """main() itself, not just v1_verdict: 0 for a pass, 2 for a widened run,
+    1 for peaks 3% off. Reverting main's return to 'PASS -> 0, else 1' makes the
+    widened run exit 1 and fails here."""
+    monkeypatch.setattr(bench.fdtd, "simulate", fake_simulate())
+    assert bench.main([]) == 0
+    assert "V1 PASS" in capsys.readouterr().out
+    assert bench.main(["--cells-per-wavelength", "8"]) == 2
+    assert "V1 NOT A SPEC PASS" in capsys.readouterr().out
+    monkeypatch.setattr(bench.fdtd, "simulate", fake_simulate(scale=1.03))
+    assert bench.main([]) == 1
+    assert "V1 FAIL" in capsys.readouterr().out
+
+
+def fake_cavity_solver(scale=1.0):
+    """A stand-in for the bench_box.py subprocess: it writes the analytic box
+    frequencies (times ``scale``) to the --json-out file main() reads."""
+    def run(command, check=False):
+        value = {flag: command[command.index(flag) + 1]
+                 for flag in ("--a", "--b", "--d", "--units", "--n-modes",
+                              "--json-out")}
+        unit = bench.UNITS_TO_M[value["--units"]]
+        k = bench.analytic_box_k(float(value["--a"]) * unit,
+                                 float(value["--b"]) * unit,
+                                 float(value["--d"]) * unit,
+                                 int(value["--n-modes"]))
+        Path(value["--json-out"]).write_text(bench.json.dumps(
+            {"freq_hz": [bench.fdtd.C0 * x / (2.0 * math.pi) * scale
+                         for x in k]}))
+        return bench.subprocess.CompletedProcess(command, 0)
+    return run
+
+
+def test_an_agreeing_cavity_table_on_a_widened_run_does_not_read_as_a_pass(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(bench.fdtd, "simulate", fake_simulate())
+    monkeypatch.setattr(bench.subprocess, "run", fake_cavity_solver())
+    # control: on a spec run the same agreeing table IS a pass
+    assert bench.main(["--compare-cavity"]) == 0
+    assert "CAVITY PASS" in capsys.readouterr().out
+    assert bench.main(["--compare-cavity", "--cells-per-wavelength", "8"]) == 2
+    out = capsys.readouterr().out
+    assert "CAVITY PASS" not in out
+    assert "CAVITY AGREES, but V1 is NOT A SPEC PASS (exit 2)" in out
+    # and a cavity solver 3% off is still a failure
+    monkeypatch.setattr(bench.subprocess, "run", fake_cavity_solver(1.03))
+    assert bench.main(["--compare-cavity"]) == 1
+    assert "CAVITY FAIL" in capsys.readouterr().out
