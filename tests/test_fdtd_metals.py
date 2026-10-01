@@ -274,3 +274,29 @@ def test_simulate_runs_the_metal_at_the_reduced_dt():
     courant = fdtd.courant_dt(20e-9, 21e-9, 22e-9)
     assert result["dt"] < 0.9 * courant
     assert np.all(np.isfinite(result["traces"]))
+
+
+def test_a_periodic_slab_is_metal_across_its_whole_cross_section():
+    # On a periodic axis the E update runs to row n-1 (the copy of row 0). A
+    # metal term bound with the wall ranges left that row vacuum, so every
+    # periodic slab had a vacuum slot through it: E at j=1 differed from
+    # j=0/j=3 by ~2.5% and V4 read ~0.03 low against Fresnel.
+    t, n = 4, 30
+    shape = (t, t, n)
+    region = np.zeros(shape, dtype=bool)
+    region[:, :, 12:18] = True
+    term = fdtd.LorentzDrude("Au", region)
+    source = fdtd.Source(kind="plane", direction="+z", component="x",
+                         box=((0, 0, 8), (t - 1, t - 1, 21)),
+                         frequency=3.6e14, bandwidth=1e14)
+    spacings = (np.full(t - 1, 5e-9), np.full(t - 1, 5e-9),
+                np.full(n - 1, 5e-9))
+    run = fdtd.simulate(np.ones(shape, np.float32), source, 400,
+                        [(1, j, 14, "x") for j in range(t)],
+                        spacings=spacings,
+                        boundary=("periodic", "periodic", "open"),
+                        pml_cells=5, ade_terms=[term])
+    peaks = [float(np.abs(trace).max()) for trace in run["traces"]]
+    assert min(peaks) > 0, "the probes inside the slab saw nothing"
+    assert (max(peaks) - min(peaks)) / max(peaks) < 1e-6, (
+        f"E inside a periodic slab varies across it: {peaks}")

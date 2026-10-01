@@ -605,7 +605,8 @@ class LorentzDrude(PolarisationTerm):
                 high = middle
         return 0.98 * low * dt
 
-    def bind(self, *, shape, dt: float, inv_eps, xp, spacings=None):
+    def bind(self, *, shape, dt: float, inv_eps, xp, spacings=None,
+             periodic=(False, False, False)):
         if tuple(self.region.shape) != tuple(shape):
             raise FDTDError(
                 f"{self.name}: the region is {self.region.shape} but the grid "
@@ -621,9 +622,16 @@ class LorentzDrude(PolarisationTerm):
                     f"refine the grid so dt shrinks")
         eps_host = 1.0 / (EPS0 * np.asarray(_host_result(inv_eps, xp),
                                             dtype=np.float64))
-        live = {"x": (slice(0, -1), slice(1, -1), slice(1, -1)),
-                "y": (slice(1, -1), slice(0, -1), slice(1, -1)),
-                "z": (slice(1, -1), slice(1, -1), slice(0, -1))}
+        # The samples the E update advances: half positions 0..n-2 along the
+        # component's own axis; integer positions 1..n-2 between walls, 1..n-1
+        # on a periodic axis (node n-1 is node 0, copied back after the terms).
+        # The wall ranges on a periodic axis left row n-1 out of the metal: a
+        # vacuum slot through every periodic slab.
+        live = {component: tuple(
+                    slice(0, -1) if a == axis else
+                    slice(1, None) if periodic[a] else slice(1, -1)
+                    for a in range(3))
+                for axis, component in enumerate(COMPONENTS)}
         self.parts = {}
         for axis, component in enumerate(COMPONENTS):
             samples = self.region.copy()
@@ -1351,7 +1359,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
         bind = getattr(term, "bind", None)
         if bind is not None:
             bind(shape=shape, dt=dt, inv_eps=inv_eps, xp=xp,
-                 spacings=tuple(float(p.min()) for p in primal))
+                 spacings=tuple(float(p.min()) for p in primal),
+                 periodic=periodic)
     metal_host = None
     for term in terms:
         region = getattr(term, "region", None)
