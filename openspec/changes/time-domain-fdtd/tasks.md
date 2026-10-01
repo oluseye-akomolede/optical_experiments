@@ -21,20 +21,29 @@
 
 ## 2. Plane-wave source, dispersive metals, drawn waveform (phase 2)
 
-- [ ] 2.1 A TF/SF box with a 1-D auxiliary incident-field grid along the axis,
+- [x] 2.1 A TF/SF box with a 1-D auxiliary incident-field grid along the axis,
   on the same dt and graded spacings; ≥ 3 cells to objects and to the CPML.
   Refused with `metal` and for a longitudinal polarisation. All profiles are
   zero-mean.
-- [ ] 2.2 Benchmark V3.
-- [ ] 2.3 Lorentz-Drude ADE terms (Rakić 1998, ε∞ = 1, parameters in eV), stored
+- [x] 2.2 Benchmark V3 (`scripts/fdtd_bench_v3.py`; the Jetson run is the lead's).
+- [x] 2.3 Lorentz-Drude ADE terms (Rakić 1998, ε∞ = 1, parameters in eV), stored
   on the metal's bounding box only, plus a material library (Au, Ag, Al, Cu, Cr)
   with the source cited in the code, a refusal outside each fit's range, and a
-  table check against a published Rakić n, k dataset at three energies per metal.
+  table check against a published Rakić n, k dataset at 12 wavelengths per metal.
   Re-measure the Jetson rate and GPU memory with an open boundary and one gold
-  region (lead runs it).
-- [ ] 2.4 Benchmark V4 (gold slab against analytic Fresnel, same model).
-- [ ] 2.5 `drawn` profile: ≤ 10 000 samples plus a duration, resampled to dt,
+  region (lead runs it). [Code and tier-1 tests done; the Jetson re-measure is
+  the lead's. The pulse-band refusal is `fdtd.check_metal_band`; the job form
+  must call it at queue time.]
+- [x] 2.4 Benchmark V4 (gold slab against analytic Fresnel, same model), on
+  periodic transverse faces (6.1a), since a finite plate inside the TF/SF box
+  diffracts at its edges and cannot meet the 0.02 gate. [Script
+  `scripts/fdtd_bench_v4.py` and its tier-1 tests done; the Jetson run is the
+  lead's.]
+- [x] 2.5 `drawn` profile: ≤ 10 000 samples plus a duration, resampled to dt,
   then mean removed; refused when > 1% of its spectral energy is above f_res.
+  [Solver side: `Source(profile="drawn")`, `fdtd.resolvable_frequency`,
+  `fdtd.drawn_energy_above`; `simulate` refuses on the dielectric index as a
+  backstop. The queue-time refusal (with the metals' |n|) is the form's, 5.1.]
 
 ## 3. Geometry, estimate and caps (phase 3)
 
@@ -75,8 +84,11 @@
 
 ## 6. Periodic boundaries (phase 6)
 
-- [ ] 6.1 Periodic faces (wrap the curl differences), plus a Bloch phase for a
-  given k: cos and sin fields stepped together through a core face hook.
+- [x] 6.1a Periodic faces at k = 0 (wrap the curl differences), a boundary per
+  axis in the solver API, and a plane wave across periodic transverse faces.
+  Built in phase 2 for V4 (lead, 22:15Z). The form option stays in phase 6.
+- [ ] 6.1b A Bloch phase for a given k: cos and sin fields stepped together
+  through a core face hook.
 - [ ] 6.2 Benchmark V6 against the existing pc band solver: an extruded 2-D
   crystal, TM and TE, kz = 0, frequencies at chosen k-points within 1%, every
   band present.

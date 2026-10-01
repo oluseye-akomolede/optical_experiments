@@ -588,7 +588,15 @@ def main(argv=None) -> int:
                                 f"(exit {done.returncode}); its modes are not a "
                                 f"reference")
             cavity_ok = not problems
-            print(f"CAVITY {'PASS' if cavity_ok else 'FAIL'}: {len(rows)} peak(s) "
+            # The cavity table can agree while the V1 run itself did not pass
+            # (a widened run exits 2): then the line must not read as a pass.
+            if not cavity_ok:
+                cavity_word = "FAIL"
+            elif code == 0:
+                cavity_word = "PASS"
+            else:
+                cavity_word = f"AGREES, but V1 is {verdict} (exit {code}), so NOT A PASS"
+            print(f"CAVITY {cavity_word}: {len(rows)} peak(s) "
                   f"against the cavity solver, tolerance {args.cavity_tolerance:g}%")
             for problem in problems:
                 print(f"  {problem}")

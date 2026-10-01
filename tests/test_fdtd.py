@@ -1,4 +1,4 @@
-"""The time-domain solver core: the claims phase 1 has to keep.
+"""The time-domain solver core: the claims phases 1 and 2 have to keep.
 
 Every test here is a SHAPE, not an absolute amplitude (see fdtd.py on units):
 a spectrum peaks where the source put it, a closed box keeps its energy, an
@@ -11,6 +11,7 @@ mode spectrum.
 from __future__ import annotations
 
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -210,6 +211,43 @@ class _DeviceXp:
     @staticmethod
     def asnumpy(value):
         return _device(value)           # the transfer, the way cupy.asnumpy is
+
+
+def test_an_energy_region_sums_only_its_own_cells():
+    """A sub-box the wave has not reached holds exactly zero while the whole
+    grid already holds energy; the whole grid spelled as slices is None."""
+    eps = np.ones((12, 10, 8), dtype=np.float32)
+    source = pulse(cell=(3, 5, 4))
+    far = (slice(9, 12), slice(None), slice(None))
+    whole = fdtd.simulate(eps, source, 30, record_energy=True)["energy"]
+    spelled = fdtd.simulate(eps, source, 30, record_energy=True,
+                            energy_region=(slice(None),) * 3)["energy"]
+    region = fdtd.simulate(eps, source, 30, record_energy=True,
+                           energy_region=far)["energy"]
+    assert spelled == whole
+    late = max(range(30), key=lambda n: whole[n])
+    assert whole[late] > 0 and region[late] < whole[late]
+    first = next(n for n in range(30) if whole[n] > 0)
+    assert region[first] == 0.0, "energy appeared where no wave can be yet"
+    assert max(region) > 0, "the wave never reached the far region"
+    for bad in ((slice(None),) * 2, (slice(None), slice(4, 4), slice(None))):
+        with pytest.raises(fdtd.FDTDError, match="energy_region"):
+            fdtd.simulate(eps, source, 2, record_energy=True,
+                          energy_region=bad)
+
+
+def test_record_peak_is_the_running_maximum_of_every_sample():
+    """At a probed sample the peak is the largest |trace| value, not the last
+    value; every component comes back full-shape."""
+    eps = np.ones((12, 10, 8), dtype=np.float32)
+    probes = [(5, 5, 4, "z"), (7, 4, 3, "x"), (4, 6, 5, "y")]
+    run = fdtd.simulate(eps, pulse(cell=(6, 5, 4)), steps_for(4.0 / F0),
+                        probes=probes, record_peak=True)
+    traces = np.abs(np.asarray(run["traces"]))
+    for (i, j, k, c), trace in zip(probes, traces):
+        assert run["peak"][c].shape == eps.shape
+        assert run["peak"][c][i, j, k] == trace.max() > trace[-1], c
+    assert fdtd.simulate(eps, pulse(cell=(6, 5, 4)), 2)["peak"] is None
 
 
 def test_the_traces_come_back_on_the_host_whatever_xp_built_them():
@@ -499,9 +537,217 @@ def test_a_cw_source_shows_up_at_its_own_frequency_in_a_probe():
         f"the driven run rang at {peak:.4g} Hz, not {F0:.4g}")
 
 
-def test_a_plane_source_is_refused_by_name():
-    with pytest.raises(fdtd.FDTDError, match="phase 2"):
-        fdtd.Source((1, 1, 1), frequency=F0, kind="plane", bandwidth=BANDWIDTH)
+def _running_integral_offset(profile, frequency):
+    """The mean of a profile's running integral after it has settled,
+    as a fraction of that integral's swing: what a soft current leaves behind
+    as a static field."""
+    dt = (1.0 / frequency) / 400.0
+    t = np.arange(0.0, 40.0 / frequency, dt)
+    charge = np.cumsum([profile(x) for x in t]) * dt
+    tail = charge[-4000:]      # exactly the last 10 periods: whole cycles only
+    swing = (tail.max() - tail.min()) / 2.0
+    return abs(tail.mean()) / max(swing, abs(tail.mean()), 1e-300)
+
+
+def test_every_profile_is_zero_mean():
+    """A soft current with a net integral leaves a static field that no
+    absorbing boundary removes (the spec's zero-mean rule). A ramped sine is
+    not enough: its integral settles 1% off zero. The pulse has no swing left
+    after it, so its offset is measured against its own peak running value."""
+    assert _running_integral_offset(
+        lambda t: fdtd.cw_profile(t, F0), F0) < 1e-4
+    dt = (1.0 / F0) / 400.0
+    t = np.arange(0.0, 40.0 / F0, dt)
+    charge = np.cumsum([fdtd.pulse_profile(x, F0, BANDWIDTH) for x in t]) * dt
+    assert abs(charge[-1]) < 1e-6 * np.abs(charge).max()
+
+
+# ---------------------------------------------------------------- plane wave
+
+#: 24^3 with a 4-cell CPML: the box faces may sit on nodes 7..16 (3 cells clear
+#: of the CPML), which leaves a 4-node core for an object 3 cells clear of them.
+PW_N = 24
+PW_PML = 4
+PW_BOX = ((7, 7, 7), (16, 16, 16))
+PW_INSIDE = 11
+#: Graded differently on each axis, so a correction that used the wrong
+#: spacing, or a 1-D line spaced unlike the 3-D axis, does not cancel.
+PW_SPACINGS = (np.linspace(0.9, 1.1, PW_N - 1), np.full(PW_N - 1, 1.0),
+               np.linspace(1.1, 0.9, PW_N - 1))
+PW_PAIRS = [(d, c) for d in fdtd.DIRECTIONS for c in fdtd.COMPONENTS
+            if c != d[1]]
+
+
+def plane(direction="+x", component="z", **kwargs):
+    options = dict(kind="plane", direction=direction, component=component,
+                   box=PW_BOX, frequency=F0, bandwidth=BANDWIDTH)
+    options.update(kwargs)
+    return fdtd.Source(**options)
+
+
+def _plane_steps():
+    # the pulse's own length plus a crossing of the whole grid
+    sigma = 1.0 / (math.pi * BANDWIDTH)
+    return steps_for(10.0 * sigma + 1.2 * PW_N * DX / C)
+
+
+def _outside_probes(component):
+    """One probe just beyond each of the box's six faces, in the scattered
+    region and clear of the CPML, all at the box's transverse centre."""
+    low, high = PW_BOX
+    probes = []
+    for axis in range(3):
+        for index in (low[axis] - 2, high[axis] + 2):
+            cell = [PW_INSIDE] * 3
+            cell[axis] = index
+            probes.append((*cell, component))
+    return probes
+
+
+def _leakage(eps, source):
+    inside = (PW_INSIDE,) * 3 + (source.component,)
+    run = fdtd.simulate(eps, source, _plane_steps(),
+                        probes=[inside, *_outside_probes(source.component)],
+                        spacings=PW_SPACINGS, boundary="open", pml_cells=PW_PML)
+    traces = np.asarray(run["traces"])
+    incident = float(np.abs(traces[0]).max())
+    return incident, float(np.abs(traces[1:]).max()) / incident
+
+
+@pytest.mark.parametrize("direction,component", PW_PAIRS)
+def test_a_plane_wave_stays_inside_its_box(direction, component):
+    """V3's leakage bound, on a graded grid, for every direction and
+    polarisation: outside the box the incident wave cancels to < 1e-3."""
+    eps = np.ones((PW_N,) * 3, dtype=np.float32)
+    incident, leak = _leakage(eps, plane(direction, component))
+    assert incident > 0.5, f"no wave reached the box centre ({incident:.3g})"
+    assert leak < 1e-3, (
+        f"{direction} {component}: {leak:.2e} of the incident wave leaked "
+        f"out of the box")
+
+
+def test_a_plane_wave_in_a_dielectric_background_stays_inside_its_box():
+    """The 1-D line must carry the wave at the background's speed."""
+    eps = np.full((PW_N,) * 3, 2.25, dtype=np.float32)
+    incident, leak = _leakage(eps, plane("-y", "x"))
+    assert incident > 0.3
+    assert leak < 1e-3, f"{leak:.2e} leaked out of a dielectric background"
+
+
+def test_an_object_in_the_box_scatters_out_of_it():
+    """The control for the leakage tests: the same probes see a scatterer."""
+    eps = np.ones((PW_N,) * 3, dtype=np.float32)
+    eps[10:14, 10:14, 10:14] = 4.0
+    _incident, leak = _leakage(eps, plane("+x", "z"))
+    assert leak > 1e-2, f"a dielectric block scattered only {leak:.2e}"
+
+
+@pytest.mark.parametrize("direction", ["+x", "-z"])
+def test_the_incident_line_lets_its_wave_go_on_a_graded_axis(direction):
+    """The 1-D line's feed must not be a wall. A hard source clamps its node
+    to the profile, i.e. to zero once the pulse is over, and the small
+    reflections off a graded axis then bounce between it and the grading for
+    good: measured 2e-4 of the peak line energy still ringing after 1200
+    steps at 6 cells per wavelength, against 3e-6 for the one-way feed (whose
+    remainder is still draining). The 3-D probes cannot see this at the
+    tests' 10+ cells per wavelength, so it is checked on the line itself.
+    Both cases feed from the axis's fine (0.9) end; fed from the coarse end
+    (-x, +z) a hard source measured clean too, so those cases could not
+    fail and are left out."""
+    n, cells_per_wavelength = 21, 6.0
+    frequency = C / (cells_per_wavelength * DX)
+    spacings = [DX * np.linspace(0.9, 1.1, n - 1), np.full(n - 1, DX),
+                DX * np.linspace(1.1, 0.9, n - 1)]
+    duals = [fdtd._dual_spacing(p) for p in spacings]
+    dt = fdtd.courant_dt(*(s.min() for s in spacings))
+    eps = np.ones((n,) * 3, dtype=np.float32)
+    source = fdtd.Source(kind="plane", direction=direction, component="y",
+                         box=((7,) * 3, (13,) * 3), frequency=frequency,
+                         bandwidth=frequency / 2.0)
+    line = fdtd._PlaneWave(source, eps.shape, spacings, duals, eps, None,
+                           (1.0 / (fdtd.EPS0 * eps)).astype(np.float32), dt,
+                           4, np)
+    energy = []
+    for step in range(1200):
+        line.advance_h(step)
+        line.advance_e(step)
+        energy.append(float(np.sum(line.E1.astype(np.float64) ** 2)))
+    left = energy[-1] / max(energy)
+    assert left < 3e-5, (
+        f"{left:.2e} of the line's peak energy is still on it after 1200 "
+        f"steps: something on the line reflects")
+
+
+@pytest.mark.parametrize("direction", ["+z", "-z"])
+def test_a_plane_wave_travels_its_way_at_c_with_its_amplitude(direction):
+    """The peak passes two points on the axis in the order the direction
+    says, at c (a 1.5-cell tolerance on 7 cells: arrival is read from the
+    sampled peak), and at the amplitude asked for."""
+    eps = np.ones((PW_N,) * 3, dtype=np.float32)
+    near, far = 8, 15
+    source = plane(direction, "x", amplitude=2.0)
+    run = fdtd.simulate(eps, source, _plane_steps(),
+                        probes=[(11, 11, near, "x"), (11, 11, far, "x")],
+                        spacings=PW_SPACINGS, boundary="open", pml_cells=PW_PML)
+    traces = np.asarray(run["traces"])
+    first, second = (0, 1) if direction == "+z" else (1, 0)
+    delay = (int(np.argmax(np.abs(traces[second])))
+             - int(np.argmax(np.abs(traces[first])))) * run["dt"]
+    distance = float(np.sum(PW_SPACINGS[2][near:far]))
+    assert delay == pytest.approx(distance / C, abs=1.5 * DX / C)
+    t = np.arange(4000) * (5.0 / BANDWIDTH) / 4000
+    peak = 2.0 * max(abs(fdtd.pulse_profile(x, F0, BANDWIDTH)) for x in t)
+    assert float(np.abs(traces).max()) == pytest.approx(peak, rel=0.03)
+
+
+def test_a_plane_wave_in_a_metal_box_is_refused_naming_the_conflict():
+    eps = np.ones((PW_N,) * 3, dtype=np.float32)
+    with pytest.raises(fdtd.FDTDError, match="plane wave.*metal.*open"):
+        fdtd.simulate(eps, plane(), 10, spacings=PW_SPACINGS,
+                      boundary="metal", pml_cells=PW_PML)
+
+
+def test_a_longitudinal_plane_wave_is_refused():
+    with pytest.raises(fdtd.FDTDError, match="transverse"):
+        plane("+y", "y")
+
+
+def test_a_plane_wave_box_must_clear_the_cpml_and_every_object_by_3_cells():
+    eps = np.ones((PW_N,) * 3, dtype=np.float32)
+    with pytest.raises(fdtd.FDTDError, match="3 cells to the absorbing layer"):
+        fdtd.simulate(eps, plane(box=((6, 7, 7), (16, 16, 16))), 2,
+                      spacings=PW_SPACINGS, boundary="open", pml_cells=PW_PML)
+    with pytest.raises(fdtd.FDTDError, match="3 cells to the absorbing layer"):
+        fdtd.simulate(eps, plane(box=((7, 7, 7), (16, 17, 16))), 2,
+                      spacings=PW_SPACINGS, boundary="open", pml_cells=PW_PML)
+    for near in (9, 18):            # 2 cells inside, then 2 cells outside a face
+        blocked = eps.copy()
+        blocked[near, 11, 11] = 4.0
+        with pytest.raises(fdtd.FDTDError, match="within 3 cells"):
+            fdtd.simulate(blocked, plane(), 2, spacings=PW_SPACINGS,
+                          boundary="open", pml_cells=PW_PML)
+    conductor = np.zeros((PW_N,) * 3, dtype=bool)
+    conductor[11, 11, 5] = True
+    with pytest.raises(fdtd.FDTDError, match="conductor"):
+        fdtd.simulate(eps, plane(), 2, spacings=PW_SPACINGS, boundary="open",
+                      pml_cells=PW_PML, pec=conductor)
+    # 3 cells clear on both sides is allowed
+    clear = eps.copy()
+    clear[10, 11, 11] = clear[20, 11, 11] = 4.0
+    fdtd.simulate(clear, plane(), 2, spacings=PW_SPACINGS, boundary="open",
+                  pml_cells=PW_PML)
+
+
+def test_a_plane_source_takes_a_direction_and_a_box_not_a_cell():
+    with pytest.raises(fdtd.FDTDError, match="no cell"):
+        fdtd.Source((1, 1, 1), kind="plane", direction="+x", box=PW_BOX,
+                    frequency=F0, bandwidth=BANDWIDTH)
+    with pytest.raises(fdtd.FDTDError, match="direction"):
+        plane(direction="x")
+    with pytest.raises(fdtd.FDTDError, match="not a direction or a box"):
+        pulse(direction="+x")
+    with pytest.raises(fdtd.FDTDError, match="empty"):
+        plane(box=((7, 7, 7), (7, 16, 16)))
 
 
 def test_a_cw_source_with_a_bandwidth_is_refused():
@@ -576,3 +822,124 @@ def test_a_cpml_that_does_not_fit_the_grid_is_refused():
     with pytest.raises(fdtd.FDTDError, match="CPML"):
         fdtd.simulate(np.ones((12, 12, 12), dtype=np.float32), pulse(),
                       n_steps=10, dx=DX, boundary="open", pml_cells=6)
+
+
+# ------------------------------------------------------------------- drawn
+
+#: A slow carrier, so a smooth drawing of it sits far below the 1 m grid's
+#: resolvable frequency c / 10 m (30 MHz, against 8 MHz here).
+SLOW = F0 / 3.0
+
+
+def drawn(samples, duration, **kwargs):
+    options = dict(cell=(6, 6, 6), frequency=SLOW, profile="drawn",
+                   samples=samples, duration=duration)
+    options.update(kwargs)
+    return fdtd.Source(**options)
+
+
+def test_a_drawn_waveform_is_resampled_to_dt_with_its_mean_removed():
+    """Samples span [0, duration] evenly; the grid reads them at whole steps,
+    mean removed, and zero after the duration. A duration that is not a whole
+    number of steps and a lopsided drawing, so an off-by-one step count or a
+    mean taken before resampling shows."""
+    samples = np.array([0.0, 3.0, 1.0, 2.0, 0.5])
+    duration = 37.3 * DT
+    source = drawn(samples, duration, amplitude=2.0)
+    source.bind(DT)
+    steps = np.arange(38) * DT                    # 0 .. 37 DT, all < duration
+    expected = np.interp(steps, np.linspace(0.0, duration, 5), samples)
+    expected -= expected.mean()
+    got = np.array([source.value(t) for t in steps])
+    np.testing.assert_allclose(got, 2.0 * expected, rtol=1e-12, atol=1e-12)
+    assert abs(got.sum()) < 1e-9 * np.abs(got).sum()
+    # the plane-wave feed reads between steps: straight lines, to zero at the end
+    assert source.value(10.5 * DT) == pytest.approx(0.5 * (got[10] + got[11]))
+    assert source.value(37.5 * DT) == pytest.approx(0.5 * got[37])
+    assert source.value(38 * DT) == 0.0 and source.value(-DT) == 0.0
+    assert source.end_time() == duration
+
+
+def test_a_drawn_pulse_drives_the_grid_like_the_pulse_itself():
+    """Drawing the pulse profile at 10 000 points must give the pulse's own run:
+    simulate binds the drawing to the dt it uses, on the same time axis."""
+    bandwidth = SLOW / 2.0
+    reference = fdtd.Source((6, 6, 6), frequency=SLOW, profile="pulse",
+                            bandwidth=bandwidth)
+    duration = reference.end_time()
+    times = np.linspace(0.0, duration, fdtd.MAX_DRAWN_SAMPLES)
+    samples = [fdtd.pulse_profile(t, SLOW, bandwidth) for t in times]
+    grid = np.ones((12, 12, 12), dtype=np.float32)
+    n_steps = steps_for(1.3 * duration)
+    want = fdtd.simulate(grid, reference, n_steps, probes=[(4, 7, 8, "z")],
+                         dx=DX)["traces"][0]
+    got = fdtd.simulate(grid, drawn(samples, duration), n_steps,
+                        probes=[(4, 7, 8, "z")], dx=DX)["traces"][0]
+    assert np.abs(want).max() > 0
+    assert np.abs(got - want).max() < 1e-3 * np.abs(want).max()
+
+
+def test_an_under_resolved_drawing_is_refused_naming_f_res():
+    """f_res = c / (10 |n|_max Delta_max). The grid is graded to 1.1 m and has
+    one eps = 4 node, so a check that used the finest spacing, or vacuum's
+    index, names a different frequency. A half-on, half-off drawing three
+    resolvable periods long puts well over 1% of its energy above f_res."""
+    spacings = (np.linspace(0.9, 1.1, 11), 1.0, 1.0)
+    grid = np.ones((12, 12, 12), dtype=np.float32)
+    grid[3, 3, 3] = 4.0
+    f_res = C / (10 * 2.0 * 1.1)
+    square = [1.0] * 50 + [0.0] * 50
+    with pytest.raises(fdtd.FDTDError, match=re.escape(f"{f_res:.4g} Hz")):
+        fdtd.simulate(grid, drawn(square, 3.0 / f_res), 10,
+                      spacings=spacings)
+    # the control: a smooth drawing on the same grid runs
+    duration = 6.0 / SLOW
+    t = np.linspace(0.0, duration, 400)
+    smooth = np.sin(2 * np.pi * SLOW * t) * np.sin(np.pi * t / duration) ** 2
+    run = fdtd.simulate(grid, drawn(smooth, duration), 200,
+                        probes=[(4, 7, 8, "z")], spacings=spacings)
+    assert np.abs(run["traces"]).max() > 0
+
+
+def test_a_drawing_finer_than_dt_is_judged_before_it_is_decimated():
+    """+1/-1 every quarter step: read at whole steps it is constant, so judging
+    the dt-resampled drawing would see nothing above f_res."""
+    samples = np.tile([1.0, -1.0], 200)
+    duration = (len(samples) - 1) * DT / 4.0
+    f_res = fdtd.resolvable_frequency((DX, DX, DX))
+    assert fdtd.drawn_energy_above(samples, duration, DT, f_res) > 0.5
+
+
+def test_a_drawing_with_nothing_left_after_its_mean_is_refused():
+    with pytest.raises(fdtd.FDTDError, match="flat"):
+        fdtd.drawn_energy_above([2.0, 2.0, 2.0], 50 * DT, DT, F0)
+    source = drawn([0.0, 1.0, 0.0], 1.5 * DT)
+    with pytest.raises(fdtd.FDTDError, match="two time steps"):
+        source.bind(DT)
+
+
+def test_a_drawn_waveform_is_at_most_ten_thousand_samples():
+    drawn(np.zeros(fdtd.MAX_DRAWN_SAMPLES), 1e-6)
+    with pytest.raises(fdtd.FDTDError, match="10000"):
+        drawn(np.zeros(fdtd.MAX_DRAWN_SAMPLES + 1), 1e-6)
+    with pytest.raises(fdtd.FDTDError, match="duration"):
+        drawn([0.0, 1.0], 0.0)
+    with pytest.raises(fdtd.FDTDError, match="drawn"):
+        fdtd.Source((6, 6, 6), frequency=F0, profile="cw", samples=[0, 1],
+                    duration=1e-6)
+
+
+def test_a_drawn_waveform_is_zero_mean_on_the_steps_the_run_takes():
+    """What binding to the run's own dt buys: the soft current's sum over the
+    steps the grid really takes is zero, so no static field is left. A
+    lopsided (all-positive) drawing on a graded grid, whose dt is not the
+    uniform-grid one."""
+    duration = 60.0 / SLOW
+    t = np.linspace(0.0, duration, 3000)
+    bump = np.sin(np.pi * t / duration) ** 2 * (1.5 + np.sin(2 * np.pi * SLOW * t))
+    source = drawn(bump, duration)
+    run = fdtd.simulate(np.ones((10, 10, 10), dtype=np.float32), source, 5,
+                        spacings=(np.linspace(0.8, 1.0, 9), 1.0, 1.0))
+    values = np.array([source.value(k * run["dt"])
+                       for k in range(int(duration / run["dt"]) + 2)])
+    assert abs(values.sum()) < 1e-9 * np.abs(values).sum()

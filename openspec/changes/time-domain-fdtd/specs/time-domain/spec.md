@@ -6,7 +6,18 @@
 
 The solver SHALL step E and H on a graded tensor-product Yee grid with
 dt = 0.99/(c·√(1/dx_min²+1/dy_min²+1/dz_min²)), so it never violates the 3-D
-Courant limit of the smallest cell.
+Courant limit of the smallest cell. When a dispersive metal is in the scene,
+dt SHALL be reduced to 0.98 of the largest step at which the metal's update is
+stable (von Neumann on a homogeneous metal with the finest spacings), and the
+run SHALL report the dt it used.
+
+#### Scenario: a metal shrinks dt only as far as it must
+- **WHEN** 5 nm gold is stepped at 0.99 of the Courant dt
+- **THEN** the stability check finds a growing mode (factor above 1.1) and the
+  run uses a dt between 0.9 and 0.99 of the Courant one
+- **AND** 2 nm gold runs at the Courant dt unchanged
+- **AND** with no metal, the same check reads 1.01 of the Courant dt as
+  growing, so it can see an unstable step
 
 #### Scenario: a closed metal box conserves energy
 - **WHEN** a pulse is launched in a lossless PEC box and the source has ended
@@ -34,6 +45,14 @@ leaves a static field that no absorbing boundary removes.
 #### Scenario: a source leaves no static field
 - **WHEN** any source profile is integrated over the run
 - **THEN** its integral is below 1e-3 of the integral of its absolute value
+
+#### Scenario: a CW source settles with no offset
+- **WHEN** a `cw` profile's running integral is averaged over whole periods
+  after its turn-on ramp
+- **THEN** the average is below 1e-4 of that integral's swing (a ramped
+  `envelope × sin` alone settles 1% off zero, which a long run's total
+  integral does not show; the profile is therefore the exact derivative of
+  `-envelope × cos(ωt)/ω`, the same pure sine once the ramp ends)
 
 ### Requirement: A metal-box pulse SHALL ring at the box's resonances
 
@@ -68,6 +87,16 @@ cavity solver.
 With boundary `open`, a 10-cell CPML SHALL absorb waves leaving the grid, so no
 reflection from the grid edge is shown as part of the simulation.
 
+#### Scenario: the layer's reflection is measured, not assumed
+- **WHEN** a pulse meets the 10-cell layer, measured on the exact 1-D reduction
+  of the solver's update with the solver's own layer coefficients
+  (`scripts/fdtd_cpml_reflection.py`)
+- **THEN** the reflected amplitude is below 1e-3 of the incident at normal
+  incidence, and below 5e-3 from 0 to 75 degrees at 10 to 40 cells per
+  wavelength
+- **AND** the same measurement with no layer (a bare wall) reads a reflection
+  above 0.5, so an instrument that sees nothing cannot pass the layer
+
 #### Scenario: benchmark V2
 - **WHEN** a CW point source runs in open vacuum to steady state
 - **THEN** at three or more probe distances r ≥ 2λ from the source, broadside
@@ -83,6 +112,57 @@ reflection from the grid edge is shown as part of the simulation.
   energy over the physical region (CPML excluded) is below 1e-4 of the peak
   energy, AND throughout the run the scattered-field region's field stays below
   1e-3 of the incident peak amplitude
+- **AND** it is checked for every direction and transverse polarisation on a
+  grid graded along the propagation axes, since the 1-D line takes that axis's
+  spacings
+- **AND** the scattered-field region is judged at every sample of every E
+  component, each at its own Yee position against the box faces, from a
+  running maximum of |E| rather than from probes
+- **AND** a run with no incident wave in the box, or with a non-finite result,
+  fails the benchmark
+
+### Requirement: Periodic faces at k = 0 SHALL repeat the cell
+
+The solver SHALL take a boundary per axis, `(bx, by, bz)`, each `metal`, `open`
+or `periodic` (a single kind still applies to all three). A `periodic` axis
+models the cell repeated forever along it with k = 0: the curl differences wrap
+from the last sample to the first. Node `n-1` of a periodic axis is the same
+point as node 0, one period on: the period is the sum of the axis's `n-1`
+spacings, the wrap's dual width is the mean of the last and first primal
+spacings, and `eps_r`, the conductor mask and every metal region SHALL hold the
+same material on those two node slabs, or the run is refused naming the axis.
+A point source on node 0 of a periodic axis is refused, naming node `n-1`. The
+slot at index `n-1` of a half-position sample along a periodic axis is a ghost:
+it is never written for E and never reported as a field value. Per-axis
+boundaries are a solver API; the form keeps `metal | open` until phase 6, and a
+Bloch phase (k ≠ 0) is phase 6.
+
+#### Scenario: the wrap is the cell repeated
+- **WHEN** a point source on uniformly spaced periodic x and y axes is moved by
+  a shift that crosses the seam on both axes
+- **THEN** every E component's peak field is the unshifted one rolled by that
+  shift, within 1e-6 of the peak, where the field varies across the period by
+  more than 1e-2 of the peak
+- **AND** an off-by-one in the wrap (the wrong source slab, the wrong copy, or
+  a periodic axis updated only over its interior) fails it
+
+#### Scenario: a closed periodic box conserves energy
+- **WHEN** a pulse runs in a box periodic on all three axes, graded on each
+- **THEN** after the source ends the conserved energy varies by less than 1e-5
+  of its mean, and a wrong wrap width fails it
+
+#### Scenario: a plane wave across periodic faces
+- **WHEN** a plane wave travels along an `open` axis with both other axes
+  `periodic` and its box spanning them (node 0 to node `n-1`)
+- **THEN** every E component's peak is uniform across the periodic axes within
+  1e-6 of the incident peak, every ghost slot reads 0, and the field outside
+  the two injecting faces stays below 1e-3 of the incident
+- **AND** benchmark V3 passes in that setup
+  (`scripts/fdtd_bench_v3.py --periodic-transverse N`)
+- **AND** a plane wave is refused with a message when its travel axis is not
+  `open`, when its two transverse axes are not both `open` or both
+  `periodic`, when any axis is `metal`, or when its box does not span a
+  periodic axis
 
 ### Requirement: The plane-wave source SHALL be a clean total-field/scattered-field box
 
@@ -90,7 +170,27 @@ A `plane` source SHALL use a TF/SF box with a 1-D auxiliary incident grid that
 uses the same dt and the same graded spacings along the propagation axis. The
 box SHALL sit at least 3 cells from every object and at least 3 cells from the
 CPML. A polarisation parallel to the propagation direction SHALL be refused
-before it is queued.
+before it is queued. The box is given as two inclusive corner nodes; the
+incident wave is defined in one background medium, so every cell within 3 of a
+face, on either side, SHALL be that medium (objects sit wholly inside the core
+or wholly outside), and a box that breaks either clearance SHALL be refused
+with a message naming the axis or the offending node. The 1-D line is padded
+beyond the 3-D grid and closed by its own CPML, so its own end reflections
+never reach the box. With both transverse axes periodic, the box spans them,
+the clearance applies along the travel axis only, and the wave enters through
+the two faces normal to its direction.
+
+#### Scenario: a plane wave leaves nothing outside its box
+- **WHEN** a plane-wave pulse in any of the six directions, with either
+  transverse polarisation, crosses an empty box on a graded grid
+- **THEN** just outside every face the field stays below 1e-3 of the incident
+  peak, AND a dielectric block inside the same box scatters above 1e-2 to the
+  same probes
+
+#### Scenario: a box too close to an object or the CPML is refused
+- **WHEN** an object, a conductor or the CPML lies within 3 cells of a box face
+- **THEN** the run is refused with a message naming the clearance and where it
+  is broken
 
 #### Scenario: a longitudinal polarisation is refused
 - **WHEN** the form asks for a plane wave polarised along its direction
@@ -164,18 +264,55 @@ bounding box. An E sample on a metal face SHALL take the metal. A run whose
 pulse band leaves the paper's fitted range for a metal in the scene SHALL be
 refused before it is queued.
 
+#### Scenario: the stepped metal has the model's susceptibility
+- **WHEN** a metal's term is driven by a sinusoidal field at 20 time steps
+  per radian (Au at 1 and 3 eV, Ag and Cr at 2 eV)
+- **THEN** the polarisation it builds matches the model's χ(ω) within 1.5%
+
+#### Scenario: a face sample takes the metal and eps_inf = 1
+- **WHEN** a single metal node sits next to a dielectric
+- **THEN** each E component takes the metal at exactly the two samples whose
+  segment touches the node
+- **AND** those samples step with ε∞ = 1 whatever the neighbouring permittivity
+
+#### Scenario: a metal near a plane wave's box is refused
+- **WHEN** a metal region lies within 3 cells of a plane wave's box faces
+- **THEN** the run is refused with a message naming a dispersive metal and
+  its node
+
 #### Scenario: the material table matches the paper
-- **WHEN** ε(ω) is computed from the library at three photon energies per metal
-- **THEN** it matches an independently published Rakić Lorentz-Drude n, k
-  dataset (cited in the test) within 2%
+- **WHEN** ε(ω) is computed from the library at 12 wavelengths per metal,
+  spread through the published table from its shortest to its longest
+- **THEN** n + ik matches an independently published Rakić Lorentz-Drude n, k
+  dataset (cited in the test) within 1e-3 (relative) at every one, tight
+  enough that a 10% typo in a single model parameter fails
 
 #### Scenario: benchmark V4
 - **WHEN** a pulse reflects at normal incidence from a gold slab at least 10
-  skin depths thick, with at least 4 cells per skin depth
+  skin depths thick, with at least 4 cells per skin depth, on an `open` travel
+  axis with periodic transverse faces (so the slab is infinite, as the Fresnel
+  result assumes)
 - **THEN** the reflectance, measured as |scattered/incident|² at a
   scattered-field probe, is within 0.02 (absolute) of the analytic Fresnel
   reflectance for the same model, over the band where the incident spectrum is
   at least 1e-2 of its peak
+
+#### Scenario: the V4 bench judges only what it measured
+- **WHEN** the V4 bench runs
+- **THEN** it takes the incident spectrum from a reference run with the same
+  metal term over an empty region (so both runs share one time step), and
+  transforms both traces without a window
+- **AND** it fails if either trace still holds more than 1e-3 of its peak in
+  its last 5% (a cut-off record), or if the ratio is not finite in the band
+- **AND** it exits 2 without running when the pulse band leaves the metal's
+  fit, and exits 2 rather than passing when the setup has fewer than 4 cells
+  per skin depth or a slab under 10 skin depths
+
+#### Scenario: a metal slab across periodic faces is uniform
+- **WHEN** a plane wave meets a metal slab that spans every periodic axis
+- **THEN** E inside the slab is the same at every transverse sample within
+  1e-6 of its peak (the metal term advances every sample the E update does,
+  including the last row of a periodic axis)
 
 ### Requirement: Thin layers SHALL be resolved, not lost
 
@@ -210,6 +347,29 @@ refused before it is queued, naming f_res.
 - **WHEN** a drawn waveform has a sharp edge putting more than 1% of its
   spectral energy above f_res
 - **THEN** the form shows the refusal, naming f_res, and no job is queued
+
+#### Scenario: the drawing is read the way it was drawn
+- **WHEN** a drawn waveform of N samples and duration T is resampled
+- **THEN** the samples span [0, T] evenly, both ends included, joined by
+  straight lines; the grid reads them at the run's own steps (after any
+  dispersive dt reduction), and the waveform's sum over those steps is zero
+
+#### Scenario: detail finer than dt is judged, not decimated away
+- **WHEN** a drawing's sample spacing is finer than dt
+- **THEN** its spectral energy above f_res is measured at the drawing's own
+  spacing, so detail that reading at dt would alias cannot pass the check
+
+#### Scenario: a drawing with nothing left is refused
+- **WHEN** a drawing is constant (nothing remains once its mean is removed) or
+  lasts under two time steps
+- **THEN** it is refused with a message saying so, not run as a silent source
+
+#### Scenario: the solver repeats the check as a backstop
+- **WHEN** a drawn source reaches the solver
+- **THEN** the solver refuses it, naming f_res, if more than 1% of its energy
+  is above f_res computed from the dielectric index alone; the queue-time
+  check, which knows the metals' |n|, is the one that keeps the job out of the
+  queue
 
 ### Requirement: The scene's physical size SHALL come from the owner's units and scale
 
