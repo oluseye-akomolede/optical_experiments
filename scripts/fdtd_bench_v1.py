@@ -46,9 +46,20 @@ land a little low; the run prints that estimate next to the measured errors. And
 a point source excites only the modes it overlaps, so the run reports how many
 of the analytic modes were seen rather than pretending the rest were checked.
 
-MEASURED ON THE ORIN, default box: 5.7 s wall, 44 MB peak RSS, 4 modes matched
-within 0.13% against a 0.638% dispersion floor. That is the number to size a
-cell cap from; the cost line below prints more of them.
+THE GATE IS THE SPEC'S 1%, AND EVERY EXCITABLE MODE MUST BE FOUND. A peak more
+than 1% from its mode fails the run, and so does an analytic mode the source
+and probe both overlap that no peak was matched to: a dropped family is a
+failure, not a smaller count. Peaks are matched to modes one-to-one (closest
+pair first), because nearest-mode matching let two peaks claim the same mode --
+measured on the default box, the 012 line at -0.30% was labelled 111 at +0.26%
+and the run reported 4 of 5 modes when all 5 were there. The tolerance widens
+only to 2 x the grid's own dispersion floor, and says so when it does; the
+default 20 cells per wavelength keeps that floor (0.40%) inside 1%.
+
+MEASURED. Orin at the old default of 16 cells per wavelength: 5.7 s wall, 44 MB
+peak RSS. The VM at 20 (numpy, 2 threads): 9.7 s, 7500 cells x 6847 steps x 3
+runs, all 5 distinct modes within 0.30%. The cost line prints the cell-step
+rate a cap can be sized from.
 
 THE CAVITY SOLVER IS NOT RUN HERE. It is the other leg of the comparison and it
 is not cheap -- it tetrahedralizes the box with TetGen and solves a sparse
@@ -164,6 +175,62 @@ def find_peaks(frequencies, amplitude, f_lo, f_hi, n_peaks, floor=0.08):
                   for i in kept)
 
 
+#: The smallest |source shape x probe shape| at which a mode counts as one the
+#: run must find. The shape factors are each at most 1; a mode under this is
+#: one the run cannot be expected to see above the peak floor, and it is listed
+#: as not gated rather than silently dropped.
+EXCITABLE = 0.05
+
+
+def coupling(triple, box, dx, cell, probe):
+    """How strongly a point source at ``cell`` and a probe at ``probe`` see a mode.
+
+    For each E component, the product of the analytic mode shape at the two
+    Yee sample points (the component's own axis is offset by half a cell, as
+    on the grid): cos along its own axis, sin along the other two. The best
+    component wins, since the run drives and records all three. A degenerate
+    TE/TM pair spans the plane normal to k, so each component that the factors
+    allow is reachable by one of the pair.
+    """
+    best = 0.0
+    for own in range(3):
+        factor = 1.0
+        for axis in range(3):
+            shift = 0.5 if axis == own else 0.0
+            wave = math.cos if axis == own else math.sin
+            for index in (cell[axis], probe[axis]):
+                factor *= wave(triple[axis] * math.pi * (index + shift) * dx
+                               / box[axis])
+        best = max(best, abs(factor))
+    return best
+
+
+def excitable_modes(labels, box, dx, cell, probe):
+    """Distinct mode keys (as in ``labels``) the run must find."""
+    return sorted(key for key, triples in labels.items()
+                  if max(coupling(t, box, dx, cell, probe) for t in triples)
+                  >= EXCITABLE)
+
+
+def match_peaks(peaks, keys):
+    """``{peak index: mode key}``, one-to-one, closest relative pair first.
+
+    Nearest-mode matching lets two peaks claim one mode and hides the mode the
+    second peak really is; here each mode takes at most one peak.
+    """
+    pairs = sorted((abs(value - fdtd.C0 * key / (2 * math.pi))
+                    / (fdtd.C0 * key / (2 * math.pi)), index, key)
+                   for index, value in enumerate(peaks) for key in keys)
+    taken_peaks, taken_keys, assigned = set(), set(), {}
+    for _error, index, key in pairs:
+        if index in taken_peaks or key in taken_keys:
+            continue
+        assigned[index] = key
+        taken_peaks.add(index)
+        taken_keys.add(key)
+    return assigned
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--a", type=float, default=40.0, help="box side along x")
@@ -172,12 +239,16 @@ def main(argv=None) -> int:
     parser.add_argument("--units", default="mm", choices=sorted(UNITS_TO_M))
     parser.add_argument("--n-modes", type=int, default=6,
                         help="how many analytic modes to chase")
-    parser.add_argument("--cells-per-wavelength", type=float, default=16.0,
+    parser.add_argument("--cells-per-wavelength", type=float, default=20.0,
                         help="grid resolution at the HIGHEST mode chased")
     parser.add_argument("--record-periods", type=float, default=120.0,
-                        help="periods of the fundamental in the recorded window")
-    parser.add_argument("--tolerance", type=float, default=3.0,
-                        help="percent; every resolvable peak must be within this")
+                        help="periods of the fundamental in the recorded window; "
+                             "a FLOOR -- the window is lengthened to resolve the "
+                             "closest analytic pair in the band")
+    parser.add_argument("--max-record-periods", type=float, default=4000.0,
+                        help="refuse rather than record longer than this")
+    parser.add_argument("--tolerance", type=float, default=1.0,
+                        help="percent; the spec's gate (spec.md, benchmark V1)")
     parser.add_argument("--xp", default="numpy", choices=("numpy", "cupy"),
                         help="cupy is the Jetson path; the same update code runs")
     parser.add_argument("--compare-cavity", action="store_true",
@@ -238,16 +309,40 @@ def main(argv=None) -> int:
     source_steps = int(math.ceil(
         fdtd.Source(cell, frequency=carrier, profile="pulse",
                     bandwidth=bandwidth).end_time() / dt))
-    window_steps = int(math.ceil(args.record_periods / f_band_lo / dt))
+    # The record must resolve the closest pair of modes the peak search can
+    # see, or two lines merge into one peak between them and the error is the
+    # record length, not the solver: measured on the Orin at 128 cells per
+    # wavelength, 012 sits 84 MHz from 111, and a 10-period record (bin
+    # ~360 MHz) read 1.29% where a 40-period one read 0.32%. A Hann window's
+    # main lobe is 4 bins wide, so a gap of 4 bins (record >= 4 / gap)
+    # separates two lines. Modes just outside the chased set count too: the
+    # search window is 0.8 x f_lo .. 1.2 x f_hi and the pulse reaches them.
+    span_lo, span_hi = 0.8 * f_band_lo, 1.2 * f_band_hi
+    visible = sorted(f for f in (fdtd.C0 * k / (2.0 * math.pi) for k in labels)
+                     if span_lo <= f <= span_hi)
+    gaps = [(b - a, a, b) for a, b in zip(visible, visible[1:])]
+    gap, gap_lo, gap_hi = min(gaps) if gaps else (math.inf, None, None)
+    record = max(args.record_periods / f_band_lo, 4.0 / gap)
+    if record * f_band_lo > args.max_record_periods:
+        print(f"CANNOT RESOLVE: modes at {gap_lo/1e9:.4f} and {gap_hi/1e9:.4f} GHz "
+              f"are {gap/1e6:.4g} MHz apart, so separating them needs "
+              f"{record * f_band_lo:.0f} periods of the fundamental, over "
+              f"--max-record-periods {args.max_record_periods:g}; a 1% gate on "
+              f"merged peaks would test the record length, not the solver")
+        return 2
+    window_steps = int(math.ceil(record / dt))
     n_steps = source_steps + window_steps
 
     cells = n_a * n_b * n_c
     field_mb = 6 * cells * 4 / 1e6
     dispersion = dispersion_error(dx, fdtd.C0 / f_band_hi)
-    # The grid has its own error floor, so a tolerance tighter than a couple of
-    # times that is a test of the resolution, not of the solver. Widening it is
-    # printed rather than silent.
-    tolerance = max(args.tolerance, 200.0 * 2.0 * dispersion)
+    # The grid has its own error floor, so a tolerance tighter than twice that
+    # is a test of the resolution, not of the solver. ``dispersion`` is a
+    # fraction and the tolerance is in percent, so twice the floor is
+    # 100 * 2 * dispersion. Widening is printed rather than silent.
+    floor = 100.0 * 2.0 * dispersion
+    tolerance = max(args.tolerance, floor)
+    widened = tolerance > args.tolerance
     print(f"box        {args.a:g} x {args.b:g} x {args.d:g} {args.units} requested "
           f"-> {n_a} x {n_b} x {n_c} cells")
     print(f"walls      {box[0]*1e3:.4g} x {box[1]*1e3:.4g} x {box[2]*1e3:.4g} mm apart "
@@ -259,10 +354,28 @@ def main(argv=None) -> int:
     print(f"source     pulse carrier {carrier/1e9:.4g} GHz, bandwidth "
           f"{bandwidth/1e9:.4g} GHz, at cell {cell}; one run per E component")
     print(f"probe      Ex, Ey, Ez at cell {probe}; peaks from |Ex|^2+|Ey|^2+|Ez|^2")
+    if gap_lo is not None:
+        lengthened = record > args.record_periods / f_band_lo * 1.0000001
+        print(f"record     {record * f_band_lo:.0f} periods of the fundamental: the "
+              f"closest pair in the search band is {gap_lo/1e9:.4f} / "
+              f"{gap_hi/1e9:.4f} GHz, {gap/1e6:.4g} MHz apart, which needs "
+              f">= {4.0 / gap * 1e9:.4g} ns"
+              + (f" (lengthened from --record-periods {args.record_periods:g})"
+                 if lengthened else ""))
     print(f"steps      {n_steps} ({source_steps} of source + {window_steps} recorded) "
           f"x {len(COMPONENTS)} runs, dt = {dt*1e12:.4g} ps")
     print(f"dispersion at the top mode: {dispersion:.3%} (the Yee phase error, so "
           f"this is the floor on the comparison)")
+    if widened:
+        print(f"TOLERANCE WIDENED from {args.tolerance:g}% to {tolerance:.3g}% "
+              f"(2 x the dispersion floor): this run does not test the spec's "
+              f"{args.tolerance:g}%; raise --cells-per-wavelength for one that does")
+    chased = sorted(set(round(float(v), 9) for v in modes))
+    excitable = excitable_modes({k: labels[k] for k in chased}, box, dx, cell, probe)
+    weak = [k for k in chased if k not in excitable]
+    print(f"excitable  {len(excitable)} distinct mode(s) overlap both the source "
+          f"and the probe (coupling >= {EXCITABLE})"
+          + (f"; {len(weak)} do not and are not gated" if weak else ""))
 
     grid = xp.ones((n_a, n_b, n_c), dtype=xp.float32)
     probes = [tuple(probe) + (component,) for component in COMPONENTS]
@@ -318,29 +431,50 @@ def main(argv=None) -> int:
     print(f"\nrecorded window {span*1e9:.4g} ns, bin {1.0/span/1e6:.4g} MHz "
           f"(peaks placed by parabola, so not quantised to the bin)")
     print(f"{'peak (GHz)':>12} {'height':>8} {'analytic (GHz)':>15} {'error':>9}  mode")
+    # Every mode the search band can see is a candidate, chased or not, so a
+    # peak from a mode just above the chased set is named rather than stray;
+    # only the chased, excitable ones are required to be found.
+    candidates = sorted(k for k in labels
+                        if span_lo <= fdtd.C0 * k / (2.0 * math.pi) <= span_hi)
+    assigned = match_peaks([value for value, _h, _c in peaks], candidates)
     worst = 0.0
     matched = set()
-    for value, height, component in peaks:
-        nearest = min(oracle, key=lambda k: abs(fdtd.C0 * k / (2 * math.pi) - value))
-        analytic = fdtd.C0 * nearest / (2.0 * math.pi)
+    stray = 0
+    for index, (value, height, component) in enumerate(peaks):
+        key = assigned.get(index)
+        if key is None:
+            stray += 1
+            print(f"{value/1e9:12.4f} {100*height/loudest:7.1f}% {'-':>15} "
+                  f"{'-':>9}  no analytic mode left to match")
+            continue
+        analytic = fdtd.C0 * key / (2.0 * math.pi)
         error = 100.0 * (value - analytic) / analytic
         worst = max(worst, abs(error))
-        matched.add(round(float(nearest), 9))
-        names = ", ".join("".join(str(i) for i in t)
-                          for t in labels[round(float(nearest), 9)])
+        if abs(error) <= tolerance:
+            matched.add(key)
+        names = ", ".join("".join(str(i) for i in t) for t in labels[key])
         print(f"{value/1e9:12.4f} {100*height/loudest:7.1f}% {analytic/1e9:15.4f} "
               f"{error:+8.2f}%  {names}")
 
-    distinct = len(set(round(float(k), 9) for k in modes))
-    verdict = "PASS" if worst <= tolerance else "FAIL"
+    missing = sorted(k for k in excitable if k not in matched)
+    failures = []
+    if worst > tolerance:
+        failures.append(f"worst error {worst:.2f}% is over {tolerance:.3g}%")
+    if missing:
+        failures.append(
+            f"{len(missing)} excitable mode(s) had no peak within tolerance: "
+            + ", ".join(f"{fdtd.C0 * k / (2 * math.pi) / 1e9:.4f} GHz ("
+                        + ", ".join("".join(map(str, t)) for t in labels[k]) + ")"
+                        for k in missing))
+    if stray:
+        failures.append(f"{stray} peak(s) matched no analytic mode")
+    verdict = "FAIL" if failures else "PASS"
     print(f"\nV1 {verdict}: worst error {worst:.2f}% over {len(peaks)} peak(s), "
-          f"tolerance {tolerance:.3g}% (dispersion floor {dispersion:.3%})")
-    if len(matched) == distinct:
-        print(f"all {distinct} chased analytic modes were excited by the three "
-              f"point sources")
-    else:
-        print(f"{len(matched)} of {distinct} chased analytic modes were excited by "
-              f"the three point sources; the rest need a source that overlaps them")
+          f"{len(matched & set(excitable))} of {len(excitable)} excitable mode(s) "
+          f"found, tolerance {tolerance:.3g}% (dispersion floor {dispersion:.3%})"
+          + (" -- WIDENED past the spec's gate" if widened else ""))
+    for failure in failures:
+        print(f"  {failure}")
     if worst > tolerance:
         print("A residual the size of the dispersion line above is the grid; "
               "anything larger is not.")

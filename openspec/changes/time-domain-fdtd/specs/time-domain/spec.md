@@ -38,6 +38,15 @@ the time-domain solver agrees with the analytic cavity and with the cavity solve
 - **WHEN** a broadband pulse is run in an empty rectangular metal box
 - **THEN** each spectrum peak in the pulse band is within 1% of an analytic
   rectangular-cavity frequency
+- **AND** peaks are matched to modes one-to-one, and every analytic mode that
+  both the source and the probe overlap has a peak within 1%; a missing mode
+  fails the benchmark
+- **AND** the recorded window is at least 4 / (the smallest gap between
+  distinct analytic modes in the search band), so neighbouring modes don't merge
+  into one peak; if that needs more than the configured maximum record, the
+  benchmark refuses and names the pair rather than running
+- **AND** the 1% tolerance is widened only to twice the grid's own dispersion
+  error, and the output says so when it is
 
 ### Requirement: An open boundary SHALL absorb outgoing waves
 
