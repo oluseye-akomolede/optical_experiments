@@ -37,6 +37,14 @@ import vm from 'node:vm';
 const here = dirname(fileURLToPath(import.meta.url));
 const viewerSrc = readFileSync(join(here, '..', '..', 'web', 'static', 'viewer.js'), 'utf8');
 
+// The REAL helpers viewer.js imports from bands.js. The harness strips imports,
+// so inside the vm these are free identifiers resolved against the context --
+// injecting the real ones means the caption test is not measuring a double.
+import { bandCount, bandGaps } from '../../web/static/bands.js';
+const FIXTURES = JSON.parse(
+  readFileSync(join(here, 'fixtures', 'band_diagrams.json'), 'utf8'),
+);
+
 // --- A DOM just large enough for the finished-job path ---------------------
 class El {
   constructor(tag = 'div', id = '') {
@@ -73,14 +81,20 @@ class El {
 function makeDocument(withJob) {
   const ids = ['job', 'status-text', 'stage-text', 'bar', 'elapsed', 'queue-line',
                'progress', 'failure', 'failure-text', 'viewer', 'modes-card',
-               'modes-body', 'scene', 'viewer-fallback'];
+               'modes-body', 'scene', 'viewer-fallback',
+               // The band panel, reached only by a pc job. Named here rather
+               // than left out because a missing element makes renderBands
+               // return early at `if (!svg)` -- the caption test would then
+               // assert on a stub that never gave the page its panel, and
+               // read as "the caption is empty" for a harness reason.
+               'bands-card', 'bands-svg', 'bands-caption', 'bands-gaps-body'];
   const byId = {};
   for (const id of ids) byId[id] = new El('div', id);
   // The template's own starting states (web/templates/job.html): the viewer,
-  // the modes card and the failure box start hidden, and the progress block
-  // starts visible. A stub that had them all visible would make "the viewer
-  // un-hid" and "the failure box stayed hidden" both vacuous.
-  for (const id of ['viewer', 'modes-card', 'failure', 'queue-line']) {
+  // the modes card, the band card and the failure box start hidden, and the
+  // progress block starts visible. A stub that had them all visible would make
+  // "the viewer un-hid" and "the failure box stayed hidden" both vacuous.
+  for (const id of ['viewer', 'modes-card', 'bands-card', 'failure', 'queue-line']) {
     byId[id].hidden = true;
   }
   // The auto-init guard: `const root = document.getElementById('job');
@@ -333,4 +347,63 @@ test('a running-status payload schedules a re-poll and leaves the viewer hidden'
   assert.equal(doc._byId.failure.hidden, true,
     'a running job is not a failure and must not show the failure text');
   assert.equal(errors.length, 0, 'a running job must not report an error');
+});
+
+test('a pc job captions the BAND count, not the k-point count', async () => {
+  // The caption is the app's headline sentence for a finished pc job, and it
+  // read ``diagrams[0].bands.length`` -- the OUTER array, which on the wire is
+  // the K-POINT count. On a real 30x4 diagram it said "30 bands". Reverting
+  // ``bandCount(diagrams[0])`` back to that leaves every other test green: the
+  // whole suite runs with the imports stripped, so bandCount is a free
+  // identifier no test supplied, and only a test that DRIVES a pc payload
+  // through the real renderBands can see the caption at all.
+  //
+  // The fixture is 3 k-points x 2 bands, so the two counts differ and a
+  // transposed caption cannot accidentally agree.
+  const ctx = loadViewer();
+  const doc = ctx.document;
+  const root = new El('div', 'job');
+  root.dataset.jobId = 'JOB-PC';
+  doc._byId.job = root;
+
+  const diagram = FIXTURES.jetson_tm_slice;
+  assert.equal(diagram.bands.length, 3, 'the fixture is 3 k-points ...');
+  assert.equal(diagram.bands[0].length, 2, '... by 2 bands');
+
+  // The stripped imports, supplied as the real functions.
+  ctx.bandCount = bandCount;
+  ctx.bandGaps = bandGaps;
+  // The plot itself is tested in test_bandplot.mjs; stub it at the boundary but
+  // RECORD the call, so "the caption was set" cannot be satisfied by a
+  // renderBands that never reached the plot.
+  const drawn = [];
+  ctx.drawBandDiagram = (svg, diagrams) => { drawn.push(diagrams); };
+
+  const data = { status: 'done', kind: 'pc', bands: diagram };
+  ctx.fetch = async () => ({ ok: true, status: 200, json: async () => data });
+
+  vm.runInContext('init(document.getElementById("job"))', ctx);
+  await new Promise((r) => setTimeout(r, 30));
+
+  assert.equal(doc._byId['bands-card'].hidden, false,
+    'a finished pc job must un-hide the band panel');
+  assert.equal(drawn.length, 1, 'renderBands must reach the plot');
+  assert.equal(drawn[0].length, 1, 'one diagram in, one diagram drawn');
+  assert.equal(doc._byId.viewer.hidden, true,
+    'a pc job has no 3-D field, so the cavity viewer must stay hidden');
+
+  const caption = String(doc._byId['bands-caption'].textContent);
+  assert.match(caption, /^2 bands/,
+    `the caption must count BANDS (2), not k-points (3): "${caption}"`);
+  assert.match(caption, /TM polarisation/,
+    `the caption must name the polarisation it drew: "${caption}"`);
+
+  // The gap table is the second real reader of the same payload, so it is
+  // asserted here too: band 1 tops at 0.281, band 2 bottoms at 0.421, so the
+  // panel must show one gap row rather than "no complete gap".
+  const rows = doc._byId['bands-gaps-body'].children;
+  assert.equal(rows.length, 1,
+    `the panel must show the one gap the diagram has, got ${rows.length} rows`);
+  assert.match(String(rows[0].innerHTML), /0\.2810[\s\S]*0\.4210/,
+    `the gap row must carry the measured bounds: ${rows[0].innerHTML}`);
 });

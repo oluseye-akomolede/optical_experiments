@@ -114,12 +114,29 @@ export function drawBandDiagram(svg, diagrams, { width = 640, height = 380 } = {
     const nB = bandCount(diagram);
     for (let band = 0; band < nB; band += 1) {
       let d = '';
+      // Is there a subpath the next point could extend? A ragged row -- one that
+      // is shorter than the widest -- has no value for this band, and
+      // ``scale.y(undefined)`` is NaN. NaN in an SVG path ``d`` is not an error
+      // any browser reports: it silently drops the whole subpath, so the curve
+      // vanishes while the gap table beside it (bandGaps skips non-finite
+      // values) still counts that band. So a missing value SKIPS the point and
+      // starts a new subpath, which is the same claim the table makes: this
+      // k-point has no value for this band.
+      let pen = false;
       for (let i = 0; i < nK; i += 1) {
         const value = diagram.bands[i][band];
+        if (!Number.isFinite(value)) {
+          pen = false;
+          continue;
+        }
         const x = scale.x(axis.lengths[i] ?? 0);
         const y = scale.y(value);
-        d += `${i === 0 ? 'M' : 'L'}${x.toFixed(2)},${y.toFixed(2)} `;
+        d += `${pen ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)} `;
+        pen = true;
       }
+      // A band with no finite value anywhere draws nothing at all, rather than
+      // an empty path element that reads as a curve of zero length.
+      if (!d) continue;
       svg.appendChild(el('path', {
         d: d.trim(), fill: 'none', stroke: colour, 'stroke-width': '1.6',
         'stroke-linejoin': 'round',

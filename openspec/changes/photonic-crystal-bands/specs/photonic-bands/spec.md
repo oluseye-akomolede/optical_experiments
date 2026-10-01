@@ -216,6 +216,15 @@ inputs are constrained to expose it.
 - **AND** a flat band (min === max, as the empty lattice produces) yields a
   finite y-range rather than a degenerate one
 
+#### Scenario: a missing value is skipped by the plot and the table alike
+- **WHEN** a diagram has a row shorter than the widest (a shape the server's
+  `_band_payload` refuses, but a reader may still be handed)
+- **THEN** `bandGaps` skips non-finite values, so a ragged row cannot erase a gap
+- **AND** the renderer puts no `NaN` into a path `d` — it skips the point and
+  starts a new subpath, since a browser silently drops a subpath containing NaN
+- **AND** a band with no finite value anywhere draws no path element at all,
+  rather than an empty one that reads as a curve of zero length
+
 ### Requirement: A photonic job SHALL reuse the cavity job path, discriminated by kind
 
 A pc job SHALL live in the same `mse.jobs` table as a cavity job, told apart by a

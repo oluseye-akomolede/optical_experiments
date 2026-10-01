@@ -133,6 +133,35 @@ test('an empty diagram draws nothing and does not throw', () => {
   assert.ok(svg.children.length > 0, 'the renderer drew nothing for a real diagram');
 });
 
+test('a ragged diagram draws no NaN into its path data', () => {
+  // A RAGGED diagram -- rows of different lengths -- is a shape the server's
+  // own validator (_band_payload) REJECTS, so it cannot arrive from production.
+  // It is here because the renderer is a reader of whatever it is handed, and
+  // the band-wise loop reaches ACROSS rows: 8e2d60e's reader drew one path per
+  // row and never looked past a row's end, so it emitted no NaN, and the
+  // band-wise one that replaced it hit `undefined`. scale.y(undefined) is NaN,
+  // and a NaN in an SVG path `d` is not an error the browser reports -- it
+  // silently drops the whole subpath, so the plot would lose a curve while the
+  // gap table beside it (bandGaps skips non-finite values) still counted that
+  // band. Plot and table must agree about which values exist.
+  //
+  // Deliberately NOT in fixtures/band_diagrams.json: that file's contract is
+  // that every entry passes _band_payload, which this one must not.
+  const ragged = {
+    polarisation: 'TM',
+    labels: ['Γ', 'X', 'M'],
+    k_points: [[0, 0], [1, 0], [1, 1]],
+    bands: [[0, 1, 2], [3], [4, 5]],
+  };
+  drawBandDiagram(svg, [ragged]);
+  const paths = svg.children.filter((c) => c.tagName === 'path');
+  assert.equal(paths.length, 3, 'one path per band in the widest row');
+  for (const p of paths) {
+    assert.ok(!/NaN/.test(p.attributes.d),
+      `a ragged diagram put NaN in path data: ${p.attributes.d}`);
+  }
+});
+
 test('the shared frame is fixed once, so ticks and marks cannot disagree', () => {
   // The viewBox is set from the SAME width/height the scale used. If it were
   // set independently, a caller passing a size would get a frame the marks were
