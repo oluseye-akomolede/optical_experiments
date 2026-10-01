@@ -557,14 +557,28 @@ class _PlaneWave:
         sign = 1.0 if p == (a + 1) % 3 else -1.0
         self.h_coef = -sign * dt / MU0
         self.e_coef = -sign * dt / (EPS0 * background)
-        # A hard source two nodes outside the 3-D grid, on the side the wave
-        # comes from: the wave it launches the other way goes into the CPML.
-        if source.direction[0] == "+":
+        # The feed is a one-way TF/SF point on the line itself, two nodes
+        # outside the 3-D grid on the side the wave comes from: nodes from the
+        # feed onward carry the wave, the side behind it carries only what the
+        # line scatters, into its CPML. NOT a hard source: a node clamped to
+        # the profile is clamped to zero once the pulse ends, a wall that
+        # traps the small reflections off a graded axis between it and the
+        # box (measured: 2e-4 of the peak energy left on a +/-10% grading,
+        # ringing on after 1200 steps).
+        self.travel = 1.0 if source.direction[0] == "+" else -1.0
+        if self.travel > 0:
             self.feed = INCIDENT_PML_CELLS + 2
+            self.feed_h = self.feed - 1           # H sample behind the feed
         else:
             self.feed = length - 1 - (INCIDENT_PML_CELLS + 2)
+            self.feed_h = self.feed
         self.dt = dt
-        self.E1[self.feed] = source.value(0.0)
+        self.speed = C0 / math.sqrt(background)
+        self.feed_width_h = float(line[self.feed_h])
+        self.feed_width_e = float(_dual_spacing(line)[self.feed])
+        # The incident H that goes with E = g(t -/+ x/v): from the line's own
+        # update dH/dt = (h_coef/dt) dE/dx.
+        self.h_of_e = -self.travel * self.h_coef / (dt * self.speed)
 
         # ---- the eight face corrections ----------------------------------
         # Each entry: (family, target component, target slice, coefficient
@@ -641,24 +655,34 @@ class _PlaneWave:
         """After the 3-D H update: uses the incident E at the same level, n."""
         self._apply("H", h_fields)
 
-    def advance_h(self):
-        """The incident H from n-1/2 to n+1/2."""
+    def advance_h(self, step: int):
+        """The incident H from n-1/2 to n+1/2 (n = ``step``)."""
         raw = (self.E1[1:] - self.E1[:-1]) / self.P1
         self.psi_h *= self.bh
         self.psi_h += self.ch * raw
         self.H1 += self.h_coef * (raw + self.psi_h)
+        # The H sample behind the feed differenced the feed's total E; it
+        # wants a scattered field, so take the injected E back out.
+        injected = self.source.value(step * self.dt)
+        self.H1[self.feed_h] -= (self.travel * self.h_coef * injected
+                                 / self.feed_width_h)
 
     def correct_e(self, e_fields: dict):
         """After the 3-D E update: uses the incident H at n+1/2."""
         self._apply("E", e_fields)
 
     def advance_e(self, step: int):
-        """The incident E from n to n+1, and the feed at the new time."""
+        """The incident E from n to n+1 (n = ``step``)."""
         raw = (self.H1[1:] - self.H1[:-1]) / self.D1
         self.psi_e *= self.be
         self.psi_e += self.ce * raw
         self.E1[1:-1] += self.e_coef * (raw + self.psi_e)
-        self.E1[self.feed] = self.source.value((step + 1) * self.dt)
+        # The feed's E differenced the scattered H behind it; it wants a
+        # total, so add the injected H there, at n+1/2 and half a cell back.
+        lag = 0.5 * self.feed_width_h / self.speed
+        injected = self.h_of_e * self.source.value((step + 0.5) * self.dt + lag)
+        self.E1[self.feed] -= (self.travel * self.e_coef * injected
+                               / self.feed_width_e)
 
 
 def simulate(eps_r, source: Source, n_steps: int, probes=(),
@@ -891,7 +915,7 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
 
         if plane is not None:
             plane.correct_h(h_field)          # uses the incident E at n
-            plane.advance_h()                 # incident H to n+1/2
+            plane.advance_h(step)             # incident H to n+1/2
 
         if energy is not None:
             # The quadratic the scheme conserves exactly pairs E and H ACROSS

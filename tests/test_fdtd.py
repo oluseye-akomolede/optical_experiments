@@ -604,6 +604,42 @@ def test_an_object_in_the_box_scatters_out_of_it():
     assert leak > 1e-2, f"a dielectric block scattered only {leak:.2e}"
 
 
+@pytest.mark.parametrize("direction", ["+x", "-z"])
+def test_the_incident_line_lets_its_wave_go_on_a_graded_axis(direction):
+    """The 1-D line's feed must not be a wall. A hard source clamps its node
+    to the profile, i.e. to zero once the pulse is over, and the small
+    reflections off a graded axis then bounce between it and the grading for
+    good: measured 2e-4 of the peak line energy still ringing after 1200
+    steps at 6 cells per wavelength, against 3e-6 for the one-way feed (whose
+    remainder is still draining). The 3-D probes cannot see this at the
+    tests' 10+ cells per wavelength, so it is checked on the line itself.
+    Both cases feed from the axis's fine (0.9) end; fed from the coarse end
+    (-x, +z) a hard source measured clean too, so those cases could not
+    fail and are left out."""
+    n, cells_per_wavelength = 21, 6.0
+    frequency = C / (cells_per_wavelength * DX)
+    spacings = [DX * np.linspace(0.9, 1.1, n - 1), np.full(n - 1, DX),
+                DX * np.linspace(1.1, 0.9, n - 1)]
+    duals = [fdtd._dual_spacing(p) for p in spacings]
+    dt = fdtd.courant_dt(*(s.min() for s in spacings))
+    eps = np.ones((n,) * 3, dtype=np.float32)
+    source = fdtd.Source(kind="plane", direction=direction, component="y",
+                         box=((7,) * 3, (13,) * 3), frequency=frequency,
+                         bandwidth=frequency / 2.0)
+    line = fdtd._PlaneWave(source, eps.shape, spacings, duals, eps, None,
+                           (1.0 / (fdtd.EPS0 * eps)).astype(np.float32), dt,
+                           4, np)
+    energy = []
+    for step in range(1200):
+        line.advance_h(step)
+        line.advance_e(step)
+        energy.append(float(np.sum(line.E1.astype(np.float64) ** 2)))
+    left = energy[-1] / max(energy)
+    assert left < 3e-5, (
+        f"{left:.2e} of the line's peak energy is still on it after 1200 "
+        f"steps: something on the line reflects")
+
+
 @pytest.mark.parametrize("direction", ["+z", "-z"])
 def test_a_plane_wave_travels_its_way_at_c_with_its_amplitude(direction):
     """The peak passes two points on the axis in the order the direction
