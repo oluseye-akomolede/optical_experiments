@@ -93,7 +93,7 @@ validated. Boxes ticked are done and verified on this branch.
 ## 6. Change bookkeeping
 
 - [x] 6.1 proposal, tasks, spec delta present
-- [ ] 6.2 `openspec validate photonic-crystal-bands --strict` passes (this run)
+- [x] 6.2 `openspec validate photonic-crystal-bands --strict` passes (this run)
 - [x] 6.3 Control C added (5.5), so the capability's validation claim now rests
   on three controls, not two.
 
