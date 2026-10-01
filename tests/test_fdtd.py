@@ -355,7 +355,11 @@ def test_an_open_boundary_absorbs_the_pulse_while_the_metal_wall_holds_it():
     # nothing left the room; at the SAME step the open box is down by five
     # orders of magnitude. Comparing each run against its own peak instead
     # would let both boxes decay and still agree.
-    held = metal_energy[after:].max() / metal_energy[after]
+    #
+    # The MINIMUM over the window, not the maximum: the window starts at
+    # metal_energy[after], so a max over it is never below 1 and a box that
+    # leaked everything would still read as held.
+    held = metal_energy[after:].min() / metal_energy[after]
     assert held > 0.9, f"the metal box kept only {held:.2%} of its energy"
     left = open_energy[after:].max() / metal_energy[after:].max()
     assert left < 0.02, (
