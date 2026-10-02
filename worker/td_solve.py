@@ -463,6 +463,27 @@ def _finite(name: str, values) -> None:
             f"show. Please report this job.")
 
 
+def frame_positions(lay: dict, stride, shape) -> list:
+    """Where each movie sample sits, per axis, in metres (the probes' frame).
+
+    The grid is graded, so the samples are NOT evenly spaced: a viewer needs
+    these to place them. A frame keeps every ``stride``-th node from the
+    first, so its samples are those nodes; a count that disagrees with the
+    frame's shape is refused rather than written as a misplaced movie.
+    """
+    origin = [float(v) for v in lay["origin_m"]]
+    out = []
+    for a in range(3):
+        kept = np.asarray(lay["nodes"][a], dtype=float)[::int(stride[a])]
+        if kept.size != int(shape[a]):
+            raise TDSolveError(
+                f"the field movie has {int(shape[a])} samples along "
+                f"{'xyz'[a]} but stride {int(stride[a])} keeps {kept.size} "
+                f"of the grid's {len(lay['nodes'][a])} nodes")
+        out.append([origin[a] + float(v) for v in kept])
+    return out
+
+
 def write_results(store_out, job_id: str, result: dict, lay: dict,
                   request: dict, caveats: list, plan: dict | None) -> list:
     """Write ``trace.bin``, the movie frames and, LAST, ``spectrum.json``.
@@ -483,6 +504,9 @@ def write_results(store_out, job_id: str, result: dict, lay: dict,
         frames = np.asarray(frames, dtype="<f4")
         _finite("field movie", frames)
 
+    plan = plan or {}
+    positions = (None if frames is None else
+                 frame_positions(lay, plan["stride"], frames.shape[1:]))
     f_lo, f_hi = spectrum_band(request, lay["band_top_hz"])
     origin = [float(v) for v in lay["origin_m"]]
     probes = []
@@ -507,7 +531,6 @@ def write_results(store_out, job_id: str, result: dict, lay: dict,
         store_out.write(key(name), np.ascontiguousarray(frames[n]).tobytes())
         names.append(name)
 
-    plan = plan or {}
     manifest = {
         "version": SPECTRUM_VERSION, "dt_s": dt, "steps": int(result["steps"]),
         "band_hz": [f_lo, f_hi], "probes": probes,
@@ -518,6 +541,7 @@ def write_results(store_out, job_id: str, result: dict, lay: dict,
             "axes": "xyz", "shape": list(frames.shape[1:]),
             "steps": [int(k) for k in plan.get("steps", [])],
             "stride": [int(k) for k in plan.get("stride", [])],
+            "positions_m": positions,
             "quantity": "|E|"},
         "caveats": list(caveats)}
     store_out.write(key(SPECTRUM_NAME),

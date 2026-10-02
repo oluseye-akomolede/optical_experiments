@@ -748,12 +748,20 @@ little-endian, C order, shaped probes × steps), one `frame_NN.bin` per movie
 frame (two-digit, 1-based, |E| float32 little-endian, C order, in the grid's
 x, y, z order) and `spectrum.json` (the manifest: time step, step count, the
 band, each probe's position, component and amplitude spectrum within the band,
-the trace and frame shapes, and the layout caveats). The manifest SHALL be
+the trace and frame shapes, each frame sample's position along x, y and z in
+metres (the grid is graded, so a viewer cannot assume even spacing), and the
+layout caveats). The manifest SHALL be
 written last, so its presence means every other file exists. A non-finite value
 in a trace, frame or spectrum SHALL fail the job before anything is written.
 The worker's upload list and the app's accepted names SHALL agree on every one
 of these names, and SHALL refuse near misses (`frame_1.bin`, `frame_001.bin`,
 a path separator).
+
+#### Scenario: the manifest places every movie sample
+- **WHEN** a movie keeps every `stride`-th node of a graded grid
+- **THEN** `frames.positions_m` lists, per axis, exactly those nodes in metres,
+  in the probes' frame, one per sample; a count that disagrees with the frame
+  shape fails the job before anything is written
 
 #### Scenario: the files decode to the solver's own output
 - **WHEN** a tiny `td` job finishes

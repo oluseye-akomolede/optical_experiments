@@ -251,6 +251,37 @@ def test_each_frame_file_is_that_frame_in_xyz_order():
     assert np.abs(frames[-1]).max() > 0
 
 
+def test_every_probe_node_is_a_movie_sample_position():
+    """The small grid keeps every node (stride 1), so each probe's snapped
+    position, computed by the probe path, must appear on every axis."""
+    res, out = _run_with_files()
+    fr = _strict_json(out.files["spectrum.json"])["frames"]
+    assert fr["stride"] == [1, 1, 1], "fixture: every node kept"
+    pos = fr["positions_m"]
+    assert [len(p) for p in pos] == fr["shape"]
+    for a in range(3):
+        assert np.all(np.diff(pos[a]) > 0), "xyz"[a]
+    for probe in _strict_json(out.files["spectrum.json"])["probes"]:
+        for a in range(3):
+            assert np.isclose(pos[a], probe["position_m"][a], rtol=0,
+                              atol=1e-12).sum() == 1, (probe, "xyz"[a])
+
+
+def test_movie_positions_follow_a_graded_grid_and_its_stride():
+    lay = {"origin_m": [-1.0, 0.0, 2.0],
+           "nodes": [np.array([0.0, 0.1, 0.3, 0.7, 1.5]),
+                     np.array([0.0, 1.0, 2.0, 2.5]),
+                     np.array([0.0, 0.25])]}
+    got = td_solve.frame_positions(lay, (2, 3, 1), (3, 2, 2))
+    assert got == [[-1.0, -0.7, 0.5], [0.0, 2.5], [2.0, 2.25]]
+
+
+def test_a_movie_whose_shape_disagrees_with_its_stride_is_refused():
+    lay = {"origin_m": [0.0] * 3, "nodes": [np.arange(5.0)] * 3}
+    with pytest.raises(td_solve.TDSolveError, match="4 samples along y"):
+        td_solve.frame_positions(lay, (2, 1, 2), (3, 4, 3))
+
+
 def test_the_manifest_is_written_last():
     res, out = _run_with_files()
     assert out.order[-1] == "spectrum.json"
