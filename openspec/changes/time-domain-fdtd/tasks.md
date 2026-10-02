@@ -100,9 +100,15 @@
   (before: up to 1.5 times it, on most offsets). The form estimate bounds each
   metal by the nodes whose dual cell overlaps its parts, which keeps it above
   the solved run when a node sits on a face.
-- [ ] 5.4b Per-part coatings end to end: a material plus a thickness on a
+- [x] 5.4b Per-part coatings end to end: a material plus a thickness on a
   part's surface, painted by the voxeliser on a grid refined by
-  `coating_layers`, offered on the page only once it runs.
+  `coating_layers`, offered on the page only once it runs. The shell lies
+  outside the part (`fdtd_voxel.CoatedIndex`, exact point-to-triangle
+  distance): it grows into open space or an enclosing host, never into a
+  neighbour or a metal boundary's wall (a coating on a part that encloses the
+  cavity is refused). Request key `coatings`; a coating picker per part on the
+  page, one-part uploads included; the estimate, the TF/SF box and the
+  conductor-point refusal all see the shells.
 - [ ] 5.4e Follow-up (lead, 2026-10-02 08:52Z; not in phase 5's critical path):
   an upload-time overlap check that fails fast. Probe only the bounding-box
   intersection of each non-nested pair (a 16^3 lattice, ~0.4 s per pair as the

@@ -194,8 +194,10 @@
           <input type="number" name="td_dx" value="0.05" min="0" step="any" data-required>
         </label>
       </div>
-      {# One material per part when the object has several (filled from /parts
-         by the script below; each picker posts part_index.<name>). #}
+      {# One material per part when the object has several, and an optional
+         coating for every part (filled from /parts by the script below; the
+         pickers post part_index.<name>, part_coating.<name> and
+         part_coating_thickness.<name>). #}
       <div id="td-parts" class="row" hidden></div>
       <p id="td-parts-note" class="muted small" hidden></p>
       <div class="row">
@@ -408,6 +410,53 @@
     return label;
   }
 
+  // A coating for any part, one-part objects included: "no coating" (the
+  // default) posts nothing; otherwise `part_coating.<name>` carries the
+  // material and `part_coating_thickness.<name>` its thickness in the form's
+  // length unit. With no coating both lose their names, so nothing is posted
+  // (disabling is not enough: apply() re-enables every control not hidden).
+  function coatingPicker(name) {
+    var label = document.createElement('label');
+    label.className = 'td-coating';
+    label.appendChild(document.createTextNode('Coating on part \u201c' + name + '\u201d'));
+    var kind = document.createElement('select');
+    kind.setAttribute('aria-label', 'Coating material of part ' + name);
+    [['', 'no coating'], ['index', 'refractive index']].concat(named.map(function (m) {
+      return [m, m === 'pec' ? 'perfect conductor (pec)' : m];
+    })).forEach(function (o) {
+      var opt = document.createElement('option');
+      opt.value = o[0];
+      opt.textContent = o[1];
+      kind.appendChild(opt);
+    });
+    var n = document.createElement('input');
+    n.type = 'number'; n.min = '1'; n.step = 'any'; n.value = '1.5';
+    n.setAttribute('aria-label', 'Refractive index of the coating of part ' + name);
+    var thick = document.createElement('input');
+    thick.type = 'number'; thick.min = '0'; thick.step = 'any'; thick.value = '0.01';
+    thick.setAttribute('aria-label', 'Coating thickness of part ' + name +
+                       ' (in the length unit)');
+    var posted = document.createElement('input');
+    posted.type = 'hidden';
+    function sync() {
+      var none = kind.value === '';
+      n.hidden = kind.value !== 'index';
+      thick.hidden = none;
+      thick.required = !none;
+      thick.name = none ? '' : 'part_coating_thickness.' + name;
+      posted.name = none ? '' : 'part_coating.' + name;
+      posted.value = kind.value === 'index' ? n.value : kind.value;
+    }
+    kind.addEventListener('change', sync);
+    n.addEventListener('input', sync);
+    sync();
+    label.appendChild(kind);
+    label.appendChild(n);
+    label.appendChild(thick);
+    label.appendChild(posted);
+    return label;
+  }
+
   function askParts() {
     var file = form.elements['meshfile'];
     var ticket = ++asked;
@@ -428,13 +477,15 @@
         if (!ok || !Array.isArray(j.parts)) {
           clearParts('Could not read this object\u2019s parts: ' +
                      ((j && j.error) || 'no answer from the server') + '.');
-        } else if (j.parts.length < 2) {
-          clearParts('');
         } else {
           clearParts('');
-          j.parts.forEach(function (name) { partsBox.appendChild(picker(name)); });
-          partsBox.hidden = false;
-          oneIndex.hidden = true;
+          var several = j.parts.length > 1;
+          j.parts.forEach(function (name) {
+            if (several) partsBox.appendChild(picker(name));
+            partsBox.appendChild(coatingPicker(name));
+          });
+          partsBox.hidden = !j.parts.length;
+          oneIndex.hidden = several;
         }
         apply();
       })

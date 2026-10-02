@@ -39,10 +39,16 @@ LENGTH_UNITS = {"nm": 1e-9, "um": 1e-6, "mm": 1e-3}
 #: against worker/td_solve.py, so the two lists cannot drift.
 REQUEST_KEYS = ("boundary", "source_kind", "profile", "frequency_hz",
                 "bandwidth", "position", "direction", "polarisation",
-                "samples", "sample_duration_s", "duration_s", "probes", "dx_m")
+                "samples", "sample_duration_s", "duration_s", "probes", "dx_m",
+                "coatings")
 
 #: Field-name prefix for each part's material, shared with the cavity form.
 MATERIAL_PREFIX = "part_index."
+
+#: Field-name prefixes for a part's coating: its material (absent or empty for
+#: no coating) and its thickness in the form's length unit.
+COATING_PREFIX = "part_coating."
+COATING_THICKNESS_PREFIX = "part_coating_thickness."
 
 #: The most energy a drawn waveform may put above the grid's resolvable
 #: frequency (the spec's 1%).
@@ -157,6 +163,7 @@ def parse_request(form) -> dict:
         req["direction"] = _choice(form, "td_direction", "direction",
                                    DIRECTIONS)
     req["probes"] = _probes(form.get("td_probes") or "", scale)
+    req["coatings"] = parse_coatings(form, scale, unit)
     return req
 
 
@@ -169,6 +176,23 @@ def named_materials(fdtd=None) -> tuple:
     return ("pec",) + tuple(fdtd.METALS)
 
 
+def _material(raw: str, what: str, named):
+    """An index of 1 or more, or one of ``named``, else a refusal naming
+    ``what`` ("material for part 'x'", "coating material for part 'x'")."""
+    if raw in named:
+        return raw
+    try:
+        n = float(raw)
+    except ValueError:
+        raise TDRequestError(
+            f"The {what} must be a refractive index (1 or more) or one of "
+            f"{', '.join(named)}; got {raw!r}.") from None
+    if not (math.isfinite(n) and n >= 1.0):
+        raise TDRequestError(f"The {what} is a refractive index, which must "
+                             f"be 1 or more; got {raw!r}.")
+    return n
+
+
 def parse_materials(form, fdtd):
     """``{part name: n or metal name or 'pec'}`` from the part fields, or None
     when the form sent none (the one-part path, which uses ``n_index``)."""
@@ -177,30 +201,48 @@ def parse_materials(form, fdtd):
     if not fields:
         return None
     named = named_materials(fdtd)
-    table = {}
-    for part, raw in fields.items():
-        if raw in named:
-            table[part] = raw
+    return {part: _material(raw, f"material for part {part!r}", named)
+            for part, raw in fields.items()}
+
+
+def parse_coatings(form, scale: float, unit: str, fdtd=None):
+    """``{part name: [material, thickness in m]}`` from the coating fields, or
+    None when no part is coated. An empty coating material means no coating;
+    a thickness without a material is refused, as is a material without a
+    positive thickness. Whether each part exists is checked against the
+    upload in ``plan_request``."""
+    chosen = {k[len(COATING_PREFIX):]: (v or "").strip()
+              for k, v in form.items() if k.startswith(COATING_PREFIX)}
+    sizes = {k[len(COATING_THICKNESS_PREFIX):]: (v or "").strip()
+             for k, v in form.items() if k.startswith(COATING_THICKNESS_PREFIX)}
+    stray = [p for p, raw in sizes.items() if raw and not chosen.get(p)]
+    if stray:
+        raise TDRequestError(
+            f"A coating thickness was sent for part {stray[0]!r} without a "
+            f"coating material. Choose its material, or clear the thickness.")
+    coats = {}
+    for part, raw in chosen.items():
+        if not raw:
             continue
-        try:
-            n = float(raw)
-        except ValueError:
-            raise TDRequestError(
-                f"The material for part {part!r} must be a refractive index "
-                f"(1 or more) or one of {', '.join(named)}; got {raw!r}.") from None
-        if not (math.isfinite(n) and n >= 1.0):
-            raise TDRequestError(f"The refractive index for part {part!r} must "
-                                 f"be 1 or more, got {raw!r}.")
-        table[part] = n
-    return table
+        if fdtd is None:
+            fdtd = _solver()[0]
+        material = _material(raw, f"coating material for part {part!r}",
+                             named_materials(fdtd))
+        if not sizes.get(part):
+            raise TDRequestError(f"The coating of part {part!r} needs a "
+                                 f"thickness ({unit}).")
+        coats[part] = [material, _number(
+            sizes[part], f"coating thickness of part {part!r} ({unit})") * scale]
+    return coats or None
 
 
-def _n_max(table, fdtd, frequency: float) -> float:
+def _n_max(table, fdtd, frequency: float, coatings=()) -> float:
     """The largest |n| in the scene: dielectric n, and each metal's
     |n| = sqrt(|eps|) at the run's reference frequency (the solver's backstop
-    knows only the dielectric part; this is the check that knows the metals)."""
+    knows only the dielectric part; this is the check that knows the metals).
+    ``coatings`` are the coating materials, which are in the scene too."""
     n = 1.0
-    for kind in table.values():
+    for kind in list(table.values()) + list(coatings):
         if isinstance(kind, str):
             if kind in fdtd.METALS:
                 n = max(n, math.sqrt(abs(complex(fdtd.permittivity(kind, frequency)))))
@@ -247,6 +289,12 @@ def plan_request(form, data: bytes, units_scale_m: float) -> dict:
                 f"({', '.join(map(repr, names))}), and a time-domain run needs "
                 f"a material for each one. Choose one for every part in the "
                 f"list the page shows once it has read the file.")
+        stray = [p for p in (request["coatings"] or {}) if p not in names]
+        if stray:
+            raise TDRequestError(
+                f"A coating names {', '.join(map(repr, stray))}, which is not "
+                f"a part of this upload. Its parts are "
+                f"{', '.join(map(repr, names))}.")
         if materials is not None:
             missing = [n for n in names if n not in materials]
             unknown = [n for n in materials if n not in names]
@@ -298,7 +346,8 @@ def _check_drawn(request, planned, est, fdtd) -> None:
             f"Make it longer.")
     f_res = fdtd.resolvable_frequency(
         planned["spacings"],
-        _n_max(planned["table"], fdtd, request["frequency_hz"]))
+        _n_max(planned["table"], fdtd, request["frequency_hz"],
+               [m for _p, m, _t in planned["coatings"]]))
     above = fdtd.drawn_energy_above(request["samples"], duration, dt, f_res)
     if above > MAX_DRAWN_ENERGY_ABOVE:
         raise TDRequestError(

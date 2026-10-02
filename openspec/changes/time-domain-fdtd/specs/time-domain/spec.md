@@ -266,8 +266,8 @@ A `td` job SHALL be stored in the jobs table with `kind = 'td'` and its request
 in a `tds` JSON column, NULL for every other kind. The request keys SHALL be
 exactly the worker's `REQUEST_KEYS` list (`boundary`, `source_kind`, `profile`,
 `frequency_hz`, `bandwidth`, `position`, `direction`, `polarisation`,
-`samples`, `sample_duration_s`, `duration_s`, `probes`, `dx_m`). Every key SHALL
-be present; a key that does not apply to the chosen source holds null. The
+`samples`, `sample_duration_s`, `duration_s`, `probes`, `dx_m`, `coatings`).
+Every key SHALL be present; a key that does not apply to the chosen source holds null. The
 worker SHALL refuse a request with a missing key, naming every missing key, and
 SHALL refuse a `tds` that is not an object. Keys outside the list SHALL be
 ignored, so results written back to the row are never read as input. The TF/SF
@@ -326,9 +326,7 @@ one material picker per part: a refractive index, `pec`, or one of the
 dispersive metals. Each picker posts `part_index.<part name>`. One material
 SHALL never be applied to every part on the owner's behalf. A missing, unknown
 or malformed material SHALL be refused before queueing, naming the part.
-Optional per-part coatings (a material plus a thickness on the part's surface)
-are a separate task (5.4b). Until a part can be coated end to end, the page
-SHALL NOT offer a coating.
+Each part MAY also be coated (next requirement).
 
 #### Scenario: a picker per part, named from the parser
 - **WHEN** a three-part .obj is chosen with the time-domain arm selected
@@ -353,6 +351,62 @@ SHALL NOT offer a coating.
   nested (a film between two plates)
 - **THEN** it returns the names the td POST's own split gives, not the cavity
   parser's refusal that the first part must enclose the rest
+
+### Requirement: A part MAY be coated, and the coating SHALL lie on the grid as a shell over the part
+
+A coating is a material (a refractive index, `pec` or a dispersive metal) plus
+a thickness on a part's surface. The page SHALL offer one for every part of a
+time-domain upload, one-part uploads included: a coating material picker
+(default "no coating") posting `part_coating.<part name>`, and a thickness in
+the form's length unit posting `part_coating_thickness.<part name>`. The
+stored request SHALL carry the key `coatings`: null, or part name →
+[material, thickness in metres].
+
+The coating SHALL be a shell of its thickness OUTSIDE the part's surface: every
+point within that distance of the surface and outside the part takes the
+coating's material, so a core coated in gold lays out as a gold shell around
+the core's material. The shell SHALL grow into open space or into a part that
+encloses the coated part (displacing that host). It SHALL NOT be painted into
+the coated part, the parts inside it, a neighbour that does not enclose it (a
+neighbour keeps its volume, so a coating on a face flush against a neighbour is
+absent there), or a metal boundary's wall. Where two shells meet, the shared-face
+rule decides: the conductor, else the higher index. The grid SHALL be refined by
+the grid builder's coating rule on each axis of the coated part (two thin layers
+at its faces where both faces are flat, else its whole span at thickness / 4),
+plus a metal coating's skin-depth spacing.
+
+#### Scenario: a gold-coated core lays out as a gold shell over its core
+- **WHEN** a dielectric part is coated in 10 nm of gold
+- **THEN** the nodes over each face within 10 nm of it are gold nodes, the
+  part's own nodes keep its index, and the nodes beyond the shell are vacuum;
+  the shell's faces are grid planes when the part's faces are flat
+
+#### Scenario: a coating on a curved part follows its surface
+- **WHEN** a sphere is coated
+- **THEN** the coating's nodes are the ones whose distance from the sphere's
+  surface is under the thickness, outside it
+
+#### Scenario: a coating displaces its host and spares its neighbour
+- **WHEN** a coated part sits inside a host part and flush against a neighbour
+- **THEN** the shell replaces the host's material around it, and the
+  neighbour keeps its own material within the shell's reach
+
+#### Scenario: a coating on the cavity's own wall is refused
+- **WHEN** a part that encloses a metal-walled cavity (no part encloses it) is
+  coated
+- **THEN** the request is refused naming the part: its shell would lie in the
+  wall
+
+#### Scenario: the source, probes, estimate and TF/SF box see the coating
+- **WHEN** a part carries a conductor coating
+- **THEN** a source or probe inside the coating is refused naming "the coating
+  of part <name>", the form's estimate counts the coating's metal and is never
+  below the solved run's, and a plane wave's TF/SF box encloses the shells
+
+#### Scenario: a bad coating is refused naming the part
+- **WHEN** a coating names a part not in the upload, has an unknown material,
+  or a thickness that is missing, not a number, or not positive
+- **THEN** the upload is refused before queueing, and the message names the part
 
 ### Requirement: Parts that touch SHALL meet on a face one of them owns, and SHALL NOT overlap
 
