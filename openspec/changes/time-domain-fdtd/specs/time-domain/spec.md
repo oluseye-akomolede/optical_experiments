@@ -382,6 +382,34 @@ neighbour spacing ratio of at most 1.3.
   exceeds half the tolerance, or whose film axis breaks the builder's rules, exits
   2 (not a spec setup) unless the run already failed
 
+### Requirement: The upload's parts SHALL be voxelised onto the grid
+
+Each sample of a node's dual cell SHALL take the material of the innermost
+uploaded part containing it. Outside every part the grid SHALL be a conductor
+for `metal` and vacuum for `open`. Every part SHALL be given a material: a
+refractive index of at least 1, `pec`, or one of the Rakić metals.
+
+#### Scenario: nested parts in any file order
+- **WHEN** an upload holds a part nested inside another, in either file order
+- **THEN** every sample inside the inner part takes the inner part's material,
+  matching the cavity tool's winding-number test point for point
+
+#### Scenario: a sample on a mesh edge's line
+- **WHEN** an axis-aligned part puts its edges on the grid's sample lines
+- **THEN** those samples are classified as the winding-number test classifies
+  them (queries are shifted ~1e-6 of the scene size so no ray meets an edge)
+
+#### Scenario: outside the shape
+- **WHEN** a `metal` run is voxelised
+- **THEN** every node whose cell lies outside the parts is in the conductor mask;
+  for an `open` run those nodes are vacuum (permittivity 1)
+
+#### Scenario: a materials table that does not fit the upload
+- **WHEN** the table leaves a part out, names a part the file lacks, gives an
+  unknown material name, or gives an index below 1 or not finite
+- **THEN** the run is refused with a message naming the part(s) and, for a
+  mismatch, the file's parts
+
 ### Requirement: A drawn waveform SHALL be checked against the grid
 
 A `drawn` source SHALL be a list of at most 10 000 dimensionless amplitude

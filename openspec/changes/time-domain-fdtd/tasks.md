@@ -52,7 +52,7 @@
   thickness on a region's surface). A unit check of the builder's own rules.
   Benchmark V5 (parallel-plate lateral modes): script and its tests; the Jetson
   run is the lead's.
-- [ ] 3.1 Voxelise the upload's regions to an index map. Cells outside the shape
+- [x] 3.1 Voxelise the upload's regions to an index map. Cells outside the shape
   are metal (`metal`) or vacuum plus a gap (`open`).
 - [ ] 3.2 Estimate cells, steps, memory and run time from the form. Refuse above
   8 M cells, 20 000 steps, 3.0 GB or 30 minutes, naming the limit, the value and
