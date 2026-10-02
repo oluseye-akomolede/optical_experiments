@@ -97,7 +97,8 @@ def _locate(nodes, point, what, pml=0):
     return tuple(cell)
 
 
-def _refuse_conductor_nodes(names, parts, scene, nodes, lo, length_scale, where):
+def _refuse_conductor_nodes(names, parts, table, scene, nodes, lo, length_scale,
+                            where):
     """A source or probe on a conductor node injects or reads nothing, which
     would read as "no response": refuse it, naming the position and part."""
     masks = ([scene["pec"]] if scene["pec"] is not None else []) + list(
@@ -110,7 +111,7 @@ def _refuse_conductor_nodes(names, parts, scene, nodes, lo, length_scale, where)
             continue
         point = np.array([nodes[a][cell[a]] for a in range(3)])
         if finder is None:
-            finder = fdtd_voxel.PartIndex(parts)
+            finder = _finder(names, parts, table)
         index = int(finder((point + lo) / float(length_scale))[0])
         owner = (f"part {names[index - 1]}" if index > 0
                  else "the metal boundary's conductor")
@@ -207,6 +208,14 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
             "boundary": boundary}
 
 
+def _finder(names, parts, table):
+    """The voxeliser's own part lookup, shared-face rule included, so a point
+    is named after the part the scene gave it."""
+    return fdtd_voxel.PartIndex(
+        parts, priority=[fdtd_voxel.priority_of(table[n]) for n in names],
+        names=names)
+
+
 def _conductor(kind) -> bool:
     return kind == "pec" or (isinstance(kind, str) and kind in fdtd.METALS)
 
@@ -256,7 +265,7 @@ def refuse_conductor_points(planned, parts, *, length_scale: float) -> None:
                          or any(_conductor(table.get(n)) for n in names)):
         return
     points = np.array([[nodes[a][c[a]] for a in range(3)] for _, c in where])
-    index = fdtd_voxel.PartIndex(parts)((points + lo) / float(length_scale))
+    index = _finder(names, parts, table)((points + lo) / float(length_scale))
     for (what, _), point, i in zip(where, points, index):
         i = int(i)
         if i > 0 and _conductor(table.get(names[i - 1])):
@@ -289,7 +298,7 @@ def layout(names, parts, request, *, length_scale: float, materials=None,
     scene = fdtd_voxel.voxelise(
         names, parts, table, tuple(n + lo[i] for i, n in enumerate(nodes)),
         boundary=planned["boundary"], length_scale=length_scale)
-    _refuse_conductor_nodes(names, parts, scene, nodes, lo, length_scale,
+    _refuse_conductor_nodes(names, parts, table, scene, nodes, lo, length_scale,
                             ([("the source position", cell)] if cell else [])
                             + [("probe", p[:3]) for p in probes])
     caveats = []

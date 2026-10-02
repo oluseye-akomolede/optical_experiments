@@ -191,3 +191,52 @@ def test_every_conductor_part_and_the_cavity_wall_join_one_mask():
                          ("outside", outside)]:
         assert region.any() and out["pec"][region].all(), name
     assert gap.any() and not out["pec"][gap].any()
+
+
+def _flush_pair():
+    """A slab below z=0 and a slab above, sharing the face z=0. The jitter
+    shifts points up, so without the rule the face goes to the upper slab."""
+    return _box((1.0, 1.0, 0.5), (0, 0, -0.25)), _box((1.0, 1.0, 0.5), (0, 0, 0.25))
+
+
+_ON_FACE = np.array([[x, y, 0.0] for x in (-0.3, 0.0, 0.2) for y in (-0.2, 0.1)])
+
+
+@pytest.mark.parametrize("flip", [False, True])
+@pytest.mark.parametrize("below, above", [("pec", 1.5), ("Au", 3.0), (2.0, 1.5)])
+def test_a_shared_face_goes_to_the_conductor_else_the_higher_index(flip, below, above):
+    low, high = _flush_pair()
+    parts, mats = [low, high], [below, above]
+    if flip:
+        parts, mats = parts[::-1], mats[::-1]
+    finder = V.PartIndex(parts, priority=[V.priority_of(m) for m in mats])
+    want = parts.index(low) + 1
+    assert (finder(_ON_FACE) == want).all()
+    # Off the face, each slab still owns its own interior.
+    assert (finder(_ON_FACE + [0, 0, 0.1]) == parts.index(high) + 1).all()
+    assert (finder(_ON_FACE - [0, 0, 0.1]) == want).all()
+
+
+def test_the_shared_face_rule_reaches_the_conductor_mask():
+    low, high = _flush_pair()
+    nodes = tuple(np.linspace(-0.6e-6, 0.6e-6, 7) for _ in range(3))
+    out = V.voxelise(["film", "plate"], [high, low], {"film": 1.5, "plate": "pec"},
+                     nodes, boundary="open", length_scale=1e-6)
+    x, y, z = np.meshgrid(*nodes, indexing="ij")
+    face = (np.abs(z) < 1e-12) & (np.abs(x) < 0.45e-6) & (np.abs(y) < 0.45e-6)
+    assert face.any() and out["pec"][face].all()
+
+
+def test_parts_that_share_volume_are_refused_naming_both():
+    a = _box((1.0, 1.0, 1.0), (0, 0, 0))
+    b = _box((1.0, 1.0, 1.0), (0.5, 0, 0))
+    finder = V.PartIndex([a, b], priority=[1.5, 2.0], names=["lens", "prism"])
+    with pytest.raises(V.OverlapError, match=r"'lens' and 'prism' overlap"):
+        finder(np.array([[0.25, 0.0, 0.0]]))
+
+
+def test_touching_and_nested_parts_are_not_overlap():
+    low, high = _flush_pair()
+    V.PartIndex([low, high])(_ON_FACE)
+    outer, inner = _box((2.0, 2.0, 2.0)), _box((0.5, 0.5, 0.5))
+    assert (V.PartIndex([outer, inner])(np.zeros((1, 3))) == 2).all()
