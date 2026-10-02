@@ -33,8 +33,11 @@ The grid is uniform: at normal incidence the 1-D incident line and the 3-D
 grid then share one dispersion relation, so the reference is exact.
 
 DEFAULTS (gold, 1.5 eV centre, bandwidth 0.3 f, band about 0.54-2.46 eV): about
-6 nm cells, 4 x 4 transverse, ~130 cells along z, so ~2e3 cells and ~1e4
-steps a run: ~2e7 cell-steps each. It is still a solver run: on the Jetson.
+6 nm cells, 4 x 4 transverse, ~110 cells along z with a 10-cell CPML, so
+~2e3 cells and ~1e4 steps a run: ~2e7 cell-steps each. It is still a solver
+run: on the Jetson. The record (source plus 40 transits) sets the bin width:
+52 bins of 37 meV across the band at CPML 10, 60 of 32 meV at CPML 20, over
+the same band; the PASS needs the judged bins to span it end to end.
 
 RUN IT ON THE JETSON (tier 2):
 
@@ -134,6 +137,32 @@ def reflectance(incident, reflected, dt: float):
     return frequencies, ratio, np.asarray(inc)
 
 
+def band_coverage(frequencies, in_band, f_low: float, f_high: float):
+    """Failures if the judged bins do not span [f_low, f_high]: each end must
+    sit within one bin of the band the metal and skin depths were checked
+    over, on neither side, with no hole between. A shorter record has fewer,
+    wider bins over the same band; this stops a narrower sweep passing."""
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    picks = np.flatnonzero(np.asarray(in_band, dtype=bool))
+    if picks.size == 0:
+        return []                            # v4_verdict names the empty band
+    step = float(frequencies[1] - frequencies[0])
+    lo, hi = float(frequencies[picks[0]]), float(frequencies[picks[-1]])
+    ev = 2 * math.pi / fdtd.EV
+    span = (f"the measured band {lo*ev:.4g}-{hi*ev:.4g} eV "
+            f"({picks.size} bins)")
+    nominal = f"the band {f_low*ev:.4g}-{f_high*ev:.4g} eV"
+    failures = []
+    if lo < f_low - step or hi > f_high + step:
+        failures.append(f"{span} leaves {nominal} the metal and skin depths "
+                        f"were checked over")
+    if lo > f_low + step or hi < f_high - step:
+        failures.append(f"{span} does not reach both ends of {nominal}")
+    if picks[-1] - picks[0] + 1 != picks.size:
+        failures.append(f"{span} has a hole")
+    return failures
+
+
 def v4_verdict(frequencies, measured, analytic, in_band, tails,
                tolerance: float = REFLECTANCE_TOLERANCE):
     """(passed, failures, worst |error|, frequency of the worst)."""
@@ -180,7 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="cells between the box faces and the slab")
     parser.add_argument("--gap", type=int, default=fdtd.BOX_CLEARANCE,
                         help="cells between the box and the CPML (spec >= 3)")
-    parser.add_argument("--pml-cells", type=int, default=20)
+    parser.add_argument("--pml-cells", type=int, default=fdtd.DEFAULT_PML_CELLS)
     parser.add_argument("--transverse", type=int, default=4,
                         help="periodic nodes along x and along y")
     parser.add_argument("--record-transits", type=float, default=40.0,
@@ -287,13 +316,11 @@ def main(argv=None) -> int:
     reflected = np.asarray(runs["slab"]["traces"][0], dtype=np.float64)
     frequencies, measured, amplitude = reflectance(incident, reflected, dt)
     in_band = band(amplitude)
-    step = float(frequencies[1] - frequencies[0])
-    if in_band.any() and (frequencies[in_band].min() < f_low - step
-                          or frequencies[in_band].max() > f_high + step):
-        print(f"V4 FAIL: the measured band "
-              f"{frequencies[in_band].min()*2*math.pi/fdtd.EV:.4g}-"
-              f"{frequencies[in_band].max()*2*math.pi/fdtd.EV:.4g} eV leaves "
-              f"the band the metal and skin depths were checked over")
+    coverage = band_coverage(frequencies, in_band, f_low, f_high)
+    if coverage:
+        print("V4 FAIL")
+        for failure in coverage:
+            print(f"  {failure}")
         return 1
     with np.errstate(divide="ignore", invalid="ignore"):
         eps_all = fdtd.permittivity(args.metal, frequencies)
@@ -327,7 +354,10 @@ def main(argv=None) -> int:
               f">= {MIN_CELLS_PER_SKIN_DEPTH:g}) and a slab of "
               f"{depths_thick:.3g} skin depths (spec >= {MIN_SKIN_DEPTHS:g})")
         return 2
-    print(f"\nV4 PASS: over {int(in_band.sum())} bins the reflectance is within "
+    ev = 2 * math.pi / fdtd.EV
+    print(f"\nV4 PASS: over {int(in_band.sum())} bins spanning "
+          f"{frequencies[in_band].min()*ev:.4g}-{frequencies[in_band].max()*ev:.4g}"
+          f" eV the reflectance is within "
           f"{worst:.4f} of Fresnel for the same model (limit "
           f"{REFLECTANCE_TOLERANCE:g}), worst at "
           f"{where*2*math.pi/fdtd.EV:.4g} eV")

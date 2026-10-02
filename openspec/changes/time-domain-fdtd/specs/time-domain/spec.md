@@ -346,6 +346,10 @@ refused before it is queued.
 - **AND** it exits 2 without running when the pulse band leaves the metal's
   fit, and exits 2 rather than passing when the setup has fewer than 4 cells
   per skin depth or a slab under 10 skin depths
+- **AND** it fails unless the judged bins span the band it checked the metal
+  and skin depths over, each end within one bin and with no hole, since a
+  shorter record gives fewer, wider bins over the same band
+- **AND** it runs with the solver's default 10-cell CPML
 
 #### Scenario: a metal slab across periodic faces is uniform
 - **WHEN** a plane wave meets a metal slab that spans every periodic axis
