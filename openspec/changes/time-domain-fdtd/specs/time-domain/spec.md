@@ -1058,3 +1058,11 @@ a message. The form option is a later phase-6 task.
 - **THEN** the spectrum's peaks are within 1% of the photonic-crystal band
   solver's frequencies at that k for that polarisation, and every band in the
   pulse band appears
+
+#### Scenario: benchmark V6 checks k against the exact light lines
+- **WHEN** the same cell holds one homogeneous medium of index n and runs at
+  several non-zero k, below and at the zone edge (X and M included)
+- **THEN** every excitable folded light line f a / c = |k + G| / n in the
+  pulse band has a peak within 1% of it, and no peak is 1% from every line
+- **AND** a tiny form of this check (20 cells, four k) runs locally in tier 1,
+  so a phase that ignored k or scaled it wrongly fails a local test

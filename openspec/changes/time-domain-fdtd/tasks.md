@@ -143,3 +143,6 @@
 - [ ] 6.2 Benchmark V6 against the existing pc band solver: an extruded 2-D
   crystal, TM and TE, kz = 0, frequencies at chosen k-points within 1%, every
   band present.
+  Bench `scripts/fdtd_bench_v6.py` written, with the homogeneous |k + G| / n
+  check at six k (tier-1 `--tiny`: four k, 26 s, in tests/test_fdtd_bench_v6.py).
+  Ticked when the lead's three Jetson commands (its docstring) all exit 0.
