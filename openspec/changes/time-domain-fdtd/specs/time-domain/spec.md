@@ -224,8 +224,13 @@ that exceeded it, and the form lever that reduces it.
 #### Scenario: the memory estimate is checked against the solver's real peak
 - **WHEN** the solver runs a tiny grid with metal, open or periodic faces, a
   conductor mask, the peak-field record or a Lorentz-Drude metal
-- **THEN** the measured peak is within 12% of the estimate for the whole run,
-  and each option's measured increment within 15% of its estimated increment
+- **THEN** the host-measured peak is between 0.8 and 1.0 of the estimate (the
+  estimate includes the device allocator's cached blocks, which numpy does not
+  keep), and each option's measured increment within 15% of its estimated
+  increment
+- **AND** every row of the Jetson rate table (metal, open and open-plus-gold at
+  1 M and 4 M cells) measures between 0.9 and 1.0 of the estimate, so the
+  memory refusal never admits a run the device cannot hold
 - **AND** a rate script measures cell-steps/s and peak device memory for metal,
   open and open-plus-gold runs at about 1 M and 4 M cells on the Jetson, beside
   the estimate, and the run-time limit's rates come from those measurements

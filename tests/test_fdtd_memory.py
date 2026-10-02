@@ -26,7 +26,10 @@ def _gold_region():
 
 
 def _measured(boundary, metals=(), **options):
-    eps = np.ones(SHAPE, dtype=np.float32)
+    # float64, so simulate's asarray(eps, float32) copies it as cupy's
+    # host-to-device asarray always does; a float32 array would be aliased
+    # and tracemalloc would never count it (the gap the reviewer found)
+    eps = np.ones(SHAPE, dtype=np.float64)
     source = fdtd.Source((11, 12, 11), frequency=4e14, bandwidth=2e14)
     terms = [fdtd.LorentzDrude(name, region) for name, region in metals]
     tracemalloc.start()
@@ -44,7 +47,10 @@ def _measured(boundary, metals=(), **options):
 def test_the_estimate_tracks_the_measured_peak(boundary):
     measured = _measured(boundary)
     predicted = fdtd.memory_estimate(SHAPE, boundary=boundary)
-    assert 0.88 <= measured / predicted <= 1.05, (
+    # numpy keeps no pool, so the host peak sits under the device estimate
+    # by the pool share (host 0.93 metal, 0.85 open at this size); above
+    # 1.0 the estimate would under-predict
+    assert 0.8 <= measured / predicted <= 1.0, (
         f"{boundary}: measured {measured} B, formula {predicted} B")
 
 
@@ -73,3 +79,29 @@ def test_the_options_add_what_they_allocate():
             f"{flags}: measured {added} B more, formula {predicted} B")
     with pytest.raises(fdtd.FDTDError):
         fdtd.memory_estimate(SHAPE, boundary="wavy")
+
+
+#: The Jetson rate table (scripts/fdtd_rate.py at 6ffa8bd, cupy, 300 steps,
+#: dx 5 nm, lead's run 2026-10-02 01:49Z): (setup, n, peak bytes). These are
+#: the device's numbers, not the formula's, so a formula that under-predicts
+#: the device (the old one did by 9-14%) fails here.
+JETSON = (("metal", 100, 56.4e6), ("metal", 160, 232.0e6),
+          ("open", 100, 110.6e6), ("open", 160, 456.7e6),
+          ("gold", 100, 134.6e6), ("gold", 160, 554.2e6))
+
+
+@pytest.mark.parametrize("kind,n,peak", JETSON)
+def test_the_estimate_covers_the_jetson_peak(kind, n, peak):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "fdtd_rate", os.path.join(os.path.dirname(__file__), "..",
+                                  "scripts", "fdtd_rate.py"))
+    rate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rate)
+    shape, boundary, metals = rate.setup(kind, n)
+    predicted = fdtd.memory_estimate(shape, boundary=boundary, metals=metals)
+    # never under the device (the refusal must not admit a run that does not
+    # fit), and not so far over that it refuses runs that do
+    assert 0.9 <= peak / predicted <= 1.0, (
+        f"{kind} n={n}: device {peak / 1e6:.1f} MB, formula "
+        f"{predicted / 1e6:.1f} MB, ratio {peak / predicted:.3f}")

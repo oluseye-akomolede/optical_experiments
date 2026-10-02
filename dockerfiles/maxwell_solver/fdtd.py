@@ -1157,20 +1157,30 @@ def _take(values, axis: int, index: int):
     return values[tuple(where)]
 
 
-# Short-lived full-grid arrays alive at the step loop's busiest moment (curl
-# differences and their products). Measured with tracemalloc on 16^3-24^3
-# numpy runs: metal walls peak at 12.2-12.7 floats per cell, of which 8 are
-# held (six fields, eps, 1/eps); scripts/fdtd_rate.py checks it on the device.
-TRANSIENT_ARRAYS = 4.5
+# Short-lived full-grid arrays alive at the step loop's busiest moment, the Ex
+# update: the stale term_x left by the Hz update, term_y and term_z, and the
+# three expression temporaries (dt*inv_eps[...], the difference, the product).
+# Reviewer's trace, qitem-20261002014955-c62b2de2.
+TRANSIENT_ARRAYS = 6
+# cupy's pool keeps freed blocks it cannot reuse for differently shaped slice
+# temporaries, and the CPML psi arrays are allocated lazily among them, so the
+# device high-water exceeds the live set. Set from the Jetson rate table
+# (6ffa8bd, cupy, 300 steps, 1 M and 4 M cells; floats per cell = peak bytes /
+# 4 / cells): metal 14.10 / 14.16, open 27.65 / 27.87, open + 1/8 gold
+# 33.65 / 33.83. These constants put every row at 0.97-0.99 of the estimate,
+# never above it, so the 3.0 GB refusal errs on the safe side.
+POOL_BASE = 0.4
+POOL_PER_OPEN_AXIS = 0.6
 
 
 def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
                     record_peak=False) -> int:
-    """Bytes ``simulate`` holds at its peak for this setup (float32 arrays).
+    """Bytes ``simulate`` holds at its peak on the device (float32 arrays).
 
-    Counts, per cell: six fields, eps and 1/eps, the transients, four CPML
-    psi arrays per open axis (two E and two H derivatives along it), the
-    conductor mask and its multiplier, and the peak |E_c| record (3 arrays). Each metal
+    Counts, per cell: six fields, eps and 1/eps, the transients, the device
+    pool's cached blocks, four CPML psi arrays per open axis (two E and two H
+    derivatives along it), the conductor mask and its multiplier, and the peak
+    |E_c| record (3 arrays). Each metal
     ``(name, region)`` adds, per component, a box over its samples (the region
     widened one node along the component) holding 2 per pole + 4 arrays, plus
     the solver's boolean union of the regions.
@@ -1178,7 +1188,8 @@ def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
     shape = tuple(int(s) for s in shape)
     cells = int(np.prod(shape))
     sides = _axis_boundaries(boundary)
-    floats = 6 + 2 + TRANSIENT_ARRAYS + 4 * sides.count("open")
+    floats = (6 + 2 + TRANSIENT_ARRAYS + POOL_BASE
+              + (4 + POOL_PER_OPEN_AXIS) * sides.count("open"))
     if pec:
         floats += 1 + 0.25                  # multiplier + boolean mask
     if record_peak:
