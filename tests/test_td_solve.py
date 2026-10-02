@@ -301,6 +301,47 @@ def test_a_non_finite_run_is_refused_before_any_file_is_written(monkeypatch):
     assert out.files == {}
 
 
+def test_a_non_finite_spectrum_is_refused_before_any_file_is_written(monkeypatch):
+    """Finite traces give finite spectra, so this forces one: the spectra are
+    computed before the first write, so even this refusal leaves nothing."""
+    real = FDTD.spectrum
+
+    def broken(*a, **k):
+        freqs, amp = real(*a, **k)
+        amp = np.array(amp, dtype=float)
+        amp[:] = np.nan
+        return freqs, amp
+
+    monkeypatch.setattr(FDTD, "spectrum", broken)
+    out = _OutStore()
+    with pytest.raises(td_solve.TDSolveError, match="not finite.*probe 1 spectrum"):
+        td_solve.solve_td(_job(), _Store(), out, xp=np, free_bytes=PLENTY)
+    assert out.files == {}
+
+
+def test_the_memory_gate_counts_the_field_movie(monkeypatch):
+    """The run records frames, so the bytes the free-memory gate and
+    ``check_limits`` read must be the estimate WITH the movie -- and for this
+    layout that is strictly more than without it, so the test can tell."""
+    seen = []
+    real = FDTD.estimate_run
+
+    def spy(nodes, **kw):
+        est = real(nodes, **kw)
+        seen.append((nodes, {k: v for k, v in kw.items()
+                             if k != "record_frames"}, est))
+        return est
+
+    monkeypatch.setattr(FDTD, "estimate_run", spy)
+    out = td_solve.solve_td(_job(), _Store(), xp=np, free_bytes=PLENTY)
+    assert len(seen) == 1
+    nodes, kw, est = seen[0]
+    with_movie = real(nodes, record_frames=True, **kw)["bytes"]
+    without = real(nodes, record_frames=False, **kw)["bytes"]
+    assert with_movie > without
+    assert est["bytes"] == with_movie == out["estimate"]["bytes"]
+
+
 def test_the_worker_uploads_every_file_the_td_solve_writes(tmp_path):
     """Through the worker's real enumerator and allow-list, not a copy."""
     import mse_worker

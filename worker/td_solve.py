@@ -176,7 +176,7 @@ def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
                                  n_index=job.get("n_index"))
         est = fdtd.estimate_run(lay["nodes"], duration=float(request["duration_s"]),
                                 boundary=request["boundary"], metals=lay["metals"],
-                                pec=lay["pec"])
+                                pec=lay["pec"], record_frames=True)
         fdtd.check_limits(est)
     except (fdtd.FDTDError, ValueError) as exc:
         # FDTDError covers LayoutError, VoxelError and EstimateError; the
@@ -281,15 +281,6 @@ def write_results(store_out, job_id: str, result: dict, lay: dict,
         frames = np.asarray(frames, dtype="<f4")
         _finite("field movie", frames)
 
-    names = []
-    store_out.write(key(TRACE_NAME), np.ascontiguousarray(traces).tobytes())
-    names.append(TRACE_NAME)
-    n_frames = 0 if frames is None else int(frames.shape[0])
-    for n in range(n_frames):
-        name = FRAME_NAME.format(n + 1)
-        store_out.write(key(name), np.ascontiguousarray(frames[n]).tobytes())
-        names.append(name)
-
     f_lo, f_hi = spectrum_band(request, lay["band_top_hz"])
     origin = [float(v) for v in lay["origin_m"]]
     probes = []
@@ -305,6 +296,15 @@ def write_results(store_out, job_id: str, result: dict, lay: dict,
                            for a in range(3)],
             "spectrum": {"frequency_hz": [float(f) for f in freqs[keep]],
                          "amplitude": [float(v) for v in amp]}})
+    names = []
+    store_out.write(key(TRACE_NAME), np.ascontiguousarray(traces).tobytes())
+    names.append(TRACE_NAME)
+    n_frames = 0 if frames is None else int(frames.shape[0])
+    for n in range(n_frames):
+        name = FRAME_NAME.format(n + 1)
+        store_out.write(key(name), np.ascontiguousarray(frames[n]).tobytes())
+        names.append(name)
+
     plan = plan or {}
     manifest = {
         "version": SPECTRUM_VERSION, "dt_s": dt, "steps": int(result["steps"]),
