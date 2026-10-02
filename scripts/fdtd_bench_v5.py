@@ -185,6 +185,27 @@ def judge(peaks, lines, gated, tolerance: float = TOLERANCE):
     return rows, failures
 
 
+def gated_modes(best_overlaps, threshold: float = EXCITABLE):
+    """Indices of the lines whose best source x probe overlap reaches the gate."""
+    return [j for j, best in enumerate(best_overlaps) if best >= threshold]
+
+
+def film_problem(film: float, dx: float):
+    """The quarter-cell rule: why ``film`` is not "far thinner", or None."""
+    if film > dx / FAR_THINNER * (1 + 1e-9):
+        return (f"the film {film:.4g} m is not at most 1/{FAR_THINNER} of the "
+                "coarse cell")
+    return None
+
+
+def floor_problem(floor: float, tolerance: float = TOLERANCE):
+    """The dispersion-floor rule: why the grid is too coarse, or None."""
+    if floor > tolerance / 2:
+        return (f"the dispersion floor {floor:.3%} is over half the "
+                f"{tolerance:.0%} tolerance")
+    return None
+
+
 def v5_verdict(failures, setup_problems):
     """``(verdict, exit code)``: FAIL 1 beats NOT A SPEC SETUP 2 beats PASS 0."""
     if failures:
@@ -247,9 +268,9 @@ def main(argv=None) -> int:
     probe_ij = (round(0.71 * args.a_cells), round(0.63 * args.b_cells))
     source_xy = (source_ij[0] * dx, source_ij[1] * dx)
     probe_xy = (probe_ij[0] * dx, probe_ij[1] * dx)
-    gated = [j for j, (_f, pairs) in enumerate(lines)
-             if max(overlap(pair, a, b, source_xy, probe_xy) for pair in pairs)
-             >= EXCITABLE]
+    best_overlaps = [max(overlap(pair, a, b, source_xy, probe_xy)
+                         for pair in pairs) for _f, pairs in lines]
+    gated = gated_modes(best_overlaps)
     floor = _v1.dispersion_error(dx, fdtd.C0 / (n * f_max))
 
     print(f"plates     {args.a_cells} x {args.b_cells} coarse cells of "
@@ -258,23 +279,18 @@ def main(argv=None) -> int:
           f"{len(gated)} gated (overlap >= {EXCITABLE}); dispersion floor "
           f"{floor:.3%} at the top")
     for j, (f, pairs) in enumerate(lines):
-        best = max(overlap(pair, a, b, source_xy, probe_xy) for pair in pairs)
-        print(f"  mode {pairs} {f:.6g} Hz overlap {best:.3f}"
+        print(f"  mode {pairs} {f:.6g} Hz overlap {best_overlaps[j]:.3f}"
               + ("" if j in gated else " (not gated)"))
 
     ratios = args.thickness_ratio[:1] if args.single else args.thickness_ratio
-    setup_problems = []
-    if floor > TOLERANCE / 2:
-        setup_problems.append(f"the dispersion floor {floor:.3%} is over half "
-                              f"the {TOLERANCE:.0%} tolerance")
+    setup_problems = [p for p in [floor_problem(floor)] if p]
     all_failures = []
     found_by_run = []
     eps_r = n * n
     for ratio in ratios:
         film = args.film_fraction * ratio * dx
-        if film > dx / FAR_THINNER * (1 + 1e-9):
-            setup_problems.append(f"the film {film:.4g} m is not at most "
-                                  f"1/{FAR_THINNER} of the coarse cell")
+        if film_problem(film, dx):
+            setup_problems.append(film_problem(film, dx))
         try:
             z = fdtd_grid.graded_axis(film, dx, [fdtd_grid.Layer(0.0, film)])
         except fdtd_grid.GridError as error:

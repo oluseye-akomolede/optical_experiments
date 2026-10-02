@@ -84,3 +84,30 @@ def test_a_failure_outranks_a_setup_problem():
     assert bench.v5_verdict(["x"], ["y"]) == ("FAIL", 1)
     assert bench.v5_verdict([], ["y"]) == ("NOT A SPEC SETUP", 2)
     assert bench.v5_verdict([], []) == ("PASS", 0)
+
+
+# The spec's "how the V5 bench decides" thresholds, each pinned on both sides.
+
+def test_a_mode_at_the_overlap_gate_is_gated_and_one_just_under_is_not():
+    gate = bench.EXCITABLE
+    assert gate == 0.05
+    assert bench.gated_modes([gate, 0.049, 0.8, 0.0]) == [0, 2]
+
+
+def test_a_quarter_cell_film_is_far_thinner_and_one_percent_more_is_not():
+    dx = 8e-9
+    assert bench.film_problem(dx / 4, dx) is None
+    problem = bench.film_problem(dx / 4 * 1.01, dx)
+    assert problem is not None and "1/4 of the coarse cell" in problem
+
+
+def test_a_floor_at_half_the_tolerance_passes_and_just_over_is_flagged():
+    assert bench.TOLERANCE == 0.01
+    assert bench.floor_problem(0.005) is None
+    problem = bench.floor_problem(0.0051)
+    assert problem is not None and "over half the 1% tolerance" in problem
+
+
+def test_a_flagged_setup_without_failures_exits_2():
+    verdict, code = bench.v5_verdict([], [bench.floor_problem(0.0051)])
+    assert code == 2
