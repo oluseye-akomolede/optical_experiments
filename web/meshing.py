@@ -19,13 +19,21 @@ class UploadError(Exception):
     """A problem with the upload that we can explain to the owner in one line."""
 
 
-def validate_upload(filename: str, data: bytes, max_bytes: int) -> None:
+def validate_upload(filename: str, data: bytes, max_bytes: int, *,
+                    closed: bool = True) -> None:
     """Raise :class:`UploadError` unless this looks like a usable .obj.
 
     Checks, in the order the owner would care about them: the name, the size,
     that trimesh can parse it at all, that it has faces, and that it is a closed
     surface -- the solver enforces PEC on the boundary, so an open surface would
     silently leak.
+
+    ``closed=False`` stops after the faces: the size and readability rails
+    only. A td upload passes it, because the closed check below merges every
+    part into one mesh and, when that is not watertight, falls back to the
+    CAVITY parser, whose touch rule refuses a film flush between two plates
+    (shared faces leave the merged mesh open). td_form's own split judges a
+    td upload's geometry, naming any open part.
     """
     name = (filename or "").strip()
     if not name:
@@ -59,6 +67,8 @@ def validate_upload(filename: str, data: bytes, max_bytes: int) -> None:
 
     if mesh is None or len(mesh.faces) == 0:
         raise UploadError("That .obj file contains no triangles.")
+    if not closed:
+        return
 
     mesh.merge_vertices()
     mesh.update_faces(mesh.nondegenerate_faces())

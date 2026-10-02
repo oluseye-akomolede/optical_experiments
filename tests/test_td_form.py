@@ -268,6 +268,34 @@ def test_parts_names_a_non_nested_td_scene_the_way_the_td_post_does(tmp_path):
     assert sorted(job["materials"]) == sorted(body["parts"])
 
 
+def test_a_film_flush_between_two_plates_is_taken_at_upload(tmp_path):
+    """Live defect (2026-10-02): flush faces leave the merged mesh open, so the
+    upload's closed check fell back to the cavity parser, which refused it."""
+    status, body = _ask_parts(tmp_path, _plates(gap=0.0), mode="td")
+    assert status == 200, body
+    assert body["parts"] == ["plate_bottom", "film", "plate_top"]
+    resp, db, _store, flashes = _post(
+        tmp_path, _plates(gap=0.0), td_boundary="open",
+        td_position="500 400 300", td_probes="500 400 300 z",
+        **{"part_index.block": None, "part_index.cube": None,
+           "part_index.plate_bottom": "Au", "part_index.film": "1.5",
+           "part_index.plate_top": "Au"})
+    assert resp.status_code == 302 and db.jobs, flashes
+
+
+def test_an_open_td_part_is_refused_by_name(tmp_path):
+    # The closed check td now skips: the td split must refuse the hole itself.
+    box = _box([0, 0, 0], [1, 1, 1])
+    open_box = trimesh.Trimesh(box.vertices, box.faces[:-2], process=False)
+    data = _obj(("lid", _box([0, 0, 2], [1, 1, 3])), ("cup", open_box))
+    status, body = _ask_parts(tmp_path, data, mode="td")
+    assert status == 400 and "'cup' is not a closed surface" in body["error"], body
+    _refused(tmp_path, "'cup' is not a closed surface", data=data,
+             td_boundary="open",
+             **{"part_index.block": None, "part_index.cube": None,
+                "part_index.lid": "1.5", "part_index.cup": "1.5"})
+
+
 def test_parts_that_share_volume_are_refused_at_upload_naming_both(tmp_path):
     """5.4e: refused before queueing, not failed later in the worker."""
     lens = _box([0, 0, 0], [0.6, 0.8, 0.6])

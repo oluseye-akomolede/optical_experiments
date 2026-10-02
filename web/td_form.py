@@ -259,9 +259,18 @@ def split_parts(data: bytes):
     pickers list exactly the parts the POST will check. The cavity parser
     (``meshing.parse_parts``) is NOT this: it also demands that the first part
     enclose the rest and that no parts touch, which a film between two plates
-    breaks. Its errors are the caller's to word.
+    breaks. Its errors are the caller's to word, except an open part: the
+    upload's own closed check is skipped for td (it falls back to the cavity
+    parser), so this is where a td upload is refused for a hole, by name.
     """
-    return _solver()[2].split_obj_parts(data)
+    names, parts = _solver()[2].split_obj_parts(data)
+    for name, part in zip(names, parts):
+        if not part.is_watertight:
+            raise TDRequestError(
+                f"Part {name!r} is not a closed surface (it has holes or open "
+                "edges), so the run cannot tell its inside from its outside. "
+                "Please upload a watertight .obj.")
+    return names, parts
 
 
 def plan_request(form, data: bytes, units_scale_m: float) -> dict:

@@ -469,6 +469,13 @@ the other's.
 - **THEN** the upload is refused before queueing, naming both parts, and no job
   is created; a flush stack of three parts is queued, with no lattice probed
 
+#### Scenario: a flush film is taken at upload, and an open part is refused by name
+- **WHEN** a td upload is a film lying flush between two plates, so the parts
+  share faces and their merged surface is open
+- **THEN** the part list and the td POST both take it (the upload's whole-mesh
+  closed check, whose fallback is the cavity parser's touch rule, does not run
+  for td); a td upload with a part that has holes is refused naming that part
+
 ### Requirement: The worker SHALL run a time-domain job only with the memory it needs
 
 The worker SHALL run at most one GPU job at a time when one of them is `td`.
@@ -725,7 +732,8 @@ The worker SHALL turn a `td` job's upload into a grid by this rule, and phase
 run that is solved.
 
 - **Parts.** The upload's named groups, each a closed surface, refused by name
-  otherwise. There is no enclosing-wall rule: in `open` space the parts are
+  otherwise.; the closed check is per part, never on the merged mesh, so parts
+  may share faces. There is no enclosing-wall rule: in `open` space the parts are
   separate objects. Each part takes its entry in the job's `materials` table
   (a refractive index of at least 1, `pec`, or a Rakić metal name); a
   one-part upload with no table takes the job's `n_index`.

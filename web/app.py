@@ -209,14 +209,18 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
             # its refusal cannot name which part is open -- and naming the part
             # is the entire reason this endpoint exists. The parser splits
             # first and names what it rejects, so it speaks last.
-            validate_upload(uploaded.filename, data, CFG.MAX_UPLOAD_BYTES)
-            if request.form.get("mode") == TDF.MODE:
+            td = request.form.get("mode") == TDF.MODE
+            # A td upload skips the closed check: its fallback is the cavity
+            # parser, which refuses a flush film (see validate_upload).
+            validate_upload(uploaded.filename, data, CFG.MAX_UPLOAD_BYTES,
+                            closed=not td)
+            if td:
                 # A td scene's parts, cut by the td POST's own split: the
                 # cavity parser below refuses plates that are not nested.
                 names = list(TDF.split_parts(data)[0])
             else:
                 names = parse_parts(data, units)
-        except UploadError as exc:
+        except (UploadError, TDF.TDRequestError) as exc:
             return jsonify({"error": str(exc)}), 400
         except Exception as exc:  # noqa: BLE001 - the td split's own words
             return jsonify({"error": "This object's parts could not be "
@@ -1167,7 +1171,11 @@ def _handle_td_upload(app, store, jobs_db):
 
     data = uploaded.read()
     try:
-        validate_upload(uploaded.filename, data, CFG.MAX_UPLOAD_BYTES)
+        # Size and readability only: the closed check falls back to the cavity
+        # parser, whose touch rule refuses a flush film; plan_request's split
+        # refuses an open part by name.
+        validate_upload(uploaded.filename, data, CFG.MAX_UPLOAD_BYTES,
+                        closed=False)
         planned = TDF.plan_request(request.form, data,
                                    unit_scale_m(units) * scale)
     except (UploadError, TDF.TDRequestError) as exc:
