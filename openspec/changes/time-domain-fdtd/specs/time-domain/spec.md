@@ -221,6 +221,23 @@ that exceeded it, and the form lever that reduces it.
 - **THEN** the page shows the refusal with the byte estimate, the limit and the
   lever, and the server does not respond 500
 
+#### Scenario: the estimate counts the steps the run will take
+- **WHEN** a run's dt is lowered below 0.99 of Courant by a dispersive metal
+- **THEN** the estimate's step count uses that lowered dt, the same dt the
+  solver reports, and a duration of a whole number of steps is not rounded up
+  by floating-point noise
+
+#### Scenario: an unmeasured configuration is timed at the slower rate
+- **WHEN** a run's configuration has no row of its own in the Jetson rate table
+  (periodic or mixed faces, or metal walls with a dispersive metal)
+- **THEN** it is timed at the slower measured rate (open, or open with gold),
+  so the 30-minute limit never admits a run on a guessed faster rate
+
+#### Scenario: every exceeded limit is named at once
+- **WHEN** a request exceeds more than one limit
+- **THEN** one refusal names each of them, in the order cells, steps, memory,
+  time, and a value exactly at a limit is admitted
+
 #### Scenario: the memory estimate is checked against the solver's real peak
 - **WHEN** the solver runs a tiny grid with metal, open or periodic faces, a
   conductor mask, the peak-field record or a Lorentz-Drude metal

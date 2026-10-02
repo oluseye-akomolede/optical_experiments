@@ -54,7 +54,7 @@
   run is the lead's.
 - [x] 3.1 Voxelise the upload's regions to an index map. Cells outside the shape
   are metal (`metal`) or vacuum plus a gap (`open`).
-- [ ] 3.2 Estimate cells, steps, memory and run time from the form. Refuse above
+- [x] 3.2 Estimate cells, steps, memory and run time from the form. Refuse above
   8 M cells, 20 000 steps, 3.0 GB or 30 minutes, naming the limit, the value and
   the lever to change.
 - [ ] 3.3 Every refusal type raised by the form or the geometry is caught by the

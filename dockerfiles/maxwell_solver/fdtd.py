@@ -1210,6 +1210,104 @@ def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
     return int(total)
 
 
+# The spec's per-run limits (requirement "A run SHALL be refused above its
+# limits before it is queued").
+MAX_CELLS = 8_000_000
+MAX_STEPS = 20_000
+MAX_BYTES = 3.0e9
+MAX_SECONDS = 30 * 60
+
+# Jetson cell-steps per second, from the 6ffa8bd rate table (cupy, 300 steps,
+# 1 M and 4 M cells; queue row 4a5da177): metal 106.69 / 114.10, open
+# 57.53 / 56.82, open + 1/8 gold 47.53 / 46.30 Mcell-steps/s. Each takes the
+# slower of its two rows. Unmeasured setups take the slower measured rate:
+# periodic or mixed faces the open rate, metal walls with a metal the gold rate.
+JETSON_RATES = {"metal": 106.69e6, "open": 56.82e6, "dispersive": 46.30e6}
+
+
+class EstimateError(FDTDError):
+    """A run over one or more limits. ``exceeded`` holds one
+    ``(name, value, limit, lever)`` per limit broken, in the spec's order."""
+
+    def __init__(self, exceeded):
+        self.exceeded = list(exceeded)
+        super().__init__(" ".join(lever for *_, lever in self.exceeded))
+
+
+def rate_setup(boundary="metal", metals=()) -> str:
+    """The rate-table row a run is timed by (see ``JETSON_RATES``)."""
+    if len(metals):
+        return "dispersive"
+    if all(side == "metal" for side in _axis_boundaries(boundary)):
+        return "metal"
+    return "open"
+
+
+def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
+                 pec=None, record_peak=False) -> dict:
+    """Cells, dt, steps, device bytes and Jetson seconds for a planned run.
+
+    ``nodes`` are the three node-coordinate arrays the run will use and
+    ``metals``/``pec`` the voxeliser's masks on them. dt is found the way
+    ``simulate`` finds it: 0.99 of Courant on the finest spacing per axis,
+    then lowered by each metal's ``stable_dt``, so the step count is the
+    one the run will take.
+    """
+    nodes = [np.asarray(n, dtype=float) for n in nodes]
+    shape = tuple(len(n) for n in nodes)
+    finest = tuple(float(np.diff(n).min()) for n in nodes)
+    metals = dict(metals or {})
+    dt = courant_dt(*finest)
+    for name, region in metals.items():
+        dt = min(dt, LorentzDrude(name, region).stable_dt(dt, finest))
+    cells = int(np.prod(shape))
+    # rounding noise must not add a step to a duration of whole steps
+    steps = int(np.ceil(float(duration) / dt * (1 - 1e-9)))
+    setup = rate_setup(boundary, metals)
+    return {
+        "shape": shape,
+        "cells": cells,
+        "dt": dt,
+        "finest": min(finest),
+        "steps": steps,
+        "bytes": memory_estimate(shape, boundary=boundary,
+                                 metals=list(metals.items()),
+                                 pec=pec is not None, record_peak=record_peak),
+        "setup": setup,
+        "seconds": cells * steps / JETSON_RATES[setup],
+    }
+
+
+def check_limits(estimate: dict) -> None:
+    """Raise ``EstimateError`` naming every limit ``estimate`` exceeds, the
+    value that exceeded it, and the form setting that reduces it."""
+    e = estimate
+    finest = f"{e['finest'] * 1e9:.3g} nm"
+    exceeded = []
+    if e["cells"] > MAX_CELLS:
+        exceeded.append(("cells", e["cells"], MAX_CELLS,
+            f"The grid has {e['cells']:,} cells, over the limit of "
+            f"{MAX_CELLS:,}. Increase dx to use fewer, larger cells."))
+    if e["steps"] > MAX_STEPS:
+        exceeded.append(("steps", e["steps"], MAX_STEPS,
+            f"The run needs {e['steps']:,} time steps, over the limit of "
+            f"{MAX_STEPS:,} (dt is {e['dt']:.3g} s, set by the finest cell, "
+            f"{finest}). Shorten the duration, or increase dx."))
+    if e["bytes"] > MAX_BYTES:
+        exceeded.append(("memory", e["bytes"], MAX_BYTES,
+            f"The run needs about {e['bytes'] / 1e9:.2f} GB of GPU memory, "
+            f"over the limit of {MAX_BYTES / 1e9:.1f} GB. Increase dx, or use "
+            f"metal walls instead of open ones (each open axis adds an "
+            f"absorbing layer's storage across the whole grid)."))
+    if e["seconds"] > MAX_SECONDS:
+        exceeded.append(("time", e["seconds"], MAX_SECONDS,
+            f"The run would take about {e['seconds'] / 60:.0f} minutes, over "
+            f"the limit of {MAX_SECONDS // 60} minutes. Shorten the duration, "
+            f"or increase dx."))
+    if exceeded:
+        raise EstimateError(exceeded)
+
+
 def simulate(eps_r, source: Source, n_steps: int, probes=(),
              *, spacings=None, dx: float = 1.0,
              boundary: str = "metal", pec=None, pml_cells: int = DEFAULT_PML_CELLS,
