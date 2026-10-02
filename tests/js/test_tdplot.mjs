@@ -59,8 +59,59 @@ test('envelope with more columns than samples gives one bucket per sample', () =
 });
 
 test('probeLabel names the component and the position in a suitable unit', () => {
+  // No manifest: no grid to read a step or a unit from, so the largest
+  // coordinate picks the prefix, as it always did.
   const label = tdplot.probeLabel({ component: 'z', position_m: [1.5e-6, 0, -2.25e-6] }, 0);
-  assert.equal(label, 'probe 1: Ez at (1.50, 0.00, -2.25) µm');
+  assert.equal(label, 'probe 1: Ez at (1.50, 0, -2.25) µm');
+});
+
+// aa6f083b's grid shape -- 58 x 53 x 48 cells over a nanometre-scale cube --
+// with a step that is exact in binary (2^-26 m, 14.9 nm) so that a case on the
+// snap line is a case on the line and not on a float's error. A real grid's
+// step is the minimum of noisy gaps, which is why the line is a millionth of a
+// cell: the stored residue is ~1e-10 of one.
+const STEP = 2 ** -26;                       // 14.9 nm, exact in binary
+const axis = (n) => Array.from({ length: n }, (_, k) => (k - 16) * STEP);
+const GRID = { frames: { positions_m: [axis(58), axis(53), axis(48)] } };
+
+test('a probe at the frame origin reads as 0, in the grid\'s own unit', () => {
+  // The stored position is origin_m + node: a probe AT the origin arrives as
+  // the float64 remainder of two grid-sized numbers. aa6f083b stored
+  // [4.002230675776569e-20, -3.2001963538451535e-19, 1.0005576689441423e-19]
+  // -- ~1e-19 m, twelve orders under the 20 nm cell -- and the page printed
+  // its residue's own unit: "0.0000400, -0.000320, 0.000100 fm".
+  const probe = { component: 'z', cell: [16, 16, 16],
+    position_m: [4.002230675776569e-20, -3.2001963538451535e-19, 1.0005576689441423e-19] };
+  assert.equal(tdplot.probeLabel(probe, 0, GRID), 'probe 1: Ez at (0, 0, 0) nm');
+  assert.equal(tdplot.probeLabel(probe, 2, GRID), 'probe 3: Ez at (0, 0, 0) nm');
+});
+
+test('the snap takes the residue and leaves every real node', () => {
+  // A node one cell along: printed, in the grid's unit.
+  const cell = { component: 'x', position_m: [STEP, 0, -2 * STEP] };
+  assert.equal(tdplot.probeLabel(cell, 0, GRID), 'probe 1: Ex at (14.9, 0, -29.8) nm');
+  // The line is a millionth of a cell: below it is the origin, and it is a
+  // line, not a blunt cut at some physical size -- 2e-6 of a cell prints.
+  const halfTheLine = { component: 'x', position_m: [0.5e-6 * STEP, 0, 0] };
+  assert.equal(tdplot.probeLabel(halfTheLine, 0, GRID), 'probe 1: Ex at (0, 0, 0) nm');
+  const twiceTheLine = { component: 'x', position_m: [2e-6 * STEP, 0, 0] };
+  assert.equal(tdplot.probeLabel(twiceTheLine, 0, GRID),
+    'probe 1: Ex at (0.0000298, 0, 0) nm');
+});
+
+test('gridStep is the finest gap between the manifest\'s sample positions', () => {
+  const graded = { frames: { positions_m: [
+    [0, 0.25, 0.5, 0.625],            // gaps 0.25, 0.25, 0.125
+    [0, 0.5, 0.75],                   // gaps 0.5, 0.25
+  ] } };
+  assert.equal(tdplot.gridStep(graded), 0.125);
+  // No positions to read: a job with no movie, a manifest older than the
+  // positions, an axis of one node (no gap), or no manifest at all.
+  assert.equal(tdplot.gridStep({ frames: { count: 3 } }), null);
+  assert.equal(tdplot.gridStep({ frames: null }), null);
+  assert.equal(tdplot.gridStep({}), null);
+  assert.equal(tdplot.gridStep(null), null);
+  assert.equal(tdplot.gridStep({ frames: { positions_m: [[0]] } }), null);
 });
 
 test('axisExponent pulls out a power of ten only when plain ticks would not read', () => {

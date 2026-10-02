@@ -107,12 +107,42 @@ export function envelope(values, columns) {
   return out;
 }
 
-/** A probe's legend text: its component and position, in the length prefix
- * that suits the largest coordinate. */
-export function probeLabel(probe, index) {
+/** The grid's own step in metres: the smallest positive gap between the sample
+ * positions the manifest lists, or null when it lists none (a job with no
+ * movie, or a manifest written before the positions were recorded). */
+export function gridStep(manifest) {
+  const pos = manifest && manifest.frames && manifest.frames.positions_m;
+  if (!Array.isArray(pos)) return null;
+  let step = Infinity;
+  for (const axis of pos) {
+    for (let i = 1; i < (axis || []).length; i += 1) {
+      const d = Math.abs(Number(axis[i]) - Number(axis[i - 1]));
+      if (d > 0 && d < step) step = d;
+    }
+  }
+  return Number.isFinite(step) ? step : null;
+}
+
+/** A probe's legend text: its component and position, in the length prefix of
+ * the job's own grid. */
+export function probeLabel(probe, index, manifest = null) {
   const pos = probe.position_m || [];
-  const { factor, prefix } = siPrefix(Math.max(...pos.map((v) => Math.abs(v)), 0));
-  const xyz = pos.map((v) => (v / factor).toPrecision(3)).join(', ');
+  // A stored position is ``origin_m + node``: two numbers the size of the grid
+  // whose sum is the coordinate. A probe sitting AT the frame's own origin
+  // therefore arrives as their float64 remainder -- here ~1e-19 m, a nanometre
+  // grid's own rounding -- and printing that in the unit its own magnitude
+  // asks for reads "0.0000400 fm": residue promoted to a measurement, twelve
+  // orders below the grid's cell. Anything under a millionth of the cell IS
+  // that origin; the stored residue is ~1e-10 of a cell at worst, so nothing
+  // real is within four orders of the line.
+  const step = gridStep(manifest);
+  const snap = step === null ? 0 : 1e-6 * step;
+  const axes = pos.map((v) => (Math.abs(Number(v)) < snap ? 0 : Number(v)));
+  // The prefix is the grid's, never the residue's: an exactly-zero coordinate
+  // reads "0" there. With no step (no movie in the manifest) neither the snap
+  // nor the floor exists, and the largest coordinate picks the unit as before.
+  const { factor, prefix } = siPrefix(Math.max(...axes.map((v) => Math.abs(v)), step || 0));
+  const xyz = axes.map((v) => (v === 0 ? '0' : (v / factor).toPrecision(3))).join(', ');
   return `probe ${index + 1}: E${probe.component} at (${xyz}) ${prefix}m`;
 }
 

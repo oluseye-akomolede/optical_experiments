@@ -1,7 +1,7 @@
 """scripts/tdcheck_fetch.py -- which job is mirrored, and what it downloads.
 
 The script exists so the time-domain render check can run against a real
-production job instead of a fixture. That gives it three jobs, and each is a
+production job instead of a fixture. That gives it four jobs, and each is a
 place where a wrong answer looks like a right one:
 
 * **Which job.** A job may be named by a prefix. A prefix that matches two runs
@@ -16,9 +16,14 @@ place where a wrong answer looks like a right one:
   name -- and chasing one into a 404 makes a complete mirror look like a page
   that failed. This happened twice while writing it, which is why it is pinned
   here.
+* **What a bad answer means.** A fetch that does not answer 200 aborts the run
+  naming the URL and the status, so a hole in the mirror cannot look like a job
+  that simply has no such file. That clause is the module's own ``get``, and it
+  is the one thing here that the fakes cannot show: the test below stubs
+  ``urlopen`` instead and drives the real ``get``.
 
 Tier 1: no network, no browser. The fetch is faked through the module's own
-``get``, and everything else is pure.
+``get`` -- except for that one test -- and everything else is pure.
 
 What these tests cannot show is that the page then checks correctly; that is
 what ``scripts/run_tdcheck.sh`` and the mirror itself are for.
@@ -27,6 +32,7 @@ what ``scripts/run_tdcheck.sh`` and the mirror itself are for.
 from __future__ import annotations
 
 import importlib.util
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -106,6 +112,50 @@ def test_static_assets_follow_the_page_and_only_path_like_strings(monkeypatch):
     # The colour-space name is a string in the JS, not a path, and no request
     # was made for it: that is the whole rule this pins.
     assert "http://mse/static/srgb-linear" not in asked
+
+
+def test_a_fetch_that_is_not_200_aborts_naming_the_url_and_the_status(monkeypatch):
+    """The real ``get``, against a stubbed ``urlopen``.
+
+    Every other test here fakes ``get`` itself, so this clause could be deleted
+    with all of them still green: a spec'd abort with no coverage is a control
+    that cannot fail.
+    """
+    mod = load()
+
+    class Answer:
+        """What urlopen() returns: a context manager with a body."""
+
+        def read(self):
+            return b"abc"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    # A 200 is the body: this test drives the real get(), not a copy of it.
+    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda url, timeout: Answer())
+    assert mod.get("http://mse/files/spectrum.json") == b"abc"
+
+    def http_error(url, timeout):
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", http_error)
+    with pytest.raises(SystemExit) as e:
+        mod.get("http://mse/files/trace.bin")
+    assert "http://mse/files/trace.bin" in str(e.value), e.value
+    assert "404" in str(e.value) and "Not Found" in str(e.value), e.value
+
+    def url_error(url, timeout):
+        raise urllib.error.URLError("Connection refused")
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", url_error)
+    with pytest.raises(SystemExit) as e:
+        mod.get("http://mse/jobs/x")
+    assert "http://mse/jobs/x" in str(e.value), e.value
+    assert "Connection refused" in str(e.value), e.value
 
 
 def test_the_patterns_read_a_reference_and_ignore_a_lookalike():

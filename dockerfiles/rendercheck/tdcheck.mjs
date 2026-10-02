@@ -49,6 +49,13 @@ const { decodeTraces, siPrefix, axisExponent, exponentText, SPECTRUM_SCALE } =
     console.log(`FAIL  TD_DIR (${DIR}) has no readable static/tdplot.js: ${e.message}`);
     return process.exit(1);
   });
+// The movie's own two drawing constants, for the same reason: the caption's
+// percentile and cut are these numbers, so the caption contract has one source.
+const { SCALE_PERCENTILE, MOVIE_THRESHOLD } =
+  await import(pathToFileURL(path.join(DIR, 'static/tdmovie.js')).href).catch((e) => {
+    console.log(`FAIL  TD_DIR (${DIR}) has no readable static/tdmovie.js: ${e.message}`);
+    return process.exit(1);
+  });
 
 const manifest = JSON.parse(fs.readFileSync(path.join(DIR, 'files/spectrum.json'), 'utf8'));
 const PROBES = manifest.probes;
@@ -90,6 +97,42 @@ const spacingS = frameTimes.length > 1
   ? (frameTimes[frameTimes.length - 1] - frameTimes[0]) / (frameTimes.length - 1) : 0;
 const cycles = manifest.source_frequency_hz
   ? spacingS * manifest.source_frequency_hz : null;
+
+// --- reading the legend's own position back ---------------------------------
+// The prefix table is the page's own: siPrefix over every decade, so a unit the
+// page cannot write is a unit this check cannot read.
+const FACTOR = new Map();
+for (let e = -24; e <= 24; e += 1) {
+  const u = siPrefix(10 ** e);
+  FACTOR.set(u.prefix, u.factor);
+}
+/** The finest gap between the sample positions a manifest lists: the job's own
+ *  cell in metres, or null when it lists none. Read here rather than imported:
+ *  the page served in TD_DIR may predate that export. */
+function fineStep(positions) {
+  if (!Array.isArray(positions)) return null;
+  let s = Infinity;
+  for (const axis of positions) {
+    for (let i = 1; i < (axis || []).length; i += 1) {
+      const d = Math.abs(Number(axis[i]) - Number(axis[i - 1]));
+      if (d > 0 && d < s) s = d;
+    }
+  }
+  return Number.isFinite(s) ? s : null;
+}
+/** A legend line's position in metres, read through the page's own prefixes:
+ *  {metres, tokens, prefix}, or {error} naming what the line does not state. */
+function legendPosition(text) {
+  const m = /^■ probe (\d+): E(.+) at \(([^()]*)\)\s*(\S*)m$/.exec(text);
+  if (!m) return { error: `${JSON.stringify(text)} states no "probe N: Ec at (x, y, z) <unit>m"` };
+  const factor = FACTOR.get(m[4]);
+  if (factor === undefined) return { error: `${JSON.stringify(m[4] + 'm')} is not a unit the page writes` };
+  const tokens = m[3].split(',').map((t) => t.trim());
+  if (tokens.length !== 3 || tokens.some((t) => !/^-?\d+(\.\d+)?$/.test(t))) {
+    return { error: `${JSON.stringify(m[3])} is not three plain numbers` };
+  }
+  return { metres: tokens.map((t) => Number(t) * factor), tokens, prefix: m[4] };
+}
 
 // --- moving the page without waiting on an animation frame ------------------
 // Setting the slider and firing its event in one evaluate is what the page's
@@ -234,6 +277,40 @@ const browser = await chromium.launch();
      && s.legend.every((t, i) => t.startsWith(wantLegend[i]))
      && new Set(wantLegend).size === wantLegend.length,
      `legend per probe: ${JSON.stringify(s.legend)}`);
+  // The legend's position is the probe's own node: worker/td_solve.py stores
+  // origin_m + the coordinate of the grid node the probe sits on, which is what
+  // the manifest's probes[].position_m holds, so the two must agree on every
+  // axis. A node AT the frame's own origin arrives as the float64 remainder of
+  // two grid-sized numbers -- on this job ~1e-19 m, a *millionth of a cell or
+  // less* -- and printing that as a position rather than as the origin is what
+  // put "0.0000400 fm" on prod job aa6f083b, twelve orders below the cell.
+  const step = fineStep(FR && FR.positions_m);
+  const stated = s.legend.map(legendPosition);
+  ok(stated.length === NP && stated.every((p) => p.metres),
+     `every legend states its position as three numbers in a unit the page writes: ` +
+     JSON.stringify(stated.map((p) => p.error || p.tokens.join(', '))));
+  if (stated.every((p) => p.metres)) {
+    // The page prints three significant digits, so a coordinate is its node to
+    // within half a percent of itself -- but never further than one cell, which
+    // is the whole of what a node's coordinate means on this grid.
+    const okAxis = (v, got) => Math.abs(got - v) <= Math.max(step || 0, Math.abs(v) * 5e-3);
+    ok(PROBES.every((p, i) => p.position_m.every((v, a) => okAxis(v, stated[i].metres[a]))),
+       `every legend position is the manifest's own node, within ` +
+       `${step === null ? 'the printed three digits' : `one cell (${step} m)`}: ` +
+       `${JSON.stringify(stated.map((p) => p.tokens.join(', ')))} vs ` +
+       `${JSON.stringify(PROBES.map((p) => p.position_m))}`);
+    if (step === null) {
+      console.log('      the manifest lists no sample positions: the origin rule is not checked here');
+    } else {
+      const origin = [];
+      stated.forEach((p, i) => PROBES[i].position_m.forEach((v, a) => {
+        if (Math.abs(v) < 1e-6 * step) origin.push(`probe ${i + 1} ${'xyz'[a]}=${v} -> ${p.tokens[a]}`);
+      }));
+      ok(origin.every((c) => c.endsWith(' -> 0')),
+         `a coordinate below a millionth of the grid's own cell (${step} m) reads as 0, ` +
+         `and a probe at the origin is a case of it: ${JSON.stringify(origin)}`);
+    }
+  }
   ok(s.caveats === 0, 'no caveat lines when the run has none');
   ok(s.trace.length === NP && s.spec.length === NP,
      `one trace and one spectrum line per probe (${NP}): ${s.trace.length} and ${s.spec.length}`);
@@ -306,8 +383,10 @@ if (!FR || !FR.count) {
       + `${(manifest.source_frequency_hz / f.factor).toPrecision(3)} ${f.prefix}Hz source)`;
   })();
   ok(st.caption.startsWith(head(1)) && st.caption.includes(spacing)
-     && st.caption.includes('One colour scale for every frame (the 99th percentile')
-     && st.caption.includes('below 0.12 of it is not drawn'), `movie caption: ${st.caption}`);
+     && st.caption.includes(`One colour scale for every frame `
+                            + `(the ${Math.round(SCALE_PERCENTILE * 100)}th percentile`)
+     && st.caption.includes(`below ${MOVIE_THRESHOLD} of it is not drawn`),
+     `movie caption: ${st.caption}`);
   // The caption's honest verdict, checked against the manifest's own numbers:
   // more than half a cycle between frames must be said to be the envelope, and
   // a spacing under that must NOT claim it.

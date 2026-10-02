@@ -1353,7 +1353,10 @@ async function renderTd(data) {
       swatch.className = 'td-swatch';
       swatch.textContent = '■ ';
       swatch.style.color = seriesColour(i);
-      li.append(swatch, probeLabel(p, i));
+      // The manifest comes along for its sample positions: they are the job's
+      // only record of its own grid, and they are what tells a probe sitting
+      // at the frame origin from one a cell away from it.
+      li.append(swatch, probeLabel(p, i, manifest));
       li.dataset.series = String(i);
       legend.appendChild(li);
     });

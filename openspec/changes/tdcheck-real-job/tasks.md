@@ -67,5 +67,27 @@
       `openspec validate --all --strict` (14 passed, 0 failed) pass. The delta
       is ADDED only: `time-domain` has no base spec yet, so a MODIFIED delta
       would be refused at archive.
-- [ ] 5.4 Commit locally on `fix-td-metal-job-page` and report the sha on row
-      `qitem-20261002201204-20f019a0` (no push).
+- [x] 5.4 Commit locally on `fix-td-metal-job-page` and report the sha on row
+      `qitem-20261002201204-20f019a0` (no push). Landed as `6891cd7`. The commit
+      message's claim of "57 fetch tests" is wrong -- the file has 5 tests (6
+      after 6.1); the correction is in the follow-up commit's message.
+
+## 6. Review fixes (row `qitem-20261002205252-0cd57f5f`, on top of 6891cd7)
+
+- [x] 6.1 The non-200 abort in `scripts/tdcheck_fetch.py` is driven through the
+      module's real `get` with `urlopen` stubbed (a 200 answers the body first,
+      as a positive control), instead of only through fakes of `get` itself.
+      Verify: with the abort deleted, the test reddens with the `HTTPError`
+      escaping, and the other five tests stay green.
+- [x] 6.2 `scripts/run_tdcheck.sh`'s `--dir` pre-check names `files/trace.bin`
+      among the files it refuses to run without, and `tests/test_run_tdcheck.py`
+      derives the required list from `tdcheck.mjs`'s own
+      `path.join(DIR, '...')` reads, so a read the runner does not cover fails
+      the test rather than crashing the check.
+      Verify: test 1 reddens against the old four-file list naming exactly
+      `['files', 'files/trace.bin', 'static/tdmovie.js']`; test 2 forces the
+      refusal (exit 2, "files/trace.bin is not readable", no `docker run`).
+- [x] 6.3 The caption contract has one source: `tdcheck.mjs` reads
+      `SCALE_PERCENTILE` and `MOVIE_THRESHOLD` from the job's own
+      `static/tdmovie.js` (exiting with a named error if it cannot) instead of
+      retyping "99th percentile" and "0.12".
