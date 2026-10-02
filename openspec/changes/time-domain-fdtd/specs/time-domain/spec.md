@@ -624,6 +624,37 @@ whatever array library ran the solve, and the memory estimate SHALL count them.
 - **WHEN** a frame step is repeated or outside the run, or a stride is below 1
 - **THEN** the solver refuses before stepping, naming the bad value
 
+### Requirement: A time-domain job's results SHALL be three kinds of flat file
+A finished `td` job SHALL store `trace.bin` (every probe's trace, float32
+little-endian, C order, shaped probes × steps), one `frame_NN.bin` per movie
+frame (two-digit, 1-based, |E| float32 little-endian, C order, in the grid's
+x, y, z order) and `spectrum.json` (the manifest: time step, step count, the
+band, each probe's position, component and amplitude spectrum within the band,
+the trace and frame shapes, and the layout caveats). The manifest SHALL be
+written last, so its presence means every other file exists. A non-finite value
+in a trace, frame or spectrum SHALL fail the job before anything is written.
+The worker's upload list and the app's accepted names SHALL agree on every one
+of these names, and SHALL refuse near misses (`frame_1.bin`, `frame_001.bin`,
+a path separator).
+
+#### Scenario: the files decode to the solver's own output
+- **WHEN** a tiny `td` job finishes
+- **THEN** `trace.bin` decodes to the solver's traces and each `frame_NN.bin`
+  to its frame, exactly, and `spectrum.json` names their shapes
+
+#### Scenario: a run that dies part way leaves no manifest
+- **WHEN** writing stops after `trace.bin` or a frame
+- **THEN** no `spectrum.json` exists for the job
+
+#### Scenario: NaN is refused before writing
+- **WHEN** a trace or frame holds NaN or infinity
+- **THEN** the job fails naming which output, and no file is written
+
+#### Scenario: a near-miss name is refused by both sides
+- **WHEN** the worker or the app is offered `frame_1.bin`, `frame_001.bin` or
+  `x/frame_01.bin`
+- **THEN** both refuse it
+
 ### Requirement: A drawn waveform SHALL be checked against the grid
 
 A `drawn` source SHALL be a list of at most 10 000 dimensionless amplitude
