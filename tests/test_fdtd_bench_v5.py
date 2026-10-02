@@ -181,3 +181,55 @@ def test_the_script_run_as_main_turns_a_crash_into_exit_two():
     assert "ZeroDivisionError" in done.stderr, done.stderr
     assert done.returncode == 2, done.stdout + done.stderr
     assert "V5 DID NOT RUN" in done.stdout
+
+
+def test_the_upload_layout_path_builds_v5s_film_case_exactly():
+    # The lead's 5.4d ask: V5's film case (a quarter-cell n = 2 film filling a
+    # metal plate pair) laid out as an uploaded part must solve on the same
+    # grid and give the same trace as V5's hand-built construction. A full
+    # 16 x 11 run at 2 cells/wavelength, 28k steps, matched every V5 line to
+    # the same frequency on both paths (-0.30% .. -1.24% from analytic); here
+    # 400 steps, where a pec mask eating one wall cell already moves the trace.
+    import numpy as np
+    import trimesh
+    sys.path.insert(0, str(ROOT / "dockerfiles" / "maxwell_solver"))
+    import fdtd
+    import fdtd_grid
+    import fdtd_layout
+
+    A, B, n, dx = 16, 11, 2.0, 1e-6
+    a, b, film = A * dx, B * dx, 0.25 * dx
+    z = fdtd_grid.graded_axis(film, dx, [fdtd_grid.Layer(0.0, film)])
+    nodes = (np.linspace(0, a, A + 1), np.linspace(0, b, B + 1), z)
+    eps, _ = fdtd_grid.average_eps(nodes, lambda p: np.zeros(len(p), int),
+                                   [n * n], samples=1)
+    k = (z.size - 1) // 2
+    src, prb = (6, 3, k), (11, 7, max(k - 1, 0), "z")
+    centre, bw = 1.2e13, 4e12
+
+    part = trimesh.creation.box(extents=(a, b, film))
+    part.apply_translation((a / 2, b / 2, film / 2))
+    request = {"boundary": "metal", "source_kind": "point", "profile": "pulse",
+               "frequency_hz": centre, "bandwidth": bw,
+               "position": [src[0] * dx, src[1] * dx, float(z[src[2]])],
+               "direction": None, "polarisation": "z", "samples": None,
+               "sample_duration_s": None, "duration_s": 1e-13,
+               "probes": [[prb[0] * dx, prb[1] * dx, float(z[prb[2]]), "z"]],
+               "dx_m": dx}
+    lay = fdtd_layout.layout(["film"], [part], request, length_scale=1.0,
+                             n_index=n)
+    assert lay["shape"] == eps.shape
+    for got, want in zip(lay["nodes"], nodes):
+        np.testing.assert_allclose(got, want, rtol=0, atol=1e-15)
+    np.testing.assert_array_equal(np.asarray(lay["eps"]), eps)
+    assert tuple(lay["cell"]) == src and tuple(lay["probes"][0]) == prb
+
+    def trace(eps, spacings, pec):
+        source = fdtd.Source(src, component="z", frequency=centre, bandwidth=bw)
+        r = fdtd.simulate(np.asarray(eps, np.float32), source, 400, [prb],
+                          spacings=spacings, boundary="metal", pec=pec)
+        return np.asarray(r["traces"][0], float)
+
+    hand = trace(eps, tuple(np.diff(x) for x in nodes), None)
+    assert np.abs(hand).max() > 0
+    np.testing.assert_array_equal(trace(lay["eps"], lay["spacings"], lay["pec"]), hand)
