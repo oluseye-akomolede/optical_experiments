@@ -47,10 +47,11 @@
 
 ## 3. Geometry, estimate and caps (phase 3)
 
-- [ ] 3.0 Graded-grid builder (≥ 4 cells per thin layer or skin depth, neighbour
+- [x] 3.0 Graded-grid builder (≥ 4 cells per thin layer or skin depth, neighbour
   ratio ≤ 1.3), sub-cell averaging at cut cells, and coatings (material +
   thickness on a region's surface). A unit check of the builder's own rules.
-  Benchmark V5 (parallel-plate lateral modes).
+  Benchmark V5 (parallel-plate lateral modes): script and its tests; the Jetson
+  run is the lead's.
 - [ ] 3.1 Voxelise the upload's regions to an index map. Cells outside the shape
   are metal (`metal`) or vacuum plus a gap (`open`).
 - [ ] 3.2 Estimate cells, steps, memory and run time from the form. Refuse above

@@ -339,6 +339,31 @@ neighbour spacing ratio of at most 1.3.
 - **THEN** every such layer has at least 4 cells across it and every neighbour
   spacing ratio is at most 1.3
 
+#### Scenario: a layer can cap its own spacing
+- **WHEN** a layer carries a spacing (a metal surface gets its skin depth at the
+  top of the band divided by 4, a curved coating its thickness divided by 4)
+- **THEN** no cell inside the layer is wider than that spacing, and the layer's
+  edges are grid nodes
+
+#### Scenario: a coating follows the region's shape
+- **WHEN** a region spanning lo..hi on an axis is coated with thickness t
+- **THEN** a region with flat faces normal to that axis adds the two thin layers
+  lo−t..lo and hi..hi+t, and any other region adds one layer lo−t..hi+t capped at
+  t/4, so a curved coating costs more cells than a flat one
+
+#### Scenario: a grading that cannot converge is refused
+- **WHEN** repairing neighbour-ratio violations grows an axis past a fixed
+  multiple of its first node count, or does not settle within the repair limit
+- **THEN** the builder raises a named grid error instead of refining further
+
+#### Scenario: a cut cell takes the volume average
+- **WHEN** a node's dual cell (halfway to each neighbour, clipped at the domain
+  ends) is split between materials
+- **THEN** its permittivity is the average over the dielectric samples of that
+  cell; a node at least half of whose samples are one metal is that metal's
+  node; a node with no dielectric sample gets permittivity 1; and nothing
+  outside the domain is sampled
+
 #### Scenario: benchmark V5
 - **WHEN** a dielectric film of index n, far thinner than the coarse cell,
   fills the gap between two PEC plates of lateral size a × b with PEC side walls,
@@ -346,6 +371,16 @@ neighbour spacing ratio of at most 1.3.
 - **THEN** its resonances are within 1% of the parallel-plate lateral modes
   f = (c/2n)·√((m/a)² + (p/b)²) with m, p ≥ 1, which depend on n and not on the
   film thickness, and every such mode in the pulse band appears
+
+#### Scenario: how the V5 bench decides
+- **WHEN** the V5 bench judges a run
+- **THEN** "far thinner" means at most a quarter of the coarse cell; the film is
+  run at two thicknesses and both are gated against the same modes; peaks are
+  matched to modes one to one, closest first; a peak more than 1% from every mode
+  of the family fails the run; a mode whose source × probe overlap is under 0.05
+  is listed as not gated; and a setup whose grid dispersion at the top of the band
+  exceeds half the tolerance, or whose film axis breaks the builder's rules, exits
+  2 (not a spec setup) unless the run already failed
 
 ### Requirement: A drawn waveform SHALL be checked against the grid
 
