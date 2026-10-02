@@ -409,7 +409,10 @@ neighbour spacing ratio of at most 1.3.
   of the family fails the run; a mode whose source × probe overlap is under 0.05
   is listed as not gated; and a setup whose grid dispersion at the top of the band
   exceeds half the tolerance, or whose film axis breaks the builder's rules, exits
-  2 (not a spec setup) unless the run already failed
+  2 (not a spec setup) unless the run already failed; a missing module or a
+  crash in the bench's own setup exits 2 ("did not run"), while an exception
+  raised by the solver during a run exits 1 (a FAIL), so a solver bug never
+  reads as a bench problem
 
 ### Requirement: The upload's parts SHALL be voxelised onto the grid
 

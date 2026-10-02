@@ -156,6 +156,21 @@ def test_a_crash_inside_main_exits_two_not_one(monkeypatch, capsys):
     assert "V5 DID NOT RUN" in out.out and "setup blew up" in out.err
 
 
+def test_a_solver_exception_mid_run_exits_one_not_two(monkeypatch, capsys):
+    calls = []
+
+    def solver_bug(*args, **kwargs):
+        calls.append(args)
+        raise FloatingPointError("solver blew up mid-run")
+    monkeypatch.setattr(bench.fdtd, "simulate", solver_bug)
+    assert bench.run(["--single"]) == 1
+    out = capsys.readouterr()
+    assert calls, "the fake solver was never reached; this tested the setup"
+    assert "V5 FAIL: the solver raised" in out.out
+    assert "V5 DID NOT RUN" not in out.out
+    assert "solver blew up mid-run" in out.err
+
+
 def test_the_script_run_as_main_turns_a_crash_into_exit_two():
     # --cells-per-wavelength 0 divides by zero inside main() before any solve
     done = subprocess.run(
