@@ -982,6 +982,37 @@ def test_the_frame_plan_spreads_its_frames_and_ends_on_the_last_step():
         fdtd.frame_plan((5, 5, 5), 0)
 
 
+def test_a_frame_plan_keeps_only_the_window_it_is_given():
+    """``first_step``/``last_step`` restrict the recorded steps: the last frame
+    is the window's last step, every frame is inside the window, and the frames
+    stay evenly spread -- the same rule as the whole-run plan, on a sub-range."""
+    whole = fdtd.frame_plan((130, 64, 65), 1000)
+    plan = fdtd.frame_plan((130, 64, 65), 1000, max_frames=40,
+                           first_step=250, last_step=999)
+    steps = plan["steps"]
+    assert plan["stride"] == whole["stride"], "the window moves no samples"
+    # The window is the whole-run rule on the window's own length, shifted onto
+    # it: the frames a 750-step run would record, 250 steps later. As in the
+    # whole-run plan the first frame ends the first interval, so it sits inside
+    # the window rather than on its first step.
+    assert steps == [s + 250 for s in
+                     fdtd.frame_plan((130, 64, 65), 750, max_frames=40)["steps"]]
+    assert len(steps) == 40 and steps[-1] == 999
+    assert all(250 <= s <= 999 for s in steps)
+    assert all(a < b for a, b in zip(steps, steps[1:]))
+    gaps = np.diff([249] + steps)
+    assert gaps.max() - gaps.min() <= 1          # evenly spread
+    # a window holding fewer steps than frames records every step of it
+    assert fdtd.frame_plan((5, 5, 5), 100, max_frames=60, first_step=10,
+                           last_step=19)["steps"] == list(range(10, 20))
+    # and a window at the very end is allowed, up to the run's last step
+    assert fdtd.frame_plan((5, 5, 5), 100, max_frames=4, first_step=96,
+                           last_step=99)["steps"][-1] == 99
+    for first, last in ((5, 4), (-1, 5), (0, 100), (0, 101)):
+        with pytest.raises(fdtd.FDTDError, match="first and last step"):
+            fdtd.frame_plan((5, 5, 5), 100, first_step=first, last_step=last)
+
+
 def _movie_run(pec=None):
     shape = (9, 7, 8)                            # non-square on purpose
     eps = np.ones(shape, np.float32)

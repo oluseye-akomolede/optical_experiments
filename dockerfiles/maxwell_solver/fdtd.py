@@ -105,25 +105,45 @@ DEFAULT_PML_CELLS = 10
 CHECK_EVERY = 64
 
 #: The field movie's caps (proposal: at most 64 samples per axis, at most 60
-#: frames). A frame is then at most 1 MiB of float32.
+#: frames by default and 120 at most). A frame is then at most 1 MiB of float32.
 MAX_FRAMES = 60
+MAX_MOVIE_FRAMES = 120
 MAX_FRAME_SAMPLES = 64
 
 
 def frame_plan(shape, n_steps: int, *, max_frames: int = MAX_FRAMES,
-               max_samples: int = MAX_FRAME_SAMPLES) -> dict:
+               max_samples: int = MAX_FRAME_SAMPLES,
+               first_step: int = 0, last_step: int = None) -> dict:
     """The steps the field movie records and the stride along each axis.
 
     The stride is the smallest whole number that brings each axis to at most
-    ``max_samples`` samples. The frames are spread evenly over the run and
-    the last one is the final step, so the movie ends where the run ends.
+    ``max_samples`` samples, and it does not depend on the steps recorded. The
+    frames are spread evenly over the steps ``first_step``..``last_step`` and
+    the last one is ``last_step``, so a movie over the whole run (the default)
+    ends where the run ends. ``count`` is the requested frame count unless the
+    range holds fewer steps.
+
+    A window is only a restriction of the recorded steps: the run still takes
+    every step, and the frames are the same nodes.
     """
     n_steps = int(n_steps)
     if n_steps < 1:
         raise FDTDError(f"a field movie needs at least 1 step, got {n_steps}")
+    if last_step is None:
+        last_step = n_steps - 1
+    first, last = int(first_step), int(last_step)
+    if not 0 <= first <= last < n_steps:
+        raise FDTDError(
+            f"a field movie's first and last step must lie in the run's "
+            f"{n_steps} steps, with the first at or before the last, got "
+            f"{first_step!r} and {last_step!r}")
     stride = tuple(max(1, -(-int(n) // int(max_samples))) for n in shape)
-    count = min(int(max_frames), n_steps)
-    steps = [((k + 1) * n_steps) // count - 1 for k in range(count)]
+    span = last - first + 1
+    count = min(int(max_frames), span)
+    if count < 1:
+        raise FDTDError(f"a field movie needs at least 1 frame, got "
+                        f"{max_frames!r}")
+    steps = [first + ((k + 1) * span) // count - 1 for k in range(count)]
     return {"steps": steps, "stride": stride}
 
 
@@ -1282,15 +1302,19 @@ POOL_PER_OPEN_AXIS = 0.6
 
 
 def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
-                    record_peak=False, record_frames=False) -> int:
+                    record_peak=False, record_frames=False,
+                    max_frames: int = MAX_FRAMES) -> int:
     """Bytes ``simulate`` holds at its peak on the device (float32 arrays).
 
     Counts, per cell: six fields, eps and 1/eps, the transients, the device
     pool's cached blocks, four CPML psi arrays per open axis (two E and two H
     derivatives along it), the conductor mask and its multiplier, and the peak
-    |E_c| record (3 arrays), and the field movie (``MAX_FRAMES`` frames at
+    |E_c| record (3 arrays), and the field movie (``max_frames`` frames at
     ``frame_plan``'s stride, plus ten of the same size: the three float64
-    component copies and the float64 sum its |E| is built from). Each metal
+    component copies and the float64 sum its |E| is built from). The frame
+    count is the one the run will record, so a 120-frame movie is counted as
+    one: the estimate errs high only if the window holds fewer steps than
+    frames. Each metal
     ``(name, region)`` adds, per component, a box over its samples (the region
     widened one node along the component) holding 2 per pole + 4 arrays, plus
     the solver's boolean union of the regions.
@@ -1307,7 +1331,7 @@ def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
     total = 4.0 * cells * floats
     if record_frames:
         sampled = int(np.prod(frame_shape(shape, frame_plan(shape, 1)["stride"])))
-        total += 4.0 * sampled * (MAX_FRAMES + 10)
+        total += 4.0 * sampled * (int(max_frames) + 10)
     if metals:
         total += cells                      # the boolean union of the regions
     for name, region in metals:
@@ -1372,7 +1396,8 @@ def rate_setup(boundary="metal", metals=()) -> str:
 
 
 def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
-                 pec=None, record_peak=False, record_frames=False) -> dict:
+                 pec=None, record_peak=False, record_frames=False,
+                 max_frames: int = MAX_FRAMES) -> dict:
     """Cells, dt, steps, device bytes and Jetson seconds for a planned run.
 
     ``nodes`` are the three node-coordinate arrays the run will use and
@@ -1401,9 +1426,13 @@ def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
         "bytes": memory_estimate(shape, boundary=boundary,
                                  metals=list(metals.items()),
                                  pec=pec is not None, record_peak=record_peak,
-                                 record_frames=record_frames),
+                                 record_frames=record_frames,
+                                 max_frames=max_frames),
         "setup": setup,
         "seconds": cells * steps / (RATE_SAFETY * JETSON_RATES[setup]),
+        # the requested movie length, so a memory refusal can say that fewer
+        # frames would fit; None when this run records no movie
+        "frames": int(max_frames) if record_frames else None,
     }
 
 
@@ -1423,11 +1452,14 @@ def check_limits(estimate: dict) -> None:
             f"{MAX_STEPS:,} (dt is {e['dt']:.3g} s, set by the finest cell, "
             f"{finest}). Shorten the duration, or increase dx."))
     if e["bytes"] > MAX_BYTES:
+        frames = e.get("frames") or 0
         exceeded.append(("memory", e["bytes"], MAX_BYTES,
             f"The run needs about {e['bytes'] / 1e9:.2f} GB of GPU memory, "
             f"over the limit of {MAX_BYTES / 1e9:.1f} GB. Increase dx, or use "
             f"metal walls instead of open ones (each open axis adds an "
-            f"absorbing layer's storage across the whole grid)."))
+            f"absorbing layer's storage across the whole grid)."
+            + (f" Or record fewer than the {frames:,} movie frames asked for."
+               if frames > MAX_FRAMES else "")))
     if e["seconds"] > MAX_SECONDS:
         exceeded.append(("time", e["seconds"], MAX_SECONDS,
             f"The run would take about {e['seconds'] / 60:.0f} minutes, over "

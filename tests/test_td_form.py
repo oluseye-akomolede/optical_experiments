@@ -623,3 +623,149 @@ def test_the_pages_own_td_defaults_are_accepted(tmp_path):
     with client.session_transaction() as session:
         flashes = [str(m) for m in session.get("_flashes", [])]
     assert resp.status_code == 302 and len(db.jobs) == 1, (fields, flashes)
+
+
+# --- the movie window (change td-movie-window) -------------------------------
+
+def _estimate(tmp_path, **over):
+    """The cap-check estimate the form computes for these fields, through the
+    form's own reader and layout (so the test compares against the number the
+    refusal itself uses, not a guess)."""
+    fdtd, fdtd_layout, _parts = TDF._solver()
+    fields = _fields(**over)
+    blob = fields.pop("meshfile")[0]
+    data = blob.read() if hasattr(blob, "read") else blob
+    request = TDF.parse_request(fields)
+    names, parts = TDF.split_parts(data)
+    planned = fdtd_layout.plan(names, parts, request, length_scale=1e-6,
+                               materials=TDF.parse_materials(fields, fdtd),
+                               n_index=1.0)
+    return fdtd_layout.estimate(planned, request)
+
+
+def test_the_movie_fields_reach_the_worker_in_seconds_and_a_count(tmp_path):
+    over = {"td_movie_start_fs": "5", "td_movie_end_fs": "15",
+            "td_frame_count": "12"}
+    resp, db, _store, flashes = _post(tmp_path, **over)
+    assert resp.status_code == 302 and len(db.jobs) == 1, flashes
+    job = next(iter(db.jobs.values()))
+    tds = job["tds"]
+    assert tds["movie_start_s"] == _close(5e-15)
+    assert tds["movie_end_s"] == _close(15e-15)
+    assert tds["frame_count"] == 12
+    # the worker's own reader and plan take the stored row, and the frames are
+    # the window's: inside 5..15 fs, the last at the window's own end. The step
+    # bounds come from the run's dt, not from an assumed one.
+    import td_solve
+    est = _estimate(tmp_path, **over)
+    dt = float(est["dt"])
+    plan = TDF._solver()[1].movie_window(td_solve.request_from(job), est)
+    times = [s * dt for s in plan["steps"]]
+    assert len(times) == 12, plan
+    assert all(5e-15 <= t <= 15e-15 for t in times), times
+    assert 0 < 15e-15 - times[-1] < dt, (
+        "the last frame is the window's own end", times[-1])
+    gap = times[1] - times[0]
+    assert 0 < times[0] - 5e-15 <= gap + dt, (
+        "the first frame is one bucket inside the window, as in today's plan",
+        times[0])
+    assert plan["steps"][-1] < est["steps"] - 1, "the window is shorter than the run"
+
+
+def test_a_form_without_the_movie_fields_queues_todays_request(tmp_path):
+    """The compatibility promise at the form: the fields the page has always
+    had (an older page, or the page's own blanks) still queue a job, and the
+    worker plans today's whole-run movie, step for step."""
+    import fdtd
+    import td_solve
+    resp, db, _store, flashes = _post(tmp_path)
+    assert resp.status_code == 302 and len(db.jobs) == 1, flashes
+    job = next(iter(db.jobs.values()))
+    tds = job["tds"]
+    assert (tds["movie_start_s"], tds["movie_end_s"], tds["frame_count"]) == (
+        None, None, None)
+    est = _estimate(tmp_path)
+    plan = TDF._solver()[1].movie_window(td_solve.request_from(job), est)
+    want = fdtd.frame_plan(tuple(est["shape"]), est["steps"],
+                           max_frames=fdtd.MAX_FRAMES)
+    assert plan == want
+
+
+def test_the_window_spread_and_end_are_the_workers_own(tmp_path):
+    """The form does not spread the frames itself: it stores the window and the
+    worker plans it, so both read the same rule (``fdtd.frame_plan``'s), and
+    the stored request carries no plan of its own."""
+    over = {"td_movie_start_fs": "5", "td_movie_end_fs": "15",
+            "td_frame_count": "7"}
+    resp, db, _store, flashes = _post(tmp_path, **over)
+    assert resp.status_code == 302 and len(db.jobs) == 1, flashes
+    tds = next(iter(db.jobs.values()))["tds"]
+    assert "steps" not in tds and "stride" not in tds, sorted(tds)
+    request = TDF.parse_request(_fields(**over))
+    est = _estimate(tmp_path, **over)
+    dt = float(est["dt"])
+    plan = TDF._solver()[1].movie_window(request, est)
+    times = [s * dt for s in plan["steps"]]
+    assert len(times) == 7, plan
+    assert all(5e-15 <= t <= 15e-15 for t in times)
+    assert 0 < 15e-15 - times[-1] < dt, "the last frame is the window's end"
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    assert max(gaps) - min(gaps) < 2 * dt, "evenly spread over the window"
+
+
+@pytest.mark.parametrize("over, needle", [
+    ({"td_movie_start_fs": "15", "td_movie_end_fs": "5"}, "at or before its start"),
+    ({"td_movie_start_fs": "15", "td_movie_end_fs": "15"}, "at or before its start"),
+    ({"td_movie_end_fs": "999"}, "outside the run"),
+    ({"td_movie_start_fs": "-3"}, "outside the run"),
+    ({"td_frame_count": "121"}, "at most 120"),
+    ({"td_frame_count": "0"}, "at least 1"),
+    ({"td_frame_count": "-4"}, "at least 1"),
+    ({"td_frame_count": "2.5"}, "whole number"),
+    ({"td_frame_count": "lots"}, "whole number"),
+])
+def test_a_movie_the_run_cannot_honour_is_refused_before_queueing(tmp_path, over,
+                                                                 needle):
+    _refused(tmp_path, needle, **over)
+
+
+def test_a_window_that_holds_enough_steps_is_not_refused(tmp_path):
+    """The guard on the guard: the same shape of request that is refused above
+    is accepted when the window is wide enough for its frames."""
+    resp, db, _store, flashes = _post(tmp_path, td_movie_start_fs="1",
+                                      td_movie_end_fs="2", td_frame_count="2")
+    assert resp.status_code == 302 and len(db.jobs) == 1, flashes
+
+
+def test_the_relation_between_a_window_and_its_frames_is_refused(tmp_path):
+    """The two refusals that are about steps, not about the window's position:
+    a window narrower than one time step, and one that holds steps but fewer of
+    them than the frames asked for. Both use the run's own dt (asserted here, so
+    a fixture whose dt changed fails loudly rather than passing vacuously)."""
+    dt = float(_estimate(tmp_path)["dt"])
+    # a window of a ten-thousandth of a femtosecond is under the run's own step
+    assert dt > 2e-19, f"fixture: dt is {dt} s, not coarser than the window"
+    _refused(tmp_path, "holds no time steps",
+             td_movie_start_fs="5", td_movie_end_fs="5.0001")
+    # a 1 fs window of a 20 fs run: more than 60 steps, fewer than 120
+    resp, db, _store, flashes = _post(tmp_path, td_movie_start_fs="5",
+                                      td_movie_end_fs="6", td_frame_count="60")
+    assert resp.status_code == 302 and len(db.jobs) == 1, flashes
+    _refused(tmp_path, "holds only", td_movie_start_fs="5",
+             td_movie_end_fs="6", td_frame_count="120")
+
+
+def test_a_120_frame_movie_is_refused_where_the_same_run_at_60_fits(
+        tmp_path, monkeypatch):
+    """The estimate is the requested count's, so a machine with only this much
+    memory refuses the 120-frame movie and still takes the 60-frame one."""
+    fdtd, _layout, _parts = TDF._solver()
+    sixty = _estimate(tmp_path)
+    many = _estimate(tmp_path, td_frame_count="120")
+    assert many["bytes"] > sixty["bytes"], "fixture: more frames cost more"
+    assert many["frames"] == 120 and sixty["frames"] == 60
+    monkeypatch.setattr(fdtd, "MAX_BYTES", (sixty["bytes"] + many["bytes"]) // 2)
+    refused = _refused(tmp_path, "GB of GPU memory", td_frame_count="120")
+    assert any("fewer than the 120 movie frames" in m for m in refused), refused
+    resp, db, _store, flashes = _post(tmp_path)
+    assert resp.status_code == 302 and len(db.jobs) == 1, flashes

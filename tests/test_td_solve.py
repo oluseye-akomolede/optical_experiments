@@ -25,7 +25,32 @@ def _complete():
     return {k: f"value-{k}" for k in td_solve.REQUEST_KEYS}
 
 
-@pytest.mark.parametrize("missing", td_solve.REQUEST_KEYS)
+#: The movie keys are the exception: a job written before the window existed
+#: carries none of them, and absent means what that job solved with.
+REQUIRED_KEYS = tuple(k for k in td_solve.REQUEST_KEYS
+                      if k not in td_solve.OPTIONAL_KEYS)
+
+
+def test_the_optional_keys_are_part_of_the_contract():
+    """Optional does not mean unknown: the keys are in ``REQUEST_KEYS`` (so a
+    request dict always carries them), which is what makes dropping one safe."""
+    assert REQUIRED_KEYS and set(td_solve.OPTIONAL_KEYS) <= set(td_solve.REQUEST_KEYS)
+    assert set(REQUIRED_KEYS) | set(td_solve.OPTIONAL_KEYS) == set(td_solve.REQUEST_KEYS)
+
+
+def test_a_job_written_before_the_movie_window_solves_as_before():
+    """An old web sends no movie keys at all; the job still solves, as the whole
+    run with the default frame count, and the request carries the keys as None."""
+    tds = _complete()
+    for key in td_solve.OPTIONAL_KEYS:
+        del tds[key]
+    request = td_solve.request_from({"tds": tds})
+    assert [request[k] for k in td_solve.OPTIONAL_KEYS] == [None] * len(
+        td_solve.OPTIONAL_KEYS)
+    assert list(request) == list(td_solve.REQUEST_KEYS)
+
+
+@pytest.mark.parametrize("missing", REQUIRED_KEYS)
 def test_a_missing_key_is_refused_by_name(missing):
     tds = _complete()
     del tds[missing]
@@ -34,9 +59,16 @@ def test_a_missing_key_is_refused_by_name(missing):
     assert missing in str(caught.value)
 
 
+@pytest.mark.parametrize("missing", td_solve.OPTIONAL_KEYS)
+def test_a_missing_movie_key_is_not_refused(missing):
+    tds = _complete()
+    del tds[missing]
+    assert td_solve.request_from({"tds": tds})[missing] is None
+
+
 def test_every_missing_key_is_named_not_just_the_first():
     tds = _complete()
-    gone = td_solve.REQUEST_KEYS[:2] + td_solve.REQUEST_KEYS[-1:]
+    gone = REQUIRED_KEYS[:2] + REQUIRED_KEYS[-1:]
     for key in gone:
         del tds[key]
     message = str(pytest.raises(td_solve.TDSolveError,
@@ -54,8 +86,10 @@ def test_a_request_that_is_not_an_object_is_refused(tds):
 def test_an_empty_object_is_refused_naming_every_key():
     message = str(pytest.raises(td_solve.TDSolveError,
                                 td_solve.request_from, {"tds": {}}).value)
-    for key in td_solve.REQUEST_KEYS:
+    for key in REQUIRED_KEYS:
         assert key in message
+    for key in td_solve.OPTIONAL_KEYS:
+        assert key not in message, f"an optional key must not be demanded: {key}"
 
 
 def test_null_values_are_kept_and_extra_keys_dropped():
@@ -143,6 +177,31 @@ def test_exactly_enough_free_memory_runs():
     td_solve.solve_td(_job(), _Store(), xp=np, free_bytes=lambda: need)
 
 
+def _bytes_for(frames: int):
+    return td_solve.solve_td(_job(frame_count=frames), _Store(), xp=np,
+                             free_bytes=PLENTY)["estimate"]["bytes"]
+
+
+def test_a_120_frame_movie_is_deferred_where_the_same_run_at_60_fits(monkeypatch):
+    """The worker's own estimate counts the frames the request asked for, not
+    the 60 the default would record: a device with room for the 60-frame movie
+    and not for the 120-frame one defers it (JetsonBusy, so it can be retried)
+    rather than starting a run whose frames it cannot hold. The form refuses
+    such a movie before queueing; a job that reaches the worker must not get
+    past this check."""
+    sixty, many = _bytes_for(60), _bytes_for(120)
+    assert many > sixty, "fixture: more frames cost more"
+    limit = sixty + max(1, (many - sixty) // 2)
+    td_solve.solve_td(_job(frame_count=60), _Store(), xp=np,
+                      free_bytes=lambda: limit)
+    ran = []
+    monkeypatch.setattr(FDTD, "simulate", lambda *a, **k: ran.append(1))
+    with pytest.raises(td_solve.JetsonBusy, match="busy"):
+        td_solve.solve_td(_job(frame_count=120), _Store(), xp=np,
+                          free_bytes=lambda: limit)
+    assert ran == [], "the 120-frame run started on a device that cannot hold it"
+
+
 def test_a_run_past_45_minutes_is_stopped_with_advice():
     """The clock jumps past the limit after the run starts: a verdict naming
     the limit and the dx/duration advice, raised from inside the step loop."""
@@ -186,6 +245,30 @@ def test_a_layout_refusal_reaches_the_owner_as_a_verdict():
     with pytest.raises(td_solve.TDSolveError, match="probe"):
         td_solve.solve_td(_job(probes=[[9e-3, 1.5e-3, 1e-3, "z"]]), _Store(),
                           xp=np, free_bytes=PLENTY)
+
+
+@pytest.mark.parametrize("changes, needle", [
+    ({"movie_start_s": 1e-10, "movie_end_s": 5e-11}, "at or before its start"),
+    ({"movie_end_s": 1e-9}, "outside the run"),
+    ({"frame_count": 121}, "at most 120"),
+])
+def test_a_window_the_run_cannot_honour_is_the_jobs_own_verdict(changes, needle):
+    """The movie window is checked against the run's own steps and dt in
+    ``fdtd_layout``; ``solve_td`` must hand that refusal on as its verdict.
+
+    A window checked OUTSIDE the solve's converting try block would leave as a
+    bare ``LayoutError`` (a ``fdtd.FDTDError``) and the worker would report the
+    job failed with a stack trace instead of this sentence."""
+    with pytest.raises(td_solve.TDSolveError, match=needle):
+        td_solve.solve_td(_job(**changes), _Store(), xp=np, free_bytes=PLENTY)
+
+
+def test_a_window_the_run_can_honour_is_not_refused():
+    """The guard on the guard: the same call with a window inside the run runs
+    (here on numpy, so the whole path is exercised, not just the check)."""
+    res, _out = _run_with_files(movie_start_s=0.5e-10, movie_end_s=1.5e-10,
+                                frame_count=5)
+    assert res["result"]["frames"].shape[0] == 5
 
 
 def test_an_upload_whose_parts_overlap_fails_naming_both_parts():
@@ -262,6 +345,14 @@ def test_the_trace_file_decodes_to_the_runs_traces_row_per_probe():
     assert [p["component"] for p in man["probes"]] == ["z", "x"]
 
 
+def _written_frame(out, man, n):
+    """Frame ``n`` (1-based) as written: the name is the manifest's own width,
+    so a three-digit movie is read by the same test as a two-digit one."""
+    name = f"frame_{n:0{man['frames']['digits']}d}.bin"
+    assert name in out.files, f"{name} was not written: {sorted(out.files)}"
+    return np.frombuffer(out.files[name], dtype="<f4")
+
+
 def test_each_frame_file_is_that_frame_in_xyz_order():
     res, out = _run_with_files()
     man = _strict_json(out.files["spectrum.json"])
@@ -272,10 +363,75 @@ def test_each_frame_file_is_that_frame_in_xyz_order():
     assert len(set(fr["shape"])) == 3, "fixture: a non-square frame"
     assert len(fr["steps"]) == fr["count"] and fr["steps"][-1] == man["steps"] - 1
     for n in range(fr["count"]):
-        got = np.frombuffer(out.files[f"frame_{n + 1:02d}.bin"], dtype="<f4")
+        got = _written_frame(out, man, n + 1)
         assert np.array_equal(got.reshape(fr["shape"]), frames[n]), n
-    assert f"frame_{fr['count'] + 1:02d}.bin" not in out.files
+    assert f"frame_{fr['count'] + 1:03d}.bin" not in out.files
     assert np.abs(frames[-1]).max() > 0
+
+
+def test_a_windowed_movie_records_inside_the_window_ending_at_its_end():
+    """The owner's window: frames only from the window's steps, spread evenly,
+    the last at the window's end -- and the manifest says so, so a reader (the
+    viewer, tdcheck) needs no constant."""
+    res, out = _run_with_files(movie_start_s=0.5e-10, movie_end_s=2e-10,
+                              frame_count=12)
+    man = _strict_json(out.files["spectrum.json"])
+    fr = man["frames"]
+    dt = man["dt_s"]
+    steps = man["steps"]
+    assert man["duration_s"] == pytest.approx(steps * dt)
+    assert fr["count"] == 12 and len(fr["steps"]) == 12
+    times = fr["times_s"]
+    assert times == sorted(times) and len(set(times)) == 12
+    # every frame is in the window; the last is at its end (the run's own step
+    # is what "at the end" means), the first is not before its start
+    assert all(0.5e-10 <= t <= 2e-10 for t in times), times
+    assert 2e-10 - times[-1] < dt
+    # spread: consecutive gaps differ by no more than one step, and no frame
+    # interval of the window is skipped at either end
+    gaps = np.diff(times) / dt
+    assert gaps.max() - gaps.min() <= 1.001, gaps
+    assert 0 < times[0] - 0.5e-10 <= gaps.max() * dt * 1.001 + dt
+    assert fr["digits"] == 3, "a movie can reach three digits; the name says so"
+    assert man["source_frequency_hz"] == pytest.approx(6e10)
+    frames = np.asarray(res["result"]["frames"])
+    assert frames.shape[0] == 12
+    for n in range(12):
+        assert np.array_equal(_written_frame(out, man, n + 1).reshape(fr["shape"]),
+                              frames[n]), n
+
+
+def test_a_movie_of_120_frames_is_named_and_manifested_in_three_digits():
+    res, out = _run_with_files(movie_start_s=0.0, movie_end_s=2e-10,
+                              frame_count=120)
+    man = _strict_json(out.files["spectrum.json"])
+    fr = man["frames"]
+    assert man["steps"] >= 120, "fixture: the run must be long enough for 120"
+    assert fr["count"] == 120 == len(fr["steps"])
+    assert fr["digits"] == 3
+    assert "frame_001.bin" in out.files and "frame_120.bin" in out.files
+    assert "frame_100.bin" in out.files, "the second hundred must be written"
+    assert "frame_01.bin" not in out.files, "three digits, never two"
+    assert np.asarray(res["result"]["frames"]).shape[0] == 120
+
+
+def test_a_job_without_the_movie_keys_records_todays_movie():
+    """The compatibility promise: a job written before the window existed
+    records the whole run with the default frame count, the same steps and the
+    same manifest fields a job with the keys spelled out records."""
+    import fdtd
+    res_old, out_old = _run_with_files()
+    res_new, out_new = _run_with_files(movie_start_s=None, movie_end_s=None,
+                                       frame_count=None)
+    old = _strict_json(out_old.files["spectrum.json"])
+    new = _strict_json(out_new.files["spectrum.json"])
+    assert new["frames"]["count"] == old["frames"]["count"]
+    assert new["frames"]["steps"] == old["frames"]["steps"]
+    assert new["frames"]["stride"] == old["frames"]["stride"]
+    assert new["frames"]["times_s"] == old["frames"]["times_s"]
+    whole = fdtd.frame_plan(tuple(old["frames"]["shape"]), old["steps"],
+                            max_frames=fdtd.MAX_FRAMES)["steps"]
+    assert old["frames"]["steps"] == list(whole), "today's own rule, unchanged"
 
 
 def test_every_probe_node_is_a_movie_sample_position():

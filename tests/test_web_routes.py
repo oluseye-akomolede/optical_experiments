@@ -2680,15 +2680,21 @@ def test_a_done_td_status_points_at_its_own_results_not_modes(tmp_path):
 def test_the_files_route_serves_every_td_result(tmp_path):
     """Each td file comes back byte for byte through files/, with JSON as JSON.
 
+    The frame names include a three-digit one: a 120-frame movie's frames 100+
+    have to come back, not 404 (they were dropped while the job reported done).
+
     Mutation that must turn this red: drop the td alternation from
-    _safe_result_name (every name then 404s).
+    _safe_result_name (every name then 404s), or narrow its frame alternation
+    back to two digits (frame_100.bin 404s).
     """
     app, store, db, _l = make_app(tmp_path)
     job_id = _done_td_job(db)
     files = {"trace.bin": b"\x00\x00\x80?" * 3,
              "spectrum.json": b'{"version": 1}',
              "frame_01.bin": b"\x01\x02\x03\x04",
-             "frame_60.bin": b"\x05\x06\x07\x08"}
+             "frame_60.bin": b"\x05\x06\x07\x08",
+             "frame_100.bin": b"\x09\x0a\x0b\x0c",
+             "frame_120.bin": b"\x0d\x0e\x0f\x10"}
     for name, data in files.items():
         store.write(STORE.job_key(job_id, name), data)
     client = app.test_client()
@@ -2710,7 +2716,7 @@ def test_td_results_404_until_done_missing_or_misnamed(tmp_path):
     client = app.test_client()
 
     assert client.get(f"/jobs/{job_id}/files/frame_02.bin").status_code == 404
-    for bad in ("frame_1.bin", "frame_001.bin", "frame_01.vtu",
+    for bad in ("frame_1.bin", "frame_0001.bin", "frame_01.vtu",
                 "trace.json", "spectrum.bin", "../frame_01.bin"):
         assert client.get(f"/jobs/{job_id}/files/{bad}").status_code == 404, bad
 
@@ -2726,7 +2732,7 @@ def test_the_app_serves_every_name_the_td_solve_writes(tmp_path):
     sys.path.insert(0, worker)
     try:
         td = importlib.import_module("td_solve")
-        fdtd_max = importlib.import_module("fdtd").MAX_FRAMES
+        fdtd_max = importlib.import_module("fdtd").MAX_MOVIE_FRAMES
     finally:
         sys.path.remove(worker)
     for name in (td.TRACE_NAME, td.SPECTRUM_NAME, td.FRAME_NAME.format(1),

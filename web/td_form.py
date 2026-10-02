@@ -40,7 +40,7 @@ LENGTH_UNITS = {"nm": 1e-9, "um": 1e-6, "mm": 1e-3}
 REQUEST_KEYS = ("boundary", "source_kind", "profile", "frequency_hz",
                 "bandwidth", "position", "direction", "polarisation",
                 "samples", "sample_duration_s", "duration_s", "probes", "dx_m",
-                "coatings")
+                "coatings", "movie_start_s", "movie_end_s", "frame_count")
 
 #: Field-name prefix for each part's material, shared with the cavity form.
 MATERIAL_PREFIX = "part_index."
@@ -87,6 +87,12 @@ def _choice(form, name: str, label: str, choices) -> str:
         raise TDRequestError(f"Please choose the {label}: one of "
                              f"{', '.join(choices)}.")
     return value
+
+
+def _optional_number(raw: str, label: str, *, positive=True):
+    """``_number`` for a field that may be left blank (None), as the movie
+    window's two times are: blank means the whole run."""
+    return None if not raw.strip() else _number(raw, label, positive=positive)
 
 
 def _number(raw: str, label: str, *, positive=True) -> float:
@@ -164,6 +170,23 @@ def parse_request(form) -> dict:
                                    DIRECTIONS)
     req["probes"] = _probes(form.get("td_probes") or "", scale)
     req["coatings"] = parse_coatings(form, scale, unit)
+    # The movie window. Blank times mean the whole run and a blank count means
+    # the solver's default; the window's own rules (inside the run, end after
+    # start, no more frames than steps) are checked against the run's step
+    # count by ``fdtd_layout.movie_window``, in ``plan_request``.
+    start = _optional_number(_field(form, "td_movie_start_fs"),
+                             "movie window start (fs)", positive=False)
+    end = _optional_number(_field(form, "td_movie_end_fs"),
+                           "movie window end (fs)", positive=False)
+    req["movie_start_s"] = None if start is None else start * FS
+    req["movie_end_s"] = None if end is None else end * FS
+    raw_frames = _field(form, "td_frame_count")
+    try:
+        req["frame_count"] = None if not raw_frames else int(raw_frames, 10)
+    except ValueError:
+        raise TDRequestError(
+            f"The movie's frame count must be a whole number, got "
+            f"{raw_frames!r}.") from None
     return req
 
 
@@ -324,6 +347,11 @@ def plan_request(form, data: bytes, units_scale_m: float) -> dict:
         fdtd_layout.refuse_conductor_points(planned, parts,
                                             length_scale=units_scale_m)
         est = fdtd_layout.estimate(planned, request)
+        # The window against the run's own steps and dt, through the worker's
+        # own function, so a window refused here is one the worker would refuse
+        # too. Its plan is not kept: the worker plans again from the stored
+        # request, and that plan is the one the run uses.
+        fdtd_layout.movie_window(request, est)
         fdtd.check_limits(est)
         if request["source_kind"] == "plane":
             place = {"kind": "plane", "direction": request["direction"],

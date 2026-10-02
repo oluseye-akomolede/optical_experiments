@@ -129,3 +129,51 @@ def test_the_field_movie_adds_what_it_allocates(shape):
                  - fdtd.memory_estimate(shape))
     assert 0.85 <= added / predicted <= 1.0, (
         f"frames add {added} B measured, {predicted} B by the formula")
+
+
+def test_the_estimate_grows_with_the_frame_count_it_is_given():
+    """The frame count the request asks for is what the estimate costs, so a
+    120-frame movie is refused where a 60-frame one fits. One frame is 4 bytes
+    a sample: the difference between 120 and 60 frames is 60 frames' worth."""
+    one = fdtd.memory_estimate(SHAPE, record_frames=True, max_frames=1)
+    two = fdtd.memory_estimate(SHAPE, record_frames=True, max_frames=2)
+    per_frame = two - one
+    assert per_frame > 0, "a frame must cost something"
+    sixty = fdtd.memory_estimate(SHAPE, record_frames=True, max_frames=60)
+    many = fdtd.memory_estimate(SHAPE, record_frames=True, max_frames=120)
+    assert many > sixty
+    assert many - sixty == pytest.approx(60 * per_frame)
+    # the default is 60, spelled out or not
+    assert sixty == fdtd.memory_estimate(SHAPE, record_frames=True)
+    # and with no movie at all the count changes nothing
+    assert (fdtd.memory_estimate(SHAPE, max_frames=120)
+            == fdtd.memory_estimate(SHAPE))
+
+
+def test_a_120_frame_movie_allocates_what_the_formula_says_over_60():
+    shape = (22, 24, 26)
+    eps = np.ones(shape, dtype=np.float64)
+    source = fdtd.Source((11, 12, 11), frequency=4e14, bandwidth=2e14)
+
+    def measured(n):
+        # a run longer than 60 steps, so the plan really is n frames long
+        tracemalloc.start()
+        tracemalloc.reset_peak()
+        try:
+            fdtd.simulate(eps, source, 130, [(11, 12, 13, "z")], dx=5e-9,
+                          frames=fdtd.frame_plan(shape, 130, max_frames=n))
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    frames_120, frames_60 = 120, 60
+    assert len(fdtd.frame_plan(shape, 130, max_frames=frames_120)["steps"]) == 120
+    assert len(fdtd.frame_plan(shape, 130, max_frames=frames_60)["steps"]) == 60
+    added = measured(frames_120) - measured(frames_60)
+    predicted = (fdtd.memory_estimate(shape, record_frames=True, max_frames=frames_120)
+                 - fdtd.memory_estimate(shape, record_frames=True, max_frames=frames_60))
+    # a few per cent over is the per-frame temporaries tracemalloc also sees;
+    # the point is that the formula's increment is the frames' own bytes, not
+    # that it is an exact account of every temporary
+    assert 0.85 <= added / predicted <= 1.05, (
+        f"60 more frames add {added} B measured, {predicted} B by the formula")

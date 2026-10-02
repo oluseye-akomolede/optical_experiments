@@ -19,10 +19,13 @@ with a 45-minute stop. ``write_results`` (4.3) writes what it produced:
                    spectrum over the source band, the trace's and the movie's
                    shapes, and the caveats. Its presence is what makes a td
                    job's results exist (the app's done route checks it).
-``frame_NN.bin``   movie frame ``NN`` (1-based, at most ``fdtd.MAX_FRAMES``):
-                   ``|E|`` float32 little-endian, C order, shaped
-                   ``frames.shape`` = (sx, sy, sz), in the grid's x, y, z order
-                   (NOT the cavity field files' (nz, ny, nx)).
+``frame_NNN.bin``  movie frame ``NNN`` (1-based, three digits, at most
+                   ``fdtd.MAX_MOVIE_FRAMES``): ``|E|`` float32 little-endian,
+                   C order, shaped ``frames.shape`` = (sx, sy, sz), in the
+                   grid's x, y, z order (NOT the cavity field files'
+                   (nz, ny, nx)). The manifest states the digit count
+                   (``frames.digits``); a movie recorded before three-digit
+                   names existed used two, and its manifest has no such key.
 
 The page serves all three through ``/jobs/<id>/files/<name>`` (404 until the
 job is done). Storage names are flat because the worker API refuses any
@@ -52,10 +55,12 @@ STOP_GRACE_S = 5 * 60
 SETUP_LIMIT_S = RUN_LIMIT_S + STOP_GRACE_S
 
 #: The result files' names (see the module docstring). ``FRAME_NAME`` takes the
-#: 1-based frame number; two digits hold ``fdtd.MAX_FRAMES`` (60).
+#: 1-based frame number; three digits hold ``fdtd.MAX_MOVIE_FRAMES`` (120), and
+#: ``FRAME_DIGITS`` is written to the manifest so a reader needs no constant.
 TRACE_NAME = "trace.bin"
 SPECTRUM_NAME = "spectrum.json"
-FRAME_NAME = "frame_{:02d}.bin"
+FRAME_DIGITS = 3
+FRAME_NAME = "frame_{:0" + str(FRAME_DIGITS) + "d}.bin"
 SPECTRUM_VERSION = 1
 
 
@@ -83,7 +88,12 @@ class TDSolveError(Exception):
 REQUEST_KEYS = ("boundary", "source_kind", "profile", "frequency_hz",
                 "bandwidth", "position", "direction", "polarisation",
                 "samples", "sample_duration_s", "duration_s", "probes", "dx_m",
-                "coatings")
+                "coatings", "movie_start_s", "movie_end_s", "frame_count")
+
+#: The one place a missing key is not a contract defect. A job written before
+#: the movie window existed carries none of these, and absent means what that
+#: job solved with: the whole run and the default frame count.
+OPTIONAL_KEYS = ("movie_start_s", "movie_end_s", "frame_count")
 
 
 def request_from(job: dict) -> dict:
@@ -91,19 +101,20 @@ def request_from(job: dict) -> dict:
 
     ``tds`` is NULL for every other kind and ``{}`` would be a td job with every
     field missing; both are refused. The check is by KEY, not truthiness, since
-    ``null`` and ``0`` are legitimate values for some keys. Keys outside the
-    contract are dropped rather than passed on, so results written back into
-    the same column can never be read as input.
+    ``null`` and ``0`` are legitimate values for some keys; the movie keys are
+    the exception (``OPTIONAL_KEYS``). Keys outside the contract are dropped
+    rather than passed on, so results written back into the same column can
+    never be read as input.
     """
     tds = job.get("tds")
     if not isinstance(tds, dict):
         raise TDSolveError(
             f"a td job must carry a 'tds' request object, got {type(tds).__name__}"
         )
-    missing = [k for k in REQUEST_KEYS if k not in tds]
+    missing = [k for k in REQUEST_KEYS if k not in tds and k not in OPTIONAL_KEYS]
     if missing:
         raise TDSolveError(f"the 'tds' request is missing {', '.join(missing)}")
-    return {k: tds[k] for k in REQUEST_KEYS}
+    return {k: tds.get(k) for k in REQUEST_KEYS}
 
 
 class JetsonBusy(Exception):
@@ -194,9 +205,18 @@ def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
                                  length_scale=length_scale,
                                  materials=job.get("materials"),
                                  n_index=job.get("n_index"))
+        # The frame count is read before the estimate because the estimate
+        # must count the frames the run will record: a 120-frame job estimated
+        # at the default 60 passes this memory check on a device that cannot
+        # hold it (see
+        # ``test_a_120_frame_movie_is_deferred_where_the_same_run_at_60_fits``).
+        # A count above the cap is refused here too, in the movie's own words.
+        # None means the solver's default.
+        frames = fdtd_layout.movie_frames(request)
         est = fdtd.estimate_run(lay["nodes"], duration=float(request["duration_s"]),
                                 boundary=request["boundary"], metals=lay["metals"],
-                                pec=lay["pec"], record_frames=True)
+                                pec=lay["pec"], record_frames=True,
+                                max_frames=fdtd.MAX_FRAMES if frames is None else frames)
         fdtd.check_limits(est)
     except (fdtd.FDTDError, ValueError) as exc:
         # FDTDError covers LayoutError, VoxelError and EstimateError; the
@@ -225,7 +245,13 @@ def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
     terms = [fdtd.LorentzDrude(name, region)
              for name, region in dict(lay["metals"]).items()]
 
-    plan = fdtd.frame_plan(lay["shape"], est["steps"])
+    # The window and the frame count, through the same function the form
+    # calls, so a window refused before queueing is one this refuses too --
+    # and, refused here, in the same words and as this solver's own verdict.
+    try:
+        plan = fdtd_layout.movie_window(request, est, frames)
+    except fdtd.FDTDError as exc:
+        raise TDSolveError(str(exc)) from exc
     started = clock()
 
     def check(step):
@@ -559,15 +585,23 @@ def write_results(store_out, job_id: str, result: dict, lay: dict,
         store_out.write(key(name), np.ascontiguousarray(frames[n]).tobytes())
         names.append(name)
 
+    frame_steps = [int(k) for k in plan.get("steps", [])]
     manifest = {
         "version": SPECTRUM_VERSION, "dt_s": dt, "steps": int(result["steps"]),
+        "duration_s": int(result["steps"]) * dt,
+        "source_frequency_hz": float(request["frequency_hz"]),
         "band_hz": [f_lo, f_hi], "probes": probes,
         "trace": {"name": TRACE_NAME, "dtype": "float32", "order": "C",
                   "shape": list(traces.shape)},
         "frames": None if frames is None else {
             "count": n_frames, "dtype": "float32", "order": "C",
+            "digits": FRAME_DIGITS,
             "axes": "xyz", "shape": list(frames.shape[1:]),
-            "steps": [int(k) for k in plan.get("steps", [])],
+            "steps": frame_steps,
+            # the time of each frame: the last is the window's end and the
+            # first is one bucket inside it (fdtd.frame_plan's spread), so a
+            # caption reads the window from what was recorded
+            "times_s": [k * dt for k in frame_steps],
             "stride": [int(k) for k in plan.get("stride", [])],
             "positions_m": positions,
             "quantity": "|E|"},

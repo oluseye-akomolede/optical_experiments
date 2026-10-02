@@ -1323,8 +1323,9 @@ def _safe_result_name(name: str) -> bool:
 
     return bool(re.fullmatch(r"modes\.json|surface\.glb|mode_\d{2}\.bin|"
                              r"mode_\d{2}\.vtu|"
-                             # the td results (worker/td_solve.py)
-                             r"trace\.bin|spectrum\.json|frame_\d{2}\.bin",
+                             # the td results (worker/td_solve.py). Frame names
+                             # are two digits up to 60 frames, three up to 120.
+                             r"trace\.bin|spectrum\.json|frame_\d{2,3}\.bin",
                              name))
 
 

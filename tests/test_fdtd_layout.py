@@ -545,3 +545,102 @@ def test_the_form_estimate_counts_a_gold_coating(boundary):
     for key in ("cells", "dt", "steps", "setup"):
         assert form[key] == solved[key], key
     assert solved["bytes"] <= form["bytes"] <= 1.05 * solved["bytes"]
+
+
+# ---- the movie window (change td-movie-window) ------------------------------
+
+def _est(steps=2000, dt=1e-16, shape=(8, 6, 5)):
+    """The numbers ``movie_window`` reads: a 200 fs run of 2000 steps of 0.1 fs,
+    so a whole number of fs is a whole number of steps (25 fs = step 250)."""
+    return {"steps": steps, "dt": dt, "shape": shape}
+
+
+def test_a_window_records_only_its_own_steps_and_ends_at_its_end():
+    """The window is the run's steps 250..1000 (25 fs to 100 fs); the frames are
+    spread over it by the rule a whole run already uses -- evenly spaced, the
+    last one at the window's end -- and nothing outside it is recorded."""
+    est = _est()
+    plan = L.movie_window({"movie_start_s": 25e-15, "movie_end_s": 100e-15,
+                           "frame_count": 40}, est)
+    steps = plan["steps"]
+    assert len(steps) == 40
+    assert steps[-1] == 1000
+    assert all(250 <= s <= 1000 for s in steps)
+    assert all(a < b for a, b in zip(steps, steps[1:]))
+    gaps = np.diff([249] + steps)
+    assert gaps.max() - gaps.min() <= 1, "evenly spread over the window"
+    # ... and the same rule as the whole run: the window's own end is the last
+    # frame's step, whatever the width.
+    for window, count in (((0, 1999), 60), ((250, 1000), 40), ((900, 1999), 7)):
+        got = L.movie_window({"movie_start_s": window[0] * 1e-16,
+                              "movie_end_s": window[1] * 1e-16,
+                              "frame_count": count}, est)["steps"]
+        assert got[-1] == window[1] and all(window[0] <= s <= window[1] for s in got)
+        assert len(got) == count
+
+
+def test_a_window_closing_at_the_runs_end_lands_on_its_last_step():
+    """An end that is a hair past the run (float noise on the duration) is the
+    run's own duration, not an out-of-run refusal, and its last frame is the
+    last step the solver takes."""
+    est = _est()
+    duration = est["steps"] * est["dt"]
+    for end in (duration, duration * (1 + 1e-12)):
+        plan = L.movie_window({"movie_start_s": duration / 2, "movie_end_s": end,
+                               "frame_count": 7}, est)
+        assert plan["steps"][-1] == 1999
+        assert all(1000 <= s <= 1999 for s in plan["steps"])
+
+
+def test_a_window_before_the_first_step_is_the_runs_start():
+    """Rounding is toward the window: its first frame is the first step at or
+    after the start, its last the last at or before the end, and an end past
+    the run's own last step is that last step."""
+    plan = L.movie_window({"movie_start_s": 1e-17, "movie_end_s": 1e-15}, _est())
+    assert plan["steps"][0] == 1 and plan["steps"][-1] == 10
+
+
+def test_a_window_of_the_whole_run_is_todays_plan_exactly():
+    """There is one plan function, so a request that says nothing about the
+    window, or spells the whole run out, is the plan of a run with no window
+    at all -- the frames an existing job recorded, step for step."""
+    import fdtd
+    est = _est(steps=1000, dt=1e-16, shape=(130, 64, 65))
+    want = fdtd.frame_plan((130, 64, 65), 1000)
+    for req in ({}, {"movie_start_s": None, "movie_end_s": None, "frame_count": None},
+                {"movie_start_s": 0.0, "movie_end_s": 1000 * 1e-16,
+                 "frame_count": 60}):
+        assert L.movie_window(req, est) == want, req
+
+
+@pytest.mark.parametrize("over, needle, also", [
+    # a window outside the run names the run's own length
+    ({"movie_start_s": -1e-16}, "outside the run", "200 fs"),
+    ({"movie_end_s": 201e-15}, "outside the run", "200 fs"),
+    ({"movie_end_s": 200e-15 * (1 + 1e-6)}, "outside the run", "200 fs"),
+    ({"movie_start_s": 5e-15, "movie_end_s": 5e-15}, "at or before its start", "5 fs"),
+    ({"movie_start_s": 10e-15, "movie_end_s": 5e-15}, "at or before its start", "10 fs"),
+    # a window narrower than one step names the run's own dt
+    ({"movie_start_s": 12e-17, "movie_end_s": 16e-17}, "holds no time steps", "0.1 fs"),
+    # more frames than the window holds steps names the window's own step count
+    ({"movie_end_s": 10e-15, "frame_count": 120}, "holds only 101 time steps", None),
+    ({"movie_start_s": 100e-15, "movie_end_s": 101e-15, "frame_count": 120},
+     "holds only 11 time steps", None),
+    # a count over the cap is refused as a count, before the window is read
+    ({"movie_start_s": 100e-15, "movie_end_s": 101e-15, "frame_count": 121},
+     "at most 120", None),
+    ({"frame_count": 121}, "at most 120", None),
+    ({"frame_count": 0}, "at least 1", None),
+    ({"frame_count": -3}, "at least 1", None),
+    ({"frame_count": 2.5}, "whole number", None),
+    ({"frame_count": "many"}, "whole number", None),
+])
+def test_a_window_the_run_cannot_honour_is_refused_in_words(over, needle, also):
+    with pytest.raises(L.LayoutError) as info:
+        L.movie_window(over, _est())
+    message = str(info.value)
+    assert needle in message, message
+    if also is not None:
+        assert also in message, f"the refusal must name {also}: {message}"
+    # a refusal is a sentence for a person, not a traceback
+    assert message[0].isupper() and message.endswith("."), message

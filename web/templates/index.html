@@ -243,6 +243,26 @@
           <input type="number" name="td_duration_fs" value="100" min="0" step="any" data-required>
         </label>
       </div>
+      <div class="row">
+        <label>Movie from (fs) &mdash; blank: the run's start
+          <input type="number" name="td_movie_start_fs" value="" min="0" step="any">
+        </label>
+        <label>Movie to (fs) &mdash; blank: the run's end
+          <input type="number" name="td_movie_end_fs" value="" min="0" step="any">
+        </label>
+        <label>Movie frames &mdash; blank: 60, at most 120
+          <input type="number" name="td_frame_count" value="" min="1" max="120" step="1">
+        </label>
+      </div>
+      <p class="muted small">
+        The movie's frames are spread evenly over this window, and the last one is
+        at its end. A shorter window spends the same frames on less time, so it
+        shows faster detail; the job page states the spacing in fs and in cycles of
+        the source frequency, and says when the frames are too far apart to show the
+        oscillation itself. At most 120 frames are kept, about a megabyte each at
+        the largest field the grid records, and the page loads them all before
+        playing.
+      </p>
       <div class="row" data-when="td_profile:drawn">
         <label>Waveform samples (numbers, spaced evenly in time)
           <textarea name="td_samples" rows="2" placeholder="0 0.5 1 0.5 0 -0.5 -1 -0.5 0" data-required></textarea>

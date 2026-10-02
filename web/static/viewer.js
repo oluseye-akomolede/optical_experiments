@@ -1389,12 +1389,44 @@ async function renderTdMovie(manifest, data) {
     caption.textContent = 'This run recorded no field movie.';
     return;
   }
+  // The frame spacing, and what it means for reading the movie. The times come
+  // from the manifest -- ``frames.times_s``, or steps x dt for a job written
+  // before that key existed -- never from a constant in this file, and the
+  // source's own frequency is what says whether the frames resolve its
+  // oscillation at all.
+  const times = frames.times_s || frames.steps.map((s) => s * manifest.dt_s);
+  const spacingS = times.length > 1
+    ? (times[times.length - 1] - times[0]) / (times.length - 1) : 0;
+  const f0 = manifest.source_frequency_hz;
+  const cycles = f0 ? spacingS * f0 : null;
+  let spacingNote = '';
+  if (spacingS > 0) {
+    const unit = siPrefix(spacingS);
+    spacingNote = ` Frames are ${(spacingS / unit.factor).toPrecision(3)} ${unit.prefix}s apart`;
+    if (!f0) {
+      spacingNote += ', and this job\'s manifest states no source frequency, so the ';
+      spacingNote += 'spacing in cycles of it is unknown.';
+    } else {
+      const f = siPrefix(f0);
+      spacingNote += ` (${cycles.toFixed(2)} cycles of the `
+        + `${(f0 / f.factor).toPrecision(3)} ${f.prefix}Hz source).`;
+      if (cycles > 0.5) {
+        spacingNote += ' More than half a cycle between frames: this movie shows '
+          + 'the envelope, not the oscillation. A shorter window shows the wave.';
+      }
+    }
+  }
+  // Every frame is fetched before playback starts (playback needs them all),
+  // which is the page's real cost; say what it is, measured from the shape.
+  const totalMb = frames.count * frames.shape.reduce((a, b) => a * b, 1) * 4 / 1e6;
   const base = new URL(data.spectrum_url, window.location.href);
   const decoded = [];
+  const digits = frames.digits || 2;   // a movie written before three-digit names
   try {
     for (let n = 1; n <= frames.count; n += 1) {
-      caption.textContent = `Loading the field movie: frame ${n} of ${frames.count}…`;
-      const name = `frame_${String(n).padStart(2, '0')}.bin`;
+      caption.textContent = `Loading the field movie: frame ${n} of `
+        + `${frames.count} (about ${totalMb.toFixed(0)} MB in all)…`;
+      const name = `frame_${String(n).padStart(digits, '0')}.bin`;
       const res = await fetch(new URL(name, base));
       if (!res.ok) throw new Error(`frame ${n} returned HTTP ${res.status}`);
       decoded.push(decodeFrame(await res.arrayBuffer(), frames.shape));
@@ -1490,9 +1522,11 @@ async function renderTdMovie(manifest, data) {
     slider.value = String(i);
     const time = frames.steps[i] * manifest.dt_s;
     caption.textContent = `|E|, frame ${i + 1} of ${frames.count}, `
-      + `t = ${(time / t.factor).toPrecision(3)} ${t.prefix}s. One colour scale for `
-      + `every frame (the ${Math.round(SCALE_PERCENTILE * 100)}th percentile of |E| over the movie); `
-      + `field below ${MOVIE_THRESHOLD} of it is not drawn.`;
+      + `t = ${(time / t.factor).toPrecision(3)} ${t.prefix}s of the run.`
+      + spacingNote
+      + ` One colour scale for every frame (the ${Math.round(SCALE_PERCENTILE * 100)}th`
+      + ` percentile of |E| over the movie); field below ${MOVIE_THRESHOLD} of it`
+      + ` is not drawn.`;
     panel.dataset.frame = String(i);
   }
   slider.addEventListener('input', () => show(Number(slider.value)));

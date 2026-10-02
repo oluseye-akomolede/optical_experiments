@@ -1049,13 +1049,16 @@ def test_the_pattern_is_anchored_so_a_leading_slash_cannot_match():
 @pytest.mark.parametrize("name", [
     "modes.json", "surface.glb", "mode_01.bin", "mode_12.vtu",
     "trace.bin", "spectrum.json", "frame_01.bin", "frame_60.bin",
+    # a three-digit movie (td_solve.FRAME_DIGITS), including its first frame:
+    # the solver writes frame_001.bin, so 001 is a name it really writes
+    "frame_001.bin", "frame_100.bin", "frame_120.bin",
 ])
 def test_the_solver_output_names_are_accepted(name):
     assert WORKER.allowed_name(name) is True
 
 
 @pytest.mark.parametrize("name", [
-    "frame_1.bin", "frame_001.bin", "frame_01.vtu", "frame_ab.bin",
+    "frame_1.bin", "frame_0001.bin", "frame_01.vtu", "frame_ab.bin",
     "frame_01.bin\n", "x/frame_01.bin", "trace.json", "spectrum.bin",
 ])
 def test_near_miss_td_names_are_refused(name):
@@ -1069,11 +1072,12 @@ def test_the_worker_and_the_app_agree_on_every_td_result_name():
     import mse_worker as W
     import td_solve as T
     names = [T.TRACE_NAME, T.SPECTRUM_NAME] + [
-        T.FRAME_NAME.format(n) for n in (1, 9, 10, T._solver()[0].MAX_FRAMES)]
+        T.FRAME_NAME.format(n) for n in (1, 9, 10, 100,
+                                         T._solver()[0].MAX_MOVIE_FRAMES)]
     for name in names:
         worker_ok = name in W._UPLOAD_EXACT or W._is_frame_file(name)
         assert worker_ok and WORKER.allowed_name(name), name
-    for bad in ("frame_1.bin", "frame_001.bin", "frame_01.vtu", "frame_ab.bin"):
+    for bad in ("frame_1.bin", "frame_0001.bin", "frame_01.vtu", "frame_ab.bin"):
         assert not W._is_frame_file(bad) and not WORKER.allowed_name(bad), bad
 
 

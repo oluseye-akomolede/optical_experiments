@@ -293,6 +293,89 @@ def _conductor(kind) -> bool:
     return kind == "pec" or (isinstance(kind, str) and kind in fdtd.METALS)
 
 
+def _fs(seconds: float) -> str:
+    """Seconds as a readable number of fs (the form's own unit)."""
+    return f"{float(seconds) / 1e-15:.6g} fs"
+
+
+def _step_at(seconds: float, dt: float, *, up: bool) -> int:
+    """The step index at ``seconds``: the first at or after it (``up``), else
+    the last at or before it. The epsilon absorbs the float noise of a time
+    that is a whole number of steps, so 3 steps is step 3 and not 4."""
+    ratio = float(seconds) / float(dt)
+    return int(np.ceil(ratio - 1e-9) if up else np.floor(ratio + 1e-9))
+
+
+def movie_frames(request):
+    """The requested frame count as a whole number, or None for the default.
+
+    Refused here, before any estimate: the count alone can be too large or not
+    a count, and the reader should hear that rather than the memory limit it
+    would have hit. Null (the form's blank field, or a job written before the
+    window existed) means the solver's default, ``fdtd.MAX_FRAMES``.
+    """
+    frames = request.get("frame_count")
+    if frames is None:
+        return None
+    try:
+        whole = float(frames).is_integer()
+    except (TypeError, ValueError):
+        whole = False
+    if not whole or int(frames) < 1:
+        raise LayoutError(
+            f"The movie's frame count must be a whole number of at least 1, "
+            f"got {frames!r}.")
+    if int(frames) > fdtd.MAX_MOVIE_FRAMES:
+        raise LayoutError(
+            f"The movie asks for {int(frames)} frames; at most "
+            f"{fdtd.MAX_MOVIE_FRAMES} can be recorded. Ask for "
+            f"{fdtd.MAX_MOVIE_FRAMES} or fewer.")
+    return int(frames)
+
+
+def movie_window(request, est, frames=None) -> dict:
+    """``fdtd.frame_plan`` for the request's movie window, or a refusal.
+
+    The form's ``movie_start_s``/``movie_end_s`` are seconds (null: the whole
+    run) and ``frame_count`` is null for the default 60. The window is turned
+    into step indices here, once, so the form and the worker spread the frames
+    over the same steps and refuse the same windows in the same words. Every
+    number in a message is the run's own: its duration, its step count, its dt.
+    """
+    steps, dt = int(est["steps"]), float(est["dt"])
+    duration = steps * dt
+    first_s, last_s = request.get("movie_start_s"), request.get("movie_end_s")
+    frames = movie_frames(request) if frames is None else frames
+    start = 0.0 if first_s is None else float(first_s)
+    end = duration if last_s is None else float(last_s)
+    if start < 0 or end > duration * (1 + 1e-9):
+        raise LayoutError(
+            f"The movie window runs from {_fs(start)} to {_fs(end)}, outside "
+            f"the run's own {_fs(duration)} ({steps:,} steps). Set the window "
+            f"inside the run, or leave both times blank for the whole run.")
+    if end <= start:
+        raise LayoutError(
+            f"The movie window ends at {_fs(end)}, at or before its start of "
+            f"{_fs(start)}. Set the end after the start, or leave both blank "
+            f"for the whole run.")
+    first_step, last_step = _step_at(start, dt, up=True), _step_at(end, dt, up=False)
+    last_step = min(last_step, steps - 1)
+    if last_step < first_step:
+        raise LayoutError(
+            f"The movie window from {_fs(start)} to {_fs(end)} holds no time "
+            f"steps: the run's dt is {_fs(dt)}. Widen the window.")
+    span = last_step - first_step + 1
+    if frames is not None and frames > span:
+        raise LayoutError(
+            f"The movie asks for {frames} frames, but its window from "
+            f"{_fs(start)} to {_fs(end)} holds only {span:,} time steps (the "
+            f"run's dt is {_fs(dt)}). Ask for {span:,} frames or fewer, or "
+            f"widen the window.")
+    return fdtd.frame_plan(tuple(est["shape"]), steps,
+                           max_frames=frames or fdtd.MAX_FRAMES,
+                           first_step=first_step, last_step=last_step)
+
+
 def estimate(planned, request, *, record_frames=True) -> dict:
     """``fdtd.estimate_run`` for a ``plan``, before anything is voxelised.
 
@@ -323,10 +406,16 @@ def estimate(planned, request, *, record_frames=True) -> dict:
                                int(np.searchsorted(lo, b, "left")))
                          for (lo, hi), a, b in zip(duals, plo, phi))] = True
     metals = {k: v for k, v in metals.items() if v.any()}
+    # The movie is counted at the frame count the run will record: the request
+    # is checked against this estimate, so a 120-frame movie must be refused
+    # here rather than after it has been queued.
+    frames = movie_frames(request)
     return fdtd.estimate_run(nodes, duration=float(request["duration_s"]),
                              boundary=planned["boundary"], metals=metals,
                              pec=True if pec else None,
-                             record_frames=record_frames)
+                             record_frames=record_frames,
+                             max_frames=fdtd.MAX_FRAMES if frames is None
+                             else frames)
 
 
 def refuse_conductor_points(planned, parts, *, length_scale: float) -> None:

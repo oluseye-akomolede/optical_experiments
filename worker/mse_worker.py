@@ -1344,10 +1344,14 @@ def _is_mode_file(name: str) -> bool:
 
 
 def _is_frame_file(name: str) -> bool:
-    """A td job's movie frame, ``frame_NN.bin`` (``td_solve.FRAME_NAME``)."""
+    """A td job's movie frame, ``frame_NN.bin`` (``td_solve.FRAME_NAME``).
+
+    Two digits for a movie of 60 frames or fewer, three for up to
+    ``fdtd.MAX_MOVIE_FRAMES`` (120); one digit is not a name the solver writes.
+    """
     number = name[len("frame_"):-len(".bin")]
     return (name.startswith("frame_") and name.endswith(".bin")
-            and len(number) == 2 and number.isdigit())
+            and len(number) in (2, 3) and number.isdigit())
 
 
 class StageReporter:

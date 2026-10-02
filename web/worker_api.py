@@ -109,7 +109,9 @@ def owner_id(token: str) -> str:
 #: filenames a worker may upload. A closed set, checked by full match -- so
 #: ``../modes.json``, ``/etc/passwd`` and ``mode_01.bin/../x`` are all refused
 #: without any path sanitising. ``trace.bin``, ``spectrum.json`` and
-#: ``frame_NN.bin`` are a td job's results (``worker/td_solve.py``).
+#: ``frame_NN.bin`` are a td job's results (``worker/td_solve.py``): two digits
+#: for a movie of 60 frames or fewer, three for up to ``MAX_MOVIE_FRAMES``
+#: (120). Both widths belong here, and both must keep matching.
 #:
 #: Full match, NOT ``match`` with a ``$`` anchor: Python's ``$`` also matches
 #: just before a trailing newline, so ``"mode_01.bin\n"`` satisfied the anchored
@@ -118,7 +120,7 @@ def owner_id(token: str) -> str:
 #: one string is the whole traversal defence and a future edit that swaps
 #: ``fullmatch`` for ``match`` should still not reopen it.
 _ALLOWED_EXACT = ("modes.json", "surface.glb", "trace.bin", "spectrum.json")
-_ALLOWED_PATTERN = re.compile(r"\A(mode_\d{2}\.(bin|vtu)|frame_\d{2}\.bin)\Z")
+_ALLOWED_PATTERN = re.compile(r"\A(mode_\d{2}\.(bin|vtu)|frame_\d{2,3}\.bin)\Z")
 
 #: per-file ceiling. The field grid is what makes a .bin big; 64 MiB is well
 #: over the largest the app has ever produced and well under what would let a

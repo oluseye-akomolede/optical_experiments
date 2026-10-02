@@ -23,6 +23,27 @@ const ok = (c, msg) => { console.log(`${c ? 'PASS' : 'FAIL'}  ${msg}`); if (!c) 
 const TYPES = { '.js': 'application/javascript', '.css': 'text/css', '.json': 'application/json' };
 const manifest = JSON.parse(fs.readFileSync(path.join(DIR, 'files/spectrum.json'), 'utf8'));
 const CAVEATS = ['thin curved features are resolved only at the coarse cell'];
+// Everything this check knows about the movie comes from the manifest it is
+// served, not from constants here: the frame count, the name width, and the
+// spacing the caption is expected to report. A fixture may be any window of
+// any run -- the current one is a 120-frame window, which the old two-digit
+// name rule would have checked wrong (and the old page would have failed).
+const FR = manifest.frames;
+const DIGITS = FR.digits || 2;
+const frameName = (n) => `frame_${String(n).padStart(DIGITS, '0')}.bin`;
+const UNITS = { P: 1e15, T: 1e12, G: 1e9, M: 1e6, k: 1e3, '': 1, m: 1e-3,
+                'µ': 1e-6, u: 1e-6, n: 1e-9, p: 1e-12, f: 1e-15 };
+const frameTimes = FR.times_s || FR.steps.map((s) => s * manifest.dt_s);
+const spacingS = frameTimes.length > 1
+  ? (frameTimes[frameTimes.length - 1] - frameTimes[0]) / (frameTimes.length - 1) : 0;
+const cycles = manifest.source_frequency_hz
+  ? spacingS * manifest.source_frequency_hz : null;
+// The caption's time for frame ``i``, in seconds, or NaN if it does not
+// state one in a unit we know.
+function captionTime(text) {
+  const m = text.match(/t = ([\d.]+) (P|T|G|M|k|m|µ|u|n|p|f)?s /);
+  return m ? Number(m[1]) * UNITS[m[2] || ''] : NaN;
+}
 
 async function open(browser, { caveats = null, traceStatus = 200, frameStatus = 200, noMovie = false,
                                zeroFrames = false, noPositions = false } = {}) {
@@ -52,10 +73,15 @@ async function open(browser, { caveats = null, traceStatus = 200, frameStatus = 
       return route.fulfill({ body: fs.readFileSync(path.join(DIR, 'files/trace.bin')),
                              contentType: 'application/octet-stream' });
     }
-    const fm = p.match(/\/files\/(frame_\d\d\.bin)$/);
+    const fm = p.match(/\/files\/(frame_\d{2,3}\.bin)$/);
     if (fm) {
-      if (frameStatus !== 200 && fm[1] === 'frame_07.bin') return route.fulfill({ status: frameStatus, body: 'x' });
-      const bytes = fs.readFileSync(path.join(DIR, 'files', fm[1]));
+      if (frameStatus !== 200 && fm[1] === frameName(7)) return route.fulfill({ status: frameStatus, body: 'x' });
+      const onDisk = path.join(DIR, 'files', fm[1]);
+      // A page that asks for a name the manifest did not write gets the 404 the
+      // real route gives it, so a wrong name shows up as a FAIL naming the
+      // page's own error, not as a crash in this check.
+      if (!fs.existsSync(onDisk)) return route.fulfill({ status: 404, body: 'no such frame' });
+      const bytes = fs.readFileSync(onDisk);
       return route.fulfill({ body: zeroFrames ? Buffer.alloc(bytes.length) : bytes,
                              contentType: 'application/octet-stream' });
     }
@@ -107,8 +133,11 @@ const browser = await chromium.launch();
   ok(!s.viewer && !s.modes && !s.bands, 'the cavity viewer, modes and band cards stay hidden');
   ok(s.caption.includes(`${manifest.probes.length} probe(s), ${manifest.steps} time steps`),
      `caption names probes and steps: ${s.caption}`);
-  ok(s.legend.length === manifest.probes.length && s.legend[0].startsWith('■ probe 1: Ez')
-     && s.legend[1].startsWith('■ probe 2: Ex'), `legend per probe: ${JSON.stringify(s.legend)}`);
+  const wantLegend = manifest.probes.map((p, i) => `■ probe ${i + 1}: E${p.component}`);
+  ok(s.legend.length === manifest.probes.length
+     && s.legend.every((t, i) => t.startsWith(wantLegend[i]))
+     && new Set(wantLegend).size === wantLegend.length,
+     `legend per probe: ${JSON.stringify(s.legend)}`);
   ok(s.caveats === 0, 'no caveat lines when the run has none');
   ok(s.trace.length === 2 && s.spec.length === 2, 'one trace and one spectrum line per probe');
   const finite = (ls) => ls.every((l) => l.every(([x, y]) => Number.isFinite(x) && Number.isFinite(y)));
@@ -143,20 +172,43 @@ let zeroShot = null;
     frame: document.getElementById('td-movie').dataset.frame }));
   ok(st.shown, 'the movie panel is shown');
   ok(st.max === String(manifest.frames.count - 1), `slider spans every frame: max ${st.max}`);
-  ok(/^\|E\|, frame 1 of 60, t = [\d.]+ (p|n)s\. One colour scale for every frame \(the 99th percentile/.test(st.caption)
+  ok(manifest.frames.count === 120 && manifest.frames.digits === 3,
+     `fixture: a 120-frame, three-digit movie (${manifest.frames.count}, ${manifest.frames.digits})`);
+  const head = (n) => `|E|, frame ${n} of ${manifest.frames.count}, t = `;
+  ok(st.caption.startsWith(head(1))
+     && /Frames are [\d.]+ (P|T|G|M|k|m|µ|u|n|p|f)?s apart \([\d.]+ cycles of the /.test(st.caption)
+     && st.caption.includes('One colour scale for every frame (the 99th percentile')
      && st.caption.includes('below 0.12 of it is not drawn'), `movie caption: ${st.caption}`);
-  // Frame 31 sits at its own recorded step, read from the manifest.
-  await page.fill('#td-movie-frame', '30');
+  // The caption's honest verdict, checked against the manifest's own numbers:
+  // more than half a cycle between frames must be said to be the envelope, and
+  // a spacing under that must NOT claim it.
+  const says = st.caption.includes('shows the envelope, not the oscillation');
+  ok(cycles !== null && ((cycles > 0.5) === says),
+     `the envelope verdict follows the spacing (${cycles} cycles/frame): ${st.caption}`);
+  // Frame i sits at its own recorded step, read from the manifest.
+  const mid = Math.floor(manifest.frames.count / 2);   // the slider is 0-based
+  await page.fill('#td-movie-frame', String(mid));
   await page.dispatchEvent('#td-movie-frame', 'input');
-  const cap31 = await page.textContent('#td-movie-caption');
-  const want = manifest.frames.steps[30] * manifest.dt_s;
-  const got = Number(cap31.match(/t = ([\d.]+) (p|n)s/)[1]) * (cap31.includes(' ps.') ? 1e-12 : 1e-9);
-  ok(cap31.startsWith('|E|, frame 31 of 60') && Math.abs(got - want) / want < 0.01,
-     `frame 31 caption at its step's time (${want}): ${cap31}`);
-  await settle(page); const mid = await shot(page);
+  const capMid = await page.textContent('#td-movie-caption');
+  const wantMid = manifest.frames.steps[mid] * manifest.dt_s;
+  const gotMid = captionTime(capMid);
+  ok(capMid.startsWith(head(mid + 1)) && Math.abs(gotMid - wantMid) / wantMid < 0.01,
+     `frame ${mid + 1} caption at its step's time (${wantMid}): ${capMid}`);
+  // The last frame is at the window's end, and the caption says where that is.
+  const last = manifest.frames.count - 1;
+  await page.fill('#td-movie-frame', String(last));
+  await page.dispatchEvent('#td-movie-frame', 'input');
+  const capLast = await page.textContent('#td-movie-caption');
+  const wantLast = frameTimes[last];
+  const gotLast = captionTime(capLast);
+  ok(capLast.startsWith(head(last + 1)) && Math.abs(gotLast - wantLast) / wantLast < 0.01,
+     `the last frame is at the window's end (${wantLast}): ${capLast}`);
+  await page.fill('#td-movie-frame', String(mid));
+  await page.dispatchEvent('#td-movie-frame', 'input');
+  await settle(page); const realMidShot = await shot(page);
   await page.fill('#td-movie-frame', '0'); await page.dispatchEvent('#td-movie-frame', 'input');
-  await settle(page); const first = await shot(page);
-  ok(mid !== first, 'two frames draw two different pictures');
+  await settle(page); const realFirstShot = await shot(page);
+  ok(realMidShot !== realFirstShot, 'two frames draw two different pictures');
   await page.click('#td-movie-play');
   await page.waitForFunction(() => Number(document.getElementById('td-movie').dataset.frame) >= 3, null, { timeout: 10000 });
   ok(await page.textContent('#td-movie-play') === 'Pause', 'play advances the frames and offers Pause');
@@ -164,9 +216,10 @@ let zeroShot = null;
   const z = await open(browser, { zeroFrames: true });
   const zc = await z.page.textContent('#td-movie-caption');
   ok(zc.endsWith('Every frame is zero: there is no field to draw.'), `an all-zero movie says so: ${zc}`);
-  await z.page.fill('#td-movie-frame', '30'); await z.page.dispatchEvent('#td-movie-frame', 'input');
+  await z.page.fill('#td-movie-frame', String(mid)); await z.page.dispatchEvent('#td-movie-frame', 'input');
   await settle(z.page); zeroShot = await shot(z.page);
-  ok(zeroShot !== mid, 'the real frame 31 draws field the all-zero movie does not');
+  ok(zeroShot !== realMidShot,
+     `the real frame ${mid + 1} draws field the all-zero movie does not`);
   await z.page.close();
 }
 {
