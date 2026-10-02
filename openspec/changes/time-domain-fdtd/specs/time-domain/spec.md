@@ -369,6 +369,19 @@ so it fails the job readably rather than refusing the upload.
 - **WHEN** a dielectric slab and a `pec` (or metal) slab share a face
 - **THEN** every node on that face is in the conductor mask, in either file order
 
+#### Scenario: a film between conductor plates keeps its drawn thickness
+- **WHEN** a dielectric film lies flush between two conductor plates, its
+  faces anywhere relative to the coarse lattice
+- **THEN** every flat face that bounds a part's box is a grid line along its
+  normal, the nodes on the film's faces are conductor nodes, and the
+  conductor walls sit exactly the film's thickness apart; a curved part's box
+  adds no grid line
+
+#### Scenario: the form's memory estimate still errs high
+- **WHEN** a metal part's face lies on a grid node
+- **THEN** the form's estimate counts every node whose dual cell overlaps the
+  part's bounding box, so it is never below the solved run's
+
 #### Scenario: between dielectrics the higher index owns the face
 - **WHEN** slabs of index 2.0 and 1.5 share a face
 - **THEN** the face's nodes take index 2.0, in either file order

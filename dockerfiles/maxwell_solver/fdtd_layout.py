@@ -10,14 +10,14 @@ and probes are given in it, and ``nodes`` are returned in it. The voxeliser
 works in mesh coordinates, so it is handed the same nodes shifted back by that
 corner.
 
-Film thickness. A conductor wall lands on a node by ``average_eps``'s majority
-rule, and a node on a shared face goes to the conductor. So a film flush
-between two conductor plates keeps exactly its thickness only when grid nodes
-sit on both faces (4 cells for a 4-cell film). On a grid offset from the faces,
-the film reads one cell too thick almost every time: the reviewer measured 5
-cells for a 4-cell film at 19 of 20 offsets and never 3, and a wall landed on
-the nearer node only 21 times in 40, so the walls do not simply snap to the
-nearer node. Task 5.4d aligns grid lines to the faces to remove this.
+Film thickness. Every flat face that bounds a part's box (a plate's face, a
+film's face, a cylinder's end cap) is a grid line along its normal axis, and a
+node on a conductor face is a conductor node (``average_eps`` samples on the
+node; the voxeliser gives a shared face to the conductor). So a film flush
+between two conductor plates keeps exactly its thickness wherever the parts
+sit. Without the lines, the film read one cell too thick on almost every grid
+offset from its faces (the reviewer measured 5 cells for a 4-cell film at 19 of
+20 offsets). A curved part has no flat face there, so its box adds no line.
 """
 from __future__ import annotations
 
@@ -60,6 +60,17 @@ def _bounds(parts, length_scale):
     pts = np.concatenate([np.asarray(p.vertices, dtype=float).reshape(-1, 3)
                           for p in parts]) * float(length_scale)
     return pts.min(axis=0), pts.max(axis=0)
+
+
+def _flat_faces(part, axis, length_scale):
+    """The part's box faces on ``axis`` that are flat: some triangle of the
+    part lies in that plane (to 1e-6 of the part's size). Metres."""
+    v = np.asarray(part.vertices, dtype=float).reshape(-1, 3) * float(length_scale)
+    tri = v[np.asarray(part.faces, dtype=np.int64).reshape(-1, 3)][:, :, axis]
+    lo, hi = v[:, axis].min(), v[:, axis].max()
+    tol = 1e-6 * float(np.ptp(v, axis=0).max())
+    return [face for face in (lo, hi)
+            if np.any(np.all(np.abs(tri - face) <= tol, axis=1))]
 
 
 def _materials(names, materials, n_index):
@@ -163,7 +174,7 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
                      request["bandwidth"])
 
     # layers in grid coordinates: 0 is the padded minimum corner
-    layers = [[], [], []]
+    layers, lines = [[], [], []], [[], [], []]
     for axis in range(3):
         if pad:
             layers[axis].append(fdtd_grid.Layer(pad, pad + size[axis]))
@@ -177,6 +188,8 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
             a, b = float(plo[axis]), float(phi[axis])
             if not b > a:
                 continue           # the voxeliser refuses a flat part by name
+            lines[axis] += [face - lo[axis] + pad
+                            for face in _flat_faces(part, axis, length_scale)]
             thin = (b - a) / THIN_CELLS if b - a < THIN_CELLS * dx else None
             if thin is not None:
                 layers[axis].append(fdtd_grid.Layer(a, b, thin))
@@ -190,7 +203,7 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
                     layers[axis] += [fdtd_grid.Layer(a, a + SKIN_DEPTHS * depth, fine),
                                      fdtd_grid.Layer(b - SKIN_DEPTHS * depth, b, fine)]
 
-    grid = fdtd_grid.build_grid(tuple(size + 2 * pad), dx, layers)
+    grid = fdtd_grid.build_grid(tuple(size + 2 * pad), dx, layers, lines)
     nodes = tuple(n - pad for n in grid["nodes"])          # owner frame
 
     pml = fdtd.DEFAULT_PML_CELLS if boundary == "open" else 0
@@ -232,25 +245,30 @@ def _conductor(kind) -> bool:
 def estimate(planned, request, *, record_frames=True) -> dict:
     """``fdtd.estimate_run`` for a ``plan``, before anything is voxelised.
 
-    Each metal's region is taken as its parts' bounding boxes on the grid, a
-    box holding every node the voxeliser can mark, so the memory errs high (by
-    the corners a curved part leaves empty) and never admits a run the
-    voxelised estimate would refuse. dt does not depend on the region
+    Each metal's region is every node whose dual cell overlaps one of its
+    parts' bounding boxes. Only those nodes can have any of their cell in the
+    part, so no other node can be marked, whatever the grading or the float
+    noise in a node that sits on a face (``searchsorted`` on the box itself
+    dropped those). The memory errs high (by that ring and the corners a curved
+    part leaves empty) and never admits a run the voxelised estimate would
+    refuse. dt does not depend on the region
     (``stable_dt`` reads the metal and the spacings), so cells, dt and steps
     are the solved run's exactly.
     """
     nodes = planned["nodes"]
     shape = tuple(len(n) for n in nodes)
     metals, pec = {}, planned["boundary"] == "metal"
+    duals = [fdtd_grid._dual_bounds(np.asarray(n, dtype=float)) for n in nodes]
     for name, (plo, phi) in zip(planned["names"], planned["part_bounds"]):
         kind = planned["table"].get(name)
         if kind == "pec":
             pec = True
         elif _conductor(kind):
             region = metals.setdefault(kind, np.zeros(shape, dtype=bool))
-            region[tuple(slice(int(np.searchsorted(n, a, "left")),
-                               int(np.searchsorted(n, b, "right")))
-                         for n, a, b in zip(nodes, plo, phi))] = True
+            # dual hi > a and dual lo < b: the cell overlaps [a, b]
+            region[tuple(slice(int(np.searchsorted(hi, a, "right")),
+                               int(np.searchsorted(lo, b, "left")))
+                         for (lo, hi), a, b in zip(duals, plo, phi))] = True
     metals = {k: v for k, v in metals.items() if v.any()}
     return fdtd.estimate_run(nodes, duration=float(request["duration_s"]),
                              boundary=planned["boundary"], metals=metals,

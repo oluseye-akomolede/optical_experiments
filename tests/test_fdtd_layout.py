@@ -194,6 +194,37 @@ def test_a_film_two_coarse_cells_thick_is_resolved_by_the_layout_rule():
         f"a 20 nm gold film at dx 10 nm got a {inside.max():.3g} m cell; "
         f"the layout's rule wants {cap:.3g}")
 
+
+# plate thicknesses (um) where, before 5.4d, the 0.2 um film read 1.19, 1.22
+# and 1.43 times its thickness: its faces were off the grid's nodes
+@pytest.mark.parametrize("lo,hi", [(0.1973, 0.2285), (0.2459, 0.3846),
+                                   (0.2846, 0.3275)])
+def test_a_film_flush_between_pec_plates_keeps_its_thickness_on_the_layouts_grid(
+        lo, hi):
+    t, z1 = 0.2, lo
+    z2 = z1 + t
+    parts = [_box((0, 0, 0), (1, 1, z1)), _box((0, 0, z1), (1, 1, z2)),
+             _box((0, 0, z2), (1, 1, z2 + hi))]
+    req = _request(dx_m=0.05e-6, position=[0.5e-6, 0.5e-6, (z1 + t / 2) * 1e-6])
+    out = L.layout(["lo", "film", "hi"], parts, req, length_scale=1e-6,
+                   materials={"lo": "pec", "film": 1.5, "hi": "pec"})
+    x, y, z = (n / 1e-6 for n in out["nodes"])
+    col = out["pec"][int(np.argmin(abs(x - 0.5))), int(np.argmin(abs(y - 0.5))), :]
+    free = np.flatnonzero(~col)
+    k = free[np.argmin(abs(z[free] - (z1 + t / 2)))]
+    below = k - np.flatnonzero(col[k::-1])[0]
+    above = k + np.flatnonzero(col[k:])[0]
+    assert z[above] - z[below] == pytest.approx(t, rel=1e-6), (
+        f"the 0.2 um film reads {z[above] - z[below]:.4g} um between its walls")
+
+
+def test_a_curved_part_adds_no_face_line():
+    sphere = trimesh.creation.icosphere(subdivisions=2, radius=1.5)
+    plate = _box((0, 0, 0), (3, 3, 0.4))
+    assert all(L._flat_faces(sphere, axis, 1.0) == [] for axis in range(3))
+    assert L._flat_faces(plate, 2, 1.0) == [0.0, 0.4]
+
+
 @pytest.mark.parametrize("boundary,far", [("metal", 5e-3), ("open", 25e-3)])
 @pytest.mark.parametrize("what", ["source", "probe"])
 def test_a_source_or_probe_outside_the_grid_is_refused_naming_the_extent(

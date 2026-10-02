@@ -190,6 +190,38 @@ def test_an_end_node_samples_only_inside_the_domain():
     np.testing.assert_allclose(eps, 1.0)
 
 
+def test_a_face_line_becomes_a_node_and_the_checker_sees_a_missing_one():
+    nodes = grid.graded_axis(1.0, 0.1, lines=[0.437])
+    assert np.min(np.abs(nodes - 0.437)) < 1e-12
+    assert grid.check_axis(nodes, 0.1, lines=[0.437]) == []
+    plain = grid.graded_axis(1.0, 0.1)
+    assert any("line 0.437" in p
+               for p in grid.check_axis(plain, 0.1, lines=[0.437]))
+
+
+def test_a_line_on_an_existing_edge_adds_no_node():
+    # two faces that meet, read from float mesh data, differ in the last digits
+    layer = [grid.Layer(0.5, 0.6)]
+    plain = grid.graded_axis(1.0, 0.1, layer)
+    lined = grid.graded_axis(1.0, 0.1, layer, lines=[0.5 * (1 + 1e-9)])
+    np.testing.assert_array_equal(lined, plain)
+
+
+def test_a_node_on_a_conductor_face_is_a_conductor_node_on_a_graded_axis():
+    # conductor for x >= 0.3; the node at 0.3 has a 0.013 dielectric half-cell
+    # below and a 0.010 conductor half-cell above (a 1.3 step, the grid's
+    # largest). An even spread gives it 0.43 conductor and calls it
+    # dielectric; centred on the node, the sample on the face is the
+    # conductor's and the node is too (0.62)
+    x = np.array([0.0, 0.1, 0.2, 0.274, 0.3, 0.32, 0.34, 0.36, 0.38, 0.4])
+    nodes = (x, np.linspace(0, 0.3, 4), np.linspace(0, 0.3, 4))
+    index_of = lambda p: np.where(p[:, 0] >= 0.3, 1, 0)
+    _, masks = grid.average_eps(nodes, index_of, [1.0, 1.0], samples=3,
+                                metals=(1,))
+    assert masks[1][4].all(), "the node on the face must be a conductor node"
+    assert not masks[1][3].any()
+
+
 def test_a_grading_that_cannot_converge_is_refused_by_name(monkeypatch):
     # growth 0.5 per cell cannot meet a 1.3 ratio; the repairs must stop with
     # a named error, not refine the fine end until the RAM runs out

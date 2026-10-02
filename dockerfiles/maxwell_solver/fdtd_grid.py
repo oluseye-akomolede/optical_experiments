@@ -40,6 +40,8 @@ _SUBSTEPS = 8            # quadrature points per cell of the envelope
 _REPAIRS = 60
 _GROWTH_LIMIT = 4       # repairs may at most quadruple the first attempt
 _MAX_NODES = 1_000_000  # no axis this tool can run is longer; a backstop
+#: A line this close to an existing edge (x the axis length) is that edge.
+LINE_SNAP = 1e-6
 
 
 class GridError(fdtd.FDTDError):
@@ -120,8 +122,14 @@ def _fill(lo, hi, h_lo, h_hi, cap, minimum):
 
 
 def graded_axis(length: float, coarse: float, layers=(), *,
-                ratio: float = MAX_RATIO, min_cells: int = MIN_CELLS):
-    """Node positions 0..length for one axis (layer edges included)."""
+                ratio: float = MAX_RATIO, min_cells: int = MIN_CELLS,
+                lines=()):
+    """Node positions 0..length for one axis (layer edges included).
+
+    ``lines`` are extra positions that must be nodes (a flat face). A line
+    within ``LINE_SNAP`` x length of an edge already present is that edge:
+    two faces that meet, read from float mesh data, differ in the last
+    digits, and keeping both would resolve a gap that is not there."""
     if not length > 0 or not coarse > 0:
         raise GridError(f"length and coarse cell must be positive, got "
                         f"{length!r}, {coarse!r}")
@@ -136,6 +144,9 @@ def graded_axis(length: float, coarse: float, layers=(), *,
     for layer in layers:
         edges += [min(max(e, 0.0), length) for e in (layer.lo, layer.hi)]
     edges = np.unique(np.round(np.asarray(edges) / length, 12)) * length
+    for line in sorted(float(v) for v in lines):
+        if 0.0 < line < length and np.min(np.abs(edges - line)) > LINE_SNAP * length:
+            edges = np.sort(np.append(edges, line))
     gaps = np.diff(edges)
 
     need = np.full(gaps.size, float(coarse))      # spacing cap per interval
@@ -190,7 +201,7 @@ def graded_axis(length: float, coarse: float, layers=(), *,
 
 
 def check_axis(nodes, coarse: float, layers=(), *, ratio: float = MAX_RATIO,
-               min_cells: int = MIN_CELLS) -> list:
+               min_cells: int = MIN_CELLS, lines=()) -> list:
     """The builder's rules, checked on finished nodes: the problems found."""
     nodes = np.asarray(nodes, dtype=float)
     widths = np.diff(nodes)
@@ -220,15 +231,22 @@ def check_axis(nodes, coarse: float, layers=(), *, ratio: float = MAX_RATIO,
         for edge in (lo, hi):
             if np.min(np.abs(nodes - edge)) > tol:
                 problems.append(f"layer edge {edge:.6g} is not a node")
+    snap = LINE_SNAP * (nodes[-1] - nodes[0])
+    for line in lines:
+        if nodes[0] < line < nodes[-1] and np.min(np.abs(nodes - line)) > snap:
+            problems.append(f"line {line:.6g} is not a node")
     return problems
 
 
-def build_grid(extent, coarse: float, layers=((), (), ())) -> dict:
-    """Nodes and simulate's ``spacings`` for a box of ``extent`` (x, y, z)."""
-    if len(tuple(extent)) != 3 or len(tuple(layers)) != 3:
-        raise GridError("extent and layers are one entry per axis (x, y, z)")
-    nodes = tuple(graded_axis(float(length), coarse, axis_layers)
-                  for length, axis_layers in zip(extent, layers))
+def build_grid(extent, coarse: float, layers=((), (), ()),
+               lines=((), (), ())) -> dict:
+    """Nodes and simulate's ``spacings`` for a box of ``extent`` (x, y, z);
+    ``lines`` are positions per axis that must be nodes."""
+    if len(tuple(extent)) != 3 or len(tuple(layers)) != 3 or len(tuple(lines)) != 3:
+        raise GridError("extent, layers and lines are one entry per axis (x, y, z)")
+    nodes = tuple(graded_axis(float(length), coarse, axis_layers,
+                              lines=axis_lines)
+                  for length, axis_layers, axis_lines in zip(extent, layers, lines))
     return {"nodes": nodes,
             "spacings": tuple(np.diff(n) for n in nodes),
             "shape": tuple(n.size for n in nodes)}
@@ -240,6 +258,24 @@ def _dual_bounds(nodes):
     return np.concatenate([[nodes[0]], mid]), np.concatenate([mid, [nodes[-1]]])
 
 
+def _node_samples(nodes, samples):
+    """Per node, ``samples`` points across its dual cell and the length each
+    stands for. Point k sits at t_k = 2 (k + 1/2) / samples - 1 in (-1, 1),
+    scaled by the half-cell below the node for t < 0 and above it for t > 0,
+    so the points straddle the node (one on it for odd ``samples``) and match
+    an even spread when both halves are equal. Returns (points, widths), each
+    (n, samples)."""
+    lo, hi = _dual_bounds(nodes)
+    below, above = (nodes - lo)[:, None], (hi - nodes)[:, None]
+
+    def place(t):
+        return nodes[:, None] + np.where(t < 0, t * below, t * above)
+
+    k = np.arange(samples)
+    edges = place(2 * np.arange(samples + 1)[None, :] / samples - 1.0)
+    return place(2 * (k[None, :] + 0.5) / samples - 1.0), np.diff(edges, axis=1)
+
+
 def average_eps(nodes, index_of, eps_of, *, samples: int = 3,
                 metals=()) -> tuple:
     """Sub-cell averaged permittivity on the grid's nodes.
@@ -247,19 +283,29 @@ def average_eps(nodes, index_of, eps_of, *, samples: int = 3,
     ``index_of(points)`` maps an (m, 3) array of positions to region indices;
     ``eps_of`` is a sequence giving each index's relative permittivity
     (metals may use any value: their nodes are reported separately).
-    Each node's dual cell is sampled at ``samples``^3 midpoints; eps is the
-    volume average over the dielectric samples, and a node is a metal node
-    when at least half of its samples are that metal. Returns (eps, masks)
-    with one boolean mask per index in ``metals``.
+    Each node's dual cell is sampled at ``samples``^3 points, each standing
+    for its share of the cell's volume; eps is the volume average over the
+    dielectric samples, and a node is a metal node when at least half of its
+    dual cell's volume is that metal. Returns (eps, masks) with one boolean
+    mask per index in ``metals``.
+
+    The samples are placed around the node, not evenly across the dual cell:
+    each axis's half-cells below and above the node are scaled separately,
+    so an odd ``samples`` puts one sample on the node itself. On a uniform
+    axis that is the same set of points as an even spread. On a graded axis
+    it keeps a node that sits on a flat conductor face a conductor node (the
+    sample on the face goes to the conductor by the voxeliser's shared-face
+    rule): an even spread misses the node, the smaller conductor-side half
+    loses the vote, and a film between two plates reads a cell too thick.
     """
     nodes = [np.asarray(n, dtype=float) for n in nodes]
     eps_of = np.asarray(eps_of, dtype=float)
     shape = tuple(n.size for n in nodes)
-    frac = (np.arange(samples) + 0.5) / samples
-    sub = []
+    sub, wts = [], []
     for n in nodes:
-        lo, hi = _dual_bounds(n)
-        sub.append(lo[:, None] + (hi - lo)[:, None] * frac[None, :])
+        points, widths = _node_samples(n, samples)
+        sub.append(points)
+        wts.append(widths)
     eps = np.empty(shape)
     masks = {m: np.zeros(shape, dtype=bool) for m in metals}
     sy, sz = sub[1].reshape(-1), sub[2].reshape(-1)
@@ -269,13 +315,18 @@ def average_eps(nodes, index_of, eps_of, *, samples: int = 3,
                                               pz.ravel()], axis=1)))
         index = index.reshape(samples, shape[1], samples, shape[2], samples)
         index = index.transpose(1, 3, 0, 2, 4).reshape(shape[1], shape[2], -1)
+        # index is (y node, z node, x sample, y sample, z sample); so is w
+        w = np.einsum("ab,cd,e->acebd", wts[1], wts[2],
+                      wts[0][i]).reshape(shape[1], shape[2], -1)
+        total = w.sum(axis=-1)
         is_metal = np.isin(index, list(metals))
         for m in metals:
-            masks[m][i] = (index == m).mean(axis=-1) >= 0.5
-        values = np.where(is_metal, 0.0, eps_of[index])
-        count = (~is_metal).sum(axis=-1)
+            share = np.where(index == m, w, 0.0).sum(axis=-1)
+            masks[m][i] = share >= 0.5 * total * (1 - 1e-12)
+        dielectric = np.where(is_metal, 0.0, w)
+        weight = dielectric.sum(axis=-1)
         # an all-metal cell has no dielectric part; its eps is never read
         # through the metal term, so 1 keeps the Courant check honest
-        eps[i] = np.where(count > 0,
-                          values.sum(axis=-1) / np.maximum(count, 1), 1.0)
+        eps[i] = np.where(weight > 0, (dielectric * eps_of[index]).sum(axis=-1)
+                          / np.where(weight > 0, weight, 1.0), 1.0)
     return eps, masks

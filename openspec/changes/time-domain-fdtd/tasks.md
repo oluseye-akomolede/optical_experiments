@@ -94,6 +94,12 @@
 - [x] 5.4c Shared faces and overlap (lead): a shared face goes to the conductor,
   else the higher index; overlapping parts are refused naming both; `/parts`
   uses the td split for td uploads.
+- [x] 5.4d Faces on the grid (lead): every flat face that bounds a part's box
+  is a grid line, and each node's samples are centred on it, so a film flush
+  between conductor plates keeps its drawn thickness wherever the parts sit
+  (before: up to 1.5 times it, on most offsets). The form estimate bounds each
+  metal by the nodes whose dual cell overlaps its parts, which keeps it above
+  the solved run when a node sits on a face.
 - [ ] 5.4b Per-part coatings end to end: a material plus a thickness on a
   part's surface, painted by the voxeliser on a grid refined by
   `coating_layers`, offered on the page only once it runs.
