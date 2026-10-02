@@ -67,7 +67,27 @@ def aborts(job, store_in, store_out, stage):
 def sleeps(job, store_in, store_out, stage):
     """Stuck inside one step: never reaches the run's own time check."""
     _note_pid(job)
+    stage.stage = "solving"
     time.sleep(600)
+
+
+def stuck_in_setup(job, store_in, store_out, stage):
+    """Never gets as far as ``solving``: a layout that does not finish."""
+    _note_pid(job)
+    stage.stage = "laying out"
+    time.sleep(600)
+
+
+def long_setup_short_run(job, store_in, store_out, stage):
+    """Setup longer than the run deadline, then a run well inside it."""
+    time.sleep(job["setup_sleep_s"])
+    stage.stage = "solving"
+    time.sleep(job["run_sleep_s"])
+    return {"job_id": job["job_id"], "kind": "td", "modes": [], "files": []}
+
+
+def returns_at_once(job, store_in, store_out, stage):
+    return {"job_id": job["job_id"], "kind": "td", "modes": [], "files": []}
 
 
 def reports_then_hangs(job, store_in, store_out, stage):

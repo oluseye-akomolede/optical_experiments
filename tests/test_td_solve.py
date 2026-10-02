@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -478,6 +479,40 @@ def test_a_child_stuck_past_the_deadline_is_killed_reaped_and_timed_out(pid_file
                                    deadline_s=3.0, reap_s=30.0)
     assert time.monotonic() - started < 20, "the deadline did not kill it"
     assert _reaped(pid_file)
+
+
+def test_a_child_stuck_in_setup_gets_the_setup_verdict(pid_file):
+    started = time.monotonic()
+    stage = types.SimpleNamespace(stage=None)
+    with pytest.raises(td_solve.TDSolveError, match="setup .* took more than"):
+        td_solve.solve_td_isolated(dict(_job(), pid_file=str(pid_file)), None,
+                                   None, stage, run=TARGETS.stuck_in_setup,
+                                   poll_s=0.1, setup_s=3.0, deadline_s=600.0,
+                                   reap_s=30.0)
+    assert time.monotonic() - started < 20, "the setup cap did not kill it"
+    assert stage.stage == "laying out"
+    assert _reaped(pid_file)
+
+
+def test_the_run_clock_starts_at_solving_not_at_spawn():
+    """Setup alone outlasts the run deadline; the run itself is well inside
+    it. Timed from spawn, this child would be killed during setup."""
+    out = td_solve.solve_td_isolated(
+        dict(_job(), setup_sleep_s=3.0, run_sleep_s=0.3), None, None, None,
+        run=TARGETS.long_setup_short_run, poll_s=0.1, deadline_s=2.0,
+        setup_s=30.0)
+    assert out["kind"] == "td"
+
+
+def test_a_reported_outcome_wins_over_a_passed_deadline():
+    """The clock is past every limit from its second reading on, but the
+    child's outcome is already on its way: the outcome, not the time-out."""
+    readings = iter([0.0])
+    out = td_solve.solve_td_isolated(
+        _job(), None, None, None, run=TARGETS.returns_at_once, poll_s=60.0,
+        deadline_s=1.0, setup_s=1.0,
+        clock=lambda: next(readings, 1e9))
+    assert out["kind"] == "td"
 
 
 def test_a_child_that_hangs_after_its_outcome_is_killed_and_reaped(pid_file):

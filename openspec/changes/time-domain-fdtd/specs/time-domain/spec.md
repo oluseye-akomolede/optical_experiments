@@ -358,6 +358,15 @@ limit.
 - **WHEN** a `td` child is still running 5 minutes past the 45-minute limit
   (its own stop is checked only between steps, so it is stuck inside one)
 - **THEN** the worker kills it and fails the job with the 45-minute message
+- **AND** the worker times the run from when the child reports `solving`, the
+  moment the child's own 45 minutes start, never from spawn, so a long setup
+  does not eat into the run's time
+- **AND** before `solving` arrives, setup is capped at 50 minutes from spawn;
+  a child that reaches it is killed and the job fails with a plain message
+  saying the setup took too long
+- **AND** the worker reads every message the child has already sent before it
+  looks at either clock, and an outcome found there wins over a deadline: a
+  child that finished is never failed as too slow
 - **AND** a child that has sent its outcome but has not exited within 60
   seconds is killed, and every child is reaped (no zombie) before the worker
   goes on
