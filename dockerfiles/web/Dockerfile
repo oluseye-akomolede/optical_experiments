@@ -70,6 +70,16 @@ COPY dockerfiles/maxwell_solver/mse_parts.py /opt/app/
 # pc_geometry.py has no imports of its own beyond numpy, and its only mse_ import
 # is the MeshingError fallback it tries and then stubs.
 COPY dockerfiles/maxwell_solver/pc_geometry.py /opt/app/
+# The FDTD layout and limits, for the td form. web/td_form.py lays out the grid
+# and checks the limits through the solver's own modules, so the run the owner
+# is refused on is the one the worker would solve. All four import numpy only
+# (fdtd_voxel adds mse_geometry, above); cupy is imported inside the solve,
+# which the web image never calls.
+# One file per line: tests/test_web_imports.py reads COPY lines singly.
+COPY dockerfiles/maxwell_solver/fdtd.py /opt/app/
+COPY dockerfiles/maxwell_solver/fdtd_grid.py /opt/app/
+COPY dockerfiles/maxwell_solver/fdtd_layout.py /opt/app/
+COPY dockerfiles/maxwell_solver/fdtd_voxel.py /opt/app/
 # The app adds this directory to sys.path for a checkout; in the image the
 # module is already here, so name it explicitly rather than relying on the
 # interpreter's default path.

@@ -523,6 +523,101 @@ def test_a_child_that_hangs_after_its_outcome_is_killed_and_reaped(pid_file):
     assert _reaped(pid_file)
 
 
+class _Link:
+    """A scripted pipe, process and clock for ``solve_td_isolated``.
+
+    Each blocking poll advances the clock by its timeout, then delivers the
+    next batch of ``arrivals``; ``on_kill`` is a batch that lands as the
+    child is killed (an outcome already in flight). Deterministic, and a
+    loop that never ends fails after ``max_polls`` instead of hanging."""
+
+    def __init__(self, arrivals, on_kill=(), max_polls=50):
+        self.arrivals, self.on_kill = list(arrivals), list(on_kill)
+        self.buffer, self.now, self.polls = [], 0.0, 0
+        self.max_polls, self.alive, self.exitcode = max_polls, True, None
+        self.killed_at = None
+
+    # context
+    def Pipe(self, duplex):
+        return self, types.SimpleNamespace(close=lambda: None)
+
+    def Process(self, target, args, daemon):
+        return self
+
+    # receive end
+    def poll(self, timeout=0.0):
+        if timeout and not self.buffer:
+            self.polls += 1
+            assert self.polls <= self.max_polls, "the wait loop never ended"
+            self.now += timeout
+            if self.arrivals:
+                self.buffer.extend(self.arrivals.pop(0))
+        return bool(self.buffer)
+
+    def recv(self):
+        message = self.buffer.pop(0)
+        if message[0] != "stage":  # a real child exits once it has reported
+            self.alive, self.exitcode = False, 0
+        return message
+
+    def close(self):
+        pass
+
+    # process
+    def start(self):
+        pass
+
+    def is_alive(self):
+        return self.alive
+
+    def kill(self):
+        self.killed_at, self.alive, self.exitcode = self.now, False, -9
+        self.buffer.extend(self.on_kill)
+
+    def join(self, timeout=None):
+        pass
+
+    def clock(self):
+        return self.now
+
+
+def _isolated(link, **kw):
+    return td_solve.solve_td_isolated(
+        _job(), None, None, types.SimpleNamespace(stage=None), context=link,
+        clock=link.clock, poll_s=1.0, **kw)
+
+
+_OK = ("ok", {"kind": "td", "files": []})
+
+
+def test_a_repeated_solving_report_does_not_restart_the_run_clock():
+    link = _Link([[("stage", "solving")]] * 20)
+    with pytest.raises(td_solve.TDSolveError, match="stopped after 45 minutes"):
+        _isolated(link, deadline_s=3.0, setup_s=1000.0)
+    assert link.killed_at is not None and link.killed_at <= 5.0, link.killed_at
+
+
+def test_the_run_deadline_not_the_setup_cap_times_a_solving_child():
+    link = _Link([[("stage", "solving")]])
+    with pytest.raises(td_solve.TDSolveError, match="stopped after 45 minutes"):
+        _isolated(link, deadline_s=3.0, setup_s=1000.0)
+    assert link.killed_at is not None and link.killed_at <= 5.0, link.killed_at
+
+
+def test_a_queued_outcome_is_read_before_the_clock_so_the_child_is_not_killed():
+    """A stage report and the outcome arrive together, after the setup cap
+    has passed: the outcome is read first, and nothing is killed."""
+    link = _Link([[("stage", "laying out"), _OK]])
+    assert _isolated(link, setup_s=0.5)["kind"] == "td"
+    assert link.killed_at is None
+
+
+def test_an_outcome_landing_as_the_child_is_killed_still_wins():
+    link = _Link([[]], on_kill=[_OK])
+    assert _isolated(link, setup_s=0.5)["kind"] == "td"
+    assert link.killed_at is not None
+
+
 def test_the_worker_uploads_every_file_the_td_solve_writes(tmp_path):
     """Through the worker's real enumerator and allow-list, not a copy."""
     import mse_worker

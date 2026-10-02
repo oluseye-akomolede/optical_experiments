@@ -13,38 +13,59 @@
     penetrates the metal and the true resonance shifts. Treat these frequencies as the
     ideal-cavity answer, not a measured one.
   </p>
-  {# The mode selector. `detail.cavity` and `detail.pc` below are the two arms;
-     the script at the bottom of this file shows exactly one and keeps the
-     `required` attributes in step with what is visible -- a hidden file input
-     that stays `required` blocks submission with a browser message pointing at
-     a control the owner cannot see, which is the could-not-ask shape in a form. #}
+  {# The mode selector. Each `.mode-detail` fieldset names the modes it belongs
+     to in `data-modes`; the script at the bottom of this file shows exactly
+     those and keeps the `required` attributes in step with what is visible -- a
+     hidden file input that stays `required` blocks submission with a browser
+     message pointing at a control the owner cannot see, which is the
+     could-not-ask shape in a form. Only controls marked `data-required` are
+     ever made required: the optional ones (scale, feature size) stay optional
+     whichever arm is showing. #}
   <form method="post" enctype="multipart/form-data" class="upload" id="upload-form">
     <div class="row">
       <label>What would you like to compute?
         <select name="mode" id="mode-select">
           <option value="cavity" selected>Optical modes of an object (3-D)</option>
           <option value="pc">Band diagram of a 2-D photonic crystal</option>
+          <option value="td">Light moving through an object over time (3-D)</option>
         </select>
       </label>
     </div>
 
-    <fieldset id="detail-cavity" class="mode-detail">
+    {# The upload itself, shared by the two arms that take an object. #}
+    <fieldset id="detail-object" class="mode-detail" data-modes="cavity td">
     <label>Model file (.obj, up to {{ max_mb }} MB)
-      <input type="file" name="meshfile" accept=".obj" required>
+      <input type="file" name="meshfile" accept=".obj" data-required>
     </label>
     <div class="row">
       <label>Units
-        <select name="units">
+        <select name="units" data-required>
           {% for unit in units %}
             <option value="{{ unit }}" {% if unit == default_units %}selected{% endif %}>{{ unit }}</option>
           {% endfor %}
         </select>
       </label>
+      <label>Scale factor &mdash; optional
+        <input type="text" name="scale" value="" placeholder="1"
+               pattern="[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?">
+      </label>
+    </div>
+    <p class="muted small">
+      The <strong>scale factor</strong> multiplies the model before anything else looks
+      at it, so <code>1000</code> turns a model drawn in millimetres into one 1000 times
+      larger. Leave it blank for the model exactly as it is. If your .obj has no stated
+      units, this is how you say how big it really is &mdash; and the size you state is
+      the size whose modes you get.
+    </p>
+    </fieldset>
+
+    <fieldset id="detail-cavity" class="mode-detail" data-modes="cavity">
+    <div class="row">
       <label>Refractive index
-        <input type="number" name="n_index" value="1.0" min="1" step="0.001" required>
+        <input type="number" name="n_index" value="1.0" min="1" step="0.001" data-required>
       </label>
       <label>Modes
-        <select name="n_modes">
+        <select name="n_modes" data-required>
           {% for count in mode_choices %}
             <option value="{{ count }}" {% if count == default_n_modes %}selected{% endif %}>{{ count }}</option>
           {% endfor %}
@@ -66,10 +87,6 @@
           {% endfor %}
         </select>
       </label>
-      <label>Scale factor &mdash; optional
-        <input type="text" name="scale" value="" placeholder="1"
-               pattern="[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?">
-      </label>
     </div>
     <p class="muted small">
       Leave the feature size on <strong>auto</strong> for the default resolution, which
@@ -81,20 +98,13 @@
       millimetres. Setting it larger than the automatic value has no effect: the mesh is
       never made coarser than the detail you name.
     </p>
-    <p class="muted small">
-      The <strong>scale factor</strong> multiplies the model before anything else looks
-      at it, so <code>1000</code> turns a model drawn in millimetres into one 1000 times
-      larger. Leave it blank for the model exactly as it is. If your .obj has no stated
-      units, this is how you say how big it really is &mdash; and the size you state is
-      the size whose modes you get.
-    </p>
     </fieldset>
 
     {# The photonic-crystal arm. No file: the request is the geometry of the
        unit cell and the two indices. Every field here is dimensionless, which
        is why there is no unit menu and no scale factor -- ω comes back in units
        of a/(2πc) and the lattice constant never needs a number. #}
-    <fieldset id="detail-pc" class="mode-detail" hidden>
+    <fieldset id="detail-pc" class="mode-detail" data-modes="pc" hidden>
       <p class="muted small">
         A 2-D photonic crystal: a square or triangular lattice of rods in a
         background, solved on the high-symmetry path through the Brillouin
@@ -105,7 +115,7 @@
       </p>
       <div class="row">
         <label>Lattice
-          <select name="lattice">
+          <select name="lattice" data-required>
             {% for lattice in lattices %}
               <option value="{{ lattice }}"{% if lattice == 'square' %} selected{% endif %}>{{ lattice }}</option>
             {% endfor %}
@@ -113,10 +123,10 @@
         </label>
         <label>Rod radius (as a fraction of a)
           <input type="number" name="r_over_a" value="0.2" min="0.001" max="0.499"
-                 step="0.001" required>
+                 step="0.001" data-required>
         </label>
         <label>Polarisation
-          <select name="polarisation">
+          <select name="polarisation" data-required>
             {% for pol in polarisations %}
               <option value="{{ pol }}"{% if pol == 'TM' %} selected{% endif %}>{{ pol }}</option>
             {% endfor %}
@@ -125,18 +135,18 @@
       </div>
       <div class="row">
         <label>Rod refractive index
-          <input type="number" name="n_rod" value="3.5" min="0.001" step="0.001" required>
+          <input type="number" name="n_rod" value="3.5" min="0.001" step="0.001" data-required>
         </label>
         <label>Background refractive index
-          <input type="number" name="n_bg" value="1.0" min="0.001" step="0.001" required>
+          <input type="number" name="n_bg" value="1.0" min="0.001" step="0.001" data-required>
         </label>
         <label>Bands (per polarisation)
           <input type="number" name="n_bands" value="6" min="1" max="{{ max_bands }}"
-                 step="1" required>
+                 step="1" data-required>
         </label>
         <label>Divisions per cell edge
           <input type="number" name="divisions" value="24" min="4"
-                 max="{{ max_divisions }}" step="1" required>
+                 max="{{ max_divisions }}" step="1" data-required>
         </label>
       </div>
       <p class="muted small">
@@ -146,6 +156,110 @@
         divisions means a finer cell and a longer solve; more bands means a
         larger eigenvalue problem. The app refuses a request that would exceed
         its node or k-point ceiling, and says which limit was hit.
+      </p>
+    </fieldset>
+
+    {# The time-domain arm. The object comes from the shared upload fieldset
+       above; this is the source, the run and the probes. Every field name here
+       is read by web/td_form.py, which refuses by name -- including the ones the
+       chosen source does not use, which are hidden by `data-when` and ignored
+       by the form. #}
+    <fieldset id="detail-td" class="mode-detail" data-modes="td" hidden>
+      <p class="muted small">
+        A time-domain run: we put your object on a grid, switch on a light
+        source, and step Maxwell's equations forward in time. The result is the
+        field recorded at each probe, its spectrum, and a short movie of the
+        field strength. Positions are measured from the <strong>lowest corner
+        of your object's bounding box</strong>, after the units and scale above,
+        in the length unit you pick here.
+      </p>
+      <div class="row">
+        <label>Outside the object
+          <select name="td_boundary" data-required>
+            <option value="open" selected>open space (waves leave)</option>
+            <option value="metal">a metal box (waves reflect)</option>
+          </select>
+        </label>
+        <label>Object's refractive index
+          <input type="number" name="td_n_index" value="1.5" min="1" step="0.001" data-required>
+        </label>
+        <label>Length unit (positions, cell size)
+          <select name="td_unit" data-required>
+            {% for unit in td_units %}
+              <option value="{{ unit }}"{% if unit == 'um' %} selected{% endif %}>{{ unit }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Cell size
+          <input type="number" name="td_dx" value="0.05" min="0" step="any" data-required>
+        </label>
+      </div>
+      <div class="row">
+        <label>Source
+          <select name="td_source_kind" id="td-source-kind" data-required>
+            <option value="point" selected>a point (a tiny antenna)</option>
+            <option value="plane">a plane wave</option>
+          </select>
+        </label>
+        <label>Field direction
+          <select name="td_polarisation" data-required>
+            {% for pol in td_polarisations %}
+              <option value="{{ pol }}"{% if pol == 'z' %} selected{% endif %}>{{ pol }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label data-when="td_source_kind:point">Source position (x y z)
+          <input type="text" name="td_position" value="" placeholder="0.5 0.5 0.5" data-required>
+        </label>
+        <label data-when="td_source_kind:plane">Travelling towards
+          <select name="td_direction" data-required>
+            {% for d in td_directions %}
+              <option value="{{ d }}"{% if d == '+x' %} selected{% endif %}>{{ d }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Time profile
+          <select name="td_profile" id="td-profile" data-required>
+            <option value="pulse" selected>a pulse (many frequencies at once)</option>
+            <option value="cw">a steady wave (one frequency)</option>
+            <option value="drawn">my own waveform</option>
+          </select>
+        </label>
+        <label>Frequency (THz)
+          <input type="number" name="td_frequency_thz" value="300" min="0" step="any" data-required>
+        </label>
+        <label data-when="td_profile:pulse">Pulse bandwidth (THz)
+          <input type="number" name="td_bandwidth_thz" value="200" min="0" step="any" data-required>
+        </label>
+        <label>Run for (fs)
+          <input type="number" name="td_duration_fs" value="100" min="0" step="any" data-required>
+        </label>
+      </div>
+      <div class="row" data-when="td_profile:drawn">
+        <label>Waveform samples (numbers, spaced evenly in time)
+          <textarea name="td_samples" rows="2" placeholder="0 0.5 1 0.5 0 -0.5 -1 -0.5 0" data-required></textarea>
+        </label>
+        <label>Waveform lasts (fs)
+          <input type="number" name="td_sample_duration_fs" value="" min="0" step="any" data-required>
+        </label>
+      </div>
+      <p class="muted small" data-when="td_profile:drawn">
+        Your waveform is played once, from the start of the run, and is zero after
+        it ends. Its average is removed first, because a source with a non-zero
+        average leaves a charge behind. A waveform with sharper detail than the
+        grid can carry is refused, naming the highest frequency the grid resolves.
+      </p>
+      <label>Probes &mdash; one per line: x y z and the field component it records
+        <textarea name="td_probes" rows="3" placeholder="0.5 0.5 0.8 z" data-required></textarea>
+      </label>
+      <p class="muted small">
+        A smaller cell size resolves finer detail but makes the run much larger:
+        halving it is about sixteen times the work. The app refuses a run that
+        would be too big or too long before it is queued, and says which limit
+        was hit; it also refuses a source or probe that lands in a metal, outside
+        the grid or inside the absorbing layer at its edge.
       </p>
     </fieldset>
 
@@ -166,7 +280,7 @@
              kind it is here rather than leaving the reader to open the page:
              two rows can otherwise look identical and one of them is a 2-D
              band diagram, not a 3-D object. #}
-          <td class="muted">{{ 'crystal' if job.kind == 'pc' else 'object' }}</td>
+          <td class="muted">{{ {'pc': 'crystal', 'td': 'time-domain'}.get(job.kind, 'object') }}</td>
           <td class="muted">{{ job.created_at }}</td>
           <td><span class="pill pill-{{ job.status }}">{{ job.status }}</span>
               {% if job.stage and job.stage != job.status %}<span class="muted small">{{ job.stage }}</span>{% endif %}</td>
@@ -182,40 +296,60 @@
 
 {% block scripts %}
 <script>
-// Show one arm of the form. The `required` attribute is toggled WITH visibility:
-// a hidden `required` box blocks the POST and the browser then cannot focus it,
-// so the owner sees "not focusable" pointing at a control that is not on the
-// page. Every input in the hidden arm is disarmed here so only the visible
-// arm's constraints apply. The button label follows the arm, because "Compute
-// modes" over a band-diagram request is the wrong promise.
+// Show the arms of the form that belong to the chosen mode. Each `.mode-detail`
+// fieldset lists its modes in `data-modes`; inside one, an element with
+// `data-when="field:value"` shows only while that field has that value (the td
+// source's position vs direction, the pulse bandwidth, the drawn waveform).
+//
+// `required` is toggled WITH visibility: a hidden `required` box blocks the POST
+// and the browser then cannot focus it, so the owner sees "not focusable"
+// pointing at a control that is not on the page. A control is made required
+// only when it is marked `data-required` AND nothing above it is hidden, so the
+// optional ones (scale, feature size) never block a submission. The button
+// label follows the mode, because "Compute modes" over a band-diagram request
+// is the wrong promise.
 (function () {
+  var form = document.getElementById('upload-form');
   var select = document.getElementById('mode-select');
-  if (!select) return;
-  var arms = {
-    cavity: document.getElementById('detail-cavity'),
-    pc: document.getElementById('detail-pc'),
-  };
+  if (!form || !select) return;
   var button = document.getElementById('submit-button');
-  var labels = { cavity: 'Compute modes', pc: 'Compute the band diagram' };
+  var labels = {
+    cavity: 'Compute modes',
+    pc: 'Compute the band diagram',
+    td: 'Run the time-domain simulation',
+  };
+
+  function fieldValue(name) {
+    var field = form.elements[name];
+    return field ? field.value : null;
+  }
 
   function apply() {
-    var chosen = select.value === 'pc' ? 'pc' : 'cavity';
-    Object.keys(arms).forEach(function (name) {
-      var arm = arms[name];
-      if (!arm) return;
-      var visible = name === chosen;
-      arm.hidden = !visible;
-      arm.querySelectorAll('input, select').forEach(function (input) {
-        if (visible) {
-          input.setAttribute('required', '');
-        } else {
-          input.removeAttribute('required');
-        }
-      });
+    var chosen = labels.hasOwnProperty(select.value) ? select.value : 'cavity';
+    form.querySelectorAll('.mode-detail').forEach(function (arm) {
+      arm.hidden = (arm.dataset.modes || '').split(/\s+/).indexOf(chosen) < 0;
     });
+    form.querySelectorAll('[data-when]').forEach(function (el) {
+      var rule = el.dataset.when.split(':');
+      el.hidden = fieldValue(rule[0]) !== rule[1];
+    });
+    form.querySelectorAll('[data-required]').forEach(function (input) {
+      if (input.closest('[hidden]')) {
+        input.removeAttribute('required');
+      } else {
+        input.setAttribute('required', '');
+      }
+    });
+    // A hidden control is also disabled, so it is not posted: a file chosen
+    // before switching to the crystal arm would otherwise ride along and get
+    // the crystal request refused for a file the owner can no longer see.
+    form.querySelectorAll('.mode-detail input, .mode-detail select, .mode-detail textarea')
+      .forEach(function (input) {
+        input.disabled = !!input.closest('[hidden]');
+      });
     if (button) button.textContent = labels[chosen];
   }
-  select.addEventListener('change', apply);
+  form.addEventListener('change', apply);
   apply();
 })();
 </script>
