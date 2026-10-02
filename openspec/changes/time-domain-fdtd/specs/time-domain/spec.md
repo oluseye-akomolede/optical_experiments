@@ -285,6 +285,15 @@ column is added idempotently by `db/001_schema.sql` and dropped by
 - **WHEN** a job is created with kind `TD`
 - **THEN** it is refused and no INSERT is sent
 
+#### Scenario: the worker dispatches every kind by name
+- **WHEN** the worker claims a job
+- **THEN** it decides the kind once, before fetching anything: `cavity` (or no
+  kind, a row older than the column) and `td` fetch their upload, `pc` fetches
+  nothing, and a `td` job is reported as "solving", never "meshing"
+- **AND** a kind outside the worker's list fails terminally with a message
+  naming it, before any input is fetched, and is never solved as a cavity
+- **AND** the worker's kind list equals the app's
+
 ### Requirement: The worker SHALL run a time-domain job only with the memory it needs
 
 The worker SHALL run at most one GPU job at a time when one of them is `td`.
