@@ -1527,11 +1527,13 @@ def real_solve(job: dict, store_in, store_out, stage: StageReporter | None = Non
 
     if kind == TD:
         # A time-domain job. Its own module, like pc: the request is ``tds``.
-        from td_solve import solve_td  # noqa: PLC0415 - sibling module, late
+        # Run in a child process, so a kernel OOM kill (SIGKILL, no exception)
+        # is seen here and fails the job once instead of killing the worker.
+        from td_solve import solve_td_isolated  # noqa: PLC0415 - sibling, late
 
         if stage is not None:
             stage.stage = "solving"
-        return solve_td(job, store_in, store_out, stage)
+        return solve_td_isolated(job, store_in, store_out, stage)
 
     # Only a cavity job reaches here: ``job_kind`` refused everything it does
     # not name, and pc and td returned above.

@@ -337,6 +337,40 @@ limit.
 - **WHEN** the device runs out of memory during a `td` run
 - **THEN** the job fails with a message naming the memory shortage
 
+#### Scenario: a kernel out-of-memory kill fails the job once
+- **WHEN** the kernel's OOM killer ends a `td` run with SIGKILL (on the Orin
+  the GPU shares system RAM, so this, not an exception, is a common way to run
+  out of memory)
+- **THEN** the job fails once with the out-of-memory message, and is never
+  requeued as a counted release
+- **AND** this holds because the run solves in a spawned child process, with
+  the worker (holding the lease) reading exit status -9 as out of memory; the
+  child ignores SIGTERM and SIGINT, so a service stop does not end a run; an
+  error raised in the child reaches the worker's classifier with its type (or
+  its type's name, when it cannot be pickled) and its cause chain; and the
+  worker's unit sets `OOMPolicy=continue`, so systemd does not stop the
+  service when the child is killed
+- **AND** only SIGKILL reads as out of memory: a child that exits non-zero or
+  dies of another signal (SIGABRT, say) fails with the plain "stopped
+  unexpectedly" message naming its exit status, never the out-of-memory one
+
+#### Scenario: a run stuck inside one step is still stopped
+- **WHEN** a `td` child is still running 5 minutes past the 45-minute limit
+  (its own stop is checked only between steps, so it is stuck inside one)
+- **THEN** the worker kills it and fails the job with the 45-minute message
+- **AND** the worker times the run from when the child reports `solving`, the
+  moment the child's own 45 minutes start, never from spawn, so a long setup
+  does not eat into the run's time
+- **AND** before `solving` arrives, setup is capped at 50 minutes from spawn;
+  a child that reaches it is killed and the job fails with a plain message
+  saying the setup took too long
+- **AND** the worker reads every message the child has already sent before it
+  looks at either clock, and an outcome found there wins over a deadline: a
+  child that finished is never failed as too slow
+- **AND** a child that has sent its outcome but has not exited within 60
+  seconds is killed, and every child is reaped (no zombie) before the worker
+  goes on
+
 #### Scenario: an overlong run is stopped
 - **WHEN** a `td` run passes 45 minutes of run time
 - **THEN** it is stopped and the job fails with a message naming the limit

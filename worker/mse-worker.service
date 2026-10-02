@@ -80,6 +80,11 @@ Environment=MSE_SOLVER_BACKEND=gpu
 # 5G is the measured working set of a solve; the Orin has 8 GB shared with the
 # system, so this is the ceiling that leaves the desktop alive.
 MemoryMax=5G
+# A time-domain run solves in a child process. When it outgrows MemoryMax the
+# kernel OOM-kills that child, and the worker (still holding the lease) fails the
+# job with the out-of-memory reason. systemd's default OOMPolicy=stop would stop
+# the whole service at that moment instead, killing the worker with the child.
+OOMPolicy=continue
 # Below the interactive shell and the desktop: when the owner is using the box,
 # the worker should give way rather than make the machine feel broken.
 Nice=10

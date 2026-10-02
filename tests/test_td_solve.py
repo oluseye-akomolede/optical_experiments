@@ -6,7 +6,10 @@ Tiny and pure: no store, no solver. The phase-5 form will be pinned against
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
+import types
 from pathlib import Path
 
 import pytest
@@ -340,6 +343,184 @@ def test_the_memory_gate_counts_the_field_movie(monkeypatch):
     without = real(nodes, record_frames=False, **kw)["bytes"]
     assert with_movie > without
     assert est["bytes"] == with_movie == out["estimate"]["bytes"]
+
+
+class _Pool:
+    def free_bytes(self):
+        return 12_345
+
+
+class _PoolXp:
+    def get_default_memory_pool(self):
+        return _Pool()
+
+
+def test_free_memory_adds_the_blocks_cupys_pool_already_holds(tmp_path):
+    """MemAvailable alone undercounts a warm worker: the pool's free blocks
+    are reusable by this process but the kernel counts them as used."""
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal: 8000000 kB\nMemAvailable: 1000 kB\n")
+    assert td_solve.available_bytes(_PoolXp(), meminfo) == 1000 * 1024 + 12_345
+    assert td_solve.available_bytes(np, meminfo) == 1000 * 1024
+
+
+# --- the run in its own process ------------------------------------------
+
+import td_child_targets as TARGETS  # noqa: E402
+
+
+class _Stages:
+    def __init__(self):
+        self.seen = []
+
+    @property
+    def stage(self):
+        return self.seen[-1] if self.seen else None
+
+    @stage.setter
+    def stage(self, name):
+        self.seen.append(name)
+
+
+def test_a_tiny_job_runs_in_its_own_process_and_writes_its_files(tmp_path):
+    """Positive control: the real solve in a spawned child, a real store."""
+    import mse_storage
+    store = mse_storage.LocalStore(tmp_path)
+    store.write("jobs/j1/input.obj", _obj())
+    stages = _Stages()
+    out = td_solve.solve_td_isolated(_job(), store, store, stages)
+    assert "result" not in out, "the arrays stay in the files"
+    assert out["files"][0] == "trace.bin" and out["files"][-1] == "spectrum.json"
+    for name in out["files"]:
+        assert (tmp_path / "jobs" / "j1" / name).is_file(), name
+    assert "writing results" in stages.seen, stages.seen
+
+
+def test_a_kernel_kill_of_the_run_is_the_out_of_memory_verdict():
+    stages = _Stages()
+    with pytest.raises(td_solve.TDSolveError) as info:
+        td_solve.solve_td_isolated(_job(), None, None, stages, run=TARGETS.killed)
+    assert str(info.value) == td_solve.oom_message()
+    assert "ran out of memory" in str(info.value)
+    assert stages.seen == ["solving"]
+
+
+def test_a_stop_signal_does_not_end_the_run():
+    """systemd sends SIGTERM to the whole cgroup; the child finishes anyway."""
+    out = td_solve.solve_td_isolated(_job(), None, None, None,
+                                     run=TARGETS.sigterm_then_finish)
+    assert out["files"] == ["trace.bin"] and "result" not in out
+
+
+def test_a_childs_error_keeps_its_type_and_its_cause():
+    """The worker's classify walks the cause chain: a GPU-init failure
+    wrapped in another error is transient, and only the chain says so."""
+    import mse_worker
+    with pytest.raises(ValueError, match="could not start") as info:
+        td_solve.solve_td_isolated(_job(), None, None, None,
+                                   run=TARGETS.gpu_init_failure)
+    assert "cudaErrorInitializationError" in str(info.value.__cause__)
+    assert mse_worker.classify(info.value) == "transient"
+
+
+def test_an_unpicklable_error_keeps_its_name_and_text():
+    with pytest.raises(RuntimeError, match="half open") as info:
+        td_solve.solve_td_isolated(_job(), None, None, None,
+                                   run=TARGETS.unpicklable)
+    assert type(info.value).__name__ == "Odd"
+
+
+def test_busy_in_the_child_is_busy_in_the_parent():
+    import mse_worker
+    with pytest.raises(td_solve.JetsonBusy) as info:
+        td_solve.solve_td_isolated(_job(), None, None, None, run=TARGETS.busy)
+    assert mse_worker.classify(info.value) == "busy"
+
+
+@pytest.mark.parametrize("target, status", [("exits_3", "3"), ("aborts", "-6")])
+def test_only_a_kill_signal_reads_as_out_of_memory(target, status):
+    """SIGKILL is the OOM killer; any other death is the plain failure."""
+    with pytest.raises(td_solve.TDSolveError) as info:
+        td_solve.solve_td_isolated(_job(), None, None, None,
+                                   run=getattr(TARGETS, target))
+    assert str(info.value) != td_solve.oom_message()
+    assert "ran out of memory" not in str(info.value)
+    assert f"stopped unexpectedly (exit status {status})" in str(info.value)
+
+
+def _reaped(pid_file) -> bool:
+    """Dead AND reaped: a zombie still answers signal 0."""
+    pid = int(pid_file.read_text())
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+@pytest.fixture
+def pid_file(tmp_path):
+    """Where a child notes its pid; SIGKILLed afterwards if still there, so a
+    red run (the child ignores SIGTERM) ends now, not when its sleep does."""
+    path = tmp_path / "pid"
+    yield path
+    if path.exists():
+        try:
+            os.kill(int(path.read_text()), 9)
+        except ProcessLookupError:
+            pass
+
+
+def test_a_child_stuck_past_the_deadline_is_killed_reaped_and_timed_out(pid_file):
+    started = time.monotonic()
+    with pytest.raises(td_solve.TDSolveError, match="stopped after 45 minutes"):
+        td_solve.solve_td_isolated(dict(_job(), pid_file=str(pid_file)), None,
+                                   None, None, run=TARGETS.sleeps, poll_s=0.1,
+                                   deadline_s=3.0, reap_s=30.0)
+    assert time.monotonic() - started < 20, "the deadline did not kill it"
+    assert _reaped(pid_file)
+
+
+def test_a_child_stuck_in_setup_gets_the_setup_verdict(pid_file):
+    started = time.monotonic()
+    stage = types.SimpleNamespace(stage=None)
+    with pytest.raises(td_solve.TDSolveError, match="setup .* took more than"):
+        td_solve.solve_td_isolated(dict(_job(), pid_file=str(pid_file)), None,
+                                   None, stage, run=TARGETS.stuck_in_setup,
+                                   poll_s=0.1, setup_s=3.0, deadline_s=600.0,
+                                   reap_s=30.0)
+    assert time.monotonic() - started < 20, "the setup cap did not kill it"
+    assert stage.stage == "laying out"
+    assert _reaped(pid_file)
+
+
+def test_the_run_clock_starts_at_solving_not_at_spawn():
+    """Setup alone outlasts the run deadline; the run itself is well inside
+    it. Timed from spawn, this child would be killed during setup."""
+    out = td_solve.solve_td_isolated(
+        dict(_job(), setup_sleep_s=3.0, run_sleep_s=0.3), None, None, None,
+        run=TARGETS.long_setup_short_run, poll_s=0.1, deadline_s=2.0,
+        setup_s=30.0)
+    assert out["kind"] == "td"
+
+
+def test_a_reported_outcome_wins_over_a_passed_deadline():
+    """The clock is past every limit from its second reading on, but the
+    child's outcome is already on its way: the outcome, not the time-out."""
+    readings = iter([0.0])
+    out = td_solve.solve_td_isolated(
+        _job(), None, None, None, run=TARGETS.returns_at_once, poll_s=60.0,
+        deadline_s=1.0, setup_s=1.0,
+        clock=lambda: next(readings, 1e9))
+    assert out["kind"] == "td"
+
+
+def test_a_child_that_hangs_after_its_outcome_is_killed_and_reaped(pid_file):
+    out = td_solve.solve_td_isolated(dict(_job(), pid_file=str(pid_file)), None,
+                                     None, None, run=TARGETS.reports_then_hangs,
+                                     poll_s=0.1, reap_s=1.0)
+    assert out["kind"] == "td"
+    assert _reaped(pid_file)
 
 
 def test_the_worker_uploads_every_file_the_td_solve_writes(tmp_path):

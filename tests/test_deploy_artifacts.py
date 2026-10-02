@@ -113,6 +113,12 @@ def test_the_unit_and_the_worker_agree_on_where_the_script_is():
     assert f"{archive_root}/worker" in script_path
 
 
+def test_a_kernel_oom_kill_of_a_child_does_not_stop_the_service():
+    """systemd's default OOMPolicy=stop would stop the worker when the kernel
+    kills its td child, and the worker would never report the job."""
+    assert directives(unit_text()).get("OOMPolicy") == "continue"
+
+
 def test_the_unit_sets_a_working_directory():
     """Without WorkingDirectory the process starts in systemd's CWD (`$HOME`).
 

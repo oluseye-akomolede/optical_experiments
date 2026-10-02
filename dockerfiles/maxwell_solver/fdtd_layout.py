@@ -120,16 +120,17 @@ def _refuse_conductor_nodes(names, parts, scene, nodes, lo, length_scale, where)
             f"read as no response")
 
 
-def layout(names, parts, request, *, length_scale: float, materials=None,
-           n_index=None) -> dict:
-    """The grid, voxelised scene, source placement and probes for a td job.
+def plan(names, parts, request, *, length_scale: float, materials=None,
+         n_index=None) -> dict:
+    """``layout`` without the voxeliser: the grid, source placement and probes.
 
-    ``request`` is ``td_solve.request_from``'s dict. Returns ``nodes`` (owner
-    frame, metres), ``spacings``, ``shape``, ``eps``, ``pec``, ``metals``,
-    ``box`` (TF/SF node-index corners, plane wave only), ``cell`` (point
-    source node), ``probes`` ([(i, j, k, component)]), ``origin_m`` (the
-    bounding box's minimum corner in mesh-frame metres) and ``caveats``
-    (strings for the result, e.g. a non-box part's thin-feature caveat).
+    Cheap enough for the web form (no per-node point-in-mesh test), so the
+    form refuses a bad grid, position or probe before the job is queued, and
+    ``estimate`` counts the same nodes ``layout`` will solve on. Returns
+    ``nodes``, ``spacings``, ``shape``, ``box``, ``cell``, ``probes``,
+    ``origin_m`` and ``band_top_hz`` as ``layout`` does, plus ``names``,
+    ``table`` (part name -> material) and ``part_bounds`` (owner-frame
+    metres, per part).
     """
     boundary = request["boundary"]
     if boundary not in BOUNDARIES:
@@ -197,10 +198,97 @@ def layout(names, parts, request, *, length_scale: float, materials=None,
         if len(probe) != 4 or probe[3] not in fdtd.COMPONENTS:
             raise LayoutError(f"a probe is [x, y, z, component], got {probe!r}")
         probes.append(_locate(nodes, probe[:3], "probe", pml) + (probe[3],))
+    part_bounds = [tuple(b - lo for b in _bounds([part], length_scale))
+                   for part in parts]
+    return {"names": names, "table": table, "nodes": nodes,
+            "spacings": grid["spacings"], "shape": grid["shape"], "box": box,
+            "cell": cell, "probes": probes, "origin_m": lo,
+            "band_top_hz": f_top, "part_bounds": part_bounds,
+            "boundary": boundary}
 
+
+def _conductor(kind) -> bool:
+    return kind == "pec" or (isinstance(kind, str) and kind in fdtd.METALS)
+
+
+def estimate(planned, request, *, record_frames=True) -> dict:
+    """``fdtd.estimate_run`` for a ``plan``, before anything is voxelised.
+
+    Each metal's region is taken as its parts' bounding boxes on the grid, a
+    box holding every node the voxeliser can mark, so the memory errs high (by
+    the corners a curved part leaves empty) and never admits a run the
+    voxelised estimate would refuse. dt does not depend on the region
+    (``stable_dt`` reads the metal and the spacings), so cells, dt and steps
+    are the solved run's exactly.
+    """
+    nodes = planned["nodes"]
+    shape = tuple(len(n) for n in nodes)
+    metals, pec = {}, planned["boundary"] == "metal"
+    for name, (plo, phi) in zip(planned["names"], planned["part_bounds"]):
+        kind = planned["table"].get(name)
+        if kind == "pec":
+            pec = True
+        elif _conductor(kind):
+            region = metals.setdefault(kind, np.zeros(shape, dtype=bool))
+            region[tuple(slice(int(np.searchsorted(n, a, "left")),
+                               int(np.searchsorted(n, b, "right")))
+                         for n, a, b in zip(nodes, plo, phi))] = True
+    metals = {k: v for k, v in metals.items() if v.any()}
+    return fdtd.estimate_run(nodes, duration=float(request["duration_s"]),
+                             boundary=planned["boundary"], metals=metals,
+                             pec=True if pec else None,
+                             record_frames=record_frames)
+
+
+def refuse_conductor_points(planned, parts, *, length_scale: float) -> None:
+    """The form's version of ``layout``'s conductor-node refusal.
+
+    Tests only the source and probe nodes (a handful of points, not the grid):
+    a node inside a pec or metal part, or outside every part of a metal-walled
+    cavity, is refused naming the position and part. ``layout`` still makes
+    the exact check on the voxelised masks when the job runs.
+    """
+    nodes, lo = planned["nodes"], planned["origin_m"]
+    where = (([("the source position", planned["cell"])] if planned["cell"] else [])
+             + [("probe", p[:3]) for p in planned["probes"]])
+    names, table = planned["names"], planned["table"]
+    if not where or not (planned["boundary"] == "metal"
+                         or any(_conductor(table.get(n)) for n in names)):
+        return
+    points = np.array([[nodes[a][c[a]] for a in range(3)] for _, c in where])
+    index = fdtd_voxel.PartIndex(parts)((points + lo) / float(length_scale))
+    for (what, _), point, i in zip(where, points, index):
+        i = int(i)
+        if i > 0 and _conductor(table.get(names[i - 1])):
+            owner = f"part {names[i - 1]}"
+        elif i == 0 and planned["boundary"] == "metal":
+            owner = "the metal boundary's conductor"
+        else:
+            continue
+        raise LayoutError(
+            f"{what} at {[round(float(x), 12) for x in point]} m sits inside "
+            f"{owner}: a conductor carries no field there, so the run would "
+            f"read as no response")
+
+
+def layout(names, parts, request, *, length_scale: float, materials=None,
+           n_index=None) -> dict:
+    """The grid, voxelised scene, source placement and probes for a td job.
+
+    ``request`` is ``td_solve.request_from``'s dict. Returns ``nodes`` (owner
+    frame, metres), ``spacings``, ``shape``, ``eps``, ``pec``, ``metals``,
+    ``box`` (TF/SF node-index corners, plane wave only), ``cell`` (point
+    source node), ``probes`` ([(i, j, k, component)]), ``origin_m`` (the
+    bounding box's minimum corner in mesh-frame metres) and ``caveats``
+    (strings for the result, e.g. a non-box part's thin-feature caveat).
+    """
+    planned = plan(names, parts, request, length_scale=length_scale,
+                   materials=materials, n_index=n_index)
+    names, table, nodes = planned["names"], planned["table"], planned["nodes"]
+    lo, cell, probes = planned["origin_m"], planned["cell"], planned["probes"]
     scene = fdtd_voxel.voxelise(
         names, parts, table, tuple(n + lo[i] for i, n in enumerate(nodes)),
-        boundary=boundary, length_scale=length_scale)
+        boundary=planned["boundary"], length_scale=length_scale)
     _refuse_conductor_nodes(names, parts, scene, nodes, lo, length_scale,
                             ([("the source position", cell)] if cell else [])
                             + [("probe", p[:3]) for p in probes])
@@ -209,7 +297,7 @@ def layout(names, parts, request, *, length_scale: float, materials=None,
         plo, phi = _bounds([part], 1.0)
         if _volume(part) < BOX_FILL * float(np.prod(phi - plo)):
             caveats.append(f"{THIN_CAVEAT} (part {name} is not a box)")
-    return {"caveats": caveats, "nodes": nodes, "spacings": grid["spacings"], "shape": grid["shape"],
-            "eps": scene["eps"], "pec": scene["pec"], "metals": scene["metals"],
-            "box": box, "cell": cell, "probes": probes, "origin_m": lo,
-            "band_top_hz": f_top}
+    return {"caveats": caveats, "nodes": nodes, "spacings": planned["spacings"],
+            "shape": planned["shape"], "eps": scene["eps"], "pec": scene["pec"],
+            "metals": scene["metals"], "box": planned["box"], "cell": cell,
+            "probes": probes, "origin_m": lo, "band_top_hz": planned["band_top_hz"]}
