@@ -3,8 +3,8 @@
 A real tiny time-domain solve (the tests' own fixture) writes its result
 files; the Flask app renders the done job page and status, and serves every
 result file through its real routes. web/static is copied beside them.
-The solve is the 120-frame window tdcheck checks: three-digit frame names and
-a caption about a window, not the whole run.
+The solve is a 120-frame window, so the three-digit frame names and a caption
+about a window (not the whole run) are exercised.
 Run from the repo root, memory-capped:
   (ulimit -v 4194304; .venv-mse/bin/python scripts/tdcheck_fixture.py DIR)
 """
@@ -13,8 +13,10 @@ sys.path[:0] = ["tests"]
 import test_td_solve as T
 import test_web_routes as W
 
-# The window and count tdcheck.mjs asserts (a 120-frame, three-digit movie, so
-# the old two-digit name rule and the old page both read it wrong).
+# A 120-frame, three-digit window, so the name width is exercised: the old
+# two-digit rule and the old page both read it wrong. What tdcheck.mjs checks
+# is derived from whatever manifest it is served, so the window is asserted
+# here, where it is asked for, rather than in the check.
 WINDOW = {"movie_start_s": 0.2e-10, "movie_end_s": 2e-10, "frame_count": 120}
 
 out_dir = pathlib.Path(sys.argv[1])
@@ -29,6 +31,7 @@ c = app.test_client()
 files = out_dir / "files"; files.mkdir(exist_ok=True)
 man0 = json.loads(out.files["spectrum.json"])
 frames = man0["frames"] or {"count": 0, "digits": 3}
+assert (frames["count"], frames["digits"]) == (WINDOW["frame_count"], 3), frames
 # the width comes from the manifest, so this fixture cannot guess it wrong
 frame_names = [f"frame_{n:0{frames['digits']}d}.bin"
                for n in range(1, frames["count"] + 1)]
