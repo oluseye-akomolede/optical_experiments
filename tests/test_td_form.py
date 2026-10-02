@@ -168,6 +168,54 @@ def test_a_part_with_no_material_is_refused(tmp_path):
     _refused(tmp_path, "no material for 'cube'", **{"part_index.cube": None})
 
 
+def _plates(gap=0.1):
+    """Two gold plates with a film between them, NOT nested: the cavity
+    parser refuses this (no part encloses the others); a td run takes it."""
+    t, f = 0.2, 0.2
+    return _obj(("plate_bottom", _box([0, 0, 0], [1.0, 0.8, t])),
+                ("film", _box([0, 0, t + gap], [1.0, 0.8, t + gap + f])),
+                ("plate_top", _box([0, 0, t + 2 * gap + f],
+                                   [1.0, 0.8, 2 * t + 2 * gap + f])))
+
+
+def _ask_parts(tmp_path, data, **form):
+    app, _store, _db, _launcher = make_app(tmp_path)
+    resp = app.test_client().post(
+        "/parts", data={"meshfile": (io_bytes(data), "plates.obj"),
+                        "units": "um", **form},
+        content_type="multipart/form-data")
+    return resp.status_code, resp.get_json()
+
+
+def test_parts_names_a_non_nested_td_scene_the_way_the_td_post_does(tmp_path):
+    # The real /parts, no stub: the page's pickers come from this answer.
+    status, body = _ask_parts(tmp_path, _plates(), mode="td")
+    assert status == 200, body
+    assert body["parts"] == ["plate_bottom", "film", "plate_top"]
+    # ...and the td POST takes exactly those names, so the pickers it shows
+    # are pickers it can submit.
+    resp, db, _store, flashes = _post(
+        tmp_path, _plates(), td_boundary="open",
+        td_position="500 400 400", td_probes="500 400 400 z",
+        **{"part_index.block": None, "part_index.cube": None,
+           "part_index.plate_bottom": "Au", "part_index.film": "1.5",
+           "part_index.plate_top": "Au"})
+    assert resp.status_code == 302 and db.jobs, flashes
+    (job,) = db.jobs.values()
+    assert sorted(job["materials"]) == sorted(body["parts"])
+
+
+def test_parts_still_runs_the_cavity_rules_for_a_cavity_upload(tmp_path):
+    # the control: the same file without mode=td meets the cavity parser
+    status, body = _ask_parts(tmp_path, _plates())
+    assert status == 400 and body["error"], body
+
+
+def test_the_page_asks_parts_for_the_td_split():
+    page = (Path(TDF.__file__).parent / "templates" / "index.html").read_text()
+    assert page.count("body.append('mode', 'td');") == 1
+
+
 def test_a_multi_part_upload_without_materials_is_refused_in_plain_words(tmp_path):
     """Never one material for every part (lead, 08:15Z): a multi-part td
     upload that posts no per-part materials is refused, naming its parts and

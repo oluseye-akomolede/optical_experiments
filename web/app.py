@@ -210,9 +210,17 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
             # is the entire reason this endpoint exists. The parser splits
             # first and names what it rejects, so it speaks last.
             validate_upload(uploaded.filename, data, CFG.MAX_UPLOAD_BYTES)
-            names = parse_parts(data, units)
+            if request.form.get("mode") == TDF.MODE:
+                # A td scene's parts, cut by the td POST's own split: the
+                # cavity parser below refuses plates that are not nested.
+                names = list(TDF.split_parts(data)[0])
+            else:
+                names = parse_parts(data, units)
         except UploadError as exc:
             return jsonify({"error": str(exc)}), 400
+        except Exception as exc:  # noqa: BLE001 - the td split's own words
+            return jsonify({"error": "This object's parts could not be "
+                                     f"read: {exc}"}), 400
         return jsonify({"parts": names})
 
     @app.route("/jobs/<job_id>")

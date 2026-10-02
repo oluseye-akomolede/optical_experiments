@@ -419,6 +419,7 @@
     var body = new FormData();
     body.append('meshfile', file.files[0]);
     body.append('units', fieldValue('units') || '');
+    body.append('mode', 'td');
     fetch('{{ url_for("parts") }}', {method: 'POST', body: body})
       .then(function (r) { return r.json().then(function (j) { return [r.ok, j]; }); })
       .then(function (res) {

@@ -209,6 +209,19 @@ def _n_max(table, fdtd, frequency: float) -> float:
     return n
 
 
+def split_parts(data: bytes):
+    """``(names, parts)`` of a td upload: the solver's own split.
+
+    The one place a td upload is cut into parts. ``plan_request`` lays out
+    what it returns, and ``/parts`` names the page's pickers from it, so the
+    pickers list exactly the parts the POST will check. The cavity parser
+    (``meshing.parse_parts``) is NOT this: it also demands that the first part
+    enclose the rest and that no parts touch, which a film between two plates
+    breaks. Its errors are the caller's to word.
+    """
+    return _solver()[2].split_obj_parts(data)
+
+
 def plan_request(form, data: bytes, units_scale_m: float) -> dict:
     """Parse, lay out and cap-check one td request against its upload.
 
@@ -217,7 +230,7 @@ def plan_request(form, data: bytes, units_scale_m: float) -> dict:
     ``materials`` (the table, or None), ``estimate`` and ``n_index``. Raises
     ``TDRequestError`` for every refusal.
     """
-    fdtd, fdtd_layout, mse_parts = _solver()
+    fdtd, fdtd_layout, _mse_parts = _solver()
     request = parse_request(form)
     materials = parse_materials(form, fdtd)
     n_index = _number(_field(form, "td_n_index") or "1", "refractive index")
@@ -225,7 +238,7 @@ def plan_request(form, data: bytes, units_scale_m: float) -> dict:
         raise TDRequestError(f"The refractive index must be 1 or more, got "
                              f"{n_index:g}.")
     try:
-        names, parts = mse_parts.split_obj_parts(data)
+        names, parts = split_parts(data)
         if materials is None and len(names) > 1:
             # Never one material for every part: the layout would refuse this
             # anyway, but in words meant for a developer.
