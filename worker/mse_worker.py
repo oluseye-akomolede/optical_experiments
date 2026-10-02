@@ -77,7 +77,7 @@ DEFAULT_ENV_FILE = Path.home() / ".config" / "mse-worker" / "env"
 #: files the worker API accepts, mirrored from web/worker_api.py. Kept as a
 #: local allow-list as well so a future solver output that nobody added to the
 #: API fails here, loudly, instead of being silently dropped on upload.
-_UPLOAD_EXACT = ("modes.json", "surface.glb")
+_UPLOAD_EXACT = ("modes.json", "surface.glb", "trace.bin", "spectrum.json")
 
 
 class WorkerError(Exception):
@@ -1311,7 +1311,8 @@ def _result_names(store, job_id: str) -> list[str]:
         for entry in entries:
             if not entry.is_file() or entry.name == "input.obj":
                 continue
-            if entry.name in _UPLOAD_EXACT or _is_mode_file(entry.name):
+            if (entry.name in _UPLOAD_EXACT or _is_mode_file(entry.name)
+                    or _is_frame_file(entry.name)):
                 names.append(entry.name)
             else:
                 raise WorkerError(
@@ -1340,6 +1341,13 @@ def _is_mode_file(name: str) -> bool:
         return False
     number = stem[len("mode_"):]
     return len(number) == 2 and number.isdigit()
+
+
+def _is_frame_file(name: str) -> bool:
+    """A td job's movie frame, ``frame_NN.bin`` (``td_solve.FRAME_NAME``)."""
+    number = name[len("frame_"):-len(".bin")]
+    return (name.startswith("frame_") and name.endswith(".bin")
+            and len(number) == 2 and number.isdigit())
 
 
 class StageReporter:

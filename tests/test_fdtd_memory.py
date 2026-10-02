@@ -105,3 +105,27 @@ def test_the_estimate_covers_the_jetson_peak(kind, n, peak):
     assert 0.9 <= peak / predicted <= 1.0, (
         f"{kind} n={n}: device {peak / 1e6:.1f} MB, formula "
         f"{predicted / 1e6:.1f} MB, ratio {peak / predicted:.3f}")
+
+
+@pytest.mark.parametrize("shape", [SHAPE, (70, 24, 130)])
+def test_the_field_movie_adds_what_it_allocates(shape):
+    # the second shape is strided (70 -> 35, 130 -> 44), so the estimate's
+    # sampled size is checked, not only the full-grid case
+    eps = np.ones(shape, dtype=np.float64)
+    source = fdtd.Source((11, 12, 11), frequency=4e14, bandwidth=2e14)
+
+    def measured(**options):
+        tracemalloc.start()
+        tracemalloc.reset_peak()
+        try:
+            fdtd.simulate(eps, source, 60, [(11, 12, 13, "z")], dx=5e-9,
+                          **options)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    added = measured(frames=fdtd.frame_plan(shape, 60)) - measured()
+    predicted = (fdtd.memory_estimate(shape, record_frames=True)
+                 - fdtd.memory_estimate(shape))
+    assert 0.85 <= added / predicted <= 1.0, (
+        f"frames add {added} B measured, {predicted} B by the formula")

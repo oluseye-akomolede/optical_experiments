@@ -280,6 +280,16 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
                 # than "not a mode job" -- the deploy-3 shape, at the page.
                 pcs = job.get("pcs") or {}
                 payload["bands"] = pcs.get("bands")
+            elif job["kind"] == DB.TD:
+                # A td job wrote a trace, a spectrum manifest and movie frames,
+                # not modes: the cavity keys would point at files that do not
+                # exist. The manifest names the trace and counts the frames, so
+                # the page reads it first and fetches ``frame_NN.bin`` from the
+                # same files/ route.
+                payload["spectrum_url"] = url_for("job_file", job_id=job_id,
+                                                  name="spectrum.json")
+                payload["trace_url"] = url_for("job_file", job_id=job_id,
+                                               name="trace.bin")
             else:
                 payload["modes"] = jobs_db.list_modes(job_id)
                 payload["manifest_url"] = url_for("job_file", job_id=job_id,
@@ -1230,7 +1240,10 @@ def _safe_result_name(name: str) -> bool:
     import re
 
     return bool(re.fullmatch(r"modes\.json|surface\.glb|mode_\d{2}\.bin|"
-                             r"mode_\d{2}\.vtu", name))
+                             r"mode_\d{2}\.vtu|"
+                             # the td results (worker/td_solve.py)
+                             r"trace\.bin|spectrum\.json|frame_\d{2}\.bin",
+                             name))
 
 
 def _vtu_download_name(job: dict, name: str) -> str:

@@ -5,6 +5,7 @@ Tiny and pure: no store, no solver. The phase-5 form will be pinned against
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -181,3 +182,178 @@ def test_a_layout_refusal_reaches_the_owner_as_a_verdict():
     with pytest.raises(td_solve.TDSolveError, match="probe"):
         td_solve.solve_td(_job(probes=[[9e-3, 1.5e-3, 1e-3, "z"]]), _Store(),
                           xp=np, free_bytes=PLENTY)
+
+
+# --------------------------------------------------------------------------
+# 4.3: the result files
+
+
+class _OutStore:
+    """Records every write, in order, keyed as the worker's ``_key`` keys."""
+
+    def __init__(self):
+        self.files = {}
+        self.order = []
+
+    def write(self, key, data):
+        assert key.startswith("jobs/j1/") and key.count("/") == 2, key
+        self.files[key[len("jobs/j1/"):]] = bytes(data)
+        self.order.append(key[len("jobs/j1/"):])
+
+
+def _strict_json(data):
+    def refuse(token):
+        raise AssertionError(f"{token} is not JSON a browser can parse")
+    return json.loads(data, parse_constant=refuse)
+
+
+#: Two probes on different components and cells, so a transposed trace or a
+#: swapped probe row reads differently from the right one.
+TWO_PROBES = [[3e-3, 1.5e-3, 1e-3, "z"], [2e-3, 2e-3, 1e-3, "x"]]
+
+
+def _run_with_files(**changes):
+    out = _OutStore()
+    changes.setdefault("dx_m", 0.5e-3)  # a non-square grid (1 mm gives 5^3)
+    res = td_solve.solve_td(_job(probes=TWO_PROBES, **changes), _Store(), out,
+                            xp=np, free_bytes=PLENTY)
+    return res, out
+
+
+def test_the_trace_file_decodes_to_the_runs_traces_row_per_probe():
+    res, out = _run_with_files()
+    man = _strict_json(out.files["spectrum.json"])
+    shape = tuple(man["trace"]["shape"])
+    assert shape == (2, res["estimate"]["steps"]) and shape[0] != shape[1]
+    got = np.frombuffer(out.files["trace.bin"], dtype="<f4").reshape(shape)
+    want = np.asarray(res["result"]["traces"])
+    assert np.array_equal(got, want)
+    assert not np.array_equal(got[0], got[1]), "fixture: the probes must differ"
+    assert [p["component"] for p in man["probes"]] == ["z", "x"]
+
+
+def test_each_frame_file_is_that_frame_in_xyz_order():
+    res, out = _run_with_files()
+    man = _strict_json(out.files["spectrum.json"])
+    frames = np.asarray(res["result"]["frames"])
+    fr = man["frames"]
+    assert fr["count"] == frames.shape[0] >= 2 and fr["axes"] == "xyz"
+    assert tuple(fr["shape"]) == frames.shape[1:]
+    assert len(set(fr["shape"])) == 3, "fixture: a non-square frame"
+    assert len(fr["steps"]) == fr["count"] and fr["steps"][-1] == man["steps"] - 1
+    for n in range(fr["count"]):
+        got = np.frombuffer(out.files[f"frame_{n + 1:02d}.bin"], dtype="<f4")
+        assert np.array_equal(got.reshape(fr["shape"]), frames[n]), n
+    assert f"frame_{fr['count'] + 1:02d}.bin" not in out.files
+    assert np.abs(frames[-1]).max() > 0
+
+
+def test_the_manifest_is_written_last():
+    res, out = _run_with_files()
+    assert out.order[-1] == "spectrum.json"
+    assert out.order[0] == "trace.bin"
+    assert res["files"] == out.order
+
+
+def test_each_probes_spectrum_spans_the_pulse_band_and_peaks_in_it():
+    res, out = _run_with_files()
+    man = _strict_json(out.files["spectrum.json"])
+    lo, hi = man["band_hz"]
+    assert (lo, hi) == (3e10, 9e10)
+    for p, probe in enumerate(man["probes"]):
+        f = np.asarray(probe["spectrum"]["frequency_hz"])
+        a = np.asarray(probe["spectrum"]["amplitude"])
+        assert f.size == a.size >= 3 and f.min() >= lo and f.max() <= hi
+        df = 1.0 / (man["dt_s"] * man["steps"])
+        assert f.min() - lo < df and hi - f.max() < df, "the band edges"
+        want_f, want_a = FDTD.spectrum(np.asarray(res["result"]["traces"])[p],
+                                       man["dt_s"])
+        keep = (want_f >= lo) & (want_f <= hi)
+        assert np.allclose(a, np.asarray(want_a)[keep], rtol=1e-6)
+
+
+def test_probe_positions_are_the_snapped_nodes_in_metres():
+    res, out = _run_with_files()
+    man = _strict_json(out.files["spectrum.json"])
+    for probe, asked in zip(man["probes"], TWO_PROBES):
+        assert np.allclose(probe["position_m"], asked[:3], atol=0.25e-3)
+
+
+def test_a_cw_spectrum_keeps_zero_to_twice_the_frequency():
+    assert td_solve.spectrum_band({"profile": "cw", "frequency_hz": 5.0},
+                                  5.0) == (0.0, 10.0)
+    assert td_solve.spectrum_band({"profile": "pulse", "frequency_hz": 5.0,
+                                   "bandwidth": 7.0}, 12.0) == (0.0, 12.0)
+
+
+def test_a_non_finite_run_is_refused_before_any_file_is_written(monkeypatch):
+    real = FDTD.simulate
+
+    def unstable(*a, **k):
+        r = real(*a, **k)
+        r["frames"][-1, 0, 0, 0] = np.nan
+        return r
+
+    monkeypatch.setattr(FDTD, "simulate", unstable)
+    out = _OutStore()
+    with pytest.raises(td_solve.TDSolveError, match="not finite"):
+        td_solve.solve_td(_job(), _Store(), out, xp=np, free_bytes=PLENTY)
+    assert out.files == {}
+
+
+def test_a_non_finite_spectrum_is_refused_before_any_file_is_written(monkeypatch):
+    """Finite traces give finite spectra, so this forces one: the spectra are
+    computed before the first write, so even this refusal leaves nothing."""
+    real = FDTD.spectrum
+
+    def broken(*a, **k):
+        freqs, amp = real(*a, **k)
+        amp = np.array(amp, dtype=float)
+        amp[:] = np.nan
+        return freqs, amp
+
+    monkeypatch.setattr(FDTD, "spectrum", broken)
+    out = _OutStore()
+    with pytest.raises(td_solve.TDSolveError, match="not finite.*probe 1 spectrum"):
+        td_solve.solve_td(_job(), _Store(), out, xp=np, free_bytes=PLENTY)
+    assert out.files == {}
+
+
+def test_the_memory_gate_counts_the_field_movie(monkeypatch):
+    """The run records frames, so the bytes the free-memory gate and
+    ``check_limits`` read must be the estimate WITH the movie -- and for this
+    layout that is strictly more than without it, so the test can tell."""
+    seen = []
+    real = FDTD.estimate_run
+
+    def spy(nodes, **kw):
+        est = real(nodes, **kw)
+        seen.append((nodes, {k: v for k, v in kw.items()
+                             if k != "record_frames"}, est))
+        return est
+
+    monkeypatch.setattr(FDTD, "estimate_run", spy)
+    out = td_solve.solve_td(_job(), _Store(), xp=np, free_bytes=PLENTY)
+    assert len(seen) == 1
+    nodes, kw, est = seen[0]
+    with_movie = real(nodes, record_frames=True, **kw)["bytes"]
+    without = real(nodes, record_frames=False, **kw)["bytes"]
+    assert with_movie > without
+    assert est["bytes"] == with_movie == out["estimate"]["bytes"]
+
+
+def test_the_worker_uploads_every_file_the_td_solve_writes(tmp_path):
+    """Through the worker's real enumerator and allow-list, not a copy."""
+    import mse_worker
+    res, out = _run_with_files()
+
+    class Store:
+        root = tmp_path
+
+        def _path(self, key):
+            return tmp_path / key
+
+    (tmp_path / "jobs" / "j1").mkdir(parents=True)
+    for name, data in out.files.items():
+        (tmp_path / "jobs" / "j1" / name).write_bytes(data)
+    assert sorted(mse_worker._result_names(Store(), "j1")) == sorted(out.files)

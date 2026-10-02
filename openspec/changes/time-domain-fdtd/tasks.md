@@ -71,7 +71,7 @@
   when it is short, for at most 60 minutes; never reroute a `td` job to the
   cluster; fail readably on a device OOM mid-run and after 45 minutes of run
   time.
-- [ ] 4.3 Result files: `trace.bin`, `spectrum.json` and `frames/<n>.bin`. List
+- [x] 4.3 Result files: `trace.bin`, `spectrum.json` and `frames/<n>.bin`. List
   every reader of each output, and give each its route, its 404 rule and a test.
 
 ## 5. Web (phase 5)

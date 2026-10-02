@@ -600,6 +600,73 @@ run that is solved.
 - **THEN** the job is refused before allocation, naming the probe and the grid's
   extent
 
+### Requirement: The solver SHALL record a bounded field movie of |E|
+On request the solver SHALL record |E| at up to 60 steps spread evenly over the
+run, the last being the final step, on the nodes a per-axis stride keeps. The
+stride SHALL be the smallest whole number that brings each axis to at most 64
+samples. Each frame SHALL be taken after the step's E update, source and
+conductors, so it shows no field inside a conductor. The three components SHALL
+be combined where they are stored, without interpolation, and squared in float64
+so small fields keep their digits. The frames SHALL come back as host float32
+whatever array library ran the solve, and the memory estimate SHALL count them.
+
+#### Scenario: the frames match the probes
+- **WHEN** a run records frames and probes at the same nodes
+- **THEN** each frame's value at a probe node is the magnitude of that probe's
+  three components at the frame's step, to float32 precision
+
+#### Scenario: a long run is capped
+- **WHEN** a 130 × 64 × 65-node grid runs for 1,000 steps
+- **THEN** the movie has 60 frames ending on step 999, with strides (3, 1, 2)
+  and frames of 44 × 64 × 33 samples
+
+#### Scenario: a bad frame plan is refused
+- **WHEN** a frame step is repeated or outside the run, or a stride is below 1
+- **THEN** the solver refuses before stepping, naming the bad value
+
+### Requirement: A time-domain job's results SHALL be three kinds of flat file
+A finished `td` job SHALL store `trace.bin` (every probe's trace, float32
+little-endian, C order, shaped probes × steps), one `frame_NN.bin` per movie
+frame (two-digit, 1-based, |E| float32 little-endian, C order, in the grid's
+x, y, z order) and `spectrum.json` (the manifest: time step, step count, the
+band, each probe's position, component and amplitude spectrum within the band,
+the trace and frame shapes, and the layout caveats). The manifest SHALL be
+written last, so its presence means every other file exists. A non-finite value
+in a trace, frame or spectrum SHALL fail the job before anything is written.
+The worker's upload list and the app's accepted names SHALL agree on every one
+of these names, and SHALL refuse near misses (`frame_1.bin`, `frame_001.bin`,
+a path separator).
+
+#### Scenario: the files decode to the solver's own output
+- **WHEN** a tiny `td` job finishes
+- **THEN** `trace.bin` decodes to the solver's traces and each `frame_NN.bin`
+  to its frame, exactly, and `spectrum.json` names their shapes
+
+#### Scenario: a run that dies part way leaves no manifest
+- **WHEN** writing stops after `trace.bin` or a frame
+- **THEN** no `spectrum.json` exists for the job
+
+#### Scenario: NaN is refused before writing
+- **WHEN** a trace or frame holds NaN or infinity
+- **THEN** the job fails naming which output, and no file is written
+
+#### Scenario: a near-miss name is refused by both sides
+- **WHEN** the worker or the app is offered `frame_1.bin`, `frame_001.bin` or
+  `x/frame_01.bin`
+- **THEN** both refuse it
+
+#### Scenario: the page reads td results through files/
+- **WHEN** a td job is done
+- **THEN** its status carries `spectrum_url` and `trace_url` (both under
+  `/jobs/<id>/files/`) and none of `modes`, `manifest_url`, `surface_url` or
+  `bands`, and `files/trace.bin`, `files/spectrum.json` and
+  `files/frame_NN.bin` return the stored bytes
+
+#### Scenario: td results are not served early or invented
+- **WHEN** the job is not done, the named frame was not written, or the name is
+  not one the solver writes
+- **THEN** the files/ route answers 404
+
 ### Requirement: A drawn waveform SHALL be checked against the grid
 
 A `drawn` source SHALL be a list of at most 10 000 dimensionless amplitude

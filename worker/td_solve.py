@@ -11,18 +11,43 @@ from a stored estimate: a count is not a grid.
 ``solve_td`` (4.2) runs it: the upload is split into parts, laid out on a
 graded grid (``fdtd_layout``), sized (``fdtd.estimate_run``) and checked
 against the free memory before a single device array exists, then stepped
-with a 45-minute stop. Result files are 4.3.
+with a 45-minute stop. ``write_results`` (4.3) writes what it produced:
+
+``trace.bin``      every probe's trace, float32 little-endian, C order,
+                   shaped ``(n_probes, steps)``; row ``p`` is probe ``p``.
+``spectrum.json``  the manifest: the time step, the probes, each probe's
+                   spectrum over the source band, the trace's and the movie's
+                   shapes, and the caveats. Its presence is what makes a td
+                   job's results exist (the app's done route checks it).
+``frame_NN.bin``   movie frame ``NN`` (1-based, at most ``fdtd.MAX_FRAMES``):
+                   ``|E|`` float32 little-endian, C order, shaped
+                   ``frames.shape`` = (sx, sy, sz), in the grid's x, y, z order
+                   (NOT the cavity field files' (nz, ny, nx)).
+
+The page serves all three through ``/jobs/<id>/files/<name>`` (404 until the
+job is done). Storage names are flat because the worker API refuses any
+name with a path separator.
 """
 from __future__ import annotations
 
+import json
 import sys
 import time
+
+import numpy as np
 from pathlib import Path
 
 _SOLVER_DIR = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
 
 #: Run-time limit: the 30-minute estimate limit plus a margin (spec).
 RUN_LIMIT_S = 45 * 60
+
+#: The result files' names (see the module docstring). ``FRAME_NAME`` takes the
+#: 1-based frame number; two digits hold ``fdtd.MAX_FRAMES`` (60).
+TRACE_NAME = "trace.bin"
+SPECTRUM_NAME = "spectrum.json"
+FRAME_NAME = "frame_{:02d}.bin"
+SPECTRUM_VERSION = 1
 
 
 class TDSolveError(Exception):
@@ -151,7 +176,7 @@ def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
                                  n_index=job.get("n_index"))
         est = fdtd.estimate_run(lay["nodes"], duration=float(request["duration_s"]),
                                 boundary=request["boundary"], metals=lay["metals"],
-                                pec=lay["pec"])
+                                pec=lay["pec"], record_frames=True)
         fdtd.check_limits(est)
     except (fdtd.FDTDError, ValueError) as exc:
         # FDTDError covers LayoutError, VoxelError and EstimateError; the
@@ -180,6 +205,7 @@ def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
     terms = [fdtd.LorentzDrude(name, region)
              for name, region in dict(lay["metals"]).items()]
 
+    plan = fdtd.frame_plan(lay["shape"], est["steps"])
     started = clock()
 
     def check(step):
@@ -195,7 +221,8 @@ def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
         result = fdtd.simulate(lay["eps"], source, est["steps"], lay["probes"],
                                spacings=lay["spacings"],
                                boundary=request["boundary"], pec=lay["pec"],
-                               xp=xp, ade_terms=terms, check=check)
+                               xp=xp, ade_terms=terms, check=check,
+                               frames=plan)
     except TDSolveError:
         raise
     except Exception as exc:  # noqa: BLE001 - only OOM is translated
@@ -205,5 +232,93 @@ def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
                 f"{_gb(est['bytes'])}; another job probably started after this "
                 f"one was checked). Please submit it again.") from exc
         raise
+    caveats = list(lay["caveats"])
+    names = []
+    if store_out is not None:
+        if stage is not None:
+            stage.stage = "writing results"
+        names = write_results(store_out, job_id, result, lay, request,
+                              caveats, plan)
     return {"job_id": job_id, "kind": "td", "modes": [], "result": result,
-            "estimate": est, "caveats": list(lay["caveats"])}
+            "estimate": est, "caveats": caveats, "files": names}
+
+
+def spectrum_band(request: dict, band_top_hz: float) -> tuple:
+    """The band ``spectrum.json`` keeps (Hz): the pulse's ``f ± bandwidth``,
+    otherwise 0 to twice the source frequency, so a cw or drawn source's line
+    sits mid-band with room either side."""
+    f = float(request["frequency_hz"])
+    if request["profile"] == "pulse":
+        return max(0.0, f - float(request["bandwidth"])), float(band_top_hz)
+    return 0.0, 2.0 * float(band_top_hz)
+
+
+def _finite(name: str, values) -> None:
+    if not np.all(np.isfinite(values)):
+        raise TDSolveError(
+            f"The run produced values that are not finite numbers in its "
+            f"{name}, so it went unstable and there is nothing correct to "
+            f"show. Please report this job.")
+
+
+def write_results(store_out, job_id: str, result: dict, lay: dict,
+                  request: dict, caveats: list, plan: dict | None) -> list:
+    """Write ``trace.bin``, the movie frames and, LAST, ``spectrum.json``.
+
+    The manifest goes last because its presence is what says the results
+    exist: a run that dies between files leaves no manifest, never a manifest
+    pointing at frames that were not written. A non-finite value anywhere is
+    refused before anything is written, since JSON has no NaN and a frame of
+    NaN would draw as nothing at all. Returns the names written, in order.
+    """
+    fdtd = _solver()[0]
+    key = lambda name: f"jobs/{job_id}/{name}"  # noqa: E731 - the worker's _key
+    traces = np.asarray(result["traces"], dtype="<f4")
+    frames = result.get("frames")
+    dt = float(result["dt"])
+    _finite("probe traces", traces)
+    if frames is not None:
+        frames = np.asarray(frames, dtype="<f4")
+        _finite("field movie", frames)
+
+    f_lo, f_hi = spectrum_band(request, lay["band_top_hz"])
+    origin = [float(v) for v in lay["origin_m"]]
+    probes = []
+    for p, probe in enumerate(lay["probes"]):
+        cell, component = tuple(int(i) for i in probe[:3]), probe[3]
+        freqs, amp = fdtd.spectrum(traces[p], dt)
+        keep = (freqs >= f_lo) & (freqs <= f_hi)
+        amp = np.asarray(amp)[keep]
+        _finite(f"probe {p + 1} spectrum", amp)
+        probes.append({
+            "cell": list(cell), "component": component,
+            "position_m": [origin[a] + float(lay["nodes"][a][cell[a]])
+                           for a in range(3)],
+            "spectrum": {"frequency_hz": [float(f) for f in freqs[keep]],
+                         "amplitude": [float(v) for v in amp]}})
+    names = []
+    store_out.write(key(TRACE_NAME), np.ascontiguousarray(traces).tobytes())
+    names.append(TRACE_NAME)
+    n_frames = 0 if frames is None else int(frames.shape[0])
+    for n in range(n_frames):
+        name = FRAME_NAME.format(n + 1)
+        store_out.write(key(name), np.ascontiguousarray(frames[n]).tobytes())
+        names.append(name)
+
+    plan = plan or {}
+    manifest = {
+        "version": SPECTRUM_VERSION, "dt_s": dt, "steps": int(result["steps"]),
+        "band_hz": [f_lo, f_hi], "probes": probes,
+        "trace": {"name": TRACE_NAME, "dtype": "float32", "order": "C",
+                  "shape": list(traces.shape)},
+        "frames": None if frames is None else {
+            "count": n_frames, "dtype": "float32", "order": "C",
+            "axes": "xyz", "shape": list(frames.shape[1:]),
+            "steps": [int(k) for k in plan.get("steps", [])],
+            "stride": [int(k) for k in plan.get("stride", [])],
+            "quantity": "|E|"},
+        "caveats": list(caveats)}
+    store_out.write(key(SPECTRUM_NAME),
+                    json.dumps(manifest, allow_nan=False).encode())
+    names.append(SPECTRUM_NAME)
+    return names
