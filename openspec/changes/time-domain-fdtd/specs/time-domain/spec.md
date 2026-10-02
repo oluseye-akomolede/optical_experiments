@@ -535,7 +535,11 @@ run that is solved.
   allocated, naming the value. A point source or probe whose nearest node is a
   conductor (the `metal` boundary's outside, a `pec` part, or a Rakić-metal
   part's interior) is refused, naming the position and the part, since its
-  source would inject nothing and its trace would read as "no response". Periodic boundaries stay a phase 6 option.
+  source would inject nothing and its trace would read as "no response".
+  With `open`, a point source or probe whose nearest node lies in the 10-cell
+  CPML at either end of any axis is refused, naming the position and the
+  range it must lie in: the layer absorbs a source as it is injected and
+  damps what a probe reads. Periodic boundaries stay a phase 6 option.
 
 #### Scenario: the frame is the bounding box's corner in metres
 - **WHEN** a one-part box spanning 2..6 mm in x is laid out with units `mm`
@@ -567,6 +571,12 @@ run that is solved.
   with `metal`, inside a `pec` part, or inside a Rakić-metal part)
 - **THEN** the job is refused before allocation, naming the position and the
   part (or the metal boundary)
+
+#### Scenario: a source or probe inside the CPML is refused
+- **WHEN** with `open`, a point source or probe lies on the grid but its
+  nearest node is inside the 10-cell CPML
+- **THEN** the job is refused before allocation, naming the position and the
+  range outside the layer
 
 #### Scenario: a probe off the grid is named
 - **WHEN** a probe lies outside the laid-out grid
