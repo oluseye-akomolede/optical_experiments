@@ -486,6 +486,58 @@ refractive index of at least 1, `pec`, or one of the Rakić metals.
 - **THEN** the run is refused with a message naming the part(s) and, for a
   mismatch, the file's parts
 
+### Requirement: A `td` upload SHALL be laid out on its grid by one fixed rule
+
+The worker SHALL turn a `td` job's upload into a grid by this rule, and phase
+5's estimate SHALL use the same function, so the run that is estimated is the
+run that is solved.
+
+- **Parts.** The upload's named groups, each a closed surface, refused by name
+  otherwise. There is no enclosing-wall rule: in `open` space the parts are
+  separate objects. Each part takes its entry in the job's `materials` table
+  (a refractive index of at least 1, `pec`, or a Rakić metal name); a
+  one-part upload with no table takes the job's `n_index`.
+- **Frame.** Metres are mesh units × the unit's metres × `scale`. The origin is
+  the minimum corner of the parts' combined bounding box. `position` and every
+  probe are metres in this frame.
+- **Extent.** For `metal` the grid is exactly the bounding box: outside the
+  parts is the conductor. For `open` every side is padded by 16 cells of
+  `dx_m` (the 3-cell TF/SF clearance, 3 more cells, and the 10-cell CPML), for
+  a point source as well as a plane wave.
+- **Plane wave.** The TF/SF box is the bounding box grown by the 3-cell
+  clearance on every side. A plane wave with `metal` is refused, as in phase 2.
+- **Cells.** The coarse cell is `dx_m`. On each axis a part whose
+  bounding-box extent is under 4 `dx_m` adds a layer over that extent. A metal
+  part adds, on each axis, a layer 3 skin depths deep inside each of its two
+  bounding-box faces (the whole extent when it is thinner than 6), with spacing
+  a quarter of the skin depth at the top of the source band. The top of the
+  band is `frequency_hz + bandwidth` for a pulse and `frequency_hz` for `cw`
+  and `drawn`. Curved thin shells are not detected; they are voxelised at the
+  grid they get, and the estimate counts that grid.
+- **Refusals.** A probe or point-source position outside the grid, and a
+  boundary other than `metal` or `open`, are refused before anything is
+  allocated, naming the value. Periodic boundaries stay a phase 6 option.
+
+#### Scenario: the frame is the bounding box's corner in metres
+- **WHEN** a one-part box spanning 2..6 mm in x is laid out with units `mm`
+  and scale 1
+- **THEN** the grid's x nodes run from 0 to 4 mm for `metal`, and from
+  -16 `dx_m` to 4 mm + 16 `dx_m` for `open`
+
+#### Scenario: a thin metal plate is resolved at its skin depth
+- **WHEN** a gold plate thinner than 6 skin depths lies in `open` space
+- **THEN** no cell across the plate is wider than a quarter of gold's skin depth
+  at the top of the band, and the plate's faces are grid nodes
+
+#### Scenario: separate objects need no wall
+- **WHEN** an `open` upload holds two closed parts, neither inside the other
+- **THEN** it is laid out without the cavity solver's one-wall refusal
+
+#### Scenario: a probe off the grid is named
+- **WHEN** a probe lies outside the laid-out grid
+- **THEN** the job is refused before allocation, naming the probe and the grid's
+  extent
+
 ### Requirement: A drawn waveform SHALL be checked against the grid
 
 A `drawn` source SHALL be a list of at most 10 000 dimensionless amplitude
