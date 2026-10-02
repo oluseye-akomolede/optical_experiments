@@ -57,8 +57,8 @@
 - [x] 3.2 Estimate cells, steps, memory and run time from the form. Refuse above
   8 M cells, 20 000 steps, 3.0 GB or 30 minutes, naming the limit, the value and
   the lever to change.
-- [ ] 3.3 Every refusal type raised by the form or the geometry is caught by the
-  route (no 500 responses).
+- 3.3 moved to 5.1a: there is no time-domain route until phase 5, so the
+  route-level refusal test lands with the route.
 
 ## 4. Job kind `td` (phase 4)
 
@@ -78,6 +78,12 @@
 
 - [ ] 5.1 Form: boundary, source kind, profile, f, bandwidth, position,
   polarisation, duration, probes and dx.
+- [ ] 5.1a (was 3.3) Every refusal raised by the form, the geometry or the
+  limits comes back as the route's refusal response, never a 500. Counting
+  raise sites is not enough (an implicit TypeError from bad input has none):
+  the route test feeds each malformed input end to end, namely a null material,
+  a list material, an empty mesh, an open/non-manifold surface, a zero-size
+  part, NaN coordinates, a mesh-library failure, and each limit broken.
 - [ ] 5.2 Viewer: field-movie playback in the existing 3-D view, plus trace and
   spectrum plots with axis units.
 - [ ] 5.3 Image smoke test, then an in-browser check against a real finished `td`
