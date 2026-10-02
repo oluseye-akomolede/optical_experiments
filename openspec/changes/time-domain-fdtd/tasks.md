@@ -83,7 +83,8 @@
   raise sites is not enough (an implicit TypeError from bad input has none):
   the route test feeds each malformed input end to end, namely a null material,
   a list material, an empty mesh, an open/non-manifold surface, a zero-size
-  part, NaN coordinates, a mesh-library failure, and each limit broken.
+  part, NaN coordinates, a zero length scale, a one-node axis, a NaN
+  duration, a mesh-library failure, and each limit broken.
 - [ ] 5.2 Viewer: field-movie playback in the existing 3-D view, plus trace and
   spectrum plots with axis units.
 - [ ] 5.3 Image smoke test, then an in-browser check against a real finished `td`
