@@ -221,6 +221,15 @@ that exceeded it, and the form lever that reduces it.
 - **THEN** the page shows the refusal with the byte estimate, the limit and the
   lever, and the server does not respond 500
 
+#### Scenario: the memory estimate is checked against the solver's real peak
+- **WHEN** the solver runs a tiny grid with metal, open or periodic faces, a
+  conductor mask, the peak-field record or a Lorentz-Drude metal
+- **THEN** the measured peak is within 12% of the estimate for the whole run,
+  and each option's measured increment within 15% of its estimated increment
+- **AND** a rate script measures cell-steps/s and peak device memory for metal,
+  open and open-plus-gold runs at about 1 M and 4 M cells on the Jetson, beside
+  the estimate, and the run-time limit's rates come from those measurements
+
 ### Requirement: The worker SHALL run a time-domain job only with the memory it needs
 
 The worker SHALL run at most one GPU job at a time when one of them is `td`.

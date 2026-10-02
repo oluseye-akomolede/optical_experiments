@@ -1157,6 +1157,48 @@ def _take(values, axis: int, index: int):
     return values[tuple(where)]
 
 
+# Short-lived full-grid arrays alive at the step loop's busiest moment (curl
+# differences and their products). Measured with tracemalloc on 16^3-24^3
+# numpy runs: metal walls peak at 12.2-12.7 floats per cell, of which 8 are
+# held (six fields, eps, 1/eps); scripts/fdtd_rate.py checks it on the device.
+TRANSIENT_ARRAYS = 4.5
+
+
+def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
+                    record_peak=False) -> int:
+    """Bytes ``simulate`` holds at its peak for this setup (float32 arrays).
+
+    Counts, per cell: six fields, eps and 1/eps, the transients, four CPML
+    psi arrays per open axis (two E and two H derivatives along it), the
+    conductor mask and its multiplier, and the peak |E_c| record (3 arrays). Each metal
+    ``(name, region)`` adds, per component, a box over its samples (the region
+    widened one node along the component) holding 2 per pole + 4 arrays, plus
+    the solver's boolean union of the regions.
+    """
+    shape = tuple(int(s) for s in shape)
+    cells = int(np.prod(shape))
+    sides = _axis_boundaries(boundary)
+    floats = 6 + 2 + TRANSIENT_ARRAYS + 4 * sides.count("open")
+    if pec:
+        floats += 1 + 0.25                  # multiplier + boolean mask
+    if record_peak:
+        floats += 3                         # the E components only
+    total = 4.0 * cells * floats
+    if metals:
+        total += cells                      # the boolean union of the regions
+    for name, region in metals:
+        where = np.argwhere(np.asarray(region, dtype=bool))
+        if where.size == 0:
+            continue
+        extent = where.max(0) - where.min(0) + 1
+        arrays = 2 * len(_metal(name).poles) + 4
+        for axis in range(3):
+            box = extent.copy()
+            box[axis] = min(box[axis] + 1, shape[axis])
+            total += 4.0 * int(np.prod(box)) * arrays
+    return int(total)
+
+
 def simulate(eps_r, source: Source, n_steps: int, probes=(),
              *, spacings=None, dx: float = 1.0,
              boundary: str = "metal", pec=None, pml_cells: int = DEFAULT_PML_CELLS,
