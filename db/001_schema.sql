@@ -100,7 +100,10 @@ CREATE TABLE IF NOT EXISTS mse.jobs (
     -- NULL means "not a pc job", exactly as NULL `materials` means the one-part
     -- path. It is NOT defaulted to `{}`: a cavity job has no photonic-crystal
     -- request, and `{}` would claim one with every field missing.
-    pcs               jsonb
+    pcs               jsonb,
+    -- The time-domain (`td`) request, as JSON: the keys `worker/td_solve.py`
+    -- reads (REQUEST_KEYS). NULL for every other kind, for the reason `pcs` is.
+    tds               jsonb
 );
 
 -- The solver used to run as a SparkApplication; it is now a plain batch/v1 Job,
@@ -293,6 +296,15 @@ BEGIN
         WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'pcs'
     ) THEN
         ALTER TABLE mse.jobs ADD COLUMN pcs jsonb;
+    END IF;
+
+    -- The time-domain request JSON, for databases created before `td`.
+    -- Nullable: NULL is the true value for every pre-existing row.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'tds'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN tds jsonb;
     END IF;
 END $$;
 

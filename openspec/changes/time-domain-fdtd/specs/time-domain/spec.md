@@ -260,6 +260,31 @@ that exceeded it, and the form lever that reduces it.
   open and open-plus-gold runs at about 1 M and 4 M cells on the Jetson, beside
   the estimate, and the run-time limit's rates come from those measurements
 
+### Requirement: A time-domain job SHALL be stored as kind `td` with a keyed request
+
+A `td` job SHALL be stored in the jobs table with `kind = 'td'` and its request
+in a `tds` JSON column, NULL for every other kind. The request keys SHALL be
+exactly the worker's `REQUEST_KEYS` list (`boundary`, `source_kind`, `profile`,
+`frequency_hz`, `bandwidth`, `position`, `direction`, `polarisation`,
+`samples`, `sample_duration_s`, `duration_s`, `probes`, `dx_m`). Every key SHALL
+be present; a key that does not apply to the chosen source holds null. The
+worker SHALL refuse a request with a missing key, naming every missing key, and
+SHALL refuse a `tds` that is not an object. Keys outside the list SHALL be
+ignored, so results written back to the row are never read as input. The TF/SF
+box is derived from the geometry, not stored. The claim payload SHALL always
+carry `tds` (null for other kinds). Creating a job with a kind outside the known
+kinds (`cavity`, `pc`, `td`) SHALL be refused before any row is written. The
+column is added idempotently by `db/001_schema.sql` and dropped by
+`db/003_rollback_td.sql`.
+
+#### Scenario: a missing request key is named
+- **WHEN** a claimed `td` job's `tds` lacks one or more keys
+- **THEN** the worker refuses it with a message naming every missing key
+
+#### Scenario: a misspelt kind never reaches the table
+- **WHEN** a job is created with kind `TD`
+- **THEN** it is refused and no INSERT is sent
+
 ### Requirement: The worker SHALL run a time-domain job only with the memory it needs
 
 The worker SHALL run at most one GPU job at a time when one of them is `td`.

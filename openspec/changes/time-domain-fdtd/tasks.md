@@ -62,7 +62,7 @@
 
 ## 4. Job kind `td` (phase 4)
 
-- [ ] 4.1 DB kind `td` with a `tds` request JSON whose keys are exactly the ones
+- [x] 4.1 DB kind `td` with a `tds` request JSON whose keys are exactly the ones
   the worker reads. A missing key is refused by name.
 - [ ] 4.2 Worker routing to the Jetson. Check every path that can change the
   routing field (unclaimed-GPU fallback, abandoned-GPU reroute, reaper and

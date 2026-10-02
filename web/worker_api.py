@@ -222,6 +222,9 @@ def _register_routes():
             # hands it straight to pc.py, so a JSON string here would be a second
             # encoding that only one of the two ends knows about.
             "pcs": job.get("pcs"),
+            # The time-domain request, or JSON null for any other kind. Same
+            # pass-through and key-always-present rules as `pcs`.
+            "tds": job.get("tds"),
             # The element caps travel with the job. They are properties of the
             # MACHINES, not of this upload, but a worker that knows only the
             # row cannot learn them: it has no cluster access and no reason to

@@ -366,11 +366,11 @@ class RoutingDb(FakeDb):
     def create_job(self, job_id, filename, units, n_index, n_modes,
                    target=DB.CLUSTER, est_tets=None,
                    min_feature_m=None, scale=1.0,
-                   kind=DB.CAVITY, pcs=None):
+                   kind=DB.CAVITY, pcs=None, tds=None):
         super().create_job(job_id, filename, units, n_index, n_modes,
                            target=target, est_tets=est_tets,
                            min_feature_m=min_feature_m, scale=scale,
-                           kind=kind, pcs=pcs)
+                           kind=kind, pcs=pcs, tds=tds)
         self.jobs[str(job_id)].update(target=target, est_tets=est_tets,
                                       gpu_queued_at="2026-09-26T00:00:00+00:00"
                                       if target == DB.JETSON else None,
@@ -629,7 +629,7 @@ class LeaseDb(RoutingDb):
     #: held. A double that returns MORE than the query would is a double that
     #: cannot fail for the reason the query can.
     CLAIM_COLUMNS = ("job_id", "units", "n_index", "n_modes",
-                     "min_feature_m", "scale", "materials", "kind", "pcs")
+                     "min_feature_m", "scale", "materials", "kind", "pcs", "tds")
 
     def claim_jetson(self, owner, lease_seconds):
         for job in self.jobs.values():
@@ -2633,6 +2633,28 @@ def test_the_claim_payload_says_cavity_for_a_cavity_job(tmp_path, monkeypatch):
 
     assert "kind" in body and body["kind"] == DB.CAVITY
     assert "pcs" in body and body["pcs"] is None
+    assert "tds" in body and body["tds"] is None
+
+
+def test_the_claim_payload_carries_the_td_kind_and_request(tmp_path, monkeypatch):
+    """A td job reaches the worker with its kind and its request as an object.
+
+    Mutation that must turn this red: drop the ``"tds"`` line from
+    web/worker_api.py's claim payload.
+    """
+    monkeypatch.setenv("MSE_WORKER_TOKEN", "tok-abc-123")
+    db = LeaseDb()
+    tds = {"boundary": "open", "source_kind": "point", "profile": "pulse",
+           "frequency_hz": 4.0e14, "bandwidth": 0.5}
+    db.create_job("job-td", "box.obj", "nm", 1.0, 0, target=DB.JETSON,
+                  kind=DB.TD, tds=tds)
+    app, _s, _d, _l = _make(tmp_path, db=db)
+
+    body = app.test_client().post("/worker/claim",
+                                  headers=_auth()).get_json()
+
+    assert body["kind"] == DB.TD
+    assert body["tds"] == tds, "the request must arrive as an object, not a string"
 
 
 # ---------------------------------------------------------------------------

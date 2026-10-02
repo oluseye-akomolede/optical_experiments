@@ -53,7 +53,11 @@ TARGETS = (CLUSTER, JETSON)
 #: be the default today".
 CAVITY = "cavity"
 PC = "pc"
-KINDS = (CAVITY, PC)
+#: ``td`` is a 3-D time-domain (FDTD) run of the upload. It runs on the Jetson
+#: GPU and nowhere else: the cluster has no FDTD solver, so like ``pc`` it must
+#: never reach the cluster launcher. Its request lives in ``tds``.
+TD = "td"
+KINDS = (CAVITY, PC, TD)
 
 #: How many times a jetson job may be handed back with no verdict before it is
 #: failed for good. Releases are legitimate for transient reasons; an unbounded
@@ -273,7 +277,8 @@ class JobStore:
                    scale: float = 1.0,
                    materials: dict | None = None,
                    kind: str = CAVITY,
-                   pcs: dict | None = None) -> None:
+                   pcs: dict | None = None,
+                   tds: dict | None = None) -> None:
         """Create the upload row. Status starts ``queued``, not ``running``.
 
         ``target`` is the machine the upload-time estimate chose. It is recorded
@@ -312,15 +317,22 @@ class JobStore:
         absent case, and for the same reason: ``{}`` would be a request with
         every field missing, which is a claim rather than an absence. It is
         serialised with ``json.dumps`` here for the same psycopg2 reason too.
+        ``tds`` is the time-domain request and follows ``pcs`` exactly: NULL
+        for every other kind, ``json.dumps`` for the same reason.
         """
+        if kind not in KINDS:
+            # The column is free text, so the database would store a misspelt
+            # kind and the worker would fail it minutes later. Refused here,
+            # before the row exists.
+            raise ValueError(f"unknown job kind {kind!r}; expected one of {KINDS}")
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO mse.jobs "
                 "(job_id, original_filename, units, n_index, n_modes, status, stage, "
                 " target, est_tets, min_feature_m, min_feature_value, "
-                " min_feature_unit, scale, gpu_queued_at, materials, kind, pcs) "
+                " min_feature_unit, scale, gpu_queued_at, materials, kind, pcs, tds) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "        CASE WHEN %s = 'jetson' THEN now() END, %s, %s, %s)",
+                "        CASE WHEN %s = 'jetson' THEN now() END, %s, %s, %s, %s)",
                 (str(job_id), original_filename, units, float(n_index),
                  int(n_modes), QUEUED, QUEUED, target,
                  None if est_tets is None else int(est_tets),
@@ -331,7 +343,8 @@ class JobStore:
                  target,
                  None if materials is None else json.dumps(materials),
                  kind,
-                 None if pcs is None else json.dumps(pcs)),
+                 None if pcs is None else json.dumps(pcs),
+                 None if tds is None else json.dumps(tds)),
             )
 
     def mark_failed(self, job_id, message: str) -> None:
@@ -558,7 +571,7 @@ class JobStore:
                 "SELECT job_id, created_at, original_filename, units, n_index, "
                 "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
                 "finished_at, target, est_tets, min_feature_m, scale, "
-                "min_feature_value, min_feature_unit, materials, kind, pcs "
+                "min_feature_value, min_feature_unit, materials, kind, pcs, tds "
                 "FROM mse.jobs WHERE job_id = %s",
                 (str(job_id),),
             )
@@ -571,7 +584,7 @@ class JobStore:
                 "SELECT job_id, created_at, original_filename, units, n_index, "
                 "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
                 "finished_at, target, est_tets, min_feature_m, scale, "
-                "min_feature_value, min_feature_unit, materials, kind, pcs "
+                "min_feature_value, min_feature_unit, materials, kind, pcs, tds "
                 "FROM mse.jobs ORDER BY created_at DESC LIMIT %s",
                 (int(limit),),
             )
@@ -667,7 +680,7 @@ class JobStore:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT job_id, units, n_index, n_modes, min_feature_m, scale, materials, "
-                "kind, pcs "
+                "kind, pcs, tds "
                 "FROM mse.jobs "
                 "WHERE target = %s AND status = %s AND lease_owner IS NULL "
                 "ORDER BY created_at "
@@ -688,7 +701,7 @@ class JobStore:
         return {"job_id": job_id, "units": row[1], "n_index": row[2],
                 "n_modes": row[3], "min_feature_m": row[4], "scale": row[5],
                 "lease_owner": owner, "materials": row[6], "kind": row[7],
-                "pcs": row[8]}
+                "pcs": row[8], "tds": row[9]}
 
     def renew_lease(self, job_id, owner: str, lease_seconds: float) -> bool:
         """Extend ``owner``'s lease. Returns whether it still holds it.
@@ -1065,6 +1078,7 @@ def _job_row(row) -> dict:
         # ``materials`` for the same additive reason the column was.
         "kind": row[19],
         "pcs": row[20],
+        "tds": row[21],
     }
 
 
