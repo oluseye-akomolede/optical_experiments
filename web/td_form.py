@@ -160,6 +160,15 @@ def parse_request(form) -> dict:
     return req
 
 
+def named_materials(fdtd=None) -> tuple:
+    """The materials a part may name instead of an index: ``pec`` and the
+    solver's dispersive metals. The page's per-part pickers list exactly
+    these, and ``parse_materials`` accepts exactly these."""
+    if fdtd is None:
+        fdtd = _solver()[0]
+    return ("pec",) + tuple(fdtd.METALS)
+
+
 def parse_materials(form, fdtd):
     """``{part name: n or metal name or 'pec'}`` from the part fields, or None
     when the form sent none (the one-part path, which uses ``n_index``)."""
@@ -167,7 +176,7 @@ def parse_materials(form, fdtd):
               for k, v in form.items() if k.startswith(MATERIAL_PREFIX)}
     if not fields:
         return None
-    named = ("pec",) + tuple(fdtd.METALS)
+    named = named_materials(fdtd)
     table = {}
     for part, raw in fields.items():
         if raw in named:
@@ -223,8 +232,8 @@ def plan_request(form, data: bytes, units_scale_m: float) -> dict:
             raise TDRequestError(
                 f"This object has {len(names)} parts "
                 f"({', '.join(map(repr, names))}), and a time-domain run needs "
-                f"a material for each one. Choosing a material per part is "
-                f"coming soon; until then, upload a single-part object.")
+                f"a material for each one. Choose one for every part in the "
+                f"list the page shows once it has read the file.")
         if materials is not None:
             missing = [n for n in names if n not in materials]
             unknown = [n for n in materials if n not in names]

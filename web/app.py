@@ -164,6 +164,7 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
                               td_units=tuple(TDF.LENGTH_UNITS),
                               td_polarisations=TDF.POLARISATIONS,
                               td_directions=TDF.DIRECTIONS,
+                              td_materials=TDF.named_materials(),
                               max_bands=PC.MAX_BANDS,
                               max_divisions=PC.MAX_DIVISIONS,
                               max_mb=CFG.MAX_UPLOAD_BYTES // (1024 * 1024))

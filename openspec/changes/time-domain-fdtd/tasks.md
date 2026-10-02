@@ -86,6 +86,14 @@
   part, NaN coordinates, a zero length scale, a one-node axis, a NaN
   duration, a mesh-library failure, a point source or probe on a conductor
   node, one outside the grid, one inside the CPML, and each limit broken.
+- [x] 5.4a Per-part materials (lead, 2026-10-02 08:15Z): a multi-part td upload
+  gets one picker per part from `/parts` (index, `pec` or a metal), posting
+  `part_index.<name>`; missing, unknown or malformed materials are refused
+  naming the part. Until this lands, multi-part td is refused in plain words
+  (e9f0cda).
+- [ ] 5.4b Per-part coatings end to end: a material plus a thickness on a
+  part's surface, painted by the voxeliser on a grid refined by
+  `coating_layers`, offered on the page only once it runs.
 - [ ] 5.2 Viewer: field-movie playback in the existing 3-D view, plus trace and
   spectrum plots with axis units.
 - [ ] 5.3 Image smoke test, then an in-browser check against a real finished `td`

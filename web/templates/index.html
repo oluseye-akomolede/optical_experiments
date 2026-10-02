@@ -180,7 +180,7 @@
             <option value="metal">a metal box (waves reflect)</option>
           </select>
         </label>
-        <label>Object's refractive index
+        <label id="td-one-index">Object's refractive index
           <input type="number" name="td_n_index" value="1.5" min="1" step="0.001" data-required>
         </label>
         <label>Length unit (positions, cell size)
@@ -194,6 +194,10 @@
           <input type="number" name="td_dx" value="0.05" min="0" step="any" data-required>
         </label>
       </div>
+      {# One material per part when the object has several (filled from /parts
+         by the script below; each picker posts part_index.<name>). #}
+      <div id="td-parts" class="row" hidden></div>
+      <p id="td-parts-note" class="muted small" hidden></p>
       <div class="row">
         <label>Source
           <select name="td_source_kind" id="td-source-kind" data-required>
@@ -351,6 +355,99 @@
   }
   form.addEventListener('change', apply);
   apply();
+
+  // Per-part materials for a multi-part time-domain object. The part names come
+  // from /parts (the solver's own parser), never from a scan here; each part gets
+  // a material select and, for "refractive index", a number box, which together
+  // fill one hidden `part_index.<name>` field. A response for an earlier file is
+  // dropped. A failed /parts call is SAID, never shown as "one part": the server
+  // then refuses a multi-part upload by name rather than guessing a material.
+  var partsBox = document.getElementById('td-parts');
+  var partsNote = document.getElementById('td-parts-note');
+  var oneIndex = document.getElementById('td-one-index');
+  var named = {{ td_materials | list | tojson }};
+  var asked = 0;
+
+  function clearParts(note) {
+    partsBox.textContent = '';
+    partsBox.hidden = true;
+    oneIndex.hidden = false;
+    partsNote.textContent = note || '';
+    partsNote.hidden = !note;
+  }
+
+  function picker(name) {
+    var label = document.createElement('label');
+    label.appendChild(document.createTextNode('Material of part \u201c' + name + '\u201d'));
+    var kind = document.createElement('select');
+    [['index', 'refractive index']].concat(named.map(function (m) {
+      return [m, m === 'pec' ? 'perfect conductor (pec)' : m];
+    })).forEach(function (o) {
+      var opt = document.createElement('option');
+      opt.value = o[0];
+      opt.textContent = o[1];
+      kind.appendChild(opt);
+    });
+    var n = document.createElement('input');
+    n.type = 'number'; n.min = '1'; n.step = 'any'; n.value = '1.5';
+    n.setAttribute('data-required', '');
+    n.setAttribute('aria-label', 'Refractive index of part ' + name);
+    var posted = document.createElement('input');
+    posted.type = 'hidden';
+    posted.name = 'part_index.' + name;
+    function sync() {
+      n.hidden = kind.value !== 'index';
+      posted.value = kind.value === 'index' ? n.value : kind.value;
+    }
+    kind.addEventListener('change', sync);
+    n.addEventListener('input', sync);
+    sync();
+    label.appendChild(kind);
+    label.appendChild(n);
+    label.appendChild(posted);
+    return label;
+  }
+
+  function askParts() {
+    var file = form.elements['meshfile'];
+    var ticket = ++asked;
+    if (select.value !== 'td' || !file || !file.files || !file.files.length) {
+      clearParts('');
+      apply();
+      return;
+    }
+    var body = new FormData();
+    body.append('meshfile', file.files[0]);
+    body.append('units', fieldValue('units') || '');
+    fetch('{{ url_for("parts") }}', {method: 'POST', body: body})
+      .then(function (r) { return r.json().then(function (j) { return [r.ok, j]; }); })
+      .then(function (res) {
+        if (ticket !== asked) return;
+        var ok = res[0], j = res[1];
+        if (!ok || !Array.isArray(j.parts)) {
+          clearParts('Could not read this object\u2019s parts: ' +
+                     ((j && j.error) || 'no answer from the server') + '.');
+        } else if (j.parts.length < 2) {
+          clearParts('');
+        } else {
+          clearParts('');
+          j.parts.forEach(function (name) { partsBox.appendChild(picker(name)); });
+          partsBox.hidden = false;
+          oneIndex.hidden = true;
+        }
+        apply();
+      })
+      .catch(function (err) {
+        if (ticket !== asked) return;
+        clearParts('Could not read this object\u2019s parts: ' + err + '.');
+        apply();
+      });
+  }
+  ['meshfile', 'units'].forEach(function (name) {
+    var field = form.elements[name];
+    if (field) field.addEventListener('change', askParts);
+  });
+  select.addEventListener('change', askParts);
 })();
 </script>
 {% endblock %}

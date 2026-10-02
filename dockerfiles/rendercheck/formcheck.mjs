@@ -7,7 +7,7 @@
 // mode, and is every control the chosen arm does not use out of the way?
 //
 // Inputs: FORM_DIR holds index.html (the rendered GET /), style.css and
-// probe.obj. Nothing is fetched from the network; every request is answered
+// probe.obj, three.obj, slow.obj and bad.obj (contents unused; /parts is scripted). Nothing is fetched from the network; every request is answered
 // from FORM_DIR. Run it like the other checks, bounded:
 //   docker run --rm --cpus=2 --memory=2g -v "$DIR:/work:ro" -e FORM_DIR=/work \
 //     --entrypoint node <rendercheck image> /work/formcheck.mjs
@@ -24,7 +24,21 @@ const ok = (c, msg) => { console.log(`${c ? 'PASS' : 'FAIL'}  ${msg}`); if (!c) 
 const browser = await chromium.launch();
 const page = await browser.newPage();
 page.on('pageerror', (e) => ok(false, `page error: ${e.message}`));
-await page.route('**/*', (route) => {
+// /parts is answered by file name, the way the app's parser would: probe.obj
+// is one part, three.obj three, bad.obj a refusal; slow.obj is three parts
+// answered late, to show a reply for an earlier file is dropped.
+const PARTS = { 'probe.obj': [200, { parts: ['probe'] }],
+                'three.obj': [200, { parts: ['plate_top', 'film', 'plate_bottom'] }],
+                'slow.obj': [200, { parts: ['a', 'b'] }],
+                'bad.obj': [400, { error: "part 'lid' is not closed" }] };
+await page.route('**/parts', async (route) => {
+  const body = route.request().postDataBuffer().toString('latin1');
+  const name = Object.keys(PARTS).find((n) => body.includes(`filename="${n}"`));
+  if (name === 'slow.obj') await new Promise((r) => setTimeout(r, 800));
+  const [status, json] = PARTS[name] || [500, { error: 'unscripted file' }];
+  route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(json) });
+});
+await page.route(/^(?!.*\/parts$).*/, (route) => {
   const url = new URL(route.request().url());
   const file = url.pathname.endsWith('.css') ? 'style.css' : 'index.html';
   route.fulfill({ body: fs.readFileSync(path.join(DIR, file)),
@@ -75,6 +89,58 @@ await page.fill('[name="td_position"]', '0.5 0.4 0.3');
 await page.fill('[name="td_probes"]', '0.5 0.4 0.5 z');
 ok(await valid(), 'td: defaults plus position and probes are valid');
 ok((await label()) === 'Run the time-domain simulation', 'td: button label');
+
+// --- per-part materials ------------------------------------------------------
+const pickers = () => page.$$eval('#td-parts label', (ls) => ls.map((l) => l.textContent));
+const posted = () => page.evaluate(() => {
+  const out = {};
+  new FormData(document.getElementById('upload-form')).forEach((v, k) => {
+    if (typeof v === 'string') out[k] = v;
+  });
+  return out;
+});
+const settle = () => page.waitForTimeout(300);
+ok((await pickers()).length === 0 && (await state('td_n_index')).shown,
+   'td/one part: no pickers; the single index is shown');
+await page.setInputFiles('input[name="meshfile"]', path.join(DIR, 'three.obj'));
+await page.waitForSelector('#td-parts label');
+ok((await pickers()).length === 3, `td/three parts: three pickers (${(await pickers()).length})`);
+ok((await pickers())[1].includes('film'), 'td/three parts: pickers named from /parts');
+ok(!(await state('td_n_index')).shown && (await state('td_n_index')).disabled,
+   'td/three parts: the single index is hidden and not posted');
+const kinds = await page.$$('#td-parts select');
+await kinds[0].selectOption('Au');
+await kinds[2].selectOption('pec');
+const boxes = await page.$$('#td-parts input[type="number"]');
+ok(!(await boxes[0].evaluate((e) => e.required || e.offsetParent !== null)),
+   'td/three parts: a metal part has no index box in the way');
+ok(await boxes[1].evaluate((e) => e.required && e.offsetParent !== null),
+   'td/three parts: an index part has a required index box');
+await boxes[1].fill('2.25');
+const sent = await posted();
+ok(sent['part_index.plate_top'] === 'Au' && sent['part_index.film'] === '2.25'
+   && sent['part_index.plate_bottom'] === 'pec',
+   `td/three parts: posts each part's material (${JSON.stringify(sent).slice(0, 200)})`);
+ok(!('td_n_index' in sent), 'td/three parts: the single index is not posted');
+ok(await valid(), 'td/three parts: a valid submission');
+await boxes[1].fill('');
+ok(!(await valid()), 'td/three parts: an empty index box blocks the submission');
+await page.setInputFiles('input[name="meshfile"]', path.join(DIR, 'probe.obj'));
+await settle();
+ok((await pickers()).length === 0 && (await state('td_n_index')).shown,
+   'td/back to one part: pickers gone, single index back');
+ok(!Object.keys(await posted()).some((k) => k.startsWith('part_index.')),
+   'td/back to one part: no stale part_index field is posted');
+await page.setInputFiles('input[name="meshfile"]', path.join(DIR, 'bad.obj'));
+await settle();
+ok((await page.textContent('#td-parts-note')).includes("part 'lid' is not closed")
+   && (await page.isVisible('#td-parts-note')),
+   'td/refused file: the parser\'s refusal is shown, not read as one part');
+await page.setInputFiles('input[name="meshfile"]', path.join(DIR, 'slow.obj'));
+await page.setInputFiles('input[name="meshfile"]', path.join(DIR, 'probe.obj'));
+await page.waitForTimeout(1200);
+ok((await pickers()).length === 0, 'td/stale reply: a late answer for an earlier file is dropped');
+ok(!(await page.isVisible('#td-parts-note')), 'td/one part again: no leftover note');
 
 // --- plane wave, then a drawn waveform ---------------------------------------
 await page.selectOption('[name="td_source_kind"]', 'plane');

@@ -169,11 +169,12 @@ def test_a_part_with_no_material_is_refused(tmp_path):
 
 
 def test_a_multi_part_upload_without_materials_is_refused_in_plain_words(tmp_path):
-    """Never one material for every part (lead, 08:15Z): until the page has
-    per-part pickers, a multi-part td upload is refused, naming its parts."""
+    """Never one material for every part (lead, 08:15Z): a multi-part td
+    upload that posts no per-part materials is refused, naming its parts and
+    pointing at the page's pickers."""
     flashes = _refused(tmp_path, "has 2 parts ('block', 'cube')",
                        **{"part_index.cube": None, "part_index.block": None})
-    assert any("coming soon" in m for m in flashes), flashes
+    assert any("Choose one for every part" in m for m in flashes), flashes
     assert not any("materials table" in m for m in flashes), flashes
 
 
@@ -420,6 +421,20 @@ def test_the_td_choices_on_the_page_are_the_ones_the_form_accepts(tmp_path):
     assert "td" in page.controls["mode"][2]
 
 
+def test_the_part_pickers_offer_exactly_the_materials_the_form_accepts(tmp_path):
+    import json, re  # noqa: E401, PLC0415
+    app, _store, _db, _launcher = make_app(tmp_path)
+    html = app.test_client().get("/").get_data(as_text=True)
+    found = re.findall(r"var named = (\[[^\]]*\]);", html)
+    assert len(found) == 1, found
+    offered = json.loads(found[0])
+    fdtd = TDF._solver()[0]
+    assert offered == list(TDF.named_materials(fdtd))
+    assert "pec" in offered and len(offered) > 1
+    for name in offered:          # every offered choice parses as itself
+        assert TDF.parse_materials({"part_index.a": name}, fdtd) == {"a": name}
+
+
 def test_the_td_arm_shows_the_upload_it_reads(tmp_path):
     # The td route reads meshfile, units and scale. They live in the shared
     # upload fieldset, which must be shown for td too: a td arm without them
@@ -447,8 +462,8 @@ def test_the_pages_own_td_defaults_are_accepted(tmp_path):
         fields.pop(hidden)
     fields["td_position"] = "0.5 0.4 0.3"
     fields["td_probes"] = "0.5 0.4 0.5 z"
-    # One part: the page has no per-part pickers yet, so a multi-part upload
-    # is refused in plain words (the multi-part refusal test above).
+    # One part: a multi-part upload posts per-part pickers, which only the
+    # page's script fills in (formcheck.mjs covers that path).
     block = _obj(("block", _box([0, 0, 0], [1.0, 0.8, 0.6])))
     fields["meshfile"] = (io_bytes(block), "block.obj")
     app, _store, db, _launcher = make_app(tmp_path / "post")
