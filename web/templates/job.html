@@ -178,6 +178,22 @@
     the k-path.
   </p>
 </section>
+
+{# The time-domain result: each probe's trace and spectrum, read from the
+   job's spectrum.json manifest and trace.bin. Hidden unless the payload's kind
+   is 'td', for the same reason as the band card. Caveats from the run are
+   listed here because the spec requires them to reach the owner. #}
+<section class="card" id="td-card" hidden>
+  <h2>Probe traces</h2>
+  <p class="muted small" id="td-caption"></p>
+  <ul class="small" id="td-legend"></ul>
+  <svg id="td-trace-svg" class="bands" width="640" height="300"
+       preserveAspectRatio="xMidYMid meet"></svg>
+  <h3>Spectrum</h3>
+  <svg id="td-spectrum-svg" class="bands" width="640" height="300"
+       preserveAspectRatio="xMidYMid meet"></svg>
+  <ul class="muted small" id="td-caveats"></ul>
+</section>
 {% endblock %}
 
 {% block scripts %}

@@ -793,6 +793,31 @@ a path separator).
   not one the solver writes
 - **THEN** the files/ route answers 404
 
+### Requirement: A finished time-domain job's page SHALL plot each probe's trace and spectrum
+The job page of a finished `td` job SHALL show a card with every probe's trace
+against time and its amplitude spectrum over the manifest's band, both with
+labelled axes in SI-prefixed units, a legend naming each probe's component and
+position in its line's colour, and the run's caveats. The cavity viewer, mode
+table and band card SHALL stay hidden. A trace longer than the plot is wide
+SHALL be drawn as each pixel column's minimum and maximum, not by decimation,
+so a CW trace does not alias into a false beat. A manifest or trace that cannot
+be fetched SHALL be named in the card's caption, never left as an empty plot.
+
+#### Scenario: a finished td job shows its probes
+- **WHEN** a finished `td` job with two probes is opened
+- **THEN** the card shows two trace lines and two spectrum lines, a time axis in
+  ps or ns, a frequency axis in GHz or THz, and a legend whose swatches match
+  the line colours, and the 3-D viewer, mode table and band card are hidden
+
+#### Scenario: a trace that cannot be fetched is named
+- **WHEN** the trace request answers 502
+- **THEN** the caption says the probe traces could not be loaded and names the
+  HTTP status
+
+#### Scenario: caveats reach the page
+- **WHEN** the manifest lists caveats
+- **THEN** each one is listed on the card
+
 ### Requirement: A drawn waveform SHALL be checked against the grid
 
 A `drawn` source SHALL be a list of at most 10 000 dimensionless amplitude
