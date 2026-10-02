@@ -51,13 +51,15 @@ thickness. It is a solver run: on the Jetson.
 RUN IT ON THE JETSON (tier 2):
 
     ssh jetson 'mkdir -p ~/mse-bench/fdtd-v5'
-    git -C <repo> archive <sha> scripts/fdtd_bench_v5.py scripts/fdtd_bench_v1.py \\
-        dockerfiles/maxwell_solver/fdtd.py dockerfiles/maxwell_solver/fdtd_grid.py \\
-        tests/bench_box.py | ssh jetson 'tar -xf - -C ~/mse-bench/fdtd-v5'
+    git -C <repo> archive <sha> scripts tests/bench_box.py \\
+        dockerfiles/maxwell_solver | ssh jetson 'tar -xf - -C ~/mse-bench/fdtd-v5'
     ssh jetson 'cd ~/mse-bench/fdtd-v5 && \\
       (ulimit -v 5000000; nice -n 10 timeout 30m python3 scripts/fdtd_bench_v5.py)'
 
-Exit 0 PASS, 1 FAIL, 2 the setup is not the spec's (or bad arguments).
+Exit 0 PASS, 1 FAIL, 2 the setup is not the spec's, bad arguments, or the
+bench did not run (an import, setup or solver crash measured nothing, so it
+is never reported as a FAIL). The whole solver directory is archived because
+V1's bench_box imports the mse_* modules beside fdtd.
 """
 
 from __future__ import annotations
@@ -81,13 +83,19 @@ import numpy as np  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "dockerfiles" / "maxwell_solver"))
 
-import fdtd  # noqa: E402
-import fdtd_grid  # noqa: E402
+# A missing file on the bench host must read as "did not run" (exit 2), not
+# as a FAIL: hold the import error and let main() report it.
+_IMPORT_ERROR = None
+try:
+    import fdtd  # noqa: E402
+    import fdtd_grid  # noqa: E402
 
-_spec = importlib.util.spec_from_file_location(
-    "fdtd_bench_v1", ROOT / "scripts" / "fdtd_bench_v1.py")
-_v1 = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_v1)
+    _spec = importlib.util.spec_from_file_location(
+        "fdtd_bench_v1", ROOT / "scripts" / "fdtd_bench_v1.py")
+    _v1 = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_v1)
+except Exception as _error:  # noqa: BLE001 -- any import failure is a no-run
+    _IMPORT_ERROR = _error
 
 #: The spec's numbers.
 TOLERANCE = 0.01                    # relative, per mode
@@ -242,6 +250,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    if _IMPORT_ERROR is not None:
+        print(f"V5 DID NOT RUN: import failed: {_IMPORT_ERROR!r} (copy the "
+              f"whole dockerfiles/maxwell_solver directory; see the docstring)")
+        return 2
     args = build_parser().parse_args(argv)
     xp = np
     if args.xp == "cupy":
@@ -359,5 +371,17 @@ def main(argv=None) -> int:
     return code
 
 
+def run(argv=None) -> int:
+    """main(), with any crash reported as "did not run" (exit 2): a crash
+    measured nothing, and exit 1 would read as a FAIL of the solver."""
+    try:
+        return main(argv)
+    except Exception:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        print("V5 DID NOT RUN: the bench crashed (exit 2, not a FAIL)")
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())

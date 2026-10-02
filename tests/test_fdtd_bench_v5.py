@@ -6,7 +6,12 @@ job.
 """
 
 import importlib.util
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location(
@@ -111,3 +116,53 @@ def test_a_floor_at_half_the_tolerance_passes_and_just_over_is_flagged():
 def test_a_flagged_setup_without_failures_exits_2():
     verdict, code = bench.v5_verdict([], [bench.floor_problem(0.0051)])
     assert code == 2
+
+
+def test_a_missing_solver_module_on_the_bench_host_exits_two_not_one(tmp_path):
+    # the Jetson crash: the archive list left out mse_eigen.py, which V1's
+    # bench_box imports. Copy what the docstring archives, minus that file,
+    # and run the real script as the lead does.
+    for rel in ("scripts", "tests/bench_box.py", "dockerfiles/maxwell_solver"):
+        src, dst = ROOT / rel, tmp_path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst, ignore=shutil.ignore_patterns(
+                "__pycache__", "mse_eigen.py"))
+        else:
+            shutil.copy(src, dst)
+    assert not (tmp_path / "dockerfiles/maxwell_solver/mse_eigen.py").exists()
+    done = subprocess.run(
+        [sys.executable, "scripts/fdtd_bench_v5.py"], cwd=tmp_path,
+        capture_output=True, text=True, timeout=120,
+        env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"})
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "V5 DID NOT RUN" in done.stdout and "mse_eigen" in done.stdout
+
+
+def test_the_docstring_archives_the_whole_solver_directory():
+    archive = bench.__doc__.split("archive <sha>")[1].split("|")[0]
+    assert archive.split() == ["scripts", "tests/bench_box.py", "\\",
+                               "dockerfiles/maxwell_solver"]
+
+
+def test_a_crash_inside_main_exits_two_not_one(monkeypatch, capsys):
+    def boom(*args, **kwargs):
+        raise RuntimeError("setup blew up")
+    monkeypatch.setattr(bench, "lateral_modes", boom)
+    with pytest.raises(RuntimeError):         # main itself does not hide it
+        bench.main([])
+    assert bench.run([]) == 2
+    out = capsys.readouterr()
+    assert "V5 DID NOT RUN" in out.out and "setup blew up" in out.err
+
+
+def test_the_script_run_as_main_turns_a_crash_into_exit_two():
+    # --cells-per-wavelength 0 divides by zero inside main() before any solve
+    done = subprocess.run(
+        [sys.executable, "scripts/fdtd_bench_v5.py",
+         "--cells-per-wavelength", "0"], cwd=ROOT,
+        capture_output=True, text=True, timeout=120,
+        env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"})
+    assert "ZeroDivisionError" in done.stderr, done.stderr
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "V5 DID NOT RUN" in done.stdout
