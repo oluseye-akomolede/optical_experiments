@@ -330,3 +330,96 @@ def test_claim_jetson_reports_cavity_and_null_for_a_cavity_job():
     assert job["pcs"] is None
     assert job["tds"] is None
     assert job["materials"] is None
+
+
+# ---- The read side: get_job / list_jobs through _job_row --------------------
+#
+# The claim tests above pin claim_jetson's positions; nothing pinned the job
+# readers. A reader that took tds from the pcs slot, or a list SELECT that
+# dropped tds (so _job_row's row[21] raises and the job list page 500s), stayed
+# green. These fakes answer each SELECT with a row built FROM THAT QUERY'S OWN
+# column list, every column holding a value no other column holds, so a wrong
+# index returns the wrong value and a dropped column shortens the row.
+
+
+def _select_columns(sql: str) -> list[str]:
+    head = sql.split("FROM")[0]
+    body = head[head.index("SELECT") + len("SELECT"):]
+    return [c.strip() for c in body.split(",")]
+
+
+def _distinct_value(column: str):
+    if column in ("created_at", "finished_at"):
+        return None  # _iso formats these; None passes through as None
+    if column in ("materials", "pcs", "tds"):
+        return {"column": column}  # jsonb: a dict, and a DIFFERENT dict each
+    return f"<{column}>"
+
+
+class _ReadCursor:
+    def __init__(self, statements):
+        self.statements = statements
+
+    def execute(self, sql, params=None):
+        self.statements.append((sql, params))
+        cols = _select_columns(sql)
+        self._rows = [tuple(_distinct_value(c) for c in cols)]
+
+    def fetchone(self):
+        return self._rows[0]
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _ReadConn(_Conn):
+    def cursor(self):
+        return _ReadCursor(self.sink)
+
+
+class _ReadStore(DB.JobStore):
+    def __init__(self):
+        self.sent = []
+
+    def _open(self, autocommit=True):
+        return _ReadConn(self.sent)
+
+
+def _read_job(reader: str) -> tuple[dict, list[str]]:
+    store = _ReadStore()
+    if reader == "get_job":
+        job = store.get_job(uuid.uuid4())
+    else:
+        (job,) = store.list_jobs()
+    (sql, _params), = store.sent
+    return job, _select_columns(sql)
+
+
+@pytest.mark.parametrize("reader", ["get_job", "list_jobs"])
+def test_a_job_reader_returns_each_column_from_its_own_position(reader):
+    """Every selected column comes back under its own name, with its own value.
+
+    pcs and tds hold different dicts, so reading tds from the pcs slot fails
+    here; a SELECT that leaves out tds makes the row one short of what
+    _job_row indexes, and the read raises instead of passing.
+    """
+    job, cols = _read_job(reader)
+    for name in ("kind", "pcs", "tds", "materials"):
+        assert name in cols, f"{reader}'s SELECT does not select {name}"
+    for name in cols:
+        assert job[name] == _distinct_value(name), (reader, name, job[name])
+    assert job["tds"] == {"column": "tds"}
+    assert job["pcs"] == {"column": "pcs"}
+
+
+@pytest.mark.parametrize("reader", ["get_job", "list_jobs"])
+def test_a_job_reader_selects_every_field_the_row_reader_returns(reader):
+    """The SELECT and _job_row's dict agree column for column, in order."""
+    job, cols = _read_job(reader)
+    assert cols == list(job)
