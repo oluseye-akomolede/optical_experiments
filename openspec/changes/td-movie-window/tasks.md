@@ -1,9 +1,11 @@
 # Tasks — td-movie-window
 
-> Archive order: this change MODIFIES a requirement that the open change
+> Archive order: this change MODIFIES two requirements that the open change
 > `time-domain-fdtd` introduces, and `openspec/specs/time-domain/` does not
 > exist until that change archives. Archive `time-domain-fdtd` first, then this
 > one (`openspec validate` reports this as INFO, and archive would refuse it).
+> Both MODIFIED deltas must be present when it does, or the archived spec keeps
+> the older text beside this change's ADDED requirements.
 
 ## 1. Solver: the window and the frame count
 
@@ -64,3 +66,10 @@
 - [x] 6.2 Mutants: revert each fix in turn and confirm the matching test is the
       one that goes red.
 - [x] 6.3 The affected suites at tier 1 (tiny, `2` threads, `nice -n 19`).
+- [x] 6.4 Review fix, spec only (no code or test change): widening a frame name
+      to three digits falsified the older "three kinds of flat file"
+      requirement, which still said two-digit and listed `frame_001.bin` as a
+      near miss. The delta now MODIFIES that requirement too (two digits up to
+      99 frames, three from 100; `frame_001.bin` moved out of the near-miss
+      list), so archiving both changes leaves one naming rule in
+      `openspec/specs/time-domain/spec.md`, not two that contradict.

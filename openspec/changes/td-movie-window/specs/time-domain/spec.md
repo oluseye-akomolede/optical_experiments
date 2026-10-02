@@ -166,3 +166,70 @@ count the requested number of frames.
 - **WHEN** the same grid records frames over a window that starts after step 0
 - **THEN** every recorded step lies inside the window, the last is the window's
   last step, and the stride is unchanged from the whole-run movie
+
+### Requirement: A time-domain job's results SHALL be three kinds of flat file
+
+A finished `td` job SHALL store `trace.bin` (every probe's trace, float32
+little-endian, C order, shaped probes × steps), one `frame_NNN.bin` per movie
+frame (1-based, |E| float32 little-endian, C order, in the grid's x, y, z order;
+named with two digits for a movie of up to 99 frames and three from 100, so a
+120-frame movie ends at `frame_120.bin`) and `spectrum.json` (the manifest: time
+step, step count, the band, each probe's position, component and amplitude
+spectrum within the band, the trace and frame shapes, each frame sample's
+position along x, y and z in metres (the grid is graded, so a viewer cannot
+assume even spacing), and the layout caveats). The spectra SHALL be scaled so
+the largest peak across all probes is 1, stated in the manifest as
+`spectrum_scale: "largest peak = 1"`, so they compare across probes and do not
+grow with the step count. A probe with no signal in the band SHALL be stored as
+flat zero with a caveat naming it, never NaN, even when no probe has any signal.
+The manifest SHALL be written last, so its presence means every other file
+exists. A non-finite value in a trace, frame or spectrum SHALL fail the job
+before anything is written. The worker's upload list and the app's accepted
+names SHALL agree on every one of these names, and SHALL refuse near misses
+(`frame_1.bin`, `frame_0001.bin`, a path separator).
+
+#### Scenario: the spectrum does not grow with the run
+- **WHEN** the same steady wave is recorded for twice as many steps
+- **THEN** the stored spectrum still peaks at 1 at the same frequency, with the
+  same shape around the peak counted in frequency bins
+
+#### Scenario: a probe the source cannot excite
+- **WHEN** a probe's trace is zero throughout
+- **THEN** its stored spectrum is all zeros, the other probes keep their scale,
+  and the caveats say that probe recorded no signal in the band
+
+#### Scenario: the manifest places every movie sample
+- **WHEN** a movie keeps every `stride`-th node of a graded grid
+- **THEN** `frames.positions_m` lists, per axis, exactly those nodes in metres,
+  in the probes' frame, one per sample; a count that disagrees with the frame
+  shape fails the job before anything is written
+
+#### Scenario: the files decode to the solver's own output
+- **WHEN** a tiny `td` job finishes
+- **THEN** `trace.bin` decodes to the solver's traces and each `frame_NNN.bin`
+  to its frame, exactly, and `spectrum.json` names their shapes
+
+#### Scenario: a run that dies part way leaves no manifest
+- **WHEN** writing stops after `trace.bin` or a frame
+- **THEN** no `spectrum.json` exists for the job
+
+#### Scenario: NaN is refused before writing
+- **WHEN** a trace or frame holds NaN or infinity
+- **THEN** the job fails naming which output, and no file is written
+
+#### Scenario: a near-miss name is refused by both sides
+- **WHEN** the worker or the app is offered `frame_1.bin`, `frame_0001.bin` or
+  `x/frame_01.bin`
+- **THEN** both refuse it
+
+#### Scenario: the page reads td results through files/
+- **WHEN** a td job is done
+- **THEN** its status carries `spectrum_url` and `trace_url` (both under
+  `/jobs/<id>/files/`) and none of `modes`, `manifest_url`, `surface_url` or
+  `bands`, and `files/trace.bin`, `files/spectrum.json` and
+  `files/frame_NNN.bin` return the stored bytes
+
+#### Scenario: td results are not served early or invented
+- **WHEN** the job is not done, the named frame was not written, or the name is
+  not one the solver writes
+- **THEN** the files/ route answers 404
