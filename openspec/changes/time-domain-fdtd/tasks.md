@@ -128,8 +128,10 @@
   overlapping 1280-face icospheres (centres 1 apart) takes 43 ms.
 - [x] 5.2 Viewer: field-movie playback in the existing 3-D view, plus trace and
   spectrum plots with axis units.
-- [ ] 5.3 Image smoke test, then an in-browser check against a real finished `td`
-  job in production.
+- [x] 5.3 Image smoke test, then an in-browser check against a real finished `td`
+  job in production. Done 2026-10-02 ~21:25Z: `scripts/run_tdcheck.sh` against a
+  fresh mirror of prod job aa6f083b served by mse-web:9f6c83b, 39 checks ALL PASS
+  (incl. the probe legend at its own grid node, within one cell).
 
 ## 6. Periodic boundaries (phase 6)
 
