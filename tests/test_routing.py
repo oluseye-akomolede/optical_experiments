@@ -2833,3 +2833,87 @@ def test_a_pc_done_on_a_lost_lease_is_a_409(tmp_path, monkeypatch):
 
     assert resp.status_code == 409, resp.data
     assert "bands" not in (db.jobs["job-pc"].get("pcs") or {})
+
+
+# ---------------------------------------------------------------------------
+# A td job never leaves the Jetson (FDTD 4.2)
+#
+# The cluster runs only the cavity solver, so every path that can change a
+# row's ``target`` is driven here with a td row: the unclaimed-GPU fallback
+# (the tick's abandon pass), the reaper, lease expiry and release. The fake's
+# ``reroute_to_cluster`` deliberately has NO kind guard (the real SQL does), so
+# the abandon test reaches the app's own decision. tests/td_routing_check.py
+# proves the same properties against real Postgres.
+# ---------------------------------------------------------------------------
+
+_TDS = {"boundary": "open", "source_kind": "point", "profile": "pulse"}
+
+
+def _td_job(db, job_id="job-td"):
+    db.create_job(job_id, "u.obj", "um", 1.0, 0, target=DB.JETSON,
+                  est_tets=1_000, kind=DB.TD, tds=dict(_TDS))
+    return db.jobs[job_id]
+
+
+def test_an_unclaimed_td_job_stays_on_the_gpu_queue(tmp_path):
+    """Red on the pc-only guard: the td row is moved and logged as moved."""
+    db = RoutingDb()
+    _td_job(db)
+    logs: list[str] = []
+
+    moved = APP._reroute_abandoned_gpu_jobs(db, FakeLauncher(), log=logs.append)
+
+    assert moved == 0
+    assert db.jobs["job-td"]["target"] == DB.JETSON
+    assert db.reroutes == []
+    assert any("'td' job" in line and "stays queued for the GPU" in line
+               for line in logs), logs
+
+
+def test_the_abandon_pass_still_moves_a_cavity_row_beside_a_td_row(tmp_path):
+    """The whitelist must not freeze the cavity fallback it sits in."""
+    db = RoutingDb()
+    _td_job(db)
+    _jetson_job(db, est_tets=20_000, job_id="job-cav")
+
+    moved = APP._reroute_abandoned_gpu_jobs(db, FakeLauncher(), log=lambda _m: None)
+
+    assert moved == 1
+    assert db.jobs["job-cav"]["target"] == DB.CLUSTER
+    assert db.jobs["job-td"]["target"] == DB.JETSON
+
+
+def test_an_expired_td_lease_requeues_it_on_the_gpu(tmp_path):
+    db = RoutingDb()
+    job = _td_job(db)
+    job.update(lease_owner="w-dead", lease_expired=True, status=DB.RUNNING)
+
+    # The reclaim step alone: the whole tick would also run the launch pass,
+    # whose FakeDb.next_queued ignores target and kind (the real one takes
+    # cluster cavity rows only), so it would "launch" the td row in the double.
+    reclaimed = APP._reclaim_expired_leases(db, log=lambda _m: None)
+
+    assert reclaimed == ["job-td"]
+    assert db.jobs["job-td"]["target"] == DB.JETSON
+    assert db.jobs["job-td"]["status"] == DB.QUEUED
+
+
+def test_the_reaper_does_not_fail_a_running_td_job(tmp_path):
+    """A td row has no k8s Job by construction; its lease owns its liveness."""
+    db = RoutingDb()
+    job = _td_job(db)
+    job.update(status=DB.RUNNING, lease_owner="w-1", k8s_job_name=None)
+
+    failed = APP._fail_dead_jobs(FakeLauncher(), db, log=lambda _m: None)
+
+    assert failed == 0
+    assert db.jobs["job-td"]["status"] == DB.RUNNING
+    assert db.jobs["job-td"]["target"] == DB.JETSON
+
+
+def test_the_real_store_refuses_a_td_job_off_the_jetson():
+    """Refused before any connection, so no later path has to rescue the row."""
+    store = DB.JobStore({"host": "invalid.invalid", "dbname": "x"})
+    with pytest.raises(ValueError, match="Jetson only"):
+        store.create_job("job-td", "u.obj", "um", 1.0, 0, target=DB.CLUSTER,
+                         kind=DB.TD, tds=dict(_TDS))

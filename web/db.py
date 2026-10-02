@@ -325,6 +325,14 @@ class JobStore:
             # kind and the worker would fail it minutes later. Refused here,
             # before the row exists.
             raise ValueError(f"unknown job kind {kind!r}; expected one of {KINDS}")
+        if kind == TD and target != JETSON:
+            # A td job runs only on the Jetson worker; the cluster has no
+            # time-domain solver. Refused before the row exists, so no later
+            # path has to rescue a td row created on the wrong queue. (pc rows
+            # are not refused here: tests/pc_routing_check.py builds a cluster
+            # pc row on purpose to prove next_queued cannot see one.)
+            raise ValueError(f"a td job runs on the Jetson only; target "
+                             f"{target!r} is not {JETSON!r}")
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO mse.jobs "
@@ -615,19 +623,20 @@ class JobStore:
         the worker API instead -- see ``claim_jetson``.
 
         Filtered by kind as well, and this is not belt-and-braces. The cluster
-        has no pc solver: ``launcher.create`` builds a CAVITY Job from whatever
-        row it is handed, so a ``kind='pc'`` row reaching here would be
-        cavity-solved and its band diagram would never be produced. The kind
-        filter is what makes the cluster queue unable to see a pc row at all,
-        independent of which target the row carries.
+        has no pc or td solver: ``launcher.create`` refuses any kind but cavity,
+        so a ``kind='pc'`` or ``'td'`` row reaching here would be failed at
+        launch instead of waiting for the Jetson. The kind filter is what makes
+        the cluster queue unable to see such a row at all, independent of which
+        target the row carries. It is a WHITELIST (``kind = 'cavity'``), so a
+        kind added later is invisible here until a cluster solver exists for it.
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT job_id, original_filename, units, n_index, n_modes, est_tets, "
                 "min_feature_m, scale, materials, kind "
-                "FROM mse.jobs WHERE status = %s AND target = %s AND kind <> %s "
+                "FROM mse.jobs WHERE status = %s AND target = %s AND kind = %s "
                 "ORDER BY created_at LIMIT 1",
-                (QUEUED, target, PC),
+                (QUEUED, target, CAVITY),
             )
             row = cur.fetchone()
         if not row:

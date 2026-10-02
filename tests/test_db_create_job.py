@@ -149,7 +149,8 @@ def _td_request():
 def test_create_job_with_a_td_request_sends_it_as_json_and_says_td():
     store = _RecordingStore()
     tds = _td_request()
-    store.create_job(uuid.uuid4(), "box.obj", "nm", 1.0, 0, kind=DB.TD, tds=tds)
+    store.create_job(uuid.uuid4(), "box.obj", "nm", 1.0, 0, target=DB.JETSON,
+                     kind=DB.TD, tds=tds)
     params = _insert_params(store)
     assert params[_db_param_index(store, "kind")] == DB.TD
     assert json.loads(params[_db_param_index(store, "tds")]) == tds
@@ -159,7 +160,9 @@ def test_create_job_with_a_td_request_sends_it_as_json_and_says_td():
 @pytest.mark.parametrize("kind", [DB.CAVITY, DB.PC, DB.TD])
 def test_create_job_accepts_every_known_kind(kind):
     store = _RecordingStore()
-    store.create_job(uuid.uuid4(), "box.obj", "mm", 1.0, 10, kind=kind)
+    # A td job is Jetson-only (4.2), so every kind is created there.
+    store.create_job(uuid.uuid4(), "box.obj", "mm", 1.0, 10, target=DB.JETSON,
+                     kind=kind)
     assert _insert_params(store)[_db_param_index(store, "kind")] == kind
 
 

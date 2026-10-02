@@ -663,15 +663,20 @@ def _reroute_abandoned_gpu_jobs(jobs_db, launcher, log=print) -> int:
             log(f"[mse-web] job {job_id}: estimated {int(est):,} elements, over "
                 f"the {limit:,} the cluster can solve; it stays queued for the GPU")
             continue
-        if entry.get("kind") == DB.PC:
-            # A pc row cannot go to the cluster: there is no pc solver there,
-            # so the launcher would build a CAVITY Job for it, and both queues
-            # would then be blind to it (next_queued skips pc; claim_jetson
-            # needs target='jetson'). It stays on the GPU queue, the same rule
-            # the size escape above applies. The message the owner sees is NOT
-            # the "moved to the cluster queue" one -- nothing moved.
-            log(f"[mse-web] job {job_id}: a photonic-crystal job, and the "
-                f"cluster has no pc solver; it stays queued for the GPU")
+        kind = entry.get("kind")
+        if kind != DB.CAVITY:
+            # Only a cavity row can go to the cluster: the launcher builds one
+            # Job shape, the cavity solver, so a pc or td row moved there would
+            # be cavity-solved, and both queues would then be blind to it
+            # (next_queued takes cavity rows only; claim_jetson needs
+            # target='jetson'). It stays on the GPU queue, the same rule the
+            # size escape above applies. A WHITELIST, so a future kind is kept
+            # here by default rather than swept to the cluster. The message the
+            # owner sees is NOT the "moved to the cluster queue" one -- nothing
+            # moved. (reroute_to_cluster refuses these in its SQL too; this arm
+            # is what makes the decision visible in the log.)
+            log(f"[mse-web] job {job_id}: a {kind!r} job, and the cluster "
+                f"only runs cavity solves; it stays queued for the GPU")
             continue
         if jobs_db.reroute_to_cluster(
                 job_id,
