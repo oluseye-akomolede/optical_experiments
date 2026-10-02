@@ -53,7 +53,11 @@ TARGETS = (CLUSTER, JETSON)
 #: be the default today".
 CAVITY = "cavity"
 PC = "pc"
-KINDS = (CAVITY, PC)
+#: ``td`` is a 3-D time-domain (FDTD) run of the upload. It runs on the Jetson
+#: GPU and nowhere else: the cluster has no FDTD solver, so like ``pc`` it must
+#: never reach the cluster launcher. Its request lives in ``tds``.
+TD = "td"
+KINDS = (CAVITY, PC, TD)
 
 #: How many times a jetson job may be handed back with no verdict before it is
 #: failed for good. Releases are legitimate for transient reasons; an unbounded
@@ -62,6 +66,25 @@ KINDS = (CAVITY, PC)
 #: enough that a genuinely broken job reaches a terminal state quickly instead
 #: of cycling through the GPU queue forever.
 MAX_RELEASES = 3
+
+#: How long a td job may wait as "Jetson busy" (short of GPU memory at start)
+#: before it fails, measured from its first deferral; and how long each
+#: deferral keeps it out of the claim query. The spec's 60 minutes.
+BUSY_WAIT_MINUTES = 60
+BUSY_RETRY_SECONDS = 60
+BUSY_STAGE = "Jetson busy"
+BUSY_GAVE_UP_MESSAGE = (
+    f"The Jetson stayed short of GPU memory for {BUSY_WAIT_MINUTES} minutes "
+    "(other work was using it), so this run never started. Please try again "
+    "later."
+)
+
+
+def _busy_message(reason: str) -> str:
+    """The row's message while a td job waits for GPU memory."""
+    reason = (reason or "not enough free GPU memory to start").strip()
+    return (f"waiting: the Jetson is busy ({reason}); it will try again for up "
+            f"to {BUSY_WAIT_MINUTES} minutes")
 
 
 def releases_are_terminal(count: int, bound: int = MAX_RELEASES) -> bool:
@@ -273,7 +296,8 @@ class JobStore:
                    scale: float = 1.0,
                    materials: dict | None = None,
                    kind: str = CAVITY,
-                   pcs: dict | None = None) -> None:
+                   pcs: dict | None = None,
+                   tds: dict | None = None) -> None:
         """Create the upload row. Status starts ``queued``, not ``running``.
 
         ``target`` is the machine the upload-time estimate chose. It is recorded
@@ -312,15 +336,30 @@ class JobStore:
         absent case, and for the same reason: ``{}`` would be a request with
         every field missing, which is a claim rather than an absence. It is
         serialised with ``json.dumps`` here for the same psycopg2 reason too.
+        ``tds`` is the time-domain request and follows ``pcs`` exactly: NULL
+        for every other kind, ``json.dumps`` for the same reason.
         """
+        if kind not in KINDS:
+            # The column is free text, so the database would store a misspelt
+            # kind and the worker would fail it minutes later. Refused here,
+            # before the row exists.
+            raise ValueError(f"unknown job kind {kind!r}; expected one of {KINDS}")
+        if kind == TD and target != JETSON:
+            # A td job runs only on the Jetson worker; the cluster has no
+            # time-domain solver. Refused before the row exists, so no later
+            # path has to rescue a td row created on the wrong queue. (pc rows
+            # are not refused here: tests/pc_routing_check.py builds a cluster
+            # pc row on purpose to prove next_queued cannot see one.)
+            raise ValueError(f"a td job runs on the Jetson only; target "
+                             f"{target!r} is not {JETSON!r}")
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO mse.jobs "
                 "(job_id, original_filename, units, n_index, n_modes, status, stage, "
                 " target, est_tets, min_feature_m, min_feature_value, "
-                " min_feature_unit, scale, gpu_queued_at, materials, kind, pcs) "
+                " min_feature_unit, scale, gpu_queued_at, materials, kind, pcs, tds) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "        CASE WHEN %s = 'jetson' THEN now() END, %s, %s, %s)",
+                "        CASE WHEN %s = 'jetson' THEN now() END, %s, %s, %s, %s)",
                 (str(job_id), original_filename, units, float(n_index),
                  int(n_modes), QUEUED, QUEUED, target,
                  None if est_tets is None else int(est_tets),
@@ -331,7 +370,8 @@ class JobStore:
                  target,
                  None if materials is None else json.dumps(materials),
                  kind,
-                 None if pcs is None else json.dumps(pcs)),
+                 None if pcs is None else json.dumps(pcs),
+                 None if tds is None else json.dumps(tds)),
             )
 
     def mark_failed(self, job_id, message: str) -> None:
@@ -498,7 +538,8 @@ class JobStore:
                 "UPDATE mse.jobs SET lease_owner = NULL, "
                 "lease_expires_at = NULL, status = %s, stage = %s, "
                 "gpu_queued_at = now(), message = %s, "
-                "release_count = release_count + 1 "
+                "release_count = release_count + 1, "
+                "busy_since = NULL, busy_until = NULL "
                 "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
                 "AND status = %s "
                 "AND release_count < %s "
@@ -558,7 +599,7 @@ class JobStore:
                 "SELECT job_id, created_at, original_filename, units, n_index, "
                 "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
                 "finished_at, target, est_tets, min_feature_m, scale, "
-                "min_feature_value, min_feature_unit, materials, kind, pcs "
+                "min_feature_value, min_feature_unit, materials, kind, pcs, tds "
                 "FROM mse.jobs WHERE job_id = %s",
                 (str(job_id),),
             )
@@ -571,7 +612,7 @@ class JobStore:
                 "SELECT job_id, created_at, original_filename, units, n_index, "
                 "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
                 "finished_at, target, est_tets, min_feature_m, scale, "
-                "min_feature_value, min_feature_unit, materials, kind, pcs "
+                "min_feature_value, min_feature_unit, materials, kind, pcs, tds "
                 "FROM mse.jobs ORDER BY created_at DESC LIMIT %s",
                 (int(limit),),
             )
@@ -602,19 +643,20 @@ class JobStore:
         the worker API instead -- see ``claim_jetson``.
 
         Filtered by kind as well, and this is not belt-and-braces. The cluster
-        has no pc solver: ``launcher.create`` builds a CAVITY Job from whatever
-        row it is handed, so a ``kind='pc'`` row reaching here would be
-        cavity-solved and its band diagram would never be produced. The kind
-        filter is what makes the cluster queue unable to see a pc row at all,
-        independent of which target the row carries.
+        has no pc or td solver: ``launcher.create`` refuses any kind but cavity,
+        so a ``kind='pc'`` or ``'td'`` row reaching here would be failed at
+        launch instead of waiting for the Jetson. The kind filter is what makes
+        the cluster queue unable to see such a row at all, independent of which
+        target the row carries. It is a WHITELIST (``kind = 'cavity'``), so a
+        kind added later is invisible here until a cluster solver exists for it.
         """
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT job_id, original_filename, units, n_index, n_modes, est_tets, "
                 "min_feature_m, scale, materials, kind "
-                "FROM mse.jobs WHERE status = %s AND target = %s AND kind <> %s "
+                "FROM mse.jobs WHERE status = %s AND target = %s AND kind = %s "
                 "ORDER BY created_at LIMIT 1",
-                (QUEUED, target, PC),
+                (QUEUED, target, CAVITY),
             )
             row = cur.fetchone()
         if not row:
@@ -667,9 +709,13 @@ class JobStore:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT job_id, units, n_index, n_modes, min_feature_m, scale, materials, "
-                "kind, pcs "
+                "kind, pcs, tds "
                 "FROM mse.jobs "
                 "WHERE target = %s AND status = %s AND lease_owner IS NULL "
+                # A td job the worker just deferred as "Jetson busy" sits out
+                # until ``busy_until``, or the same worker would claim it again
+                # at once and spin. Every other row has busy_until NULL.
+                "AND (busy_until IS NULL OR busy_until <= now()) "
                 "ORDER BY created_at "
                 "FOR UPDATE SKIP LOCKED LIMIT 1",
                 (JETSON, QUEUED),
@@ -688,7 +734,7 @@ class JobStore:
         return {"job_id": job_id, "units": row[1], "n_index": row[2],
                 "n_modes": row[3], "min_feature_m": row[4], "scale": row[5],
                 "lease_owner": owner, "materials": row[6], "kind": row[7],
-                "pcs": row[8]}
+                "pcs": row[8], "tds": row[9]}
 
     def renew_lease(self, job_id, owner: str, lease_seconds: float) -> bool:
         """Extend ``owner``'s lease. Returns whether it still holds it.
@@ -914,7 +960,8 @@ class JobStore:
             cur.execute(
                 "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL, "
                 "status = %s, stage = %s, gpu_queued_at = now(), "
-                "release_count = release_count + 1 "
+                "release_count = release_count + 1, "
+                "busy_since = NULL, busy_until = NULL "
                 "WHERE job_id = %s AND lease_owner = %s AND release_count < %s "
                 "RETURNING release_count",
                 (QUEUED, "queued", str(job_id), owner, MAX_RELEASES),
@@ -966,6 +1013,61 @@ class JobStore:
                 (FAILED, FAILED,
                  _terminal_message(message, row[0]),
                  str(job_id), owner),
+            )
+            return "failed"
+
+    def defer_busy(self, job_id, owner: str, message: str = "") -> str | None:
+        """Put a td job back in the queue because the Jetson is short of memory.
+
+        Returns ``"deferred"``, ``"failed"`` (it has waited ``BUSY_WAIT_MINUTES``
+        since its first deferral) or ``None`` (not this owner's lease, or not a
+        td job -- the caller answers 409).
+
+        NOT a release. A busy Jetson says nothing about the job, so
+        ``release_count`` is left alone: three deferrals would otherwise fail a
+        job that never ran. The bound here is the wall-clock wait instead,
+        measured from ``busy_since``, which the first deferral sets and later
+        ones keep. ``busy_until`` holds the job out of the claim query for
+        ``BUSY_RETRY_SECONDS``, so the worker that just deferred it does not
+        claim it straight back. ``target`` is not touched: a td job stays on the
+        Jetson queue, the only place it can run.
+
+        One statement for the deferral, with the bound in its WHERE, for the
+        reason ``release_jetson`` is one: the database makes the comparison, so
+        a deferral after the deadline matches nothing and takes the failure
+        branch.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL, "
+                "status = %s, stage = %s, message = %s, "
+                "busy_since = COALESCE(busy_since, now()), "
+                "busy_until = now() + make_interval(secs => %s) "
+                "WHERE job_id = %s AND lease_owner = %s AND kind = %s "
+                "AND (busy_since IS NULL "
+                "     OR busy_since > now() - make_interval(mins => %s)) "
+                "RETURNING busy_since",
+                (QUEUED, BUSY_STAGE, _busy_message(message),
+                 float(BUSY_RETRY_SECONDS), str(job_id), owner, TD,
+                 int(BUSY_WAIT_MINUTES)),
+            )
+            if cur.fetchone() is not None:
+                return "deferred"
+            # Zero rows: not ours, not td, or past the wait. Only the last fails.
+            cur.execute(
+                "SELECT busy_since <= now() - make_interval(mins => %s) "
+                "FROM mse.jobs WHERE job_id = %s AND lease_owner = %s "
+                "AND kind = %s",
+                (int(BUSY_WAIT_MINUTES), str(job_id), owner, TD),
+            )
+            row = cur.fetchone()
+            if row is None or not row[0]:
+                return None
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
+                "finished_at = now(), lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (FAILED, FAILED, BUSY_GAVE_UP_MESSAGE, str(job_id), owner),
             )
             return "failed"
 
@@ -1065,6 +1167,7 @@ def _job_row(row) -> dict:
         # ``materials`` for the same additive reason the column was.
         "kind": row[19],
         "pcs": row[20],
+        "tds": row[21],
     }
 
 

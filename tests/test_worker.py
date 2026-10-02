@@ -1464,3 +1464,194 @@ def test_a_pc_solve_that_raises_ends_the_job_failed_not_done(tmp_path, server,
     assert not (row.get("pcs") or {}).get("bands")
     assert server.store.keys_under(job["job_id"]) == []
 
+
+
+# ---------------------------------------------------------------------------
+# Kind dispatch: one decision (``job_kind``), every kind named, nothing falls
+# through to the cavity fetch and mesh
+# ---------------------------------------------------------------------------
+
+class _RecordingAPI:
+    """The worker-facing API surface ``run_job`` touches, recording each call.
+
+    Used where the question is ORDER -- was the input fetched, and before the
+    solve or not at all -- which a real server answers only indirectly (a 404
+    becomes a transient release several layers away). Signatures are the real
+    ``WorkerAPI`` ones.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def fetch_input(self, job_id):
+        self.calls.append(("fetch_input", job_id))
+        return b"o 1\n"
+
+    def progress(self, job_id, stage):
+        self.calls.append(("progress", job_id, stage))
+
+    def failed(self, job_id, message):
+        self.calls.append(("failed", job_id, message))
+
+    def release(self, job_id, message=""):
+        self.calls.append(("release", job_id, message))
+        return {}
+
+    def busy(self, job_id, message=""):
+        self.calls.append(("busy", job_id, message))
+        return {"ok": True, "deferred": True, "failed": False}
+
+    def names(self):
+        return [c[0] for c in self.calls]
+
+
+def _recording_worker(tmp_path, solve):
+    config = W.Config("http://unused.invalid", TOKEN,
+                      work_root=tmp_path / "work",
+                      lock_path=tmp_path / "gpu.lock",
+                      poll_seconds=0.05, keep_failed=1, beat_seconds=60.0)
+    api = _RecordingAPI()
+    worker = W.Worker(config, api, FakeLock(), solve=solve,
+                      store_factory=_local_store, log=lambda m, **k: None)
+    return worker, api
+
+
+def test_an_unknown_kind_fails_before_anything_is_fetched(tmp_path):
+    """``run_job`` refuses a kind it lacks BEFORE the input fetch, terminally.
+
+    RED before the fix: ``run_job`` decided ``is_pc = kind == "pc"`` and sent
+    every other kind down the cavity branch -- it fetched an input and set the
+    stage to "meshing" -- and only ``real_solve`` refused it, after the fetch.
+    """
+    solved = []
+    worker, api = _recording_worker(tmp_path, lambda *a, **k: solved.append(a))
+
+    result = worker.run_job({"job_id": "u-1", "kind": "hologram"})
+
+    assert result == "failed"
+    assert "fetch_input" not in api.names(), (
+        "a kind the worker cannot run must not fetch an input first")
+    assert solved == [], "nor reach the solve"
+    failed = [c for c in api.calls if c[0] == "failed"]
+    assert len(failed) == 1, f"terminal /failed exactly once, got {api.names()}"
+    assert "hologram" in failed[0][2], "the owner's message names the kind"
+    assert "release" not in api.names(), (
+        "an unknown kind is a verdict about the row, not a blip to retry")
+
+
+def test_a_td_job_fetches_its_upload_and_is_never_meshing(tmp_path):
+    """A td job has an upload (unlike pc), and its stage is "solving".
+
+    The fetch must happen, and BEFORE the solve: the td solve voxelises the
+    upload. "meshing" is the cavity's TetGen phase, which a td job never runs.
+    """
+    seen = {}
+
+    def solve(job, store_in, store_out, stage=None):
+        seen["calls_at_solve"] = list(api.names())
+        seen["stage"] = stage.stage
+        raise RuntimeError("stop here: the order is what is under test")
+
+    worker, api = _recording_worker(tmp_path, solve)
+    worker.run_job({"job_id": "t-1", "kind": "td", "tds": {}})
+
+    assert seen, "the td job must reach the solve"
+    assert "fetch_input" in seen["calls_at_solve"], (
+        "a td job's upload must be fetched before its solve")
+    assert seen["stage"] == "solving"
+    assert ("progress", "t-1", "meshing") not in api.calls
+
+
+def test_real_solve_dispatches_td_to_its_own_module(monkeypatch):
+    """``real_solve`` sends kind='td' to ``td_solve.solve_td`` -- not the cavity."""
+    import types
+
+    calls = []
+    fake = types.ModuleType("td_solve")
+    fake.solve_td = lambda job, store_in, store_out, stage: calls.append(job) or "ok"
+    monkeypatch.setitem(sys.modules, "td_solve", fake)
+    pc_calls = []
+    _install_fake_pc_solve(monkeypatch, pc_calls)
+
+    assert W.real_solve({"job_id": "t-2", "kind": "td"}, None, None, None) == "ok"
+    assert [j["job_id"] for j in calls] == ["t-2"]
+    assert pc_calls == []
+
+
+def test_the_worker_runs_exactly_the_kinds_the_app_creates():
+    """``WORKER_KINDS`` and the app's ``db.KINDS`` name the same kinds.
+
+    A kind the app can create but the worker refuses would fail every such job;
+    one the worker runs but the app cannot create is dead code. Read from both
+    sources, not retyped here.
+    """
+    assert set(W.WORKER_KINDS) == set(DB.KINDS)
+
+
+# ---------------------------------------------------------------------------
+# td outcomes: busy is an uncounted deferral; a td refusal or stop is terminal
+# ---------------------------------------------------------------------------
+
+def _td_errors():
+    sys.path.insert(0, str(Path(W.__file__).resolve().parent))
+    import td_solve
+    return td_solve
+
+
+def test_classify_maps_jetson_busy_to_busy_and_td_stops_to_terminal():
+    td = _td_errors()
+    assert W.classify(td.JetsonBusy("needs 9 GB, 2 GB free")) == "busy"
+    # A TDSolveError is a verdict whatever its cause chain: solve_td raises one
+    # only for a refusal or a stop, and lets a bare device error through. The
+    # first two are the OOM stop as solve_td builds it; those would be terminal
+    # even without the td arm, because the chain says "out of memory" (a GPU
+    # STATUS word). The third is the case the arm exists for, a contract rather
+    # than a path solve_td takes today: a stop whose chain the wrapper-walking
+    # GPU branch reads as an INIT fault, which would release it and loop it.
+    class CUDARuntimeError(RuntimeError):
+        pass
+
+    for message, cause in (
+            ("The Jetson ran out of memory during the run", MemoryError("out of memory")),
+            ("The Jetson ran out of memory during the run",
+             CUDARuntimeError("cudaErrorMemoryAllocation: out of memory")),
+            ("The run was stopped after 45 minutes",
+             CUDARuntimeError("cudaErrorInitializationError: initialization error"))):
+        try:
+            try:
+                raise cause
+            except Exception as inner:
+                raise td.TDSolveError(message) from inner
+        except td.TDSolveError as stop:
+            assert W.classify(stop) == "terminal", (message, str(cause))
+    assert W.classify(td.TDSolveError("stopped after 45 minutes")) == "terminal"
+
+
+def test_a_busy_td_job_is_deferred_not_failed_or_released(tmp_path):
+    td = _td_errors()
+
+    def solve(job, store_in, store_out, stage=None):
+        raise td.JetsonBusy("The Jetson is busy: needs 9.0 GB, 2.0 GB free")
+
+    worker, api = _recording_worker(tmp_path, solve)
+    worker.run_job({"job_id": "t-9", "kind": "td", "tds": {}})
+
+    assert [c[0] for c in api.calls if c[0] in ("busy", "failed", "release")] \
+        == ["busy"], api.names()
+    busy = [c for c in api.calls if c[0] == "busy"][0]
+    assert "9.0 GB" in busy[2], "the deferral carries the owner's sentence"
+
+
+def test_a_td_stop_reaches_the_owner_in_its_own_words(tmp_path):
+    td = _td_errors()
+    said = "The run was stopped after 45 minutes. Increase dx."
+
+    def solve(job, store_in, store_out, stage=None):
+        raise td.TDSolveError(said)
+
+    worker, api = _recording_worker(tmp_path, solve)
+    worker.run_job({"job_id": "t-8", "kind": "td", "tds": {}})
+
+    failed = [c for c in api.calls if c[0] == "failed"]
+    assert [c[2] for c in failed] == [said], api.names()
+    assert "release" not in api.names()

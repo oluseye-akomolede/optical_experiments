@@ -330,8 +330,18 @@ def main(argv=None) -> int:
               f"{shape[2]} = {cells}, {n_steps} steps = "
               f"{cells * n_steps:.3g} cell-steps", flush=True)
         clock = time.perf_counter()
-        run = fdtd.simulate(eps.astype(np.float32), source, n_steps, [probe],
-                            spacings=spacings, boundary="metal", xp=xp)
+        try:
+            run = fdtd.simulate(eps.astype(np.float32), source, n_steps,
+                                [probe], spacings=spacings, boundary="metal",
+                                xp=xp)
+        except Exception:  # noqa: BLE001 -- the solver's failure IS the result
+            # Raised by the solver mid-run: a FAIL (exit 1), not "did not
+            # run". run()'s exit 2 is for the bench's own setup and imports;
+            # catching the solver here keeps a solver bug from reading as one.
+            import traceback
+            traceback.print_exc()
+            print(f"V5 FAIL: the solver raised during the film x{ratio:g} run")
+            return 1
         print(f"           {time.perf_counter() - clock:.1f} s", flush=True)
         trace = np.asarray(run["traces"][0], dtype=np.float64)[start_step:]
         frequencies, amplitude = fdtd.spectrum(trace, run["dt"])
@@ -372,8 +382,10 @@ def main(argv=None) -> int:
 
 
 def run(argv=None) -> int:
-    """main(), with any crash reported as "did not run" (exit 2): a crash
-    measured nothing, and exit 1 would read as a FAIL of the solver."""
+    """main(), with a crash in the bench's setup reported as "did not run"
+    (exit 2): it measured nothing, and exit 1 would read as a FAIL of the
+    solver. A solver exception mid-run never gets here; main() reports it as a
+    FAIL (exit 1)."""
     try:
         return main(argv)
     except Exception:  # noqa: BLE001

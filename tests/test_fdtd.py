@@ -943,3 +943,21 @@ def test_a_drawn_waveform_is_zero_mean_on_the_steps_the_run_takes():
     values = np.array([source.value(k * run["dt"])
                        for k in range(int(duration / run["dt"]) + 2)])
     assert abs(values.sum()) < 1e-9 * np.abs(values).sum()
+
+
+def test_check_hook_is_called_every_check_every_steps_and_can_stop_the_run():
+    seen = []
+    eps = np.ones((6, 5, 4), dtype=np.float32)
+    n = 2 * fdtd.CHECK_EVERY + 2
+    fdtd.simulate(eps, pulse(cell=(3, 2, 2)), n, check=seen.append)
+    assert seen == [0, fdtd.CHECK_EVERY, 2 * fdtd.CHECK_EVERY]
+
+    class Stop(Exception):
+        pass
+
+    def stop(step):
+        if step:
+            raise Stop(step)
+    with pytest.raises(Stop) as info:
+        fdtd.simulate(eps, pulse(cell=(3, 2, 2)), n, check=stop)
+    assert info.value.args == (fdtd.CHECK_EVERY,)

@@ -266,6 +266,21 @@ def classify(exc: BaseException) -> str:
 
     name = type(exc).__name__
 
+    # A td job: ``JetsonBusy`` is no verdict and no failure (the uncounted
+    # deferral), and a ``TDSolveError`` is a verdict on the job with a message
+    # already written for the owner, including the out-of-memory and 45-minute
+    # stops. Today the default arm would also say "terminal" (the OOM stop is
+    # raised FROM the device error, and no branch below matches it); this is
+    # explicit so a new transient branch further down cannot capture it.
+    try:
+        from td_solve import JetsonBusy, TDSolveError  # noqa: PLC0415
+    except ImportError:                       # pragma: no cover
+        JetsonBusy = TDSolveError = ()
+    if JetsonBusy and isinstance(exc, JetsonBusy):
+        return "busy"
+    if TDSolveError and isinstance(exc, TDSolveError):
+        return "terminal"
+
     # --- transient: this worker could not, another one might ---
     if isinstance(exc, LeaseLost):
         # Not a verdict at all: the job was taken from us. Reporting it failed
@@ -566,6 +581,25 @@ class WorkerAPI:
                 # nothing to undo.
                 return
             raise
+
+    def busy(self, job_id: str, message: str = "") -> dict:
+        """Requeue a td job because the Jetson is short of GPU memory.
+
+        Uncounted, unlike ``release``; the app bounds the wait by time and
+        fails the job itself once it is over (``{"failed": True}``).
+        """
+        try:
+            _status, payload = self._request("POST",
+                                             f"/worker/jobs/{job_id}/busy",
+                                             json_body={"message": message[:2000]})
+        except APIError as exc:
+            if exc.status == 409:
+                return {"ok": False, "deferred": False, "failed": False}
+            raise
+        try:
+            return json.loads(payload) if payload else {"ok": True}
+        except ValueError:
+            return {"ok": True}
 
     def release(self, job_id: str, message: str = "") -> dict:
         """Hand the job back with NO verdict, because the reason was transient.
@@ -879,25 +913,41 @@ class Worker:
         work_dir = job_dir(self.config.work_root, job_id)
         reporter = StageReporter()
 
-        #: WHICH SOLVE this is. Read once, from the claim, and used for every
-        #: decision below that a cavity job and a pc job answer differently:
-        #: the input fetch, the result scan, the stage names, and this log
-        #: line. It is the same field ``real_solve`` dispatches on, so the
-        #: method states the kind in one place rather than testing it at each
-        #: site -- which is how the fetch came to be missing a test in the
-        #: first place.
-        is_pc = job.get("kind") == "pc"
+        #: WHICH SOLVE this is. Decided once, by ``job_kind`` -- the same
+        #: function ``real_solve`` dispatches through -- and used for every
+        #: decision below that the kinds answer differently: the input fetch,
+        #: the result scan, the stage names, and this log line. An unknown kind
+        #: is refused HERE, before the fetch, inside the ``try`` below so it is
+        #: reported as a failed job. It used to be ``is_pc = kind == "pc"``,
+        #: which sent every non-pc kind (a td job included) down the cavity
+        #: fetch and "meshing" stage before ``real_solve`` refused it.
+        try:
+            kind = job_kind(job)
+        except WorkerError as exc:
+            self._log(f"claimed {job_id}: {exc}")
+            self._fail(job_id, work_dir, exc)
+            self.lock.release()
+            return "failed"
+        is_pc = kind == PC
+        #: Only cavity and td jobs have an upload. A pc job's unit cell is
+        #: built inside its solve, and the app has no input.obj for it.
+        has_upload = kind in (CAVITY, TD)
 
         # A pc job has no ``n_modes`` and no upload units: it is a band diagram
         # of a unit cell, and its parameters live in ``pcs``. Logging the
         # cavity fields would print "None modes, units None, scale None" for
         # every pc job, which reads as a malformed claim rather than as the
-        # other kind of job it is.
+        # other kind of job it is. A td job likewise has no ``n_modes``.
         if is_pc:
             pcs = job.get("pcs") or {}
             self._log(f"claimed {job_id}: pc, {pcs.get('lattice')} lattice, "
                       f"r/a={pcs.get('r_over_a')}, {pcs.get('n_bands')} bands, "
                       f"{pcs.get('polarisation')}")
+        elif kind == TD:
+            tds = job.get("tds") or {}
+            self._log(f"claimed {job_id}: td, {tds.get('source_kind')} source, "
+                      f"{tds.get('profile')} profile, {tds.get('boundary')} "
+                      f"boundary, units {job.get('units')}")
         else:
             self._log(f"claimed {job_id}: {job.get('n_modes')} modes, "
                       f"units {job.get('units')}, scale {job.get('scale')}")
@@ -912,16 +962,16 @@ class Worker:
             # (``_done`` -> ``done_bands``) rather than as result files. Fetching
             # here would 404 -- the app has no input.obj for a pc row -- and the
             # result scan after the solve would then find no files to upload, so
-            # BOTH steps are skipped from the one ``is_pc`` decision above.
+            # BOTH steps are skipped from the one ``kind`` decision above.
             store = self._store_factory(work_dir, job_id)
-            if not is_pc:
+            if has_upload:
                 input_bytes = self.api.fetch_input(job_id)
                 store.write(_input_key(job_id), input_bytes)
 
             # The stage names the phase the owner is shown. "meshing" would be a
             # lie for a pc job, whose mesh is built inside the solve -- the same
             # reason its solve branch reports "solving".
-            self._stage = "solving" if is_pc else "meshing"
+            self._stage = "meshing" if kind == CAVITY else "solving"
             reporter.stage = self._stage
             summary = self._solve(job, store, store, stage=reporter)
             if self.stop.is_set():
@@ -1055,6 +1105,23 @@ class Worker:
             # app's own response body. On a 5xx the body is where the app's
             # traceback would be, truncated to 500 chars by ``_request``.
             self._log(f"job {job_id}: the app refused a call -- {exc.describe()}")
+        if kind == "busy":
+            # Not a failure: the app requeues the row without counting it and
+            # fails it itself once the wait is over. No failure directory.
+            try:
+                answer = self.api.busy(job_id, message)
+            except APIError as api_exc:
+                self._log(f"could not defer {job_id} ({api_exc}); the lease "
+                          f"will expire and the app will requeue it")
+            else:
+                if answer.get("failed"):
+                    self._log(f"{job_id}: the Jetson stayed busy past the wait; "
+                              f"the app failed it")
+                elif not answer.get("ok", True):
+                    self._log(f"not deferring {job_id}: this worker no longer "
+                              f"holds it")
+            shutil.rmtree(work_dir, ignore_errors=True)
+            return
         if kind == "lease-lost":
             # ``_done`` raises LeaseLost rather than claiming a job it no longer
             # owns, and the app has already reassigned the row. Reporting
@@ -1364,6 +1431,14 @@ def _owner_message(exc: BaseException) -> str:
     """
     if isinstance(exc, WorkerError) and str(exc):
         return str(exc)
+    # A td refusal or stop (and the busy note) is written for the owner, like
+    # ``WorkerError``: the dx/duration advice in it is the part they act on.
+    try:
+        from td_solve import JetsonBusy, TDSolveError  # noqa: PLC0415
+        if isinstance(exc, (JetsonBusy, TDSolveError)) and str(exc):
+            return str(exc)
+    except ImportError:                       # pragma: no cover
+        pass
     try:
         if str(_SOLVER_DIR) not in sys.path:
             sys.path.insert(0, str(_SOLVER_DIR))
@@ -1373,6 +1448,38 @@ def _owner_message(exc: BaseException) -> str:
                 "has been recorded; please try again, or contact support if it "
                 "keeps happening.")
     return SOLVER.owner_message(exc)
+
+
+#: The kinds this worker runs. The app's ``db.KINDS`` names the same three;
+#: a test pins the two against each other.
+CAVITY, PC, TD = "cavity", "pc", "td"
+WORKER_KINDS = (CAVITY, PC, TD)
+
+
+def job_kind(job: dict) -> str:
+    """The claim's kind, or a NAMED terminal failure for one this worker lacks.
+
+    The ONE decision both ``run_job`` and ``real_solve`` dispatch on. Every
+    kind is matched explicitly; nothing falls through to the cavity solve. That
+    fall-through is the defect this replaced: anything that was not ``pc`` was
+    fetched and meshed as a cavity -- the same shape as the cluster launching a
+    pc row as a cavity Job, on the other machine.
+
+    ``None`` is a cavity job: it means the claim did not say, which is how a
+    cavity row created before ``kind`` existed arrives. Nothing else is
+    defaulted -- not ``""``, not a different spelling.
+    """
+    kind = job.get("kind")
+    if kind is None:
+        return CAVITY
+    if kind in WORKER_KINDS:
+        return kind
+    raise WorkerError(
+        f"the worker does not implement kind={kind!r}; it solves "
+        f"{', '.join(repr(k) for k in WORKER_KINDS)}. Refusing rather than "
+        f"falling through to the cavity solver, which would produce a result "
+        f"for a job the worker did not understand."
+    )
 
 
 def real_solve(job: dict, store_in, store_out, stage: StageReporter | None = None):
@@ -1388,7 +1495,8 @@ def real_solve(job: dict, store_in, store_out, stage: StageReporter | None = Non
     that made every large job fail. A claim that arrives without them is a
     protocol error, not a cue to guess.
     """
-    if job.get("kind") == "pc":
+    kind = job_kind(job)
+    if kind == PC:
         # A photonic-crystal job: no mesh, no GPU, no modes. Dispatched on the
         # claim's kind, which the app set from the row -- the worker does not
         # guess a kind from the payload's shape, because a cavity job with an
@@ -1409,20 +1517,17 @@ def real_solve(job: dict, store_in, store_out, stage: StageReporter | None = Non
         return {"job_id": str(job["job_id"]), "kind": "pc", "bands": bands,
                 "modes": []}
 
-    if job.get("kind") not in (None, "cavity"):
-        # Every other kind is a NAMED failure, not a cavity solve. This used to
-        # be a silent else: anything that was not `pc` fell through to the
-        # cavity path, so a row carrying a kind the worker does not implement
-        # would be solved as if it were a cavity -- the same shape of defect as
-        # the cluster launching a pc row as a cavity Job, on the other machine.
-        # `None` is allowed because it means the claim did not say, which is how
-        # a cavity row created before `kind` existed arrives.
-        raise WorkerError(
-            f"the worker does not implement kind={job.get('kind')!r}; it solves "
-            f"kind='cavity' and kind='pc'. Refusing rather than falling through "
-            f"to the cavity solver, which would produce a result for a job the "
-            f"worker did not understand."
-        )
+    if kind == TD:
+        # A time-domain job. Its own module, like pc: the request is ``tds``.
+        from td_solve import solve_td  # noqa: PLC0415 - sibling module, late
+
+        if stage is not None:
+            stage.stage = "solving"
+        return solve_td(job, store_in, store_out, stage)
+
+    # Only a cavity job reaches here: ``job_kind`` refused everything it does
+    # not name, and pc and td returned above.
+    assert kind == CAVITY, kind
 
     if str(_SOLVER_DIR) not in sys.path:
         sys.path.insert(0, str(_SOLVER_DIR))

@@ -101,6 +101,10 @@ PML_REFLECTION = 1e-12
 DEFAULT_PML_CELLS = 10
 
 
+#: How often ``simulate`` calls its ``check`` hook, in steps.
+CHECK_EVERY = 64
+
+
 class FDTDError(Exception):
     """Anything this module refuses to run, named in the message."""
 
@@ -1327,7 +1331,7 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
              *, spacings=None, dx: float = 1.0,
              boundary: str = "metal", pec=None, pml_cells: int = DEFAULT_PML_CELLS,
              xp=None, record_energy: bool = False, energy_region=None,
-             record_peak: bool = False, ade_terms=()) -> dict:
+             record_peak: bool = False, ade_terms=(), check=None) -> dict:
     """Run the grid and return the probe traces.
 
     ``eps_r`` ``(nx, ny, nz)`` is the relative permittivity of each node and it
@@ -1370,6 +1374,12 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     running maximum kept on the device (no sync a step), so a check that a
     region stayed quiet "throughout the run" reads every cell of it rather
     than a handful of probes.
+
+    ``check``, if given, is called as ``check(step)`` before step 0 and every
+    ``CHECK_EVERY`` steps after it, on the host; it stops the run by raising
+    (the worker's 45-minute limit). It reads no device value, so it adds no
+    sync: on cupy the host may be a launch queue ahead of the device, which
+    is seconds, not minutes.
     """
     xp = np if xp is None else xp
     f32 = xp.float32
@@ -1664,6 +1674,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
         eps64 = xp.asarray(eps, dtype=xp.float64)[region]
 
     for step in range(n_steps):
+        if check is not None and step % CHECK_EVERY == 0:
+            check(step)
         t = step * dt
         if energy is not None:
             h_before = (Hx.copy(), Hy.copy(), Hz.copy())      # H at n-1/2

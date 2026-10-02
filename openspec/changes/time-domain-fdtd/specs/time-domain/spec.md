@@ -260,6 +260,40 @@ that exceeded it, and the form lever that reduces it.
   open and open-plus-gold runs at about 1 M and 4 M cells on the Jetson, beside
   the estimate, and the run-time limit's rates come from those measurements
 
+### Requirement: A time-domain job SHALL be stored as kind `td` with a keyed request
+
+A `td` job SHALL be stored in the jobs table with `kind = 'td'` and its request
+in a `tds` JSON column, NULL for every other kind. The request keys SHALL be
+exactly the worker's `REQUEST_KEYS` list (`boundary`, `source_kind`, `profile`,
+`frequency_hz`, `bandwidth`, `position`, `direction`, `polarisation`,
+`samples`, `sample_duration_s`, `duration_s`, `probes`, `dx_m`). Every key SHALL
+be present; a key that does not apply to the chosen source holds null. The
+worker SHALL refuse a request with a missing key, naming every missing key, and
+SHALL refuse a `tds` that is not an object. Keys outside the list SHALL be
+ignored, so results written back to the row are never read as input. The TF/SF
+box is derived from the geometry, not stored. The claim payload SHALL always
+carry `tds` (null for other kinds). Creating a job with a kind outside the known
+kinds (`cavity`, `pc`, `td`) SHALL be refused before any row is written. The
+column is added idempotently by `db/001_schema.sql` and dropped by
+`db/003_rollback_td.sql`.
+
+#### Scenario: a missing request key is named
+- **WHEN** a claimed `td` job's `tds` lacks one or more keys
+- **THEN** the worker refuses it with a message naming every missing key
+
+#### Scenario: a misspelt kind never reaches the table
+- **WHEN** a job is created with kind `TD`
+- **THEN** it is refused and no INSERT is sent
+
+#### Scenario: the worker dispatches every kind by name
+- **WHEN** the worker claims a job
+- **THEN** it decides the kind once, before fetching anything: `cavity` (or no
+  kind, a row older than the column) and `td` fetch their upload, `pc` fetches
+  nothing, and a `td` job is reported as "solving", never "meshing"
+- **AND** a kind outside the worker's list fails terminally with a message
+  naming it, before any input is fetched, and is never solved as a cavity
+- **AND** the worker's kind list equals the app's
+
 ### Requirement: The worker SHALL run a time-domain job only with the memory it needs
 
 The worker SHALL run at most one GPU job at a time when one of them is `td`.
@@ -280,10 +314,24 @@ limit.
 - **THEN** the job stays queued with a "Jetson busy" status and runs once
   memory is free
 
+#### Scenario: waiting for memory does not use up the retries
+- **WHEN** the worker defers a `td` job because the Jetson is busy, any number
+  of times within the 60 minutes
+- **THEN** the job's release count is unchanged (a busy machine is no verdict
+  on the job), the 60 minutes are counted from the FIRST deferral and later
+  deferrals do not restart them, and the job is not handed out again for 60
+  seconds after each deferral, so the worker does not claim it straight back
+- **AND** only a `td` job can be deferred this way, and only by the worker that
+  holds its lease
+- **AND** a release or an expired lease requeues the job with a fresh wait: a
+  deferral after that starts a new 60 minutes, so an old wait cannot fail it
+
 #### Scenario: a Jetson that stays busy fails readably
 - **WHEN** free memory stays short for 60 minutes
 - **THEN** the job fails with a message saying the Jetson stayed busy, and it was
   never moved to the cluster queue
+- **AND** it is finished like any failed job: its lease is released and its
+  finish time is set
 
 #### Scenario: memory taken mid-run fails readably
 - **WHEN** the device runs out of memory during a `td` run
@@ -292,6 +340,23 @@ limit.
 #### Scenario: an overlong run is stopped
 - **WHEN** a `td` run passes 45 minutes of run time
 - **THEN** it is stopped and the job fails with a message naming the limit
+- **AND** the run time is checked before the first step and every 64 steps
+  after it, on the host without reading any device value, so the stop comes at
+  most 64 steps late and the check adds no device sync; the message names the
+  step reached, the total, and the advice (increase dx or shorten the duration)
+
+#### Scenario: free memory is what a new run can take on the Orin
+- **WHEN** the worker checks free memory before a `td` run
+- **THEN** it compares the estimate with the kernel's MemAvailable (the Orin's
+  GPU shares system RAM) plus the blocks this process's cupy memory pool
+  already holds free, and runs on numpy when no device is present
+
+#### Scenario: a time-domain verdict is never retried
+- **WHEN** a `td` job is refused (layout, mesh, estimate or limits) or stopped
+  (out of memory, 45 minutes)
+- **THEN** it is failed with that message shown to the owner unchanged, never
+  released for another attempt, whatever error it was raised from; a device
+  error the solver does not translate is classified like any other job's
 
 ### Requirement: Dispersive metals SHALL follow their published model
 
@@ -359,9 +424,11 @@ refused before it is queued.
 
 ### Requirement: Thin layers SHALL be resolved, not lost
 
-The grid SHALL place at least 4 cells across every layer thinner than the
-coarse cell, or across the metal skin depth where that is thinner, with a
-neighbour spacing ratio of at most 1.3.
+The grid SHALL place at least 4 cells across every layer it is given that is
+thinner than the coarse cell, or across the metal skin depth where that is
+thinner, with a neighbour spacing ratio of at most 1.3. For a `td` upload the
+layers are the ones the layout rule detects; a thin feature it does not
+detect is reported by a caveat on the result, not resolved.
 
 #### Scenario: the grid builder keeps its own rules
 - **WHEN** the grid builder is given layers thinner than the coarse cell
@@ -409,7 +476,10 @@ neighbour spacing ratio of at most 1.3.
   of the family fails the run; a mode whose source × probe overlap is under 0.05
   is listed as not gated; and a setup whose grid dispersion at the top of the band
   exceeds half the tolerance, or whose film axis breaks the builder's rules, exits
-  2 (not a spec setup) unless the run already failed
+  2 (not a spec setup) unless the run already failed; a missing module or a
+  crash in the bench's own setup exits 2 ("did not run"), while an exception
+  raised by the solver during a run exits 1 (a FAIL), so a solver bug never
+  reads as a bench problem
 
 ### Requirement: The upload's parts SHALL be voxelised onto the grid
 
@@ -438,6 +508,97 @@ refractive index of at least 1, `pec`, or one of the Rakić metals.
   unknown material name, or gives an index below 1 or not finite
 - **THEN** the run is refused with a message naming the part(s) and, for a
   mismatch, the file's parts
+
+### Requirement: A `td` upload SHALL be laid out on its grid by one fixed rule
+
+The worker SHALL turn a `td` job's upload into a grid by this rule, and phase
+5's estimate SHALL use the same function, so the run that is estimated is the
+run that is solved.
+
+- **Parts.** The upload's named groups, each a closed surface, refused by name
+  otherwise. There is no enclosing-wall rule: in `open` space the parts are
+  separate objects. Each part takes its entry in the job's `materials` table
+  (a refractive index of at least 1, `pec`, or a Rakić metal name); a
+  one-part upload with no table takes the job's `n_index`.
+- **Frame.** Metres are mesh units × the unit's metres × `scale`. The origin is
+  the minimum corner of the parts' combined bounding box. `position` and every
+  probe are metres in this frame.
+- **Extent.** For `metal` the grid is exactly the bounding box: outside the
+  parts is the conductor. For `open` every side is padded by 16 cells of
+  `dx_m` (the 3-cell TF/SF clearance, 3 more cells, and the 10-cell CPML), for
+  a point source as well as a plane wave.
+- **Plane wave.** The TF/SF box is the bounding box grown by the 3-cell
+  clearance on every side. A plane wave with `metal` is refused, as in phase 2.
+- **Cells.** The coarse cell is `dx_m`. On each axis a part whose
+  bounding-box extent is under 4 `dx_m` adds a layer over that extent with
+  spacing a quarter of the extent, so it has at least 4 cells across. A metal
+  part adds, on each axis, a layer 3 skin depths deep inside each of its two
+  bounding-box faces (the whole extent when it is thinner than 6), with spacing
+  a quarter of the skin depth at the top of the source band; where both apply
+  the smaller spacing wins. The skin depth is `fdtd_grid.skin_depth(metal, f)`
+  = c / (2π f κ), κ the imaginary part of √ε(f) of the Rakić model; the worker
+  and the estimate both call that function. The top of the band is
+  `frequency_hz + bandwidth` for a pulse and `frequency_hz` for `cw` and
+  `drawn`.
+- **Thin shells.** The layers above are the only thin features the layout
+  detects (axis-aligned extents and metal bounding-box faces). A curved thin
+  shell is voxelised at the grid it gets, and the estimate counts that grid;
+  the result carries the caveat "thin curved features are resolved only at
+  the coarse cell" whenever a part is not a box (its volume is under 0.99
+  of its bounding box's), since its thin walls may not be refined. The
+  thin-layer requirement applies to the detected layers.
+- **Refusals.** A probe or point-source position outside the grid, and a
+  boundary other than `metal` or `open`, are refused before anything is
+  allocated, naming the value. A point source or probe whose nearest node is a
+  conductor (the `metal` boundary's outside, a `pec` part, or a Rakić-metal
+  part's interior) is refused, naming the position and the part, since its
+  source would inject nothing and its trace would read as "no response".
+  With `open`, a point source or probe whose nearest node lies in the 10-cell
+  CPML at either end of any axis is refused, naming the position and the
+  range it must lie in: the layer absorbs a source as it is injected and
+  damps what a probe reads. Periodic boundaries stay a phase 6 option.
+
+#### Scenario: the frame is the bounding box's corner in metres
+- **WHEN** a one-part box spanning 2..6 mm in x is laid out with units `mm`
+  and scale 1
+- **THEN** the grid's x nodes run from 0 to 4 mm for `metal`, and from
+  -16 `dx_m` to 4 mm + 16 `dx_m` for `open`
+
+#### Scenario: a thin metal plate is resolved at its skin depth
+- **WHEN** a gold plate thinner than 6 skin depths lies in `open` space
+- **THEN** no cell across the plate is wider than a quarter of gold's skin depth
+  at the top of the band, and the plate's faces are grid nodes
+
+#### Scenario: separate objects need no wall
+- **WHEN** an `open` upload holds two closed parts, neither inside the other
+- **THEN** it is laid out without the cavity solver's one-wall refusal
+
+#### Scenario: a part thinner than 4 cells gets 4 cells
+- **WHEN** a dielectric plate 1.5 `dx_m` thick lies in `open` space
+- **THEN** at least 4 cells lie across the plate and no cell across it is wider
+  than a quarter of its thickness
+
+#### Scenario: a curved part carries the thin-feature caveat
+- **WHEN** a part is not a box (a sphere, say)
+- **THEN** the result carries the caveat that thin curved features are resolved
+  only at the coarse cell, and a box-only upload carries no such caveat
+
+#### Scenario: a source or probe inside a conductor is refused
+- **WHEN** a point source or probe sits on a conductor node (outside the parts
+  with `metal`, inside a `pec` part, or inside a Rakić-metal part)
+- **THEN** the job is refused before allocation, naming the position and the
+  part (or the metal boundary)
+
+#### Scenario: a source or probe inside the CPML is refused
+- **WHEN** with `open`, a point source or probe lies on the grid but its
+  nearest node is inside the 10-cell CPML
+- **THEN** the job is refused before allocation, naming the position and the
+  range outside the layer
+
+#### Scenario: a probe off the grid is named
+- **WHEN** a probe lies outside the laid-out grid
+- **THEN** the job is refused before allocation, naming the probe and the grid's
+  extent
 
 ### Requirement: A drawn waveform SHALL be checked against the grid
 

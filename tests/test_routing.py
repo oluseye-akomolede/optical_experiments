@@ -366,11 +366,11 @@ class RoutingDb(FakeDb):
     def create_job(self, job_id, filename, units, n_index, n_modes,
                    target=DB.CLUSTER, est_tets=None,
                    min_feature_m=None, scale=1.0,
-                   kind=DB.CAVITY, pcs=None):
+                   kind=DB.CAVITY, pcs=None, tds=None):
         super().create_job(job_id, filename, units, n_index, n_modes,
                            target=target, est_tets=est_tets,
                            min_feature_m=min_feature_m, scale=scale,
-                           kind=kind, pcs=pcs)
+                           kind=kind, pcs=pcs, tds=tds)
         self.jobs[str(job_id)].update(target=target, est_tets=est_tets,
                                       gpu_queued_at="2026-09-26T00:00:00+00:00"
                                       if target == DB.JETSON else None,
@@ -629,7 +629,7 @@ class LeaseDb(RoutingDb):
     #: held. A double that returns MORE than the query would is a double that
     #: cannot fail for the reason the query can.
     CLAIM_COLUMNS = ("job_id", "units", "n_index", "n_modes",
-                     "min_feature_m", "scale", "materials", "kind", "pcs")
+                     "min_feature_m", "scale", "materials", "kind", "pcs", "tds")
 
     def claim_jetson(self, owner, lease_seconds):
         for job in self.jobs.values():
@@ -654,6 +654,24 @@ class LeaseDb(RoutingDb):
         job = self.jobs.get(str(job_id))
         return bool(job and job.get("lease_owner") == owner
                     and not job.get("lease_expired"))
+
+    def defer_busy(self, job_id, owner, message=""):
+        # Modelled on web/db.py, including the two branches a double is most
+        # tempted to skip: a non-td row is refused (None), and the wait is
+        # bounded. ``busy_minutes`` stands in for now() - busy_since; tests set
+        # it to put a row past the bound. release_count is never touched.
+        job = self.jobs.get(str(job_id))
+        if not job or job.get("lease_owner") != owner or job.get("kind") != DB.TD:
+            return None
+        if job.get("busy_minutes", 0) >= DB.BUSY_WAIT_MINUTES:
+            job.update(status=DB.FAILED, stage=DB.FAILED,
+                       message=DB.BUSY_GAVE_UP_MESSAGE,
+                       lease_owner=None, lease_expires_at=None)
+            return "failed"
+        job.setdefault("busy_minutes", 0)
+        job.update(lease_owner=None, lease_expires_at=None, status=DB.QUEUED,
+                   stage=DB.BUSY_STAGE, message=DB._busy_message(message))
+        return "deferred"
 
     def release_jetson(self, job_id, owner, message=""):
         job = self.jobs.get(str(job_id))
@@ -2633,6 +2651,28 @@ def test_the_claim_payload_says_cavity_for_a_cavity_job(tmp_path, monkeypatch):
 
     assert "kind" in body and body["kind"] == DB.CAVITY
     assert "pcs" in body and body["pcs"] is None
+    assert "tds" in body and body["tds"] is None
+
+
+def test_the_claim_payload_carries_the_td_kind_and_request(tmp_path, monkeypatch):
+    """A td job reaches the worker with its kind and its request as an object.
+
+    Mutation that must turn this red: drop the ``"tds"`` line from
+    web/worker_api.py's claim payload.
+    """
+    monkeypatch.setenv("MSE_WORKER_TOKEN", "tok-abc-123")
+    db = LeaseDb()
+    tds = {"boundary": "open", "source_kind": "point", "profile": "pulse",
+           "frequency_hz": 4.0e14, "bandwidth": 0.5}
+    db.create_job("job-td", "box.obj", "nm", 1.0, 0, target=DB.JETSON,
+                  kind=DB.TD, tds=tds)
+    app, _s, _d, _l = _make(tmp_path, db=db)
+
+    body = app.test_client().post("/worker/claim",
+                                  headers=_auth()).get_json()
+
+    assert body["kind"] == DB.TD
+    assert body["tds"] == tds, "the request must arrive as an object, not a string"
 
 
 # ---------------------------------------------------------------------------
@@ -2811,3 +2851,130 @@ def test_a_pc_done_on_a_lost_lease_is_a_409(tmp_path, monkeypatch):
 
     assert resp.status_code == 409, resp.data
     assert "bands" not in (db.jobs["job-pc"].get("pcs") or {})
+
+
+# ---------------------------------------------------------------------------
+# A td job never leaves the Jetson (FDTD 4.2)
+#
+# The cluster runs only the cavity solver, so every path that can change a
+# row's ``target`` is driven here with a td row: the unclaimed-GPU fallback
+# (the tick's abandon pass), the reaper, lease expiry and release. The fake's
+# ``reroute_to_cluster`` deliberately has NO kind guard (the real SQL does), so
+# the abandon test reaches the app's own decision. tests/td_routing_check.py
+# proves the same properties against real Postgres.
+# ---------------------------------------------------------------------------
+
+_TDS = {"boundary": "open", "source_kind": "point", "profile": "pulse"}
+
+
+def _td_job(db, job_id="job-td"):
+    db.create_job(job_id, "u.obj", "um", 1.0, 0, target=DB.JETSON,
+                  est_tets=1_000, kind=DB.TD, tds=dict(_TDS))
+    return db.jobs[job_id]
+
+
+def test_an_unclaimed_td_job_stays_on_the_gpu_queue(tmp_path):
+    """Red on the pc-only guard: the td row is moved and logged as moved."""
+    db = RoutingDb()
+    _td_job(db)
+    logs: list[str] = []
+
+    moved = APP._reroute_abandoned_gpu_jobs(db, FakeLauncher(), log=logs.append)
+
+    assert moved == 0
+    assert db.jobs["job-td"]["target"] == DB.JETSON
+    assert db.reroutes == []
+    assert any("'td' job" in line and "stays queued for the GPU" in line
+               for line in logs), logs
+
+
+def test_the_abandon_pass_still_moves_a_cavity_row_beside_a_td_row(tmp_path):
+    """The whitelist must not freeze the cavity fallback it sits in."""
+    db = RoutingDb()
+    _td_job(db)
+    _jetson_job(db, est_tets=20_000, job_id="job-cav")
+
+    moved = APP._reroute_abandoned_gpu_jobs(db, FakeLauncher(), log=lambda _m: None)
+
+    assert moved == 1
+    assert db.jobs["job-cav"]["target"] == DB.CLUSTER
+    assert db.jobs["job-td"]["target"] == DB.JETSON
+
+
+def test_an_expired_td_lease_requeues_it_on_the_gpu(tmp_path):
+    db = RoutingDb()
+    job = _td_job(db)
+    job.update(lease_owner="w-dead", lease_expired=True, status=DB.RUNNING)
+
+    # The reclaim step alone: the whole tick would also run the launch pass,
+    # whose FakeDb.next_queued ignores target and kind (the real one takes
+    # cluster cavity rows only), so it would "launch" the td row in the double.
+    reclaimed = APP._reclaim_expired_leases(db, log=lambda _m: None)
+
+    assert reclaimed == ["job-td"]
+    assert db.jobs["job-td"]["target"] == DB.JETSON
+    assert db.jobs["job-td"]["status"] == DB.QUEUED
+
+
+def test_the_reaper_does_not_fail_a_running_td_job(tmp_path):
+    """A td row has no k8s Job by construction; its lease owns its liveness."""
+    db = RoutingDb()
+    job = _td_job(db)
+    job.update(status=DB.RUNNING, lease_owner="w-1", k8s_job_name=None)
+
+    failed = APP._fail_dead_jobs(FakeLauncher(), db, log=lambda _m: None)
+
+    assert failed == 0
+    assert db.jobs["job-td"]["status"] == DB.RUNNING
+    assert db.jobs["job-td"]["target"] == DB.JETSON
+
+
+def test_the_real_store_refuses_a_td_job_off_the_jetson():
+    """Refused before any connection, so no later path has to rescue the row."""
+    store = DB.JobStore({"host": "invalid.invalid", "dbname": "x"})
+    with pytest.raises(ValueError, match="Jetson only"):
+        store.create_job("job-td", "u.obj", "um", 1.0, 0, target=DB.CLUSTER,
+                         kind=DB.TD, tds=dict(_TDS))
+
+
+def _busy_td_job(db, job_id="td-1"):
+    db.create_job(job_id, "u.obj", "um", 1.0, 0, target=DB.JETSON,
+                  est_tets=1_000, kind=DB.TD,
+                  tds={"boundary": "open", "source_kind": "point"})
+    db.jobs[job_id]["lease_owner"] = WORKER.owner_id("tok-abc-123")
+    return db.jobs[job_id]
+
+
+def test_busy_requeues_a_td_job_without_spending_a_release(tmp_path, worker):
+    """4.2: a Jetson short of GPU memory is no verdict on the job."""
+    client, db, _store = worker
+    _busy_td_job(db)
+    resp = client.post("/worker/jobs/td-1/busy", headers=_auth(),
+                       json={"message": "3.1 GB free, 6.0 GB needed"})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "deferred": True, "failed": False}
+    row = db.jobs["td-1"]
+    assert row["status"] == DB.QUEUED and row["lease_owner"] is None
+    assert row["release_count"] == 0, "a busy deferral must not spend a release"
+    assert row["stage"] == DB.BUSY_STAGE
+    assert "6.0 GB needed" in row["message"]
+    assert f"{DB.BUSY_WAIT_MINUTES} minutes" in row["message"]
+
+
+def test_busy_on_a_lease_this_worker_does_not_hold_is_409(tmp_path, worker):
+    client, db, _store = worker
+    _busy_td_job(db)["lease_owner"] = "w-someone-else"
+    resp = client.post("/worker/jobs/td-1/busy", headers=_auth(), json={})
+    assert resp.status_code == 409
+    assert db.jobs["td-1"]["lease_owner"] == "w-someone-else"
+
+
+def test_busy_past_the_wait_fails_the_job_readably(tmp_path, worker):
+    client, db, _store = worker
+    _busy_td_job(db)["busy_minutes"] = DB.BUSY_WAIT_MINUTES
+    resp = client.post("/worker/jobs/td-1/busy", headers=_auth(), json={})
+    assert resp.get_json() == {"ok": True, "deferred": False, "failed": True}
+    row = db.jobs["td-1"]
+    assert row["status"] == DB.FAILED
+    assert row["message"] == DB.BUSY_GAVE_UP_MESSAGE
+    assert "60 minutes" in row["message"], "the owner is told how long it waited"
