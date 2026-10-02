@@ -91,7 +91,9 @@ ok(await valid(), 'td: defaults plus position and probes are valid');
 ok((await label()) === 'Run the time-domain simulation', 'td: button label');
 
 // --- per-part materials ------------------------------------------------------
-const pickers = () => page.$$eval('#td-parts label', (ls) => ls.map((l) => l.textContent));
+const pickers = () => page.$$eval('#td-parts label:not(.td-coating)', (ls) => ls.map((l) => l.textContent));
+const coatings = () => page.$$eval('#td-parts label.td-coating', (ls) => ls.map((l) => l.textContent));
+const coatingKeys = async () => Object.keys(await posted()).filter((k) => k.startsWith('part_coating'));
 const posted = () => page.evaluate(() => {
   const out = {};
   new FormData(document.getElementById('upload-form')).forEach((v, k) => {
@@ -100,18 +102,40 @@ const posted = () => page.evaluate(() => {
   return out;
 });
 const settle = () => page.waitForTimeout(300);
+await page.waitForSelector('#td-parts label.td-coating');
 ok((await pickers()).length === 0 && (await state('td_n_index')).shown,
-   'td/one part: no pickers; the single index is shown');
+   'td/one part: no material pickers; the single index is shown');
+ok((await coatings()).length === 1 && (await coatings())[0].includes('probe'),
+   `td/one part: one coating picker, named from /parts (${await coatings()})`);
+ok((await coatingKeys()).length === 0, 'td/one part: "no coating" posts no coating field');
+const coatKind = await page.$('#td-parts label.td-coating select');
+await coatKind.selectOption('Au');
+let sentCoat = await posted();
+ok(sentCoat['part_coating.probe'] === 'Au' && sentCoat['part_coating_thickness.probe'] === '0.01',
+   `td/one part: a gold coating posts its material and thickness (${JSON.stringify(sentCoat).slice(0, 300)})`);
+ok(await valid(), 'td/one part: a coated part is a valid submission');
+await page.fill('[name="part_coating_thickness.probe"]', '');
+ok(!(await valid()), 'td/one part: a coating with no thickness blocks the submission');
+await coatKind.selectOption('index');
+await page.fill('[name="part_coating_thickness.probe"]', '0.02');
+await page.fill('#td-parts label.td-coating input[type="number"]:not([name])', '2');
+sentCoat = await posted();
+ok(sentCoat['part_coating.probe'] === '2' && sentCoat['part_coating_thickness.probe'] === '0.02',
+   `td/one part: an index coating posts its index (${JSON.stringify(sentCoat).slice(0, 300)})`);
+await coatKind.selectOption('');
+ok((await coatingKeys()).length === 0 && await valid(),
+   'td/one part: back to "no coating" posts nothing and is valid');
 await page.setInputFiles('input[name="meshfile"]', path.join(DIR, 'three.obj'));
 await page.waitForSelector('#td-parts label');
 ok((await pickers()).length === 3, `td/three parts: three pickers (${(await pickers()).length})`);
 ok((await pickers())[1].includes('film'), 'td/three parts: pickers named from /parts');
+ok((await coatings()).length === 3, `td/three parts: a coating picker per part (${(await coatings()).length})`);
 ok(!(await state('td_n_index')).shown && (await state('td_n_index')).disabled,
    'td/three parts: the single index is hidden and not posted');
-const kinds = await page.$$('#td-parts select');
+const kinds = await page.$$('#td-parts label:not(.td-coating) select');
 await kinds[0].selectOption('Au');
 await kinds[2].selectOption('pec');
-const boxes = await page.$$('#td-parts input[type="number"]');
+const boxes = await page.$$('#td-parts label:not(.td-coating) input[type="number"]');
 ok(!(await boxes[0].evaluate((e) => e.required || e.offsetParent !== null)),
    'td/three parts: a metal part has no index box in the way');
 ok(await boxes[1].evaluate((e) => e.required && e.offsetParent !== null),

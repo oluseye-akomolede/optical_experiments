@@ -115,6 +115,7 @@ def test_a_td_form_queues_a_jetson_td_row_the_worker_can_lay_out(tmp_path):
     assert tds["probes"][1][:3] == _close([400e-9, 300e-9, 200e-9])
     assert tds["probes"][1][3] == "x"
     assert tds["direction"] is None and tds["samples"] is None
+    assert tds["coatings"] is None
 
     # The worker's own reader and layout accept the stored row.
     import td_solve
@@ -131,6 +132,68 @@ def test_a_td_form_queues_a_jetson_td_row_the_worker_can_lay_out(tmp_path):
         assert abs(nodes[i] - 300e-9) <= np.max(np.diff(nodes)) / 2 + 1e-15
     assert set(lay["metals"]) == {"Au"}
     assert job["est_tets"] == int(np.prod(lay["shape"]))
+
+
+def test_a_coated_part_reaches_the_worker_as_a_shell(tmp_path):
+    """The page's coating fields for the gold cube (thickness in the form's
+    unit, nm) are stored in metres, and the worker's own reader and layout
+    paint a conductor shell just outside the cube's face."""
+    resp, db, store, flashes = _post(
+        tmp_path, **{"part_coating.cube": "pec",
+                     "part_coating_thickness.cube": "10"})
+    assert resp.status_code == 302 and len(db.jobs) == 1, flashes
+    (job_id, job), = db.jobs.items()
+    (part, (material, thickness)), = job["tds"]["coatings"].items()
+    assert (part, material) == ("cube", "pec") and thickness == _close(10e-9)
+
+    import td_solve
+
+    _fdtd, fdtd_layout, mse_parts = TDF._solver()
+    names, parts = mse_parts.split_obj_parts(
+        store.read(f"jobs/{job_id}/input.obj"))
+    lay = fdtd_layout.layout(names, parts, td_solve.request_from(job),
+                             length_scale=1e-6, materials=job["materials"],
+                             n_index=job["n_index"])
+    x, y, z = lay["nodes"]
+    j, k = int(np.argmin(np.abs(y - 0.6e-6))), int(np.argmin(np.abs(z - 0.4e-6)))
+    shell = (x > 0.59e-6 + 1e-15) & (x < 0.6e-6 - 1e-15)
+    beyond = (x > 0.5e-6) & (x < 0.58e-6)
+    assert shell.any() and np.asarray(lay["pec"])[shell, j, k].all()
+    assert not np.asarray(lay["pec"])[beyond, j, k].any()
+    assert job["est_tets"] == int(np.prod(lay["shape"]))
+
+
+@pytest.mark.parametrize("over, needle", [
+    ({"part_coating.lid": "Au", "part_coating_thickness.lid": "10"},
+     "coating names 'lid', which is not a part of this upload"),
+    ({"part_coating.cube": "Au"}, "coating of part 'cube' needs a thickness (nm)"),
+    ({"part_coating.cube": "Xx", "part_coating_thickness.cube": "10"},
+     "coating material for part 'cube' must be a refractive index"),
+    ({"part_coating.cube": "0.5", "part_coating_thickness.cube": "10"},
+     "must be 1 or more"),
+    ({"part_coating.cube": "Au", "part_coating_thickness.cube": "0"},
+     "coating thickness of part 'cube' (nm) must be greater than zero"),
+    ({"part_coating.cube": "Au", "part_coating_thickness.cube": "thin"},
+     "coating thickness of part 'cube' (nm) must be a number"),
+    ({"part_coating_thickness.cube": "10"}, "without a coating material"),
+    ({"part_coating.block": "Au", "part_coating_thickness.block": "10"},
+     "enclose the cavity"),
+])
+def test_a_bad_coating_is_refused_naming_the_part(tmp_path, over, needle):
+    _refused(tmp_path, needle, **over)
+
+
+def test_no_coating_posts_nothing_and_queues_none(tmp_path):
+    resp, db, _store, flashes = _post(tmp_path, **{"part_coating.cube": ""})
+    assert resp.status_code == 302 and len(db.jobs) == 1, flashes
+    assert next(iter(db.jobs.values()))["tds"]["coatings"] is None
+
+
+def test_the_page_posts_the_coating_fields_the_form_reads(tmp_path):
+    app, _store, _db, _launcher = make_app(tmp_path)
+    html = app.test_client().get("/").get_data(as_text=True)
+    for prefix in (TDF.COATING_PREFIX, TDF.COATING_THICKNESS_PREFIX):
+        assert html.count(f"'{prefix}' + name") == 1, prefix
 
 
 def test_a_plane_wave_in_open_space_is_queued(tmp_path):
@@ -203,6 +266,18 @@ def test_parts_names_a_non_nested_td_scene_the_way_the_td_post_does(tmp_path):
     assert resp.status_code == 302 and db.jobs, flashes
     (job,) = db.jobs.values()
     assert sorted(job["materials"]) == sorted(body["parts"])
+
+
+def test_parts_that_share_volume_are_refused_at_upload_naming_both(tmp_path):
+    """5.4e: refused before queueing, not failed later in the worker."""
+    lens = _box([0, 0, 0], [0.6, 0.8, 0.6])
+    prism = _box([0.4, 0, 0], [1.0, 0.8, 0.6])
+    flashes = _refused(
+        tmp_path, "'lens' and 'prism' overlap", _obj(("lens", lens), ("prism", prism)),
+        td_boundary="open", td_position="200 400 300", td_probes="800 400 300 z",
+        **{"part_index.block": None, "part_index.cube": None,
+           "part_index.lens": "1.5", "part_index.prism": "2"})
+    assert any("may touch, but not share volume" in m for m in flashes), flashes
 
 
 def test_parts_still_runs_the_cavity_rules_for_a_cavity_upload(tmp_path):

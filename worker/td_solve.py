@@ -82,7 +82,8 @@ class TDSolveError(Exception):
 #: and the clearance rule, for the reason ``k_points`` is not a pc key.
 REQUEST_KEYS = ("boundary", "source_kind", "profile", "frequency_hz",
                 "bandwidth", "position", "direction", "polarisation",
-                "samples", "sample_duration_s", "duration_s", "probes", "dx_m")
+                "samples", "sample_duration_s", "duration_s", "probes", "dx_m",
+                "coatings")
 
 
 def request_from(job: dict) -> dict:

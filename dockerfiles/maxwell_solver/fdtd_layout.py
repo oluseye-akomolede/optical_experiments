@@ -18,6 +18,15 @@ between two conductor plates keeps exactly its thickness wherever the parts
 sit. Without the lines, the film read one cell too thick on almost every grid
 offset from its faces (the reviewer measured 5 cells for a 4-cell film at 19 of
 20 offsets). A curved part has no flat face there, so its box adds no line.
+
+Coatings (``request["coatings"]``: part name -> [material, thickness in m]).
+A coating is a shell outside its part's surface (``fdtd_voxel.CoatedIndex``).
+Each axis of a coated part gets ``fdtd_grid.coating_layers``: two thin layers
+at its faces where both are flat, else its whole span resolved at thickness /
+4, plus the skin-depth spacing for a metal coating. In open space the grid and
+a plane wave's TF/SF box cover the shells; the frame's origin stays at the
+parts' corner. In a metal cavity an outermost part's shell would lie in the
+wall, so it is refused.
 """
 from __future__ import annotations
 
@@ -117,24 +126,31 @@ def _locate(nodes, point, what, pml=0):
     return tuple(cell)
 
 
+def _owner(index, names, table, coats):
+    """``(words, material)`` for a lookup index: a part, a coating or 0."""
+    if 0 < index <= len(names):
+        return f"part {names[index - 1]}", table.get(names[index - 1])
+    if index > len(names):
+        p, material, _t = coats[index - len(names) - 1]
+        return f"the coating of part {names[p]}", material
+    return "the metal boundary's conductor", None
+
+
 def _refuse_conductor_nodes(names, parts, table, scene, nodes, lo, length_scale,
-                            where):
+                            where, finder):
     """A source or probe on a conductor node injects or reads nothing, which
     would read as "no response": refuse it, naming the position and part."""
     masks = ([scene["pec"]] if scene["pec"] is not None else []) + list(
         scene["metals"].values())
     if not masks:
         return
-    finder = None
     for what, cell in where:
         if not any(bool(m[cell]) for m in masks):
             continue
         point = np.array([nodes[a][cell[a]] for a in range(3)])
-        if finder is None:
-            finder = _finder(names, parts, table)
-        index = int(finder((point + lo) / float(length_scale))[0])
-        owner = (f"part {names[index - 1]}" if index > 0
-                 else "the metal boundary's conductor")
+        index_of, coats = finder()
+        index = int(index_of((point + lo) / float(length_scale))[0])
+        owner = _owner(index, names, table, coats)[0]
         raise LayoutError(
             f"{what} at {[round(float(x), 12) for x in point]} m sits inside "
             f"{owner}: a conductor carries no field there, so the run would "
@@ -166,21 +182,53 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
         raise LayoutError(f"dx_m must be positive, got {request['dx_m']!r}")
     names = list(names)
     table = _materials(names, materials, n_index)
+    coats = fdtd_voxel.coating_table(names, request.get("coatings"))
+    if coats and boundary == "metal":
+        depths = fdtd_voxel.nesting_depths(parts) if len(parts) > 1 else [0]
+        outer = [names[p] for p, _m, _t in coats if depths[p] == 0]
+        if outer:
+            raise LayoutError(
+                f"part(s) {', '.join(map(repr, outer))} enclose the cavity, so "
+                f"a coating on them would lie in the metal boundary's wall. Coat "
+                f"a part inside the cavity, or use 'open' boundaries.")
+    thick = {p: t for p, _m, t in coats}
 
     lo, hi = _bounds(parts, length_scale)
-    size = hi - lo
+    # the grid's extent: the parts, and in open space their coatings' shells
+    olo, ohi = lo.copy(), hi.copy()
+    if boundary == "open":
+        for p, t in thick.items():
+            plo, phi = _bounds([parts[p]], length_scale)
+            olo, ohi = np.minimum(olo, plo - t), np.maximum(ohi, phi + t)
+    size, off = ohi - olo, lo - olo
     pad = OPEN_PAD_CELLS * dx if boundary == "open" else 0.0
     f_top = band_top(request["profile"], request["frequency_hz"],
                      request["bandwidth"])
 
-    # layers in grid coordinates: 0 is the padded minimum corner
+    # layers in grid coordinates: 0 is the padded minimum corner of the extent
     layers, lines = [[], [], []], [[], [], []]
     for axis in range(3):
         if pad:
             layers[axis].append(fdtd_grid.Layer(pad, pad + size[axis]))
+    coat_bounds = []
+    for p, material, t in coats:
+        plo, phi = _bounds([parts[p]], length_scale)
+        coat_bounds.append((material, plo - t - lo, phi + t - lo))
+        depth = (fdtd_grid.skin_depth(material, f_top)
+                 if isinstance(material, str) and material in fdtd.METALS else None)
+        for axis in range(3):
+            a, b = float(plo[axis] - olo[axis] + pad), float(phi[axis] - olo[axis] + pad)
+            flat = len(_flat_faces(parts[p], axis, length_scale)) == 2
+            shell = fdtd_grid.coating_layers(a, b, t, flat=flat)
+            layers[axis] += shell
+            if depth is not None:
+                # where the thickness rule covers the same span, build_grid
+                # keeps the smaller spacing of the two
+                layers[axis] += [fdtd_grid.Layer(s.lo, s.hi, depth / CELLS_PER_SKIN)
+                                 for s in shell]
     for name, part in zip(names, parts):
         plo, phi = _bounds([part], length_scale)
-        plo, phi = plo - lo + pad, phi - lo + pad
+        plo, phi = plo - olo + pad, phi - olo + pad
         kind = table.get(name)
         metal = kind if isinstance(kind, str) and kind in fdtd.METALS else None
         depth = fdtd_grid.skin_depth(metal, f_top) if metal else None
@@ -188,7 +236,7 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
             a, b = float(plo[axis]), float(phi[axis])
             if not b > a:
                 continue           # the voxeliser refuses a flat part by name
-            lines[axis] += [face - lo[axis] + pad
+            lines[axis] += [face - olo[axis] + pad
                             for face in _flat_faces(part, axis, length_scale)]
             thin = (b - a) / THIN_CELLS if b - a < THIN_CELLS * dx else None
             if thin is not None:
@@ -204,13 +252,14 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
                                      fdtd_grid.Layer(b - SKIN_DEPTHS * depth, b, fine)]
 
     grid = fdtd_grid.build_grid(tuple(size + 2 * pad), dx, layers, lines)
-    nodes = tuple(n - pad for n in grid["nodes"])          # owner frame
+    nodes = tuple(n - pad - off[a]                         # owner frame
+                  for a, n in enumerate(grid["nodes"]))
 
     pml = fdtd.DEFAULT_PML_CELLS if boundary == "open" else 0
     box = None
     if plane:
-        faces = [(_node_index(n, 0.0), _node_index(n, float(s)))
-                 for n, s in zip(nodes, size)]
+        faces = [(_node_index(n, float(-o)), _node_index(n, float(s - o)))
+                 for n, s, o in zip(nodes, size, off)]
         box = (tuple(f[0] - fdtd.BOX_CLEARANCE for f in faces),
                tuple(f[1] + fdtd.BOX_CLEARANCE for f in faces))
     cell = None
@@ -227,15 +276,17 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
             "spacings": grid["spacings"], "shape": grid["shape"], "box": box,
             "cell": cell, "probes": probes, "origin_m": lo,
             "band_top_hz": f_top, "part_bounds": part_bounds,
-            "boundary": boundary}
+            "boundary": boundary, "coatings": coats, "coat_bounds": coat_bounds}
 
 
-def _finder(names, parts, table):
-    """The voxeliser's own part lookup, shared-face rule included, so a point
-    is named after the part the scene gave it."""
-    return fdtd_voxel.PartIndex(
-        parts, priority=[fdtd_voxel.priority_of(table[n]) for n in names],
-        names=names)
+def _finder(names, parts, table, coatings, boundary, length_scale, nodes):
+    """The voxeliser's own lookup, shared-face rule, coatings and face
+    tolerance included, so a point is named after the part or coating the
+    scene gave it. Returns ``(index_of, coats)`` as
+    ``fdtd_voxel.coated_index`` does."""
+    return fdtd_voxel.coated_index(names, parts, table, coatings,
+                                   boundary=boundary, length_scale=length_scale,
+                                   snap=fdtd_voxel.grid_snap(nodes, length_scale))
 
 
 def _conductor(kind) -> bool:
@@ -246,7 +297,8 @@ def estimate(planned, request, *, record_frames=True) -> dict:
     """``fdtd.estimate_run`` for a ``plan``, before anything is voxelised.
 
     Each metal's region is every node whose dual cell overlaps one of its
-    parts' bounding boxes. Only those nodes can have any of their cell in the
+    parts' bounding boxes, or a coating's (its part's box grown by the
+    thickness). Only those nodes can have any of their cell in the
     part, so no other node can be marked, whatever the grading or the float
     noise in a node that sits on a face (``searchsorted`` on the box itself
     dropped those). The memory errs high (by that ring and the corners a curved
@@ -259,8 +311,9 @@ def estimate(planned, request, *, record_frames=True) -> dict:
     shape = tuple(len(n) for n in nodes)
     metals, pec = {}, planned["boundary"] == "metal"
     duals = [fdtd_grid._dual_bounds(np.asarray(n, dtype=float)) for n in nodes]
-    for name, (plo, phi) in zip(planned["names"], planned["part_bounds"]):
-        kind = planned["table"].get(name)
+    regions = [(planned["table"].get(name), plo, phi)
+               for name, (plo, phi) in zip(planned["names"], planned["part_bounds"])]
+    for kind, plo, phi in regions + list(planned.get("coat_bounds", ())):
         if kind == "pec":
             pec = True
         elif _conductor(kind):
@@ -288,18 +341,20 @@ def refuse_conductor_points(planned, parts, *, length_scale: float) -> None:
     where = (([("the source position", planned["cell"])] if planned["cell"] else [])
              + [("probe", p[:3]) for p in planned["probes"]])
     names, table = planned["names"], planned["table"]
+    coats = planned.get("coatings") or []
     if not where or not (planned["boundary"] == "metal"
-                         or any(_conductor(table.get(n)) for n in names)):
+                         or any(_conductor(table.get(n)) for n in names)
+                         or any(_conductor(m) for _p, m, _t in coats)):
         return
     points = np.array([[nodes[a][c[a]] for a in range(3)] for _, c in where])
-    index = _finder(names, parts, table)((points + lo) / float(length_scale))
+    index_of, coats = _finder(names, parts, table,
+                              {names[p]: (m, t) for p, m, t in coats},
+                              planned["boundary"], length_scale, nodes)
+    index = index_of((points + lo) / float(length_scale))
     for (what, _), point, i in zip(where, points, index):
         i = int(i)
-        if i > 0 and _conductor(table.get(names[i - 1])):
-            owner = f"part {names[i - 1]}"
-        elif i == 0 and planned["boundary"] == "metal":
-            owner = "the metal boundary's conductor"
-        else:
+        owner, kind = _owner(i, names, table, coats)
+        if not (_conductor(kind) or (i == 0 and planned["boundary"] == "metal")):
             continue
         raise LayoutError(
             f"{what} at {[round(float(x), 12) for x in point]} m sits inside "
@@ -322,12 +377,17 @@ def layout(names, parts, request, *, length_scale: float, materials=None,
                    materials=materials, n_index=n_index)
     names, table, nodes = planned["names"], planned["table"], planned["nodes"]
     lo, cell, probes = planned["origin_m"], planned["cell"], planned["probes"]
+    coatings = request.get("coatings")
     scene = fdtd_voxel.voxelise(
         names, parts, table, tuple(n + lo[i] for i, n in enumerate(nodes)),
-        boundary=planned["boundary"], length_scale=length_scale)
-    _refuse_conductor_nodes(names, parts, table, scene, nodes, lo, length_scale,
-                            ([("the source position", cell)] if cell else [])
-                            + [("probe", p[:3]) for p in probes])
+        boundary=planned["boundary"], length_scale=length_scale,
+        coatings=coatings)
+    _refuse_conductor_nodes(
+        names, parts, table, scene, nodes, lo, length_scale,
+        ([("the source position", cell)] if cell else [])
+        + [("probe", p[:3]) for p in probes],
+        lambda: _finder(names, parts, table, coatings, planned["boundary"],
+                        length_scale, nodes))
     caveats = []
     for name, part in zip(names, parts):
         plo, phi = _bounds([part], 1.0)

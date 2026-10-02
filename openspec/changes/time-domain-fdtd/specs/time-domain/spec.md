@@ -266,8 +266,8 @@ A `td` job SHALL be stored in the jobs table with `kind = 'td'` and its request
 in a `tds` JSON column, NULL for every other kind. The request keys SHALL be
 exactly the worker's `REQUEST_KEYS` list (`boundary`, `source_kind`, `profile`,
 `frequency_hz`, `bandwidth`, `position`, `direction`, `polarisation`,
-`samples`, `sample_duration_s`, `duration_s`, `probes`, `dx_m`). Every key SHALL
-be present; a key that does not apply to the chosen source holds null. The
+`samples`, `sample_duration_s`, `duration_s`, `probes`, `dx_m`, `coatings`).
+Every key SHALL be present; a key that does not apply to the chosen source holds null. The
 worker SHALL refuse a request with a missing key, naming every missing key, and
 SHALL refuse a `tds` that is not an object. Keys outside the list SHALL be
 ignored, so results written back to the row are never read as input. The TF/SF
@@ -326,9 +326,7 @@ one material picker per part: a refractive index, `pec`, or one of the
 dispersive metals. Each picker posts `part_index.<part name>`. One material
 SHALL never be applied to every part on the owner's behalf. A missing, unknown
 or malformed material SHALL be refused before queueing, naming the part.
-Optional per-part coatings (a material plus a thickness on the part's surface)
-are a separate task (5.4b). Until a part can be coated end to end, the page
-SHALL NOT offer a coating.
+Each part MAY also be coated (next requirement).
 
 #### Scenario: a picker per part, named from the parser
 - **WHEN** a three-part .obj is chosen with the time-domain arm selected
@@ -354,6 +352,73 @@ SHALL NOT offer a coating.
 - **THEN** it returns the names the td POST's own split gives, not the cavity
   parser's refusal that the first part must enclose the rest
 
+### Requirement: A part MAY be coated, and the coating SHALL lie on the grid as a shell over the part
+
+A coating is a material (a refractive index, `pec` or a dispersive metal) plus
+a thickness on a part's surface. The page SHALL offer one for every part of a
+time-domain upload, one-part uploads included: a coating material picker
+(default "no coating") posting `part_coating.<part name>`, and a thickness in
+the form's length unit posting `part_coating_thickness.<part name>`. The
+stored request SHALL carry the key `coatings`: null, or part name →
+[material, thickness in metres].
+
+The coating SHALL be a shell of its thickness OUTSIDE the part's surface: every
+point within that distance of the surface and outside the part takes the
+coating's material, so a core coated in gold lays out as a gold shell around
+the core's material. The shell SHALL grow into open space or into a part that
+encloses the coated part (displacing that host). It SHALL NOT be painted into
+the coated part, the parts inside it, a neighbour that does not enclose it (a
+neighbour keeps its volume, so a coating on a face flush against a neighbour is
+absent there), or a metal boundary's wall. Where two shells meet, the shared-face
+rule decides: the conductor, else the higher index. The grid SHALL be refined by
+the grid builder's coating rule on each axis of the coated part (two thin layers
+at its faces where both faces are flat, else its whole span at thickness / 4),
+plus a metal coating's skin-depth spacing.
+
+#### Scenario: a gold-coated core lays out as a gold shell over its core
+- **WHEN** a dielectric part is coated in 10 nm of gold
+- **THEN** the nodes over each face within 10 nm of it are gold nodes, the
+  part's own nodes keep its index, and the nodes beyond the shell are vacuum;
+  the shell's faces are grid planes when the part's faces are flat
+
+#### Scenario: a node on a coating's face is decided by rule, not rounding
+- **WHEN** a node lies within the grid's face-line tolerance (the tolerance the
+  grid snaps face lines with) of the coated part's surface or of the shell's
+  outer face
+- **THEN** it is on that face, and the shared-face rule decides it: on the
+  part's surface the conductor, else the higher index, of part and coating; on
+  the outer face the coating, unless the space it grows into ranks higher (open
+  space ranks as index 1). So a 50 nm gold coating on a dielectric box is the
+  same number of nodes thick on all six faces, wherever the box sits in the
+  mesh frame
+
+#### Scenario: a coating on a curved part follows its surface
+- **WHEN** a sphere is coated
+- **THEN** the coating's nodes are the ones whose distance from the sphere's
+  surface is under the thickness, outside it
+
+#### Scenario: a coating displaces its host and spares its neighbour
+- **WHEN** a coated part sits inside a host part and flush against a neighbour
+- **THEN** the shell replaces the host's material around it, and the
+  neighbour keeps its own material within the shell's reach
+
+#### Scenario: a coating on the cavity's own wall is refused
+- **WHEN** a part that encloses a metal-walled cavity (no part encloses it) is
+  coated
+- **THEN** the request is refused naming the part: its shell would lie in the
+  wall
+
+#### Scenario: the source, probes, estimate and TF/SF box see the coating
+- **WHEN** a part carries a conductor coating
+- **THEN** a source or probe inside the coating is refused naming "the coating
+  of part <name>", the form's estimate counts the coating's metal and is never
+  below the solved run's, and a plane wave's TF/SF box encloses the shells
+
+#### Scenario: a bad coating is refused naming the part
+- **WHEN** a coating names a part not in the upload, has an unknown material,
+  or a thickness that is missing, not a number, or not positive
+- **THEN** the upload is refused before queueing, and the message names the part
+
 ### Requirement: Parts that touch SHALL meet on a face one of them owns, and SHALL NOT overlap
 
 A film flush against its plates shares a face with each. A grid node on a
@@ -362,8 +427,15 @@ any dielectric, and between two dielectrics to the higher refractive index,
 whatever the file order. The same rule SHALL name the part a source or probe
 sits in. Two parts, neither inside the other, that share volume SHALL be
 refused naming both parts; nested parts are not overlap (the innermost owns
-its volume). The overlap check runs when the scene is voxelised, in the worker,
-so it fails the job readably rather than refusing the upload.
+its volume). The upload SHALL be refused before queueing when a sampled check
+finds shared volume: for each pair neither of which encloses the other, a
+16 x 16 x 16 lattice of cell centres in the intersection of their bounding
+boxes is tested against both parts. Flush neighbours meet in a box of zero
+thickness and SHALL NOT be probed. The lattice can step over a sliver thinner
+than its spacing, so the voxeliser's check on every grid node, in the worker,
+SHALL stay authoritative and fail the job readably. Nesting is decided by an
+exact containment test, asked only where one part's bounding box lies within
+the other's.
 
 #### Scenario: a film's faces go to its plates
 - **WHEN** a dielectric slab and a `pec` (or metal) slab share a face
@@ -390,6 +462,12 @@ so it fails the job readably rather than refusing the upload.
 - **WHEN** two parts, neither enclosing the other, share volume
 - **THEN** the run fails with a message naming both parts; touching or nested
   parts run
+
+#### Scenario: an overlap is refused at upload
+- **WHEN** a td upload holds two parts, neither enclosing the other, that share
+  volume the lattice samples
+- **THEN** the upload is refused before queueing, naming both parts, and no job
+  is created; a flush stack of three parts is queued, with no lattice probed
 
 ### Requirement: The worker SHALL run a time-domain job only with the memory it needs
 
@@ -928,6 +1006,42 @@ A `td` request MAY declare periodic faces with a Bloch wave vector k. The run
 SHALL then model an infinite crystal of that cell. Except at k = 0 and the zone
 edge, the cos and sin fields SHALL be stepped together with cross-coupled face
 updates, through a face hook in the core.
+
+The solver takes `bloch=(kx, ky, kz)` in rad/m; the field obeys
+F(x + L) = exp(i k L) F(x) across each periodic axis of period L (the sum of
+its `n-1` spacings). The core stays real float32. A phase k L within 1e-12 of
+0 or pi runs the real core alone, the copy slabs taking the factor +1 or -1.
+Any other phase steps a second, sin, set of the six field arrays beside the
+cos set through the same update; only the cos set is driven, and the face hook
+fills the H ghost with exp(i k L) times half sample 0 and E node 0 with
+exp(-i k L) times node `n-1`, mixing the two sets. The result adds
+`traces_sin` (the probes on the sin set, absent on the real path); energy sums
+both sets, a frame is the complex field's |E|, and `peak` is the cos set's.
+A non-zero k on an axis that is not periodic, a malformed wave vector, and a
+paired run with a plane wave or a polarisation term (a metal) are refused with
+a message. The form option is a later phase-6 task.
+
+#### Scenario: a Bloch cell is one cell of the supercell
+- **WHEN** a cell with a dielectric rod, graded along x, runs at k = 2 pi p /
+  (M L) on its periodic axes with a point source, and an M-cell supercell runs
+  at k = 0 driven by the same source times cos(k.R) in the cell at R
+- **THEN** in every cell R, every probed E component (seam nodes on every axis
+  included) equals cos(k.R) times the cos trace minus sin(k.R) times the sin
+  trace, within 5e-6 of the peak, for phases paired on two axes, at the zone
+  edge alone, and at the zone edge with a paired axis
+- **AND** a wrong sign on either coupling, an unstepped sin set, a wrong period
+  or a wrong zone-edge sign fails it
+
+#### Scenario: a closed Bloch box conserves energy
+- **WHEN** a pulse runs in a graded box periodic on all three axes with a
+  paired phase on each
+- **THEN** after the source ends the energy summed over both sets varies by
+  less than 1e-5 of its mean
+
+#### Scenario: k = 0 is the plain periodic run
+- **WHEN** a periodic run with an open axis, a conductor, a dielectric, energy,
+  peak and frames is made with `bloch` omitted or zero
+- **THEN** every output is bit-identical to the phase-2 (6.1a) solver's
 
 #### Scenario: benchmark V6
 - **WHEN** a pulse is run in one cell of a 2-D crystal extruded along z, with

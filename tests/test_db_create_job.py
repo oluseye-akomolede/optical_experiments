@@ -141,7 +141,7 @@ def _td_request():
               "position": [0.0, 0.0, 0.0], "direction": None,
               "polarisation": "z", "samples": None, "sample_duration_s": None,
               "duration_s": 2.0e-13, "probes": [[1e-7, 0.0, 0.0, "z"]],
-              "dx_m": 2.0e-8}
+              "dx_m": 2.0e-8, "coatings": None}
     assert set(values) == set(td_solve.REQUEST_KEYS)
     return values
 

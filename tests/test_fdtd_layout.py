@@ -394,3 +394,154 @@ def test_the_form_estimate_counts_a_pec_parts_conductor_mask():
                                boundary="open", metals=laid["metals"],
                                pec=laid["pec"], record_frames=True)
     assert form["bytes"] == solved["bytes"]
+
+
+# --- coatings (task 5.4b) ---------------------------------------------------
+
+def _coated_core(boundary="open", **over):
+    """A 120 x 80 x 100 nm core of n = 1.5 coated in 10 nm of gold."""
+    req = _request(**{"boundary": boundary, "dx_m": 40e-9,
+                      "position": [60e-9, 40e-9, -30e-9],
+                      "coatings": {"core": ["Au", 10e-9]}, **over})
+    return ["core"], [_box((0, 0, 0), (120, 80, 100))], req
+
+
+def _at(nodes, value):
+    i = int(np.argmin(np.abs(nodes - value)))
+    assert abs(nodes[i] - value) < 1e-15, f"no node at {value}"
+    return i
+
+
+def test_a_gold_coated_core_lays_out_as_a_gold_shell_over_its_core():
+    names, parts, req = _coated_core()
+    out = L.layout(names, parts, req, length_scale=1e-9, materials={"core": 1.5})
+    x, y, z = out["nodes"]
+    # the shell's faces are grid planes on every axis (flat faces)
+    for n, (a, b) in zip(out["nodes"], ((0, 120e-9), (0, 80e-9), (0, 100e-9))):
+        _at(n, a - 10e-9), _at(n, a), _at(n, b), _at(n, b + 10e-9)
+    gold = out["metals"]["Au"]
+    j, k = int(np.argmin(np.abs(y - 40e-9))), int(np.argmin(np.abs(z - 50e-9)))
+    # along x through the middle: vacuum, gold shell, core, gold shell, vacuum
+    inside_shell = (x > -10e-9 + 1e-15) & (x < -1e-15)
+    assert inside_shell.any() and gold[inside_shell, j, k].all()
+    core = (x > 1e-15) & (x < 120e-9 - 1e-15)
+    assert not gold[core, j, k].any()
+    assert np.allclose(out["eps"][core, j, k], 2.25)
+    far = (x < -20e-9) | (x > 140e-9)
+    assert not gold[far, j, k].any()
+    assert np.allclose(out["eps"][far, j, k], 1.0)
+
+
+@pytest.mark.parametrize("offset", [(0.0, 0.0, 0.0), (12.5, 48.4, 58.3),
+                                    (-731.1, 3.7e3, 0.29)])
+def test_every_face_of_a_coating_is_the_same_number_of_nodes_thick(offset):
+    """The reviewer's 12 face planes: 50 nm of gold on a 306 x 333 x 504 nm
+    n = 1.5 box. Every node on the core's six faces and on the shell's six
+    outer faces is gold (the conductor wins a face over the dielectric core
+    and over vacuum), so the shell is the same number of nodes thick on every
+    face. A float comparison decided those nodes face by face: 6, 7 or 8."""
+    size, t = np.array([306.0, 333.0, 504.0]), 50.0
+    lo = np.asarray(offset)
+    names, parts = ["core"], [_box(lo, lo + size)]
+    req = _request(boundary="open", dx_m=100e-9, position=list(size / 2 * 1e-9),
+                   duration_s=2e-15, coatings={"core": ["Au", t * 1e-9]})
+    out = L.layout(names, parts, req, length_scale=1e-9, materials={"core": 1.5})
+    gold, nodes = out["metals"]["Au"], out["nodes"]
+    thick = []
+    for a in range(3):
+        b, c = [i for i in range(3) if i != a]
+        # the face's footprint: nodes strictly inside the core's extent
+        span = [(nodes[i] > 1e-15) & (nodes[i] < size[i] * 1e-9 - 1e-15)
+                for i in (b, c)]
+        for core_face, outer_face in ((0.0, -t), (size[a], size[a] + t)):
+            planes = {}
+            for what, at in (("core", core_face), ("outer", outer_face)):
+                i = _at(nodes[a], at * 1e-9)
+                plane = np.take(gold, i, axis=a)[np.ix_(*span)]
+                planes[what] = int(plane.sum()), plane.size
+                assert plane.all(), (offset, a, at, what, planes[what])
+            lo_i, hi_i = sorted((_at(nodes[a], core_face * 1e-9),
+                                 _at(nodes[a], outer_face * 1e-9)))
+            thick.append(hi_i - lo_i + 1)
+            mid = [int(np.argmin(np.abs(nodes[i] - size[i] / 2 * 1e-9))) for i in (b, c)]
+            line = [slice(None)] * 3
+            line[b], line[c] = mid
+            column = gold[tuple(line)][lo_i:hi_i + 1]
+            assert column.all(), (offset, a, core_face, column)
+            # the nodes just beyond the shell's two faces are not gold
+            assert not gold[tuple(line)][[lo_i - 1, hi_i + 1]].any(), (offset, a)
+    assert len(set(thick)) == 1, (offset, thick)
+
+
+def test_a_dielectric_coating_gets_its_own_thin_layers():
+    """No skin depth here, so only the coating rule can put the shell's outer
+    faces on the grid and 4 cells across it (a gold coating's skin-depth
+    layers cover the same spans and would hide a missing coating rule). Inside
+    a host, so the shell's outer faces are not the grid's own edges."""
+    _n, parts, req = _coated_core("metal", coatings={"core": [3.0, 10e-9]},
+                                  position=[20e-9, 20e-9, 20e-9])
+    names, parts = ["host", "core"], [_box((-200, -200, -200), (320, 280, 300)),
+                                      parts[0]]
+    planned = L.plan(names, parts, req, length_scale=1e-9,
+                     materials={"host": 1.0, "core": 1.5})
+    a = 200e-9                    # the frame starts at the host's corner
+    for n, b in zip(planned["nodes"], (a + 120e-9, a + 80e-9, a + 100e-9)):
+        for lo, hi in ((a - 10e-9, a), (b, b + 10e-9)):
+            cells = _at(n, hi) - _at(n, lo)
+            assert cells >= 4, (lo, hi, cells)
+
+
+def test_a_plane_wave_box_encloses_the_coating():
+    import fdtd
+    # a dielectric coating: no skin-depth cells, so a smaller grid
+    names, parts, req = _coated_core(source_kind="plane", direction="+z",
+                                     polarisation="x", position=None,
+                                     coatings={"core": [3.0, 10e-9]})
+    out = L.layout(names, parts, req, length_scale=1e-9, materials={"core": 1.5})
+    c = fdtd.BOX_CLEARANCE
+    lo = tuple(_at(n, -10e-9) - c for n in out["nodes"])
+    hi = tuple(_at(n, s + 10e-9) + c
+               for n, s in zip(out["nodes"], (120e-9, 80e-9, 100e-9)))
+    assert out["box"] == (lo, hi)
+    # the frame's origin stays at the parts' corner
+    assert _at(out["nodes"][0], 0.0) > 0
+
+
+def test_a_coating_on_the_cavitys_own_wall_is_refused():
+    names, parts, req = _coated_core("metal", position=[60e-9, 40e-9, 50e-9])
+    with pytest.raises(L.LayoutError, match=r"'core' enclose the cavity.*metal boundary's wall"):
+        L.plan(names, parts, req, length_scale=1e-9, materials={"core": 1.5})
+
+
+def test_the_form_refuses_a_source_in_a_gold_coating_naming_it():
+    names, parts, req = _coated_core(position=[-5e-9, 40e-9, 50e-9],
+                                     coatings={"core": ["pec", 10e-9]})
+    planned = L.plan(names, parts, req, length_scale=1e-9, materials={"core": 1.5})
+    with pytest.raises(L.LayoutError, match=r"sits inside the coating of part core"):
+        L.refuse_conductor_points(planned, parts, length_scale=1e-9)
+    with pytest.raises(L.LayoutError, match=r"sits inside the coating of part core"):
+        L.layout(names, parts, req, length_scale=1e-9, materials={"core": 1.5})
+
+
+@pytest.mark.parametrize("boundary", ["metal", "open"])
+def test_the_form_estimate_counts_a_gold_coating(boundary):
+    """A gold-coated dielectric core inside a host: the estimate counts the
+    coating's metal (else it would admit a run the solved scene refuses)."""
+    import fdtd
+    names = ["host", "core"]
+    parts = [_box((0, 0, 0), (200, 200, 200)), _box((70, 70, 70), (130, 130, 130))]
+    req = _request(boundary=boundary, dx_m=50e-9, position=[30e-9, 30e-9, 30e-9],
+                   duration_s=2e-15, coatings={"core": ["Au", 10e-9]})
+    kw = dict(length_scale=1e-9, materials={"host": 1.5, "core": 1.2})
+    planned = L.plan(names, parts, req, **kw)
+    form = L.estimate(planned, req)
+    laid = L.layout(names, parts, req, **kw)
+    for a in range(3):
+        np.testing.assert_array_equal(planned["nodes"][a], laid["nodes"][a])
+    solved = fdtd.estimate_run(laid["nodes"], duration=req["duration_s"],
+                               boundary=boundary, metals=laid["metals"],
+                               pec=laid["pec"], record_frames=True)
+    assert laid["metals"], "the coating must voxelise, or this compares nothing"
+    for key in ("cells", "dt", "steps", "setup"):
+        assert form[key] == solved[key], key
+    assert solved["bytes"] <= form["bytes"] <= 1.05 * solved["bytes"]

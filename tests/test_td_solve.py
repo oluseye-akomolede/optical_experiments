@@ -104,7 +104,7 @@ def _job(**changes):
            "position": [1e-3, 1.5e-3, 1e-3], "direction": None,
            "polarisation": "z", "samples": None, "sample_duration_s": None,
            "duration_s": 2e-10, "probes": [[3e-3, 1.5e-3, 1e-3, "z"]],
-           "dx_m": 1e-3}
+           "dx_m": 1e-3, "coatings": None}
     req.update(changes)
     return {"job_id": "j1", "kind": "td", "units": "mm", "scale": 1.0,
             "materials": None, "n_index": 1.5, "tds": req}

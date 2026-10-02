@@ -100,15 +100,32 @@
   (before: up to 1.5 times it, on most offsets). The form estimate bounds each
   metal by the nodes whose dual cell overlaps its parts, which keeps it above
   the solved run when a node sits on a face.
-- [ ] 5.4b Per-part coatings end to end: a material plus a thickness on a
+- [x] 5.4b Per-part coatings end to end: a material plus a thickness on a
   part's surface, painted by the voxeliser on a grid refined by
-  `coating_layers`, offered on the page only once it runs.
-- [ ] 5.4e Follow-up (lead, 2026-10-02 08:52Z; not in phase 5's critical path):
+  `coating_layers`, offered on the page only once it runs. The shell lies
+  outside the part (`fdtd_voxel.CoatedIndex`, exact point-to-triangle
+  distance): it grows into open space or an enclosing host, never into a
+  neighbour or a metal boundary's wall (a coating on a part that encloses the
+  cavity is refused). Request key `coatings`; a coating picker per part on the
+  page, one-part uploads included; the estimate, the TF/SF box and the
+  conductor-point refusal all see the shells. Review fix: a node within the
+  grid's face-line tolerance (`fdtd_voxel.grid_snap`) of the core's surface or
+  the shell's outer face is on that face and the shared-face rule decides it;
+  float rounding had made one 50 nm gold coating 6, 7 or 8 nodes thick by face.
+- [x] 5.4e Follow-up (lead, 2026-10-02 08:52Z; not in phase 5's critical path):
   an upload-time overlap check that fails fast. Probe only the bounding-box
   intersection of each non-nested pair (a 16^3 lattice, ~0.4 s per pair as the
   reviewer measured; flush neighbours have zero-thickness intersections and
   cost nothing). It is sampled and can miss a sliver, so the worker's
-  voxeliser refusal stays authoritative.
+  voxeliser refusal stays authoritative. Done as
+  `fdtd_voxel.refuse_overlap`, called by `td_form.plan_request`. Measured
+  (VM, best of 3): a 3-part flush stack 0.3 ms; overlapping boxes refused in
+  20 ms. The cost was the exact nesting test, now asked only where one
+  bounding box fits in the other: two 1280-face icospheres (radius 1, centres
+  3 apart) took 1.47 s with every pair asked and take 0.057 ms now (VM, best
+  of 3, re-measured 2026-10-02 after the reviewer's 1.67 s -> 0.1 ms; an
+  earlier "25 s" here did not reproduce and is withdrawn). Refusing two
+  overlapping 1280-face icospheres (centres 1 apart) takes 43 ms.
 - [x] 5.2 Viewer: field-movie playback in the existing 3-D view, plus trace and
   spectrum plots with axis units.
 - [ ] 5.3 Image smoke test, then an in-browser check against a real finished `td`
@@ -119,8 +136,10 @@
 - [x] 6.1a Periodic faces at k = 0 (wrap the curl differences), a boundary per
   axis in the solver API, and a plane wave across periodic transverse faces.
   Built in phase 2 for V4 (lead, 22:15Z). The form option stays in phase 6.
-- [ ] 6.1b A Bloch phase for a given k: cos and sin fields stepped together
-  through a core face hook.
+- [x] 6.1b A Bloch phase for a given k: cos and sin fields stepped together
+  through a core face hook. Solver API only (`bloch=`); a paired run refuses
+  metals and plane waves, and the memory estimate does not yet count the sin
+  set (both belong with the form option).
 - [ ] 6.2 Benchmark V6 against the existing pc band solver: an extruded 2-D
   crystal, TM and TE, kz = 0, frequencies at chosen k-points within 1%, every
   band present.

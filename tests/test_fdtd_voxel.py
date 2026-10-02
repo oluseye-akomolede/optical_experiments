@@ -263,3 +263,266 @@ def test_touching_and_nested_parts_are_not_overlap():
     V.PartIndex([low, high])(_ON_FACE)
     outer, inner = _box((2.0, 2.0, 2.0)), _box((0.5, 0.5, 0.5))
     assert (V.PartIndex([outer, inner])(np.zeros((1, 3))) == 2).all()
+
+
+# --- the upload-time overlap check (task 5.4e) -------------------------------
+
+def _stack(gap=0.0):
+    """Three slabs stacked flush along z (none nested): bottom, film, top."""
+    return [_box((1.0, 0.8, 0.2), (0, 0, 0.1)),
+            _box((1.0, 0.8, 0.2), (0, 0, 0.3 + gap)),
+            _box((1.0, 0.8, 0.2), (0, 0, 0.5 + 2 * gap))]
+
+
+def test_the_upload_check_refuses_overlap_naming_both_parts():
+    a = _box((1.0, 1.0, 1.0), (0, 0, 0))
+    b = _box((1.0, 1.0, 1.0), (0.5, 0, 0))
+    far = _box((0.2, 0.2, 0.2), (3.0, 0, 0))
+    with pytest.raises(V.OverlapError, match=r"'lens' and 'prism' overlap"):
+        V.refuse_overlap(["lens", "far", "prism"], [a, far, b])
+
+
+def test_the_upload_check_sees_an_overlap_its_box_only_partly_holds():
+    # b turned 30 degrees about z: the two bounding boxes' intersection is
+    # only partly shared volume, so the lattice has to find the shared part
+    import trimesh
+
+    a = _box((1.0, 1.0, 1.0), (0, 0, 0))
+    b = _box((1.0, 1.0, 1.0), (0, 0, 0))
+    b.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 6, [0, 0, 1]))
+    b.apply_translation((1.05, 0.2, 0.1))
+    with pytest.raises(V.OverlapError, match=r"'a' and 'b' overlap"):
+        V.refuse_overlap(["a", "b"], [a, b])
+
+
+def test_the_upload_check_passes_flush_and_nested_parts_probing_nothing_flush(monkeypatch):
+    probed = []
+    real = V.PartIndex._inside
+
+    def counting(self, pts, which=None):
+        probed.append(len(pts))
+        return real(self, pts, which)
+
+    monkeypatch.setattr(V.PartIndex, "_inside", counting)
+    V.refuse_overlap(["bottom", "film", "top"], _stack())
+    assert probed == [], "a flush pair meets in a zero-thickness box: no probe"
+    outer, inner = _box((2.0, 2.0, 2.0)), _box((0.5, 0.5, 0.5))
+    V.refuse_overlap(["outer", "inner"], [outer, inner])
+    assert probed == [], "nested parts are not overlap: no probe"
+    # the control: a stack pressed 0.05 together is probed, and refused
+    with pytest.raises(V.OverlapError, match=r"'bottom' and 'film' overlap"):
+        V.refuse_overlap(["bottom", "film", "top"], _stack(gap=-0.05))
+    assert probed and probed[0] == V.OVERLAP_LATTICE ** 3
+
+
+def test_nesting_asks_the_slow_containment_test_only_where_a_box_fits(monkeypatch):
+    import trimesh
+
+    asked = []
+    real = GEO.part_contains
+
+    def counting(outer, inner, **kw):
+        asked.append(1)
+        return real(outer, inner, **kw)
+
+    monkeypatch.setattr(GEO, "part_contains", counting)
+    tilted = _box((0.4, 0.4, 0.4), (0.2, 0.0, 0.0))
+    tilted.apply_transform(trimesh.transformations.rotation_matrix(0.3, [0, 0, 1]))
+    parts = [_box((2.0, 2.0, 2.0)), tilted, _box((0.4, 0.4, 0.4), (0.3, 0, 0)),
+             _box((0.5, 0.5, 0.5), (5.0, 0, 0))] + _stack()
+    for part in parts[4:]:
+        part.apply_translation((0, 0, 3.0))
+    got = V._encloses(parts)
+    monkeypatch.setattr(GEO, "part_contains", real)
+    n = len(parts)
+    full = [[i != j and real(parts[j], parts[i]) for j in range(n)] for i in range(n)]
+    assert got == [[full[i][j] and not full[j][i] for j in range(n)] for i in range(n)]
+    assert got[1][0] and got[2][0] and not got[1][2]
+    # of 56 ordered pairs only the two small parts' boxes fit in another's
+    # (the big box's): the overlapping small pair, the far box and the flush
+    # stack are never asked
+    assert len(asked) == 2, len(asked)
+
+
+# --- coatings (task 5.4b) ---------------------------------------------------
+
+def _box_distance(lo, hi, pts):
+    """Exact distance from points outside an axis-aligned box to the box."""
+    return np.linalg.norm(np.maximum(np.maximum(lo - pts, pts - hi), 0.0), axis=1)
+
+
+def test_surface_distance_matches_the_exact_box_distance_outside():
+    box = _box((1.0, 0.6, 0.8), (0.1, 0.0, -0.1))
+    lo, hi = box.bounds
+    rng = np.random.default_rng(3)
+    pts = rng.uniform(-1.5, 1.5, (400, 3))
+    pts = pts[_box_distance(lo, hi, pts) > 0]
+    got = V.surface_distance(GEO.of_faces(box.vertices, box.faces), pts)
+    assert np.allclose(got, _box_distance(lo, hi, pts), atol=1e-12)
+    # and with a reach: inside it exact, beyond it inf
+    near = V.surface_distance(GEO.of_faces(box.vertices, box.faces), pts, 0.3)
+    want = _box_distance(lo, hi, pts)
+    assert np.allclose(near[want <= 0.3], want[want <= 0.3], atol=1e-12)
+    assert np.all(near[want > 0.3 + 1e-9] > 0.3)
+
+
+def _coated_scene():
+    """A 1 x 0.6 x 0.8 um core of n = 1.5 at the origin, open space, on a
+    0.05 um grid that puts nodes on the core's faces and on a 0.1 um shell's
+    outer faces. Non-square, so an axis mix-up moves the shell."""
+    nodes = [np.round(np.arange(-16, 17) * 0.05, 12) * 1e-6,
+             np.round(np.arange(-12, 13) * 0.05, 12) * 1e-6,
+             np.round(np.arange(-14, 15) * 0.05, 12) * 1e-6]
+    return _box((1.0, 0.6, 0.8)), nodes
+
+
+def _shell_masks(nodes, half, t):
+    """Nodes strictly inside the core; nodes in the shell over one face (not
+    over an edge or corner, where the rounded shell and its box differ); and
+    nodes beyond the shell."""
+    x, y, z = np.meshgrid(*nodes, indexing="ij")
+    r = np.stack([np.abs(x), np.abs(y), np.abs(z)], -1)
+    h = np.asarray(half) * 1e-6
+    tm, eps = t * 1e-6, 1e-12
+    core = np.all(r < h - eps, axis=-1)
+    outside_core = np.any(r > h + eps, axis=-1)
+    # within the shell along exactly one axis: the face slabs, no rounded edges
+    over = np.maximum(r - h, 0.0)
+    one_axis = (over > eps).sum(axis=-1) == 1
+    shell = outside_core & one_axis & (over.max(axis=-1) < tm - eps)
+    # a whole cell clear of the shell (diagonal 0.05 um x sqrt 3), so no
+    # node's dual cell reaches into it
+    beyond = np.linalg.norm(over, axis=-1) > tm + 0.09e-6
+    return core, shell, beyond
+
+
+@pytest.mark.parametrize("coat", ["Au", "pec", 3.0])
+def test_a_coated_part_lays_out_as_a_shell_of_the_coating_over_its_core(coat):
+    """The 5.4b check: the part's cells read as its own material, a shell one
+    thickness deep over its surface reads as the coating, and beyond it is
+    vacuum. On cbfff8a ``voxelise`` takes no coating at all."""
+    core_part, nodes = _coated_scene()
+    out = V.voxelise(["core"], [core_part], {"core": 1.5}, nodes,
+                     boundary="open", length_scale=1e-6,
+                     coatings={"core": (coat, 0.1e-6)})
+    core, shell, beyond = _shell_masks(nodes, (0.5, 0.3, 0.4), 0.1)
+    assert core.any() and shell.any() and beyond.any()
+    assert np.allclose(out["eps"][core], 2.25)
+    assert np.allclose(out["eps"][beyond], 1.0)
+    if coat == "pec":
+        assert out["pec"][shell].all() and not out["pec"][core | beyond].any()
+        assert out["metals"] == {}
+    elif coat == "Au":
+        gold = out["metals"]["Au"]
+        assert gold[shell].all() and not gold[core | beyond].any()
+        assert out["pec"] is None
+    else:
+        assert np.allclose(out["eps"][shell], 9.0)
+        assert out["pec"] is None and out["metals"] == {}
+
+
+@pytest.mark.parametrize("core, coat, core_face_owner", [
+    (1.5, "Au", "coating"),    # the conductor coating takes the core's face
+    ("pec", 3.0, "core"),      # a conductor core keeps its face
+    (1.5, 3.0, "coating"),     # between dielectrics, the higher index
+    (3.0, 1.5, "core"),
+])
+def test_a_node_on_a_coatings_face_is_decided_by_the_shared_face_rule(
+        core, coat, core_face_owner):
+    """A point within the grid's snap of the core's face, or of the shell's
+    outer face, is on that face whichever way float rounding put it: the
+    shared-face rule decides the core's face, and the coating owns its outer
+    face over open space. The reviewer's 5.4b defect: these went by rounding."""
+    t = 0.1
+    snap = V.grid_snap([np.array([0.0, 4.0])])
+    index_of, _c = V.coated_index(["core"], [_box((1.0, 0.6, 0.8))], {"core": core},
+                                  {"core": (coat, t)}, boundary="open",
+                                  length_scale=1.0, snap=snap)
+    face = np.array([[0.5, 0.05, -0.1], [-0.5, 0.1, 0.2], [0.2, -0.1, 0.4]])
+    normal = np.array([[1.0, 0, 0], [-1.0, 0, 0], [0, 0, 1.0]])
+    owner = {"core": 1, "coating": 2}[core_face_owner]
+    for nudge in (-0.1 * snap, 0.0, 0.1 * snap):
+        on_core = face + nudge * normal
+        on_outer = face + (t + nudge) * normal
+        assert (index_of(on_core) == owner).all(), (nudge, index_of(on_core))
+        assert (index_of(on_outer) == 2).all(), (nudge, index_of(on_outer))
+        # a clear step either way is not on the face
+        assert (index_of(face - 3 * snap * normal) == 1).all()
+        assert (index_of(face + (t + 3 * snap) * normal) == 0).all()
+
+
+def test_a_coating_on_a_curved_part_follows_its_surface():
+    sphere = trimesh.creation.icosphere(subdivisions=3, radius=0.5)
+    nodes = [np.linspace(-0.8e-6, 0.8e-6, 17)] * 3
+    out = V.voxelise(["ball"], [sphere], {"ball": 1.5}, nodes, boundary="open",
+                     length_scale=1e-6, coatings={"ball": ("Au", 0.2e-6)})
+    x, y, z = np.meshgrid(*nodes, indexing="ij")
+    r = np.sqrt(x ** 2 + y ** 2 + z ** 2) * 1e6
+    gold = out["metals"]["Au"]
+    # the icosphere's facets sit up to ~1% inside the radius; keep clear of both faces
+    assert gold[(r > 0.53) & (r < 0.67)].all()
+    assert not gold[r < 0.47].any() and not gold[r > 0.72].any()
+    assert np.allclose(out["eps"][r < 0.4], 2.25)
+
+
+def test_a_coating_paints_its_enclosing_host_but_never_a_neighbour():
+    host = _box((2.0, 2.0, 2.0))
+    core = _box((0.4, 0.4, 0.4), (-0.4, 0.0, 0.0))
+    # a neighbour flush against the core's +x face
+    side = _box((0.4, 0.4, 0.4), (0.0, 0.0, 0.0))
+    nodes = [np.round(np.arange(-20, 13) * 0.05, 12) * 1e-6,
+             np.round(np.arange(-8, 9) * 0.05, 12) * 1e-6,
+             np.round(np.arange(-8, 9) * 0.05, 12) * 1e-6]
+    out = V.voxelise(["host", "core", "side"], [host, core, side],
+                     {"host": 1.2, "core": 1.5, "side": 2.0}, nodes,
+                     boundary="open", length_scale=1e-6,
+                     coatings={"core": (3.0, 0.1e-6)})
+    i = {round(float(v) * 1e6, 3): k for k, v in enumerate(nodes[0])}
+    j = len(nodes[1]) // 2
+    eps = out["eps"][:, j, j]
+    # -x of the core (x in -0.7..-0.6): the shell displaces the host
+    assert np.isclose(eps[i[-0.65]], 9.0)
+    assert np.isclose(eps[i[-0.8]], 1.44)
+    # +x of the core is the neighbour (from -0.2): within the shell's reach
+    # of the core's face it keeps its own material
+    assert np.isclose(eps[i[-0.15]], 4.0) and np.isclose(eps[i[0.05]], 4.0)
+
+
+def test_a_metal_boundary_wall_is_not_painted():
+    """Outside every part of a cavity is the conductor wall; a coating does
+    not paint into it (the layout refuses an outermost coated part)."""
+    wall = _box((2.0, 1.6, 2.0))
+    nodes = _scene_nodes()
+    plain = V.voxelise(["cavity"], [wall], {"cavity": 1.5}, nodes,
+                       boundary="metal", length_scale=1e-6)
+    coated = V.voxelise(["cavity"], [wall], {"cavity": 1.5}, nodes,
+                        boundary="metal", length_scale=1e-6,
+                        coatings={"cavity": (3.0, 0.2e-6)})
+    assert np.array_equal(plain["pec"], coated["pec"])
+    assert np.array_equal(plain["eps"], coated["eps"])
+
+
+def test_where_two_shells_meet_the_conductor_wins():
+    a = _box((0.4, 0.4, 0.4), (-0.3, 0.0, 0.0))
+    b = _box((0.4, 0.4, 0.4), (0.3, 0.0, 0.0))
+    gap = np.array([[0.0, 0.0, 0.0]])          # 0.1 um from both
+    for coats in ({"a": (3.0, 0.15e-6), "b": ("Au", 0.15e-6)},
+                  {"a": ("Au", 0.15e-6), "b": (3.0, 0.15e-6)}):
+        finder, table = V.coated_index(["a", "b"], [a, b], {"a": 1.5, "b": 1.5},
+                                       coats, boundary="open", length_scale=1e-6)
+        gold = 3 + [m for _p, m, _t in table].index("Au")
+        assert int(finder(gap)[0]) == gold
+
+
+@pytest.mark.parametrize("coatings, needle", [
+    ({"lid": ("Au", 1e-8)}, r"coating names part\(s\) 'lid'"),
+    ({"core": ("Xx", 1e-8)}, r"coating of part 'core': unknown material 'Xx'"),
+    ({"core": ("Au", 0.0)}, r"coating of part 'core' needs a positive thickness"),
+    ({"core": ("Au", "10nm")}, r"coating of part 'core' needs a positive thickness"),
+    ({"core": "Au"}, r"coating of part 'core' must be a material and a thickness"),
+])
+def test_a_bad_coating_is_refused_by_name(coatings, needle):
+    core_part, nodes = _coated_scene()
+    with pytest.raises(V.VoxelError, match=needle):
+        V.voxelise(["core"], [core_part], {"core": 1.5}, nodes, boundary="open",
+                   length_scale=1e-6, coatings=coatings)

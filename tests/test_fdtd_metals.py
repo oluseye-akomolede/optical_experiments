@@ -322,3 +322,20 @@ def test_a_metal_filling_the_grid_covers_exactly_the_samples_the_e_update_advanc
         box = term.parts[component]["box"]
         assert tuple((s.start, s.stop) for s in box) == want, component
         assert term.parts[component]["keep"].all(), component
+
+
+def test_energy_can_be_recorded_with_a_metal_in_the_box():
+    # A metal's increment is (where, values); unpacking it into the energy
+    # sum's own ``region`` name made the second step's sum broadcast the whole
+    # grid against the metal's sub-box and raise.
+    shape = (10, 6, 6)
+    region = np.zeros(shape, bool)
+    region[5:7, :, :] = True
+    source = fdtd.Source((3, 3, 2), frequency=4e14, bandwidth=3e14,
+                         component="z")
+    run = fdtd.simulate(np.ones(shape, np.float32), source, 40, dx=1e-8,
+                        boundary="metal", record_energy=True,
+                        ade_terms=[fdtd.LorentzDrude("Au", region)])
+    energy = np.asarray(run["energy"])
+    assert energy.shape == (40,) and np.all(np.isfinite(energy))
+    assert energy[-1] > 0
