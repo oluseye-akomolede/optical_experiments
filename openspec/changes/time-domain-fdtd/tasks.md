@@ -76,9 +76,9 @@
 
 ## 5. Web (phase 5)
 
-- [ ] 5.1 Form: boundary, source kind, profile, f, bandwidth, position,
+- [x] 5.1 Form: boundary, source kind, profile, f, bandwidth, position,
   polarisation, duration, probes and dx.
-- [ ] 5.1a (was 3.3) Every refusal raised by the form, the geometry or the
+- [x] 5.1a (was 3.3) Every refusal raised by the form, the geometry or the
   limits comes back as the route's refusal response, never a 500. Counting
   raise sites is not enough (an implicit TypeError from bad input has none):
   the route test feeds each malformed input end to end, namely a null material,

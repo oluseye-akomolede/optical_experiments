@@ -339,3 +339,112 @@ def test_the_drawn_limit_counts_the_gold_cube_index(tmp_path):
                                       **_drawn(np.round(burst, 5), "40"),
                                       **{"part_index.cube": "1.5"})
     assert resp.status_code == 302 and len(db.jobs) == 1, flashes
+
+
+# --- the upload page's td arm ------------------------------------------------
+#
+# The page and web/td_form.py meet only through field names and option values.
+# These read both sides from their sources -- the names td_form actually reads,
+# the tuples it actually checks against -- so a renamed field or a new choice
+# on one side alone goes red here instead of as a refusal the owner cannot fix.
+
+class _Controls(__import__("html.parser").parser.HTMLParser):
+    """Every named form control on a page: name -> (tag, attrs, [option values]),
+    and the ``data-modes`` of the fieldset each sits in."""
+
+    def __init__(self):
+        super().__init__()
+        self.controls, self.modes, self.selected = {}, {}, {}
+        self._fieldsets, self._select = [], None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "fieldset":
+            self._fieldsets.append(attrs.get("data-modes"))
+        elif tag in ("input", "select", "textarea") and attrs.get("name"):
+            self.controls[attrs["name"]] = (tag, attrs, [])
+            self.modes[attrs["name"]] = next(
+                (m for m in reversed(self._fieldsets) if m), None)
+            if tag == "select":
+                self._select = attrs["name"]
+        elif tag == "option" and self._select:
+            self.controls[self._select][2].append(attrs.get("value"))
+            if "selected" in attrs:
+                self.selected[self._select] = attrs.get("value")
+
+    def handle_endtag(self, tag):
+        if tag == "fieldset":
+            self._fieldsets.pop()
+        elif tag == "select":
+            self._select = None
+
+
+def _page(tmp_path):
+    app, _store, _db, _launcher = make_app(tmp_path)
+    resp = app.test_client().get("/")
+    assert resp.status_code == 200
+    parser = _Controls()
+    parser.feed(resp.get_data(as_text=True))
+    return parser
+
+
+def test_the_page_offers_exactly_the_td_fields_the_form_reads(tmp_path):
+    import re  # noqa: PLC0415
+    source = (Path(TDF.__file__)).read_text()
+    read = set(re.findall(r'(?:_field|_choice)\(form, "(td_\w+)"', source))
+    read |= set(re.findall(r'form\.get\("(td_\w+)"', source))
+    assert len(read) >= 14, read          # the parser itself must have found them
+    page = _page(tmp_path)
+    offered = {n for n in page.controls if n.startswith("td_")}
+    assert offered == read, (sorted(offered - read), sorted(read - offered))
+    assert all(page.modes[n] == "td" for n in offered), page.modes
+
+
+def test_the_td_choices_on_the_page_are_the_ones_the_form_accepts(tmp_path):
+    page = _page(tmp_path)
+    expected = {"td_unit": tuple(TDF.LENGTH_UNITS), "td_boundary": TDF.BOUNDARIES,
+                "td_source_kind": TDF.SOURCE_KINDS, "td_profile": TDF.PROFILES,
+                "td_polarisation": TDF.POLARISATIONS,
+                "td_direction": TDF.DIRECTIONS}
+    for name, choices in expected.items():
+        assert sorted(page.controls[name][2]) == sorted(choices), name
+    assert "td" in page.controls["mode"][2]
+
+
+def test_the_td_arm_shows_the_upload_it_reads(tmp_path):
+    # The td route reads meshfile, units and scale. They live in the shared
+    # upload fieldset, which must be shown for td too: a td arm without them
+    # posts a request with no file the owner could have chosen.
+    page = _page(tmp_path)
+    for name in ("meshfile", "units", "scale"):
+        assert "td" in (page.modes[name] or "").split(), (name, page.modes[name])
+
+
+def test_the_pages_own_td_defaults_are_accepted(tmp_path):
+    # Submit what the browser would post for the td arm as first shown: every
+    # default value, the shown (point, pulse) fields only, plus the two fields
+    # that start empty because only the owner can know them.
+    page = _page(tmp_path)
+    fields = {"mode": "td", "units": "um", "scale": ""}
+    for name, (tag, attrs, options) in page.controls.items():
+        if not name.startswith("td_"):
+            continue
+        if tag == "select":   # the browser posts the first option unless one is selected
+            fields[name] = page.selected.get(name, options[0])
+        else:
+            fields[name] = attrs.get("value", "")
+    assert fields["td_source_kind"] == "point" and fields["td_profile"] == "pulse"
+    for hidden in ("td_direction", "td_samples", "td_sample_duration_fs"):
+        fields.pop(hidden)
+    fields["td_position"] = "0.5 0.4 0.3"
+    fields["td_probes"] = "0.5 0.4 0.5 z"
+    # One part: the page has no materials table yet, so a multi-part upload is
+    # refused ("2 parts need a materials table") -- see the row note.
+    block = _obj(("block", _box([0, 0, 0], [1.0, 0.8, 0.6])))
+    fields["meshfile"] = (io_bytes(block), "block.obj")
+    app, _store, db, _launcher = make_app(tmp_path / "post")
+    client = app.test_client()
+    resp = client.post("/", data=fields, content_type="multipart/form-data")
+    with client.session_transaction() as session:
+        flashes = [str(m) for m in session.get("_flashes", [])]
+    assert resp.status_code == 302 and len(db.jobs) == 1, (fields, flashes)

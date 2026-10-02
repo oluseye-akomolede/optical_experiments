@@ -2624,15 +2624,22 @@ def test_the_job_list_says_which_kind_each_row_is(tmp_path):
     db.create_job(pc_id, "square lattice, r/a=0.2", "mm", 1.0, 16,
                   target=DB.CLUSTER, kind=DB.PC, pcs={"lattice": "square"})
     db.create_job(cav_id, "box.obj", "mm", 1.0, 10, target=DB.CLUSTER)
+    td_id = str(uuid.uuid4())
+    db.create_job(td_id, "scene.obj (time domain)", "um", 1.0, 10,
+                  target=DB.CLUSTER, kind=DB.TD)
 
     html = app.test_client().get("/").get_data(as_text=True)
-    # Split the table into rows so each is checked against its OWN label.
-    rows = {r.split('href="/jobs/')[1].split('"')[0]: r
+    # Split the table into rows so each is checked against its OWN label. Each
+    # row ends at its </tr>: the last one would otherwise run on through the
+    # rest of the page, script comments included.
+    rows = {r.split('href="/jobs/')[1].split('"')[0]: r.split("</tr>")[0]
             for r in html.split("<tr>") if 'href="/jobs/' in r}
-    assert pc_id in rows and cav_id in rows, "a row is missing from the list"
+    assert pc_id in rows and cav_id in rows and td_id in rows, \
+        "a row is missing from the list"
     assert "crystal" in rows[pc_id], rows[pc_id]
     assert "crystal" not in rows[cav_id], rows[cav_id]
     assert "object" in rows[cav_id], rows[cav_id]
+    assert "time-domain" in rows[td_id] and "object" not in rows[td_id], rows[td_id]
 
 
 # ---------------------------------------------------------------------------

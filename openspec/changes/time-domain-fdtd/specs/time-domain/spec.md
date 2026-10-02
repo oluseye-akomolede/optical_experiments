@@ -294,6 +294,29 @@ column is added idempotently by `db/001_schema.sql` and dropped by
   naming it, before any input is fetched, and is never solved as a cavity
 - **AND** the worker's kind list equals the app's
 
+### Requirement: The upload page SHALL offer a time-domain arm that posts exactly what the form reads
+
+The upload page's mode selector SHALL offer a time-domain choice. Its arm SHALL
+show the shared upload (file, units, scale) and the td fields the form reads,
+with the same names and choices; fields the chosen source or profile does not
+use SHALL be hidden. Only fields marked required SHALL ever block a submission,
+and a control that is hidden SHALL be neither required nor posted.
+
+#### Scenario: names and choices match the parser
+- **WHEN** the page is rendered
+- **THEN** its td control names are exactly the ones `web/td_form.py` reads, and
+  each choice list equals the tuple the form checks it against
+
+#### Scenario: the page's own defaults are accepted
+- **WHEN** the td arm is submitted with its default values, a one-part upload,
+  a source position and a probe
+- **THEN** the job is queued
+
+#### Scenario: optional fields never block, hidden fields never post
+- **WHEN** a cavity upload is submitted with the optional scale left blank, or a
+  file is chosen and the crystal mode is then picked
+- **THEN** the browser accepts the cavity form, and the crystal form posts no file
+
 ### Requirement: The worker SHALL run a time-domain job only with the memory it needs
 
 The worker SHALL run at most one GPU job at a time when one of them is `td`.
