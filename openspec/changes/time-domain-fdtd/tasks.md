@@ -145,4 +145,6 @@
   band present.
   Bench `scripts/fdtd_bench_v6.py` written, with the homogeneous |k + G| / n
   check at six k (tier-1 `--tiny`: four k, 26 s, in tests/test_fdtd_bench_v6.py).
-  Ticked when the lead's three Jetson commands (its docstring) all exit 0.
+  Crystal lines also pass a two-resolution convergence gate (48 and 64
+  cells, eps sampled 9 per cell edge, 150 periods recorded).
+  Ticked when the lead's six Jetson commands (its docstring) all exit 0.

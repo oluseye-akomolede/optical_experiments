@@ -732,7 +732,7 @@ The worker SHALL turn a `td` job's upload into a grid by this rule, and phase
 run that is solved.
 
 - **Parts.** The upload's named groups, each a closed surface, refused by name
-  otherwise.; the closed check is per part, never on the merged mesh, so parts
+  otherwise; the closed check is per part, never on the merged mesh, so parts
   may share faces. There is no enclosing-wall rule: in `open` space the parts are
   separate objects. Each part takes its entry in the job's `materials` table
   (a refractive index of at least 1, `pec`, or a Rakić metal name); a
@@ -1058,6 +1058,22 @@ a message. The form option is a later phase-6 task.
 - **THEN** the spectrum's peaks are within 1% of the photonic-crystal band
   solver's frequencies at that k for that polarisation, and every band in the
   pulse band appears
+- **AND** peaks are paired with bands in frequency order (a grid shifts
+  neighbouring bands alike, so closest-first pairing would swap two bands
+  closer than twice that shift)
+- **AND** the record is long enough that spectral resolution is not part of
+  the error (at least 150 periods of the band's lowest frequency)
+
+#### Scenario: benchmark V6 shows each crystal band converging
+- **WHEN** the crystal runs at two resolutions, a coarse one and the full one
+- **THEN** every band is found at both, and its error at the full resolution
+  is smaller in magnitude than at the coarse one, unless both errors are
+  within 0.25% (the reference's and the spectrum's own accuracy)
+- **AND** a band within 1% at the full resolution that does not approach the
+  pc value fails, since one resolution under 1% does not show convergence
+- **AND** the crystal's eps is sampled finely enough at the rod edge that
+  finer sampling moves no band by more than 0.01% (9 samples per cell edge;
+  3 aliased the slowest band into a false plateau)
 
 #### Scenario: benchmark V6 checks k against the exact light lines
 - **WHEN** the same cell holds one homogeneous medium of index n and runs at
