@@ -44,6 +44,9 @@ _SOLVER_DIR = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_
 
 #: Run-time limit: the 30-minute estimate limit plus a margin (spec).
 RUN_LIMIT_S = 45 * 60
+#: How long past ``RUN_LIMIT_S`` the worker waits for a child that has not
+#: stopped itself before killing it (it is stuck inside one step).
+STOP_GRACE_S = 5 * 60
 
 #: The result files' names (see the module docstring). ``FRAME_NAME`` takes the
 #: 1-based frame number; two digits hold ``fdtd.MAX_FRAMES`` (60).
@@ -348,21 +351,33 @@ def _child(conn, job, store_in, store_out, run=None):
 
 
 def solve_td_isolated(job: dict, store_in, store_out=None, stage=None, *,
-                      run=None, context=None, poll_s=1.0) -> dict:
+                      run=None, context=None, poll_s=1.0,
+                      deadline_s=RUN_LIMIT_S + STOP_GRACE_S,
+                      reap_s=60.0, clock=time.monotonic) -> dict:
     """``solve_td`` in a spawned child; its outcome, raised or returned here.
 
     Spawned, never forked: a forked copy of a process that has touched CUDA
-    cannot use the GPU. ``run`` (a module-level function, run in the child
-    instead of ``solve_td``) and ``context`` are seams for the tests."""
+    cannot use the GPU. The child stops itself at ``RUN_LIMIT_S``, but only
+    between steps; a child still running ``deadline_s`` after it started is
+    stuck inside one, so it is killed and the job gets the time-limit verdict.
+    A child that has not exited ``reap_s`` after its outcome (or after the
+    deadline) is killed, and every child is reaped before this returns.
+    ``run`` (a module-level function, run in the child instead of
+    ``solve_td``), ``context``, ``deadline_s``, ``reap_s`` and ``clock`` are
+    seams for the tests."""
     ctx = context or multiprocessing.get_context("spawn")
     receive, send = ctx.Pipe(duplex=False)
     proc = ctx.Process(target=_child, args=(send, job, store_in, store_out, run),
                        daemon=True)
     proc.start()
     send.close()
-    outcome = None
+    outcome, overdue, started = None, False, clock()
     try:
         while outcome is None:
+            if clock() - started > deadline_s:
+                overdue = True
+                proc.kill()
+                break
             if receive.poll(poll_s):
                 try:
                     message = receive.recv()
@@ -377,10 +392,14 @@ def solve_td_isolated(job: dict, store_in, store_out=None, stage=None, *,
                 break
     finally:
         receive.close()
-        proc.join(60)
+        proc.join(reap_s)
         if proc.is_alive():
             proc.kill()
             proc.join()
+    if overdue:
+        raise TDSolveError(
+            f"The run was stopped after {RUN_LIMIT_S // 60} minutes, the limit "
+            f"for one run. Increase dx or shorten the duration.")
     if outcome is None:
         if proc.exitcode == -signal.SIGKILL:
             raise TDSolveError(oom_message())

@@ -6,7 +6,9 @@ Tiny and pure: no store, no solver. The phase-5 form will be pinned against
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -432,6 +434,58 @@ def test_busy_in_the_child_is_busy_in_the_parent():
     with pytest.raises(td_solve.JetsonBusy) as info:
         td_solve.solve_td_isolated(_job(), None, None, None, run=TARGETS.busy)
     assert mse_worker.classify(info.value) == "busy"
+
+
+@pytest.mark.parametrize("target, status", [("exits_3", "3"), ("aborts", "-6")])
+def test_only_a_kill_signal_reads_as_out_of_memory(target, status):
+    """SIGKILL is the OOM killer; any other death is the plain failure."""
+    with pytest.raises(td_solve.TDSolveError) as info:
+        td_solve.solve_td_isolated(_job(), None, None, None,
+                                   run=getattr(TARGETS, target))
+    assert str(info.value) != td_solve.oom_message()
+    assert "ran out of memory" not in str(info.value)
+    assert f"stopped unexpectedly (exit status {status})" in str(info.value)
+
+
+def _reaped(pid_file) -> bool:
+    """Dead AND reaped: a zombie still answers signal 0."""
+    pid = int(pid_file.read_text())
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+@pytest.fixture
+def pid_file(tmp_path):
+    """Where a child notes its pid; SIGKILLed afterwards if still there, so a
+    red run (the child ignores SIGTERM) ends now, not when its sleep does."""
+    path = tmp_path / "pid"
+    yield path
+    if path.exists():
+        try:
+            os.kill(int(path.read_text()), 9)
+        except ProcessLookupError:
+            pass
+
+
+def test_a_child_stuck_past_the_deadline_is_killed_reaped_and_timed_out(pid_file):
+    started = time.monotonic()
+    with pytest.raises(td_solve.TDSolveError, match="stopped after 45 minutes"):
+        td_solve.solve_td_isolated(dict(_job(), pid_file=str(pid_file)), None,
+                                   None, None, run=TARGETS.sleeps, poll_s=0.1,
+                                   deadline_s=3.0, reap_s=30.0)
+    assert time.monotonic() - started < 20, "the deadline did not kill it"
+    assert _reaped(pid_file)
+
+
+def test_a_child_that_hangs_after_its_outcome_is_killed_and_reaped(pid_file):
+    out = td_solve.solve_td_isolated(dict(_job(), pid_file=str(pid_file)), None,
+                                     None, None, run=TARGETS.reports_then_hangs,
+                                     poll_s=0.1, reap_s=1.0)
+    assert out["kind"] == "td"
+    assert _reaped(pid_file)
 
 
 def test_the_worker_uploads_every_file_the_td_solve_writes(tmp_path):

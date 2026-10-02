@@ -350,6 +350,17 @@ limit.
   its type's name, when it cannot be pickled) and its cause chain; and the
   worker's unit sets `OOMPolicy=continue`, so systemd does not stop the
   service when the child is killed
+- **AND** only SIGKILL reads as out of memory: a child that exits non-zero or
+  dies of another signal (SIGABRT, say) fails with the plain "stopped
+  unexpectedly" message naming its exit status, never the out-of-memory one
+
+#### Scenario: a run stuck inside one step is still stopped
+- **WHEN** a `td` child is still running 5 minutes past the 45-minute limit
+  (its own stop is checked only between steps, so it is stuck inside one)
+- **THEN** the worker kills it and fails the job with the 45-minute message
+- **AND** a child that has sent its outcome but has not exited within 60
+  seconds is killed, and every child is reaped (no zombie) before the worker
+  goes on
 
 #### Scenario: an overlong run is stopped
 - **WHEN** a `td` run passes 45 minutes of run time

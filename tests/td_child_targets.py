@@ -47,3 +47,33 @@ def unpicklable(job, store_in, store_out, stage):
 
 def busy(job, store_in, store_out, stage):
     raise td_solve.JetsonBusy("The Jetson is busy.")
+
+
+def _note_pid(job):
+    with open(job["pid_file"], "w") as f:
+        f.write(str(os.getpid()))
+
+
+def exits_3(job, store_in, store_out, stage):
+    """A crash that is not the OOM killer: a plain non-zero exit."""
+    os._exit(3)
+
+
+def aborts(job, store_in, store_out, stage):
+    """A native crash (SIGABRT), which is not the OOM killer either."""
+    os.abort()
+
+
+def sleeps(job, store_in, store_out, stage):
+    """Stuck inside one step: never reaches the run's own time check."""
+    _note_pid(job)
+    time.sleep(600)
+
+
+def reports_then_hangs(job, store_in, store_out, stage):
+    """Sends its outcome, then never exits (a non-daemon thread holds the
+    process open, as a stuck driver teardown would)."""
+    import threading
+    _note_pid(job)
+    threading.Thread(target=time.sleep, args=(600,), daemon=False).start()
+    return {"job_id": job["job_id"], "kind": "td", "modes": [], "files": []}
