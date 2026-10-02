@@ -154,3 +154,93 @@ def test_a_source_or_probe_inside_the_cpml_is_refused(what, side):
              length_scale=1e-3, n_index=1.5)            # positive control
     with pytest.raises(L.LayoutError, match=r"absorbing layer.*x must lie"):
         L.layout(["a"], [part], bad, length_scale=1e-3, n_index=1.5)
+
+
+def test_gold_thinner_than_its_skin_depth_takes_the_thickness_rule():
+    # 10 nm of gold in z: extent/4 (2.5 nm) is under skin depth/4 here, so the
+    # min must pick the thickness rule; the 60 nm fixture above tests the
+    # other order
+    import fdtd_grid
+    names = ["host", "gold"]
+    parts = [_box((0, 0, 0), (200, 200, 200)), _box((70, 70, 95), (130, 130, 105))]
+    req = _request(dx_m=50e-9, position=[30e-9, 30e-9, 30e-9])
+    out = L.layout(names, parts, req, length_scale=1e-9,
+                   materials={"host": 1.5, "gold": "Au"})
+    cap = 10e-9 / 4
+    assert cap < fdtd_grid.skin_depth("Au", 4.0e14) / 4   # the fixture tests the min
+    z = out["nodes"][2]
+    inside = np.diff(z[(z >= 95e-9 - 1e-15) & (z <= 105e-9 + 1e-15)])
+    assert inside.max() <= cap * (1 + 1e-9), (
+        f"a 10 nm gold film got a {inside.max():.3g} m cell; the thickness rule wants {cap:.3g}")
+
+
+@pytest.mark.parametrize("boundary,far", [("metal", 5e-3), ("open", 25e-3)])
+@pytest.mark.parametrize("what", ["source", "probe"])
+def test_a_source_or_probe_outside_the_grid_is_refused_naming_the_extent(
+        what, boundary, far):
+    # metal: the grid is the part's 0..3 mm; open adds 16 mm of padding, so
+    # 25 mm is off the grid either way
+    part = _box((0, 0, 0), (3, 3, 3))
+    legal, off = [1e-3, 1e-3, 1e-3], [far, 1e-3, 1e-3]
+    req = _request(boundary=boundary, dx_m=1e-3, position=legal)
+    L.layout(["a"], [part], dict(req, probes=[legal + ["z"]]),
+             length_scale=1e-3, n_index=1.5)            # positive control
+    bad = (dict(req, position=off) if what == "source"
+           else dict(req, probes=[off + ["z"]]))
+    with pytest.raises(L.LayoutError, match=r"outside the grid: x spans -?[0-9.e-]+\.\.[0-9.e-]+ m"):
+        L.layout(["a"], [part], bad, length_scale=1e-3, n_index=1.5)
+
+
+@pytest.mark.parametrize("profile,top", [("pulse", 4.0e14), ("cw", 3.0e14),
+                                         ("drawn", 3.0e14)])
+def test_the_band_top_adds_the_bandwidth_only_for_a_pulse(profile, top):
+    assert L.band_top(profile, 3.0e14, 1.0e14) == pytest.approx(top, rel=1e-12)
+
+
+def test_thick_gold_gets_a_skin_layer_inside_both_faces():
+    # 400 nm of gold is over 6 skin depths: each bounding face gets a layer 3
+    # skin depths deep at depth/4, the low face AND the high face
+    import fdtd_grid
+    names = ["host", "gold"]
+    parts = [_box((0, 0, 0), (800, 800, 800)), _box((200, 200, 200), (600, 600, 600))]
+    req = _request(dx_m=100e-9, position=[100e-9, 100e-9, 100e-9])
+    out = L.layout(names, parts, req, length_scale=1e-9,
+                   materials={"host": 1.5, "gold": "Au"})
+    depth = fdtd_grid.skin_depth("Au", 4.0e14)
+    assert 400e-9 > 2 * L.SKIN_DEPTHS * depth            # the fixture is thick
+    fine = depth / L.CELLS_PER_SKIN
+    for axis in range(3):
+        n = out["nodes"][axis]
+        for face, (a, b) in (("low", (200e-9, 200e-9 + 3 * depth)),
+                             ("high", (600e-9 - 3 * depth, 600e-9))):
+            cells = np.diff(n[(n >= a - 1e-15) & (n <= b + 1e-15)])
+            assert len(cells) and cells.max() <= fine * (1 + 1e-9), (
+                f"{'xyz'[axis]} {face} face of the gold: {cells.max():.3g} m "
+                f"cells where the skin layer wants {fine:.3g}")
+
+
+def test_the_plane_wave_box_is_the_bounding_box_grown_by_the_clearance():
+    import fdtd
+    part = _box((0, 0, 0), (4, 3, 2))
+    req = _request(boundary="open", dx_m=1e-3, source_kind="plane",
+                   direction="+z", polarisation="x", position=None)
+    out = L.layout(["a"], [part], req, length_scale=1e-3, n_index=1.5)
+    size = (4e-3, 3e-3, 2e-3)
+    lo = tuple(int(np.argmin(np.abs(n))) for n in out["nodes"])
+    hi = tuple(int(np.argmin(np.abs(n - s))) for n, s in zip(out["nodes"], size))
+    c = fdtd.BOX_CLEARANCE
+    assert c == 3
+    assert out["box"] == (tuple(i - c for i in lo), tuple(i + c for i in hi)), (
+        f"box {out['box']} is not the faces {lo}..{hi} grown by {c} cells")
+    assert out["cell"] is None
+
+
+def test_an_unknown_boundary_and_a_plane_wave_in_metal_are_refused():
+    part = _box((0, 0, 0), (3, 3, 3))
+    with pytest.raises(L.LayoutError, match=r"boundary 'periodic' must be one of metal, open"):
+        L.layout(["a"], [part], _request(boundary="periodic", dx_m=1e-3),
+                 length_scale=1e-3, n_index=1.5)
+    with pytest.raises(L.LayoutError, match=r"plane wave needs 'open'"):
+        L.layout(["a"], [part], _request(source_kind="plane", direction="+z",
+                                         polarisation="x", position=None, dx_m=1e-3),
+                 length_scale=1e-3, n_index=1.5)
