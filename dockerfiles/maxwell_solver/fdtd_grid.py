@@ -39,6 +39,7 @@ _SAMPLES = 200           # at least this many quadrature points per interval
 _SUBSTEPS = 8            # quadrature points per cell of the envelope
 _REPAIRS = 60
 _GROWTH_LIMIT = 4       # repairs may at most quadruple the first attempt
+_MAX_NODES = 1_000_000  # no axis this tool can run is longer; a backstop
 
 
 class GridError(fdtd.FDTDError):
@@ -158,6 +159,13 @@ def graded_axis(length: float, coarse: float, layers=(), *,
             h[i] = min(h[i], h[i - 1] + GROWTH * gaps[i - 1])
         for i in range(h.size - 2, -1, -1):
             h[i] = min(h[i], h[i + 1] + GROWTH * gaps[i])
+        # each repair shrinks spacings by 0.7, so without a size check the
+        # next fill could be enormous; refuse before building it
+        planned = float(np.sum(gaps / np.maximum(np.minimum(h[:-1], h[1:]),
+                                                 1e-300)))
+        if planned > _MAX_NODES:
+            raise GridError(f"grading did not converge: the axis would need "
+                            f"about {planned:.3g} nodes (limit {_MAX_NODES})")
         nodes = [edges[:1]]
         for k, gap in enumerate(gaps):
             minimum = min_cells if gap < coarse else 1
