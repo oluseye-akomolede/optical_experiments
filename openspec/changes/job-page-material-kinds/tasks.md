@@ -20,18 +20,34 @@
 
 - [x] 3.1 `web/app.py`: `_coating_rows(job)` reads the stored `tds` request's
       `coatings` and returns part / material / thickness, the thickness shown in
-      the unit the job was typed in; a value this build cannot read is shown as
+      the unit the form was typed in; a value this build cannot read is shown as
       it stands rather than raising.
 - [x] 3.2 `web/templates/job.html`: a `td` job with coatings lists them under
       the materials table.
 
-## 4. Proof
+## 4. The coating's unit (review fix, 2026-10-02)
 
-- [x] 4.1 Red-before-fix: `test_a_td_job_page_renders_a_metal_part_without_a_500`
+- [x] 4.1 `web/td_form.py`: `parse_request` stores the form's own length unit
+      (`td_unit`) in the request, beside the metre thicknesses it was applied
+      to. Not a `REQUEST_KEYS` member: the worker's `request_from` drops any
+      key outside that tuple, which is what the round-trip test leans on.
+- [x] 4.2 `web/app.py`: `_coating_rows` divides by the stored `td_unit` — the
+      factor `parse_coatings` multiplied by — not by `job["units"]` (the
+      object's upload unit, a different field of the same form). A request with
+      no stored unit shows the value in metres.
+- [x] 4.3 Proof through the REAL form (`tests/test_td_form.py`): the default
+      form's pair (`units=um`, `td_unit=nm`) with a 10 nm coating. Red at the
+      previous commit as the page's own symptom, `0.01 um` where the owner
+      typed `10 nm`; the stored request also has no `td_unit` there.
+      `tests/test_web_routes.py` adds the no-stored-unit row shown in metres.
+
+## 5. Proof
+
+- [x] 5.1 Red-before-fix: `test_a_td_job_page_renders_a_metal_part_without_a_500`
       (red at HEAD as the production `TypeError: must be real number, not str`)
       and `test_a_coated_part_shows_its_coating_on_the_job_page` (red at HEAD as
       the coating block's absence — all-float base materials, so it does not go
       red through its sibling's bug).
-- [x] 4.2 The cavity regression (`test_the_job_page_renders_the_material_table_it_stored`)
+- [x] 5.2 The cavity regression (`test_the_job_page_renders_the_material_table_it_stored`)
       still passes: floats keep `%g`, the column and note are unchanged.
-- [x] 4.3 The affected suites at tier 1 (tiny, `2` threads, `nice -n 19`).
+- [x] 5.3 The affected suites at tier 1 (tiny, `2` threads, `nice -n 19`).

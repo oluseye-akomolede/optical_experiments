@@ -2398,6 +2398,13 @@ def test_a_coated_part_shows_its_coating_on_the_job_page(tmp_path):
     """
     app, _store, db, _launcher = make_app(tmp_path)
     job_id = str(uuid.uuid4())
+    # The request carries the TD form's own length unit beside the thicknesses
+    # it was applied to, as the form stores it -- the page cannot recover it
+    # from the metres. ``units`` here is the OBJECT's upload unit, a different
+    # field of the same form; a hand-built row where the two coincide is
+    # exactly the fixture that hid the mislabelling, so the page's
+    # unit-follows-the-form behaviour is proved through the real form in
+    # tests/test_td_form.py instead.
     tds = dict(_TDS, coatings={"film": ["Au", 20e-9]})
     # All-float base materials on purpose: the red this test must show is the
     # ABSENT coatings block, not the metal-formatting TypeError its sibling
@@ -2413,6 +2420,33 @@ def test_a_coated_part_shows_its_coating_on_the_job_page(tmp_path):
     assert "film" in block.group(1) and "Au" in block.group(1)
     # 20 nm, in the unit the job was typed in (um) and in plain words.
     assert "0.02" in block.group(1)
+
+
+def test_a_coating_request_without_its_unit_is_shown_in_metres(tmp_path):
+    """A request written before the form's unit was stored has only metres.
+
+    The page must not fall back to ``job["units"]``: that is the OBJECT's
+    upload unit, so a fallback there would print a confidently wrong number for
+    exactly the rows the fallback exists for. With nothing to divide by, the
+    metre value stands as it is -- and this job's object unit (um) is
+    deliberately the one the old code divided by, so a page that still reaches
+    for it prints 0.01 here and fails.
+    """
+    app, _store, db, _launcher = make_app(tmp_path)
+    job_id = str(uuid.uuid4())
+    tds = {k: v for k, v in _TDS.items() if k != "td_unit"}
+    tds["coatings"] = {"film": ["Au", 1e-8]}
+    db.create_job(job_id, "film.obj (time domain)", "um", 1.0, 0,
+                  target=DB.JETSON, kind=DB.TD,
+                  materials={"substrate": 1.5}, tds=tds)
+
+    body = app.test_client().get(f"/jobs/{job_id}").get_data(as_text=True)
+    block = re.search(r'id="coatings"(.*?)</table>', body, re.S)
+    assert block is not None, "the coating is absent from the page"
+    cell = re.search(r"<tr><td>film</td><td>.*?</td>\s*<td>(.*?)</td></tr>",
+                     block.group(1))
+    assert cell is not None, block.group(1)
+    assert cell.group(1).strip() == "1e-08 m", cell.group(1)
 
 
 # ---------------------------------------------------------------------------
@@ -2717,7 +2751,7 @@ def test_the_job_list_says_which_kind_each_row_is(tmp_path):
 # td results: status keys and the files/ route
 # ---------------------------------------------------------------------------
 _TDS = {"boundary": "open", "source_kind": "point", "profile": "pulse",
-        "frequency_hz": 4.0e14, "bandwidth": 0.5}
+        "frequency_hz": 4.0e14, "bandwidth": 0.5, "td_unit": "um"}
 
 
 def _done_td_job(db):

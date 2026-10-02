@@ -1254,24 +1254,38 @@ def _coating_rows(job: dict) -> list[dict]:
     page shows the materials table alone, so without this a coated part would
     read as uncoated -- the page would silently omit a layer the solve used.
 
-    The thickness is stored in metres: ``td_form.parse_coatings`` parsed it with
-    the unit's own factor, so dividing by that same factor returns the number
-    the owner typed, which is what they can check against the form. Formatted
-    like the page's feature caption (``:g`` in the owner's unit).
+    The thickness is stored in metres: ``td_form.parse_coatings`` multiplied the
+    number the owner typed by the TD FORM's length unit (``td_unit``), which the
+    request now carries, so dividing by that same factor returns the number they
+    typed -- what they can check against the form. It is deliberately NOT
+    ``job["units"]``: that is the OBJECT's upload unit, a different field on the
+    same form holding a different number (``units=um`` with ``td_unit=nm`` is
+    the form's own default), and dividing by it mislabels every coating by the
+    ratio of the two while looking like an ordinary thickness.
+
+    A request written before that unit was stored has only the metre value: it
+    is shown in metres, rather than inventing a unit the page cannot justify.
+
+    Formatted with ``%g`` in the owner's unit, the same way the feature
+    caption shows the size they ASKED for -- this is their own number coming
+    back, not a measurement of the mesh.
 
     Empty list for a job with no request or no coatings, so the template's
     guard is truthiness alone.
     """
-    coats = (job.get("tds") or {}).get("coatings") or {}
+    tds = job.get("tds") or {}
+    coats = tds.get("coatings") or {}
     if not coats:
         return []
-    unit = job.get("units") or CFG.DEFAULT_UNITS
-    per_m = unit_scale_m(unit)
+    unit = tds.get("td_unit")
+    per_m = TDF.LENGTH_UNITS.get(unit) if isinstance(unit, str) else None
     rows = []
     for part, pair in sorted(coats.items()):
         try:
             material, thickness_m = pair
-            thickness = f"{float(thickness_m) / per_m:.4g} {unit}"
+            metres = float(thickness_m)
+            thickness = (f"{metres / per_m:g} {unit}" if per_m
+                         else f"{metres:g} m")
         except (TypeError, ValueError):
             # A request this build cannot read is shown as it stands rather
             # than raising: this page's whole defect class is a render that

@@ -9,6 +9,7 @@ store a request the worker refuses.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -22,6 +23,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 trimesh = pytest.importorskip("trimesh")
 
+import app as APP  # noqa: E402
 import db as DB  # noqa: E402
 import td_form as TDF  # noqa: E402
 from test_web_routes import io_bytes, make_app  # noqa: E402
@@ -161,6 +163,68 @@ def test_a_coated_part_reaches_the_worker_as_a_shell(tmp_path):
     assert shell.any() and np.asarray(lay["pec"])[shell, j, k].all()
     assert not np.asarray(lay["pec"])[beyond, j, k].any()
     assert job["est_tets"] == int(np.prod(lay["shape"]))
+
+
+def test_the_job_page_shows_a_coating_in_the_unit_the_form_was_typed_in(
+        tmp_path):
+    """The thickness comes back as the number the owner typed, in the unit
+    they typed it in -- through the REAL form, not a hand-built row.
+
+    Two length units sit on this one form: the object's ``units`` and the td
+    arm's ``td_unit``, the field the coating thicknesses are typed in (the
+    template says so where it renders the pickers). ``parse_coatings`` stores
+    metres, so the page has to divide by the SAME factor it multiplied by;
+    dividing by the object's unit instead mislabels every coating by the ratio
+    of the two while looking like an ordinary thickness. The default form posts
+    ``units=um`` with ``td_unit=nm`` and here we post mm with um, so a page
+    that reaches for the wrong field is caught either way.
+    """
+    app, _store, db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+    resp = client.post("/", content_type="multipart/form-data", data=_fields(**{
+        # The default pair, which is the counterexample: the object is in um
+        # and the td form's own lengths in nm.
+        "units": "um", "td_unit": "nm",
+        # The inner part: the outer one encloses the cavity, so a coating on
+        # it is refused (it would lie inside the boundary wall).
+        "part_coating.cube": "pec", "part_coating_thickness.cube": "10"}))
+    with client.session_transaction() as session:
+        flashes = [str(m) for m in session.get("_flashes", [])]
+    assert resp.status_code == 302, (flashes, resp.data[:400])
+    (job_id, job), = db.jobs.items()
+    # The two units are two different fields and they differ here: a fixture
+    # where they coincide cannot see this defect, which is how it got in.
+    assert (job["units"], job["tds"]["td_unit"]) == ("um", "nm"), job["tds"]
+    assert job["tds"]["coatings"] == {"cube": ["pec", _close(10e-9)]}
+
+    body = client.get(f"/jobs/{job_id}").get_data(as_text=True)
+    block = re.search(r'id="coatings"(.*?)</table>', body, re.S)
+    assert block is not None, "the coating is absent from the job page"
+    cell = re.search(r"<tr><td>cube</td><td>.*?</td>\s*<td>(.*?)</td></tr>",
+                     block.group(1))
+    assert cell is not None, block.group(1)
+    assert cell.group(1).strip() == "10 nm", cell.group(1)
+
+
+@pytest.mark.parametrize("unit,typed", [("nm", "10"), ("um", "0.01"),
+                                        ("um", "12.345"), ("mm", "0.0025")])
+def test_a_coating_thickness_round_trips_through_metres(unit, typed):
+    """The page's number is the owner's number, for every unit on the form.
+
+    The store keeps metres and the page divides by the form's unit, so this is
+    the one place the two can disagree by 1000x -- and a format with too few
+    significant figures would quietly round the owner's digits off. Checked
+    over every unit the form offers, with the object's unit set to something
+    else so a page reaching for it cannot pass.
+    """
+    form = {"part_coating.cube": "pec", "part_coating_thickness.cube": typed}
+    coats = TDF.parse_coatings(form, TDF.LENGTH_UNITS[unit], unit)
+    # The producer and the page's reader, with the object unit deliberately
+    # different from the form's -- the defect this pair exists to catch.
+    rows = APP._coating_rows({"units": "mm",
+                              "tds": {"coatings": coats, "td_unit": unit}})
+    assert rows == [{"part": "cube", "material": "pec",
+                     "thickness": f"{typed} {unit}"}]
 
 
 @pytest.mark.parametrize("over, needle", [

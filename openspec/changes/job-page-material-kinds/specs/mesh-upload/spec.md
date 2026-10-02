@@ -37,15 +37,29 @@ solver's dispersive model and `pec` is a perfect conductor. Source:
 A time-domain job's page SHALL show the coatings stored in the job's REQUEST —
 not in the materials table, because a part's base material and the film on it are
 different things and only the base material enters the solver's layout table —
-each coating with its material and its thickness in the unit the job was typed
-in. A part with no coating SHALL NOT be shown as coated. A coating value this
-build cannot read SHALL be shown as it stands rather than raising. Source:
-`web/app.py` (`_coating_rows`), `web/templates/job.html`.
+each coating with its material and its thickness in the unit the coating was
+typed in. A coating thickness SHALL be stored with that unit: the request SHALL
+carry the time-domain form's own length unit (the one the thicknesses and cell
+size were typed in), because the stored metre value does not say what unit it
+came from, and the page SHALL divide by that same unit. The page SHALL NOT use
+the object's upload unit, which is a different field of the same form. A request
+stored before that unit existed has only metres, and the page SHALL then show the
+value in metres rather than presenting a unit it cannot justify. A part with no
+coating SHALL NOT be shown as coated. A coating value this build cannot read
+SHALL be shown as it stands rather than raising. Source: `web/app.py`
+(`_coating_rows`), `web/td_form.py` (`parse_request`), `web/templates/job.html`.
 
-#### Scenario: a coated part shows its coating
-- **WHEN** a stored `td` job requests a 20 nm coating of `Au` on part `film` and
-  the job's unit is `um`
-- **THEN** the page shows `film` with coating `Au` and thickness `0.02 um`
+#### Scenario: a coated part shows its coating in the form's unit
+- **WHEN** a stored `td` job was submitted with the time-domain form's length
+  unit `nm` and the object's unit `um`, and requests a 10 nm coating of `Au` on
+  part `film`
+- **THEN** the page shows `film` with coating `Au` and thickness `10 nm` — the
+  unit of the field the number was typed in, not the object's `um`
+
+#### Scenario: a request with no stored unit shows metres
+- **WHEN** a stored `td` job's request carries a coating thickness but no
+  time-domain length unit, and its object unit is `um`
+- **THEN** the page shows the thickness in metres, and not as a number in `um`
 
 #### Scenario: an uncoated job shows no coating table
 - **WHEN** a stored `td` job's request has no coatings

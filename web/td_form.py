@@ -170,6 +170,14 @@ def parse_request(form) -> dict:
                                    DIRECTIONS)
     req["probes"] = _probes(form.get("td_probes") or "", scale)
     req["coatings"] = parse_coatings(form, scale, unit)
+    # The unit every length on this form was typed in, stored BESIDE the values
+    # it was applied to. It is not a key the worker reads -- ``request_from``
+    # drops anything outside ``REQUEST_KEYS`` -- but a metre value cannot say
+    # what unit it was typed in, and the page that shows a coating thickness
+    # back to the owner needs exactly that (the same reason ``min_feature_unit``
+    # is stored beside ``min_feature_m``). Without it the page can only reach
+    # for the object's ``units``, a different field on the same form.
+    req["td_unit"] = unit
     # The movie window. Blank times mean the whole run and a blank count means
     # the solver's default; the window's own rules (inside the run, end after
     # start, no more frames than steps) are checked against the run's step
