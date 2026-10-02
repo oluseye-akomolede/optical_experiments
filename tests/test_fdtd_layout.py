@@ -174,6 +174,26 @@ def test_gold_thinner_than_its_skin_depth_takes_the_thickness_rule():
         f"a 10 nm gold film got a {inside.max():.3g} m cell; the thickness rule wants {cap:.3g}")
 
 
+
+def test_a_film_two_coarse_cells_thick_is_resolved_by_the_layout_rule():
+    # 20 nm of gold at dx 10 nm: two coarse cells, so build_grid's own
+    # thin-layer floor (which only acts below ONE coarse cell) does not apply,
+    # and only the layout's min(extent/4, skin/4) = 5 nm resolves it
+    import fdtd_grid
+    names = ["host", "gold"]
+    parts = [_box((0, 0, 0), (200, 200, 200)), _box((70, 70, 90), (130, 130, 110))]
+    req = _request(dx_m=10e-9, position=[30e-9, 30e-9, 30e-9])
+    out = L.layout(names, parts, req, length_scale=1e-9,
+                   materials={"host": 1.5, "gold": "Au"})
+    cap = 20e-9 / 4
+    assert 20e-9 >= 10e-9                  # not under one coarse cell
+    assert cap < fdtd_grid.skin_depth("Au", 4.0e14) / 4   # the min picks extent/4
+    z = out["nodes"][2]
+    inside = np.diff(z[(z >= 90e-9 - 1e-15) & (z <= 110e-9 + 1e-15)])
+    assert inside.max() <= cap * (1 + 1e-9), (
+        f"a 20 nm gold film at dx 10 nm got a {inside.max():.3g} m cell; "
+        f"the layout's rule wants {cap:.3g}")
+
 @pytest.mark.parametrize("boundary,far", [("metal", 5e-3), ("open", 25e-3)])
 @pytest.mark.parametrize("what", ["source", "probe"])
 def test_a_source_or_probe_outside_the_grid_is_refused_naming_the_extent(

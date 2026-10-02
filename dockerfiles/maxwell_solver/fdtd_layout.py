@@ -172,9 +172,9 @@ def layout(names, parts, request, *, length_scale: float, materials=None,
             if depth is not None:
                 fine = depth / CELLS_PER_SKIN
                 if b - a < 2 * SKIN_DEPTHS * depth:
-                    # the smaller spacing wins where both rules apply
-                    layers[axis].append(fdtd_grid.Layer(
-                        a, b, fine if thin is None else min(fine, thin)))
+                    # where the thin rule's layer covers the same span,
+                    # build_grid keeps the smaller spacing of the two
+                    layers[axis].append(fdtd_grid.Layer(a, b, fine))
                 else:
                     layers[axis] += [fdtd_grid.Layer(a, a + SKIN_DEPTHS * depth, fine),
                                      fdtd_grid.Layer(b - SKIN_DEPTHS * depth, b, fine)]
