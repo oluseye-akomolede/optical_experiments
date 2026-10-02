@@ -264,3 +264,102 @@ def test_an_unknown_boundary_and_a_plane_wave_in_metal_are_refused():
         L.layout(["a"], [part], _request(source_kind="plane", direction="+z",
                                          polarisation="x", position=None, dx_m=1e-3),
                  length_scale=1e-3, n_index=1.5)
+
+
+# --- plan / estimate / refuse_conductor_points: the form's cheap half ------
+
+def _gold_scene(shape="box"):
+    names = ["host", "gold"]
+    gold = (_box((70, 70, 70), (130, 130, 130)) if shape == "box"
+            else trimesh.creation.icosphere(subdivisions=2, radius=30.0)
+            .apply_translation((100, 100, 100)))
+    return names, [_box((0, 0, 0), (200, 200, 200)), gold]
+
+
+@pytest.mark.parametrize("boundary", ["metal", "open"])
+def test_the_plan_lays_out_the_nodes_the_layout_solves_on(boundary):
+    names, parts = _gold_scene()
+    req = _request(boundary=boundary, dx_m=50e-9, position=[30e-9, 30e-9, 30e-9],
+                   probes=[[170e-9, 30e-9, 30e-9, "x"]])
+    kw = dict(length_scale=1e-9, materials={"host": 1.5, "gold": "Au"})
+    planned, laid = L.plan(names, parts, req, **kw), L.layout(names, parts, req, **kw)
+    for a in range(3):
+        np.testing.assert_array_equal(planned["nodes"][a], laid["nodes"][a])
+    assert planned["cell"] == laid["cell"] and planned["probes"] == laid["probes"]
+    assert planned["box"] == laid["box"]
+
+
+@pytest.mark.parametrize("shape", ["box", "sphere"])
+@pytest.mark.parametrize("boundary", ["metal", "open"])
+def test_the_form_estimate_counts_the_solved_steps_and_never_less_memory(
+        shape, boundary):
+    import fdtd
+    names, parts = _gold_scene(shape)
+    req = _request(boundary=boundary, dx_m=50e-9, position=[30e-9, 30e-9, 30e-9],
+                   duration_s=2e-15)
+    kw = dict(length_scale=1e-9, materials={"host": 1.5, "gold": "Au"})
+    form = L.estimate(L.plan(names, parts, req, **kw), req)
+    laid = L.layout(names, parts, req, **kw)
+    solved = fdtd.estimate_run(laid["nodes"], duration=req["duration_s"],
+                               boundary=boundary, metals=laid["metals"],
+                               pec=laid["pec"], record_frames=True)
+    assert laid["metals"], "the gold must voxelise, or this compares nothing"
+    for key in ("cells", "dt", "steps", "setup"):
+        assert form[key] == solved[key], key
+    assert form["bytes"] >= solved["bytes"]
+    assert form["bytes"] <= 1.05 * solved["bytes"], "the bound is loose"
+
+
+def test_the_form_refuses_a_source_in_the_metal_boundary_naming_it():
+    names, parts = _two_boxes()
+    req = _request(dx_m=0.5e-3, position=[3e-3, 1.5e-3, 1.5e-3])
+    planned = L.plan(names, parts, req, length_scale=1e-3,
+                     materials={"left": 1.5, "right": 1.5})
+    with pytest.raises(L.LayoutError, match=r"source position.*metal boundary"):
+        L.refuse_conductor_points(planned, parts, length_scale=1e-3)
+
+
+def test_the_form_refuses_a_source_inside_a_pec_part_naming_the_part():
+    names = ["shell", "core"]
+    parts = [_box((0, 0, 0), (6, 4, 4)), _box((2, 1, 1), (4, 3, 3))]
+    req = _request(boundary="open", dx_m=0.5e-3, position=[3e-3, 2e-3, 2e-3])
+    planned = L.plan(names, parts, req, length_scale=1e-3,
+                     materials={"shell": 1.5, "core": "pec"})
+    with pytest.raises(L.LayoutError, match=r"source position.*part core"):
+        L.refuse_conductor_points(planned, parts, length_scale=1e-3)
+
+
+def test_the_form_refuses_a_probe_inside_a_rakic_metal_naming_the_part():
+    names, parts = _gold_scene()
+    req = _request(boundary="open", dx_m=50e-9, position=[30e-9, 30e-9, 30e-9],
+                   probes=[[100e-9, 100e-9, 100e-9, "z"]])
+    planned = L.plan(names, parts, req, length_scale=1e-9,
+                     materials={"host": 1.5, "gold": "Au"})
+    with pytest.raises(L.LayoutError, match=r"probe.*part gold"):
+        L.refuse_conductor_points(planned, parts, length_scale=1e-9)
+
+
+def test_the_form_passes_a_source_and_probe_in_a_dielectric():
+    # the positive control for the three refusals above
+    names, parts = _two_boxes()
+    req = _request(dx_m=0.5e-3, position=[1e-3, 1.5e-3, 1.5e-3],
+                   probes=[[5e-3, 1.5e-3, 1.5e-3, "x"]])
+    planned = L.plan(names, parts, req, length_scale=1e-3,
+                     materials={"left": 1.5, "right": 1.5})
+    assert L.refuse_conductor_points(planned, parts, length_scale=1e-3) is None
+
+
+def test_the_form_estimate_counts_a_pec_parts_conductor_mask():
+    import fdtd
+    names = ["shell", "core"]
+    parts = [_box((0, 0, 0), (6, 4, 4)), _box((2, 1, 1), (4, 3, 3))]
+    req = _request(boundary="open", dx_m=0.5e-3, position=[1e-3, 2e-3, 2e-3],
+                   duration_s=1e-12)
+    kw = dict(length_scale=1e-3, materials={"shell": 1.5, "core": "pec"})
+    form = L.estimate(L.plan(names, parts, req, **kw), req)
+    laid = L.layout(names, parts, req, **kw)
+    assert laid["pec"] is not None, "the core must voxelise as pec"
+    solved = fdtd.estimate_run(laid["nodes"], duration=req["duration_s"],
+                               boundary="open", metals=laid["metals"],
+                               pec=laid["pec"], record_frames=True)
+    assert form["bytes"] == solved["bytes"]
