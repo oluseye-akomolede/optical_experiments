@@ -1363,9 +1363,13 @@ async function renderTd(data) {
       li.textContent = c;
       caveats.appendChild(li);
     }
-    // Inside the try: manifest is block-scoped to it. The movie reports its
-    // own failures in its caption, so it is not awaited here.
-    renderTdMovie(manifest, data);
+    // Inside the try: manifest is block-scoped to it. Not awaited, so the
+    // plots show while frames load; any throw from the movie goes to its own
+    // caption instead of leaving it on "Loading".
+    renderTdMovie(manifest, data).catch((err) => {
+      document.getElementById('td-movie-caption').textContent =
+        `The field movie could not be shown: ${err.message}.`;
+    });
   } catch (err) {
     caption.textContent = `The probe traces could not be loaded: ${err.message}.`;
   }

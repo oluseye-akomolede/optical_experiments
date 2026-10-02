@@ -119,15 +119,40 @@ export function resampleFrame(frame, lattice) {
 // The shared scale: the SCALE_PERCENTILE of every positive sample in every
 // frame. Null when no frame has a positive sample (an all-zero movie has no
 // scale, and is drawn empty, correctly).
+// Exact, without sorting every sample (a full sort froze the tab for ~5 s on
+// a large stack): a histogram finds the bin holding the percentile rank, and
+// only that bin's values are sorted. The bin is the top 16 bits of the
+// float32 pattern, which for positive floats increases with the value (256
+// bins per octave), so each bin is a contiguous run of ranks and the result
+// equals the full sort's.
+const BIN_SHIFT = 16;
+function bitsOf(frame) {
+  const f = frame instanceof Float32Array ? frame : Float32Array.from(frame);
+  return new Uint32Array(f.buffer, f.byteOffset, f.length);
+}
 export function movieScale(frames) {
+  const counts = new Uint32Array(1 << (32 - BIN_SHIFT));
+  const views = frames.map((f) => [f instanceof Float32Array ? f : Float32Array.from(f), bitsOf(f)]);
   let total = 0;
-  for (const f of frames) for (const v of f) if (v > 0) total += 1;
+  for (const [f, bits] of views) {
+    for (let i = 0; i < f.length; i += 1) {
+      if (f[i] > 0) { counts[bits[i] >>> BIN_SHIFT] += 1; total += 1; }
+    }
+  }
   if (!total) return null;
-  const all = new Float32Array(total);
+  const rank = Math.min(total - 1, Math.floor(SCALE_PERCENTILE * (total - 1)));
+  let target = 0;
+  let below = 0;
+  while (below + counts[target] <= rank) { below += counts[target]; target += 1; }
+  const inBin = new Float32Array(counts[target]);
   let k = 0;
-  for (const f of frames) for (const v of f) if (v > 0) { all[k] = v; k += 1; }
-  all.sort();
-  return all[Math.min(total - 1, Math.floor(SCALE_PERCENTILE * (total - 1)))];
+  for (const [f, bits] of views) {
+    for (let i = 0; i < f.length; i += 1) {
+      if (f[i] > 0 && bits[i] >>> BIN_SHIFT === target) { inBin[k] = f[i]; k += 1; }
+    }
+  }
+  inBin.sort();
+  return inBin[rank - below];
 }
 
 // A frame divided by the shared scale and clamped to 1, ready for the shader.

@@ -68,6 +68,34 @@ test('movieScale is one high percentile shared by every frame', () => {
   assert.equal(movie.movieScale([new Float32Array(4)]), null);
 });
 
+// The pre-histogram definition, kept as the oracle: sort every positive
+// sample and take the SCALE_PERCENTILE rank.
+function sortedScale(frames) {
+  const all = [];
+  for (const f of frames) for (const v of f) if (v > 0) all.push(v);
+  if (!all.length) return null;
+  const sorted = Float32Array.from(all).sort();
+  return sorted[Math.min(sorted.length - 1, Math.floor(movie.SCALE_PERCENTILE * (sorted.length - 1)))];
+}
+
+test('movieScale equals the full-sort percentile exactly (tolerance 0)', () => {
+  let seed = 7;
+  const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const cases = [
+    // heavy tail over 12 decades, with zeros
+    [0, 1, 2].map(() => Float32Array.from({ length: 5000 }, () => (rand() < 0.2 ? 0 : 10 ** (12 * rand() - 6)))),
+    // many ties straddling the rank, plus one spike
+    [Float32Array.from({ length: 3000 }, (_, i) => (i < 2990 ? 3 : 1e9))],
+    // 4000 distinct values inside one histogram bin (bins are 1/256 octave;
+    // these span 0.4%, 8 float32 ulps apart), so the rank is chosen in-bin
+    [Float32Array.from({ length: 4000 }, (_, i) => 1 + 1e-6 * ((i * 7919) % 4000)), Float32Array.from([1e-9, 1e9])],
+    // all equal, and a single sample
+    [Float32Array.from({ length: 50 }, () => 0.25)],
+    [Float32Array.from([0, 0, 5])],
+  ];
+  for (const frames of cases) assert.equal(movie.movieScale(frames), sortedScale(frames));
+});
+
 test('scaledFrame divides by the shared scale and clamps at 1', () => {
   close(movie.scaledFrame(Float32Array.from([0, 5, 10, 40]), 10), [0, 0.5, 1, 1]);
   close(movie.scaledFrame(Float32Array.from([3]), null), [0]);
