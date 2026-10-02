@@ -38,15 +38,28 @@ class VoxelError(fdtd.FDTDError):
     """A materials table or boundary that the voxeliser cannot build."""
 
 
+def _encloses(parts) -> list:
+    """``inside[i][j]``: part ``i`` lies within part ``j`` (and not both ways)."""
+    contains = [[i != j and GEO.part_contains(other, mine)
+                 for j, other in enumerate(parts)] for i, mine in enumerate(parts)]
+    return [[contains[i][j] and not contains[j][i] for j in range(len(parts))]
+            for i in range(len(parts))]
+
+
 def nesting_depths(parts) -> list:
     """How many other parts enclose each part (0 for an outermost part)."""
-    depths = []
-    for i, mine in enumerate(parts):
-        depths.append(sum(
-            1 for j, other in enumerate(parts)
-            if j != i and GEO.part_contains(other, mine)
-            and not GEO.part_contains(mine, other)))
-    return depths
+    return [sum(row) for row in _encloses(parts)]
+
+
+def priority_of(material) -> float:
+    """Who owns a point on a face two parts share: a conductor (``pec`` or a
+    Rakić metal) over any dielectric, and between dielectrics the higher
+    refractive index."""
+    return float(material) if not isinstance(material, str) else np.inf
+
+
+class OverlapError(VoxelError):
+    """Two parts, neither inside the other, share volume."""
 
 
 def _ray_crossings(tris, rays):
@@ -91,33 +104,77 @@ def _ray_crossings(tris, rays):
 
 
 class PartIndex:
-    """``index_of(points)`` for a list of closed parts, in part coordinates."""
+    """``index_of(points)`` for a list of closed parts, in part coordinates.
 
-    def __init__(self, parts, depths=None):
+    A point inside nested parts belongs to the innermost. A point on a face
+    two parts share (a film flush against its plates) belongs to the part
+    with the higher ``priority`` (``priority_of`` each part's material: the
+    conductor, else the higher index); without priorities, or between equals,
+    the jitter decides as before. Each point is tested shifted both ways
+    along the jitter: the two answers differ exactly where it sits on a face.
+    A point strictly inside two parts neither of which encloses the other is
+    overlapping volume, refused as ``OverlapError`` naming both parts.
+    """
+
+    def __init__(self, parts, depths=None, *, priority=None, names=None):
         self.tris = [GEO.of_faces(p.vertices, p.faces) for p in parts]
-        self.depths = list(nesting_depths(parts) if depths is None else depths)
+        nested = _encloses(parts) if len(parts) > 1 else [[False]]
+        self.depths = list([sum(r) for r in nested] if depths is None else depths)
+        self.apart = [(p, q) for p in range(len(parts)) for q in range(p)
+                      if not nested[p][q] and not nested[q][p]]
+        self.priority = None if priority is None else [float(x) for x in priority]
+        self.names = (list(names) if names is not None
+                      else [f"part {i + 1}" for i in range(len(parts))])
         lo = np.min([np.min(t.reshape(-1, 3), axis=0) for t in self.tris], axis=0)
         hi = np.max([np.max(t.reshape(-1, 3), axis=0) for t in self.tris], axis=0)
         self.shift = _JITTER * max(float(np.max(hi - lo)), 1e-300)
 
-    def __call__(self, points):
-        pts = np.asarray(points, dtype=float).reshape(-1, 3) + self.shift
+    def _inside(self, pts):
+        """(parts, points) bool: each point inside each part."""
         rays, line = np.unique(pts[:, :2], axis=0, return_inverse=True)
         line = line.reshape(-1)
         by_line = np.argsort(line, kind="stable")
         starts = np.searchsorted(line[by_line], np.arange(len(rays) + 1))
-        index = np.full(len(pts), OUTSIDE, dtype=np.int64)
-        best = np.full(len(pts), -1, dtype=np.int64)
+        inside = np.zeros((len(self.tris), len(pts)), dtype=bool)
         for p, tris in enumerate(self.tris):
             crossings = _ray_crossings(tris, rays)
-            inside = np.zeros(len(pts), dtype=bool)
             for r in np.flatnonzero([len(z) > 0 for z in crossings]):
                 members = by_line[starts[r]:starts[r + 1]]
                 below = np.searchsorted(crossings[r], pts[members, 2])
-                inside[members] = below % 2 == 1
-            deeper = inside & (self.depths[p] > best)
+                inside[p, members] = below % 2 == 1
+        return inside
+
+    def _deepest(self, inside):
+        index = np.full(inside.shape[1], OUTSIDE, dtype=np.int64)
+        best = np.full(inside.shape[1], -1, dtype=np.int64)
+        for p in range(len(self.tris)):
+            deeper = inside[p] & (self.depths[p] > best)
             index[deeper] = p + 1
             best[deeper] = self.depths[p]
+        return index
+
+    def __call__(self, points):
+        pts = np.asarray(points, dtype=float).reshape(-1, 3)
+        up = self._inside(pts + self.shift)
+        index = self._deepest(up)
+        if len(self.tris) < 2:
+            return index
+        down = self._inside(pts - self.shift)
+        strict = up & down
+        for p, q in self.apart:
+            both = strict[p] & strict[q]
+            if both.any():
+                at = pts[int(np.flatnonzero(both)[0])]
+                raise OverlapError(
+                    f"parts {self.names[q]!r} and {self.names[p]!r} overlap "
+                    f"(both contain the point {[float(f'{x:.6g}') for x in at]} "
+                    f"in model units): parts may touch, but not share volume.")
+        if self.priority is not None:
+            other = self._deepest(down)
+            face = (other != index) & (index > OUTSIDE) & (other > OUTSIDE)
+            rank = np.array([-np.inf] + self.priority)
+            take = face & (rank[other] > rank[index])
+            index[take] = other[take]
         return index
 
 
@@ -178,7 +235,8 @@ def voxelise(names, parts, materials, nodes, *, boundary: str = "metal",
                          f"{', '.join(fdtd.BOUNDARIES)}.")
     names = list(names)
     table = _material_table(names, materials)
-    finder = PartIndex(parts)
+    finder = PartIndex(parts, priority=[priority_of(materials[n]) for n in names],
+                       names=names)
     # index 0 (outside) is a conductor for a cavity and vacuum for open space
     outside = ("pec",) if boundary == "metal" else ("eps", 1.0)
     kinds = [outside] + table

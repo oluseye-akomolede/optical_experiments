@@ -348,6 +348,36 @@ SHALL NOT offer a coating.
 - **WHEN** a multi-part time-domain upload arrives with no materials
 - **THEN** it is refused in plain words naming its parts, and nothing is queued
 
+#### Scenario: `/parts` names a td scene the way the td POST cuts it
+- **WHEN** the time-domain arm asks `/parts` for a scene whose parts are not
+  nested (a film between two plates)
+- **THEN** it returns the names the td POST's own split gives, not the cavity
+  parser's refusal that the first part must enclose the rest
+
+### Requirement: Parts that touch SHALL meet on a face one of them owns, and SHALL NOT overlap
+
+A film flush against its plates shares a face with each. A grid node on a
+shared face SHALL belong to the conductor (`pec` or a dispersive metal) over
+any dielectric, and between two dielectrics to the higher refractive index,
+whatever the file order. The same rule SHALL name the part a source or probe
+sits in. Two parts, neither inside the other, that share volume SHALL be
+refused naming both parts; nested parts are not overlap (the innermost owns
+its volume). The overlap check runs when the scene is voxelised, in the worker,
+so it fails the job readably rather than refusing the upload.
+
+#### Scenario: a film's faces go to its plates
+- **WHEN** a dielectric slab and a `pec` (or metal) slab share a face
+- **THEN** every node on that face is in the conductor mask, in either file order
+
+#### Scenario: between dielectrics the higher index owns the face
+- **WHEN** slabs of index 2.0 and 1.5 share a face
+- **THEN** the face's nodes take index 2.0, in either file order
+
+#### Scenario: overlapping parts are refused by name
+- **WHEN** two parts, neither enclosing the other, share volume
+- **THEN** the run fails with a message naming both parts; touching or nested
+  parts run
+
 ### Requirement: The worker SHALL run a time-domain job only with the memory it needs
 
 The worker SHALL run at most one GPU job at a time when one of them is `td`.

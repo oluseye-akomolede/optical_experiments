@@ -91,6 +91,9 @@
   `part_index.<name>`; missing, unknown or malformed materials are refused
   naming the part. Until this lands, multi-part td is refused in plain words
   (e9f0cda).
+- [x] 5.4c Shared faces and overlap (lead): a shared face goes to the conductor,
+  else the higher index; overlapping parts are refused naming both; `/parts`
+  uses the td split for td uploads.
 - [ ] 5.4b Per-part coatings end to end: a material plus a thickness on a
   part's surface, painted by the voxeliser on a grid refined by
   `coating_layers`, offered on the page only once it runs.
