@@ -1071,9 +1071,14 @@ a message. The form option is a later phase-6 task.
   within 0.25% (the reference's and the spectrum's own accuracy)
 - **AND** a band within 1% at the full resolution that does not approach the
   pc value fails, since one resolution under 1% does not show convergence
-- **AND** the crystal's eps is sampled finely enough at the rod edge that
-  finer sampling moves no band by more than 0.01% (9 samples per cell edge;
-  3 aliased the slowest band into a false plateau)
+- **AND** the crystal's eps is sampled at least 9 times per cell edge, where
+  the slowest band's error is settled: at 48 cells, 9, 15, 18 and 24 samples
+  read it as -1.17%, -1.10%, -1.14% and -1.13%, a spread of 0.064% against
+  this gate's own 0.25%, so the sampling is no longer part of the error
+- **AND** sampling below that (3 per cell edge) is rejected rather than
+  accepted as coarser: it reads the same band as -0.93%, a smaller error that
+  flatters the coarse line instead of converging it, so aliasing at the rod
+  edge would hide a coarse line's true error
 
 #### Scenario: benchmark V6 checks k against the exact light lines
 - **WHEN** the same cell holds one homogeneous medium of index n and runs at

@@ -60,10 +60,17 @@ sets (~2.4x the time).
 
 The crystal's TE band 1 at X is the slow line (measured on the VM, 150
 periods, 9 samples): -1.166% at 48 cells, -0.959% at 64, -0.620% at 96,
-first order through 64 and 96 to about +0.06%. With 3 samples it read
--0.36% at 48 and -0.38% at 64: aliasing at the rod edge, not convergence.
-At 64 cells it is under 1% by only 0.04%; the convergence gate is what shows
-it is heading to the pc value. TM lines are within 0.3% at 48.
+first order through 64 and 96 to about +0.06%. At 64 cells it is under 1% by
+only 0.04%; the convergence gate is what shows it is heading to the pc value.
+TM lines are within 0.3% at 48.
+
+Sampling the eps more finely is settled well before this (measured the same
+way): at 48 cells, 9, 15, 18 and 24 samples per cell edge read band 1 as
+-1.166%, -1.102%, -1.144%, -1.130% (a spread of 0.064%, against the gate's
+0.25%). Fewer than that is not a coarser answer but a wrong one, and in the
+flattering direction: 3 samples read -0.927% at 48 cells -- smaller than the
+9-sample error, so aliasing at the rod edge hides the coarse line's true
+error instead of converging it. 9 is the bench's choice for that reason.
 
 RUN IT ON THE JETSON (tier 2), as six commands so each stays inside the
 30 min tier-2 timeout. Estimated from VM runs (nice 19, 2 threads): about
@@ -150,7 +157,9 @@ SIDELOBE_DB = 31.5                  # ... and how far down it is
 SIDELOBE_MARGIN = 2.0               # a peak this far under the envelope is a sidelobe
 SIDELOBE_REACH = 20.0               # record bins; past this the envelope is under the floor
 ROD_EPS, ROD_RADIUS = 8.9, 0.2      # the crystal: rods in air, r / a
-EPS_SAMPLES = 9                     # per cell edge; 3 aliased TE1 at X to -0.37%, 15 = 9 to 0.005%
+EPS_SAMPLES = 9                     # per cell edge; at 48 cells TE1 at X reads
+                                    # -0.93% at 3 samples, -1.17% at 9 and
+                                    # -1.10/-1.14/-1.13% at 15/18/24 (see above)
 
 SOURCE_AT = (0.13, 0.29)            # lattice units, off every symmetry line
 PROBES_AT = ((0.71, 0.37), (0.41, 0.83), (0.87, 0.61), (0.23, 0.57))
