@@ -300,3 +300,25 @@ def test_a_periodic_slab_is_metal_across_its_whole_cross_section():
     assert min(peaks) > 0, "the probes inside the slab saw nothing"
     assert (max(peaks) - min(peaks)) / max(peaks) < 1e-6, (
         f"E inside a periodic slab varies across it: {peaks}")
+
+
+@pytest.mark.parametrize("periodic", [(False, False, False),
+                                      (True, True, False)])
+def test_a_metal_filling_the_grid_covers_exactly_the_samples_the_e_update_advances(
+        periodic):
+    """Each component's metal box is its E update range: half positions
+    0..n-2 along its own axis, nodes 1..n-2 across a wall or open axis and
+    1..n-1 across a periodic one. A sample beyond it is never curl-updated,
+    so a wider box changes no field (no run can see it); this pins it."""
+    shape = (7, 8, 9)                         # non-square
+    eps = np.ones(shape, dtype=np.float32)
+    term = fdtd.LorentzDrude("Au", np.ones(shape, dtype=bool))
+    term.bind(shape=shape, dt=1e-18, xp=np, inv_eps=1 / (fdtd.EPS0 * eps),
+              periodic=periodic)
+    for axis, component in enumerate(fdtd.COMPONENTS):
+        want = tuple((0, n - 1) if a == axis else
+                     (1, n) if periodic[a] else (1, n - 1)
+                     for a, n in enumerate(shape))
+        box = term.parts[component]["box"]
+        assert tuple((s.start, s.stop) for s in box) == want, component
+        assert term.parts[component]["keep"].all(), component
