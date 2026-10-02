@@ -961,3 +961,89 @@ def test_check_hook_is_called_every_check_every_steps_and_can_stop_the_run():
     with pytest.raises(Stop) as info:
         fdtd.simulate(eps, pulse(cell=(3, 2, 2)), n, check=stop)
     assert info.value.args == (fdtd.CHECK_EVERY,)
+
+
+# ---- the field movie (task 4.3) ---------------------------------------------
+
+def test_the_frame_plan_spreads_its_frames_and_ends_on_the_last_step():
+    plan = fdtd.frame_plan((130, 64, 65), 1000)
+    # 130 needs a stride of 3 to fit 64 samples (2 would keep 65); 64 fits
+    # as it is; 65 needs 2
+    assert plan["stride"] == (3, 1, 2)
+    assert fdtd.frame_shape((130, 64, 65), plan["stride"]) == (44, 64, 33)
+    steps = plan["steps"]
+    assert len(steps) == 60 and steps[-1] == 999
+    assert all(a < b for a, b in zip(steps, steps[1:])) and steps[0] >= 0
+    gaps = np.diff([-1] + steps)
+    assert gaps.max() - gaps.min() <= 1          # evenly spread
+    # a run shorter than the cap records every step
+    assert fdtd.frame_plan((5, 5, 5), 10)["steps"] == list(range(10))
+    with pytest.raises(fdtd.FDTDError):
+        fdtd.frame_plan((5, 5, 5), 0)
+
+
+def _movie_run(pec=None):
+    shape = (9, 7, 8)                            # non-square on purpose
+    eps = np.ones(shape, np.float32)
+    eps[5:8, 1:4, 2:6] = 2.5
+    probes = [(i, j, k, c) for (i, j, k) in ((4, 2, 3), (6, 5, 6), (2, 4, 0))
+              for c in "xyz"]
+    plan = {"steps": [5, 17, 39], "stride": (2, 1, 3)}
+    run = fdtd.simulate(eps, pulse(cell=(4, 3, 4), component="y"), 40, probes,
+                        pec=pec, frames=plan)
+    return run, probes, plan
+
+
+@pytest.mark.parametrize("with_pec", [False, True])
+def test_a_frame_is_the_field_magnitude_the_probes_read(with_pec):
+    pec = None
+    if with_pec:
+        pec = np.zeros((9, 7, 8), dtype=bool)
+        pec[1:3, 1:3, 5:7] = True
+    run, probes, plan = _movie_run(pec)
+    frames = run["frames"]
+    assert isinstance(frames, np.ndarray) and frames.dtype == np.float32
+    assert frames.shape == (3, 5, 7, 3)          # 9/2 -> 5, 7, 8/3 -> 3
+    traces = run["traces"]
+    for node in range(0, len(probes), 3):
+        i, j, k, _ = probes[node]
+        for index, step in enumerate(plan["steps"]):
+            components = traces[node:node + 3, step].astype(np.float64)
+            expected = np.sqrt((components ** 2).sum())
+            got = frames[index, i // 2, j, k // 3]
+            assert got == pytest.approx(expected, rel=1e-6, abs=1e-30), (
+                f"node {(i, j, k)} step {step}: frame {got}, probes {expected}")
+    assert frames[-1].max() > 0                  # the pulse is in the picture
+    if with_pec:
+        # the stride keeps conductor nodes i=2, j=1..2, k=6: no field there,
+        # so a frame taken before the conductor mask would show one
+        assert not frames[:, 1, 1:3, 2].any()
+        assert frames[:, 1, 4:, 2].any()           # but beside it, yes
+
+
+def test_a_bad_frame_plan_is_refused():
+    eps = np.ones((5, 5, 5), np.float32)
+    for plan in ({"steps": [3, 3], "stride": (1, 1, 1)},
+                 {"steps": [4], "stride": (1, 1, 1)},
+                 {"steps": [-1], "stride": (1, 1, 1)},
+                 {"steps": [1], "stride": (1, 0, 1)}):
+        with pytest.raises(fdtd.FDTDError):
+            fdtd.simulate(eps, pulse(cell=(2, 2, 2)), 4, frames=plan)
+
+
+def test_no_frames_were_asked_for():
+    run = fdtd.simulate(np.ones((5, 5, 5), np.float32), pulse(cell=(2, 2, 2)), 3)
+    assert run["frames"] is None
+
+
+def test_the_frames_come_back_on_the_host_whatever_xp_built_them():
+    # the same refusing device fake as the traces test above: a frame left
+    # device-resident would make the worker's np.asarray raise on the Jetson
+    xp = _DeviceXp()
+    plan = {"steps": [9, 39], "stride": (2, 1, 3)}
+    problem = dict(eps_r=np.ones((7, 6, 8), np.float32),
+                   source=pulse(cell=(3, 3, 3)), n_steps=40, frames=plan)
+    device = fdtd.simulate(xp=xp, **problem)["frames"]
+    host = fdtd.simulate(**problem)["frames"]
+    assert type(device) is np.ndarray and device.dtype == np.float32
+    assert host.any() and np.array_equal(device, host)

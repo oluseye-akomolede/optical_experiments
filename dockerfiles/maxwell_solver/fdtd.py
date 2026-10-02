@@ -104,6 +104,33 @@ DEFAULT_PML_CELLS = 10
 #: How often ``simulate`` calls its ``check`` hook, in steps.
 CHECK_EVERY = 64
 
+#: The field movie's caps (proposal: at most 64 samples per axis, at most 60
+#: frames). A frame is then at most 1 MiB of float32.
+MAX_FRAMES = 60
+MAX_FRAME_SAMPLES = 64
+
+
+def frame_plan(shape, n_steps: int, *, max_frames: int = MAX_FRAMES,
+               max_samples: int = MAX_FRAME_SAMPLES) -> dict:
+    """The steps the field movie records and the stride along each axis.
+
+    The stride is the smallest whole number that brings each axis to at most
+    ``max_samples`` samples. The frames are spread evenly over the run and
+    the last one is the final step, so the movie ends where the run ends.
+    """
+    n_steps = int(n_steps)
+    if n_steps < 1:
+        raise FDTDError(f"a field movie needs at least 1 step, got {n_steps}")
+    stride = tuple(max(1, -(-int(n) // int(max_samples))) for n in shape)
+    count = min(int(max_frames), n_steps)
+    steps = [((k + 1) * n_steps) // count - 1 for k in range(count)]
+    return {"steps": steps, "stride": stride}
+
+
+def frame_shape(shape, stride) -> tuple:
+    """Samples per axis that ``frame_plan``'s stride keeps."""
+    return tuple(len(range(0, int(n), int(k))) for n, k in zip(shape, stride))
+
 
 class FDTDError(Exception):
     """Anything this module refuses to run, named in the message."""
@@ -1178,13 +1205,15 @@ POOL_PER_OPEN_AXIS = 0.6
 
 
 def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
-                    record_peak=False) -> int:
+                    record_peak=False, record_frames=False) -> int:
     """Bytes ``simulate`` holds at its peak on the device (float32 arrays).
 
     Counts, per cell: six fields, eps and 1/eps, the transients, the device
     pool's cached blocks, four CPML psi arrays per open axis (two E and two H
     derivatives along it), the conductor mask and its multiplier, and the peak
-    |E_c| record (3 arrays). Each metal
+    |E_c| record (3 arrays), and the field movie (``MAX_FRAMES`` frames at
+    ``frame_plan``'s stride, plus ten of the same size: the three float64
+    component copies and the float64 sum its |E| is built from). Each metal
     ``(name, region)`` adds, per component, a box over its samples (the region
     widened one node along the component) holding 2 per pole + 4 arrays, plus
     the solver's boolean union of the regions.
@@ -1199,6 +1228,9 @@ def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
     if record_peak:
         floats += 3                         # the E components only
     total = 4.0 * cells * floats
+    if record_frames:
+        sampled = int(np.prod(frame_shape(shape, frame_plan(shape, 1)["stride"])))
+        total += 4.0 * sampled * (MAX_FRAMES + 10)
     if metals:
         total += cells                      # the boolean union of the regions
     for name, region in metals:
@@ -1263,7 +1295,7 @@ def rate_setup(boundary="metal", metals=()) -> str:
 
 
 def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
-                 pec=None, record_peak=False) -> dict:
+                 pec=None, record_peak=False, record_frames=False) -> dict:
     """Cells, dt, steps, device bytes and Jetson seconds for a planned run.
 
     ``nodes`` are the three node-coordinate arrays the run will use and
@@ -1291,7 +1323,8 @@ def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
         "steps": steps,
         "bytes": memory_estimate(shape, boundary=boundary,
                                  metals=list(metals.items()),
-                                 pec=pec is not None, record_peak=record_peak),
+                                 pec=pec is not None, record_peak=record_peak,
+                                 record_frames=record_frames),
         "setup": setup,
         "seconds": cells * steps / (RATE_SAFETY * JETSON_RATES[setup]),
     }
@@ -1331,7 +1364,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
              *, spacings=None, dx: float = 1.0,
              boundary: str = "metal", pec=None, pml_cells: int = DEFAULT_PML_CELLS,
              xp=None, record_energy: bool = False, energy_region=None,
-             record_peak: bool = False, ade_terms=(), check=None) -> dict:
+             record_peak: bool = False, ade_terms=(), check=None,
+             frames=None) -> dict:
     """Run the grid and return the probe traces.
 
     ``eps_r`` ``(nx, ny, nz)`` is the relative permittivity of each node and it
@@ -1374,6 +1408,13 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     running maximum kept on the device (no sync a step), so a check that a
     region stayed quiet "throughout the run" reads every cell of it rather
     than a handful of probes.
+
+    ``frames`` (a :func:`frame_plan` dict) adds ``"frames"``: ``|E|`` after
+    the E update of each listed step, on the nodes ``stride`` keeps, as one
+    ``(n_frames, sx, sy, sz)`` float32 array in the grid's (x, y, z) order.
+    The three components are combined where they are stored, half a cell
+    apart, without interpolation: it is a picture of the field, not a
+    measurement. It is written into a device array (no sync a step).
 
     ``check``, if given, is called as ``check(step)`` before step 0 and every
     ``CHECK_EVERY`` steps after it, on the host; it stops the run by raising
@@ -1634,6 +1675,21 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     energy: list[float] | None = [] if record_energy else None
     peak = ({c: xp.zeros(shape, dtype=f32) for c in COMPONENTS}
             if record_peak else None)
+    movie = frame_at = sampled = None
+    if frames is not None:
+        stride = tuple(int(k) for k in frames["stride"])
+        if len(stride) != 3 or min(stride) < 1:
+            raise FDTDError(f"a frame stride is three whole numbers >= 1, "
+                            f"got {frames['stride']!r}")
+        frame_at = {}
+        for index, s in enumerate(frames["steps"]):
+            if not 0 <= int(s) < n_steps or int(s) in frame_at:
+                raise FDTDError(f"frame step {s!r} is repeated or outside "
+                                f"the run's {n_steps} steps")
+            frame_at[int(s)] = index
+        sampled = tuple(slice(None, None, k) for k in stride)
+        movie = xp.zeros((len(frame_at),) + frame_shape(shape, stride),
+                         dtype=f32)
     if energy_region is None:
         region = (slice(None),) * 3
     else:
@@ -1842,6 +1898,12 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             else:
                 value = field[component][cell]
             traces[index, step] = value
+        if frame_at is not None and step in frame_at:
+            # float64: a field of 1e-21 squares to below float32's normal
+            # range and would lose digits before the square root
+            ex, ey, ez = (values[sampled].astype(xp.float64)
+                          for values in (Ex, Ey, Ez))
+            movie[frame_at[step]] = xp.sqrt(ex * ex + ey * ey + ez * ez)
         if peak is not None:
             for component in COMPONENTS:
                 xp.maximum(peak[component], xp.abs(field[component]),
@@ -1851,7 +1913,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
         peak = {c: _host_result(values, xp) for c, values in peak.items()}
     return {"traces": _host_result(traces, xp), "dt": dt, "steps": n_steps,
             "spacings": [np.array(p) for p in primal], "energy": energy,
-            "peak": peak}
+            "peak": peak,
+            "frames": None if movie is None else _host_result(movie, xp)}
 
 
 def _host_result(value, xp):
