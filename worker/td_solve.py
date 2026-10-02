@@ -24,8 +24,8 @@ with a 45-minute stop. ``write_results`` (4.3) writes what it produced:
                    ``frames.shape`` = (sx, sy, sz), in the grid's x, y, z order
                    (NOT the cavity field files' (nz, ny, nx)).
 
-The page routes serve them as ``files/trace.bin``, ``files/spectrum.json`` and
-``frames/<n>.bin``. Storage names are flat because the worker API refuses any
+The page serves all three through ``/jobs/<id>/files/<name>`` (404 until the
+job is done). Storage names are flat because the worker API refuses any
 name with a path separator.
 """
 from __future__ import annotations

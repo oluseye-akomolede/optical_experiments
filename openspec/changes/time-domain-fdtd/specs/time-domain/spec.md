@@ -655,6 +655,18 @@ a path separator).
   `x/frame_01.bin`
 - **THEN** both refuse it
 
+#### Scenario: the page reads td results through files/
+- **WHEN** a td job is done
+- **THEN** its status carries `spectrum_url` and `trace_url` (both under
+  `/jobs/<id>/files/`) and none of `modes`, `manifest_url`, `surface_url` or
+  `bands`, and `files/trace.bin`, `files/spectrum.json` and
+  `files/frame_NN.bin` return the stored bytes
+
+#### Scenario: td results are not served early or invented
+- **WHEN** the job is not done, the named frame was not written, or the name is
+  not one the solver writes
+- **THEN** the files/ route answers 404
+
 ### Requirement: A drawn waveform SHALL be checked against the grid
 
 A `drawn` source SHALL be a list of at most 10 000 dimensionless amplitude

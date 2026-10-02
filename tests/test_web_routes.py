@@ -2633,3 +2633,95 @@ def test_the_job_list_says_which_kind_each_row_is(tmp_path):
     assert "crystal" in rows[pc_id], rows[pc_id]
     assert "crystal" not in rows[cav_id], rows[cav_id]
     assert "object" in rows[cav_id], rows[cav_id]
+
+
+# ---------------------------------------------------------------------------
+# td results: status keys and the files/ route
+# ---------------------------------------------------------------------------
+_TDS = {"boundary": "open", "source_kind": "point", "profile": "pulse",
+        "frequency_hz": 4.0e14, "bandwidth": 0.5}
+
+
+def _done_td_job(db):
+    job_id = str(uuid.uuid4())
+    db.create_job(job_id, "box.obj", "nm", 1.0, 0, target=DB.JETSON,
+                  kind=DB.TD, tds=dict(_TDS))
+    db.jobs[job_id].update(status=DB.DONE, stage=DB.DONE,
+                           finished_at="2026-10-02T09:00:00+00:00")
+    return job_id
+
+
+def test_a_done_td_status_points_at_its_own_results_not_modes(tmp_path):
+    """A finished td job's status names the spectrum and the trace, and none of
+    the cavity keys: ``modes: []`` would read as "found no modes", and the
+    manifest/surface URLs name files a td job never writes.
+
+    Mutation that must turn this red: delete the ``DB.TD`` branch in job_status.
+    """
+    app, _store, db, _l = make_app(tmp_path)
+    job_id = _done_td_job(db)
+
+    body = app.test_client().get(f"/jobs/{job_id}/status").get_json()
+
+    assert body["kind"] == DB.TD
+    assert body["spectrum_url"] == f"/jobs/{job_id}/files/spectrum.json"
+    assert body["trace_url"] == f"/jobs/{job_id}/files/trace.bin"
+    for key in ("modes", "manifest_url", "surface_url", "bands"):
+        assert key not in body, f"a td status must not carry {key!r}"
+
+
+def test_the_files_route_serves_every_td_result(tmp_path):
+    """Each td file comes back byte for byte through files/, with JSON as JSON.
+
+    Mutation that must turn this red: drop the td alternation from
+    _safe_result_name (every name then 404s).
+    """
+    app, store, db, _l = make_app(tmp_path)
+    job_id = _done_td_job(db)
+    files = {"trace.bin": b"\x00\x00\x80?" * 3,
+             "spectrum.json": b'{"version": 1}',
+             "frame_01.bin": b"\x01\x02\x03\x04",
+             "frame_60.bin": b"\x05\x06\x07\x08"}
+    for name, data in files.items():
+        store.write(STORE.job_key(job_id, name), data)
+    client = app.test_client()
+
+    for name, data in files.items():
+        response = client.get(f"/jobs/{job_id}/files/{name}")
+        assert response.status_code == 200, name
+        assert response.data == data, name
+    assert client.get(f"/jobs/{job_id}/files/spectrum.json"
+                      ).mimetype == "application/json"
+
+
+def test_td_results_404_until_done_missing_or_misnamed(tmp_path):
+    """The 404 rules: a running job's files, a file not written, and names the
+    solver never writes (wrong digit count, wrong extension, traversal)."""
+    app, store, db, _l = make_app(tmp_path)
+    job_id = _done_td_job(db)
+    store.write(STORE.job_key(job_id, "frame_01.bin"), b"\x00" * 4)
+    client = app.test_client()
+
+    assert client.get(f"/jobs/{job_id}/files/frame_02.bin").status_code == 404
+    for bad in ("frame_1.bin", "frame_001.bin", "frame_01.vtu",
+                "trace.json", "spectrum.bin", "../frame_01.bin"):
+        assert client.get(f"/jobs/{job_id}/files/{bad}").status_code == 404, bad
+
+    db.jobs[job_id].update(status=DB.RUNNING, stage=DB.RUNNING)
+    assert client.get(f"/jobs/{job_id}/files/frame_01.bin").status_code == 404
+
+
+def test_the_app_serves_every_name_the_td_solve_writes(tmp_path):
+    """The read side agrees with the writer: the names come from td_solve's own
+    constants, not retyped, at the largest frame number it can write."""
+    import importlib
+    worker = str(Path(__file__).resolve().parents[1] / "worker")
+    sys.path.insert(0, worker)
+    try:
+        td = importlib.import_module("td_solve")
+        fdtd_max = importlib.import_module("fdtd").MAX_FRAMES
+    finally:
+        sys.path.remove(worker)
+    for name in (td.TRACE_NAME, td.SPECTRUM_NAME, td.FRAME_NAME.format(1),
+                 td.FRAME_NAME.format(fdtd_max)):
+        assert APP._safe_result_name(name), name
