@@ -748,12 +748,34 @@ little-endian, C order, shaped probes × steps), one `frame_NN.bin` per movie
 frame (two-digit, 1-based, |E| float32 little-endian, C order, in the grid's
 x, y, z order) and `spectrum.json` (the manifest: time step, step count, the
 band, each probe's position, component and amplitude spectrum within the band,
-the trace and frame shapes, and the layout caveats). The manifest SHALL be
+the trace and frame shapes, each frame sample's position along x, y and z in
+metres (the grid is graded, so a viewer cannot assume even spacing), and the
+layout caveats). The spectra SHALL be scaled so the largest peak across all
+probes is 1, stated in the manifest as `spectrum_scale: "largest peak = 1"`, so
+they compare across probes and do not grow with the step count. A probe with
+no signal in the band SHALL be stored as flat zero with a caveat naming it,
+never NaN, even when no probe has any signal. The manifest SHALL be
 written last, so its presence means every other file exists. A non-finite value
 in a trace, frame or spectrum SHALL fail the job before anything is written.
 The worker's upload list and the app's accepted names SHALL agree on every one
 of these names, and SHALL refuse near misses (`frame_1.bin`, `frame_001.bin`,
 a path separator).
+
+#### Scenario: the spectrum does not grow with the run
+- **WHEN** the same steady wave is recorded for twice as many steps
+- **THEN** the stored spectrum still peaks at 1 at the same frequency, with the
+  same shape around the peak counted in frequency bins
+
+#### Scenario: a probe the source cannot excite
+- **WHEN** a probe's trace is zero throughout
+- **THEN** its stored spectrum is all zeros, the other probes keep their scale,
+  and the caveats say that probe recorded no signal in the band
+
+#### Scenario: the manifest places every movie sample
+- **WHEN** a movie keeps every `stride`-th node of a graded grid
+- **THEN** `frames.positions_m` lists, per axis, exactly those nodes in metres,
+  in the probes' frame, one per sample; a count that disagrees with the frame
+  shape fails the job before anything is written
 
 #### Scenario: the files decode to the solver's own output
 - **WHEN** a tiny `td` job finishes
@@ -784,6 +806,32 @@ a path separator).
 - **WHEN** the job is not done, the named frame was not written, or the name is
   not one the solver writes
 - **THEN** the files/ route answers 404
+
+### Requirement: A finished time-domain job's page SHALL plot each probe's trace and spectrum
+The job page of a finished `td` job SHALL show a card with every probe's trace
+against time and its amplitude spectrum over the manifest's band (the
+spectrum axis labelled with the manifest's scale, "largest peak = 1"), both with
+labelled axes in SI-prefixed units, a legend naming each probe's component and
+position in its line's colour, and the run's caveats. The cavity viewer, mode
+table and band card SHALL stay hidden. A trace longer than the plot is wide
+SHALL be drawn as each pixel column's minimum and maximum, not by decimation,
+so a CW trace does not alias into a false beat. A manifest or trace that cannot
+be fetched SHALL be named in the card's caption, never left as an empty plot.
+
+#### Scenario: a finished td job shows its probes
+- **WHEN** a finished `td` job with two probes is opened
+- **THEN** the card shows two trace lines and two spectrum lines, a time axis in
+  ps or ns, a frequency axis in GHz or THz, and a legend whose swatches match
+  the line colours, and the 3-D viewer, mode table and band card are hidden
+
+#### Scenario: a trace that cannot be fetched is named
+- **WHEN** the trace request answers 502
+- **THEN** the caption says the probe traces could not be loaded and names the
+  HTTP status
+
+#### Scenario: caveats reach the page
+- **WHEN** the manifest lists caveats
+- **THEN** each one is listed on the card
 
 ### Requirement: A drawn waveform SHALL be checked against the grid
 

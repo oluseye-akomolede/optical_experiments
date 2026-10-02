@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import types
@@ -187,6 +188,32 @@ def test_a_layout_refusal_reaches_the_owner_as_a_verdict():
                           xp=np, free_bytes=PLENTY)
 
 
+def test_an_upload_whose_parts_overlap_fails_naming_both_parts():
+    """Two parts inside the block share volume (x in [2, 2.5] mm). The
+    voxeliser's OverlapError is an FDTDError, so the owner reads its sentence
+    as the job's verdict, with both part names in it."""
+    import trimesh
+
+    lines, base = [], 0
+    for name, lo, hi in [("block", (0, 0, 0), (4, 3, 2)),
+                         ("lens", (0.5, 0.5, 0.5), (2.5, 2.5, 1.5)),
+                         ("prism", (2.0, 0.5, 0.5), (3.5, 2.5, 1.5))]:
+        box = trimesh.creation.box(extents=np.subtract(hi, lo))
+        box.apply_translation(np.add(lo, hi) / 2)
+        lines.append(f"o {name}")
+        lines += [f"v {x!r} {y!r} {z!r}" for x, y, z in box.vertices.tolist()]
+        lines += ["f " + " ".join(str(base + i + 1) for i in f)
+                  for f in box.faces.tolist()]
+        base += len(box.vertices)
+    store = _Store()
+    store.obj = ("\n".join(lines) + "\n").encode()
+    job = _job()
+    job["materials"] = {"block": 1.0, "lens": 1.5, "prism": 2.0}
+    with pytest.raises(td_solve.TDSolveError,
+                       match=r"parts 'lens' and 'prism' overlap"):
+        td_solve.solve_td(job, store, xp=np, free_bytes=PLENTY)
+
+
 # --------------------------------------------------------------------------
 # 4.3: the result files
 
@@ -251,6 +278,37 @@ def test_each_frame_file_is_that_frame_in_xyz_order():
     assert np.abs(frames[-1]).max() > 0
 
 
+def test_every_probe_node_is_a_movie_sample_position():
+    """The small grid keeps every node (stride 1), so each probe's snapped
+    position, computed by the probe path, must appear on every axis."""
+    res, out = _run_with_files()
+    fr = _strict_json(out.files["spectrum.json"])["frames"]
+    assert fr["stride"] == [1, 1, 1], "fixture: every node kept"
+    pos = fr["positions_m"]
+    assert [len(p) for p in pos] == fr["shape"]
+    for a in range(3):
+        assert np.all(np.diff(pos[a]) > 0), "xyz"[a]
+    for probe in _strict_json(out.files["spectrum.json"])["probes"]:
+        for a in range(3):
+            assert np.isclose(pos[a], probe["position_m"][a], rtol=0,
+                              atol=1e-12).sum() == 1, (probe, "xyz"[a])
+
+
+def test_movie_positions_follow_a_graded_grid_and_its_stride():
+    lay = {"origin_m": [-1.0, 0.0, 2.0],
+           "nodes": [np.array([0.0, 0.1, 0.3, 0.7, 1.5]),
+                     np.array([0.0, 1.0, 2.0, 2.5]),
+                     np.array([0.0, 0.25])]}
+    got = td_solve.frame_positions(lay, (2, 3, 1), (3, 2, 2))
+    assert got == [[-1.0, -0.7, 0.5], [0.0, 2.5], [2.0, 2.25]]
+
+
+def test_a_movie_whose_shape_disagrees_with_its_stride_is_refused():
+    lay = {"origin_m": [0.0] * 3, "nodes": [np.arange(5.0)] * 3}
+    with pytest.raises(td_solve.TDSolveError, match="4 samples along y"):
+        td_solve.frame_positions(lay, (2, 1, 2), (3, 4, 3))
+
+
 def test_the_manifest_is_written_last():
     res, out = _run_with_files()
     assert out.order[-1] == "spectrum.json"
@@ -272,7 +330,76 @@ def test_each_probes_spectrum_spans_the_pulse_band_and_peaks_in_it():
         want_f, want_a = FDTD.spectrum(np.asarray(res["result"]["traces"])[p],
                                        man["dt_s"])
         keep = (want_f >= lo) & (want_f <= hi)
-        assert np.allclose(a, np.asarray(want_a)[keep], rtol=1e-6)
+        raw = [np.asarray(FDTD.spectrum(t, man["dt_s"])[1])[keep]
+               for t in np.asarray(res["result"]["traces"])]
+        peak = max(r.max() for r in raw)
+        assert peak != pytest.approx(1.0), "fixture: the raw peak must not be 1"
+        assert np.allclose(a, np.asarray(want_a)[keep] / peak, rtol=1e-6)
+    assert man["spectrum_scale"] == "largest peak = 1"
+    assert max(max(p["spectrum"]["amplitude"]) for p in man["probes"]) \
+        == pytest.approx(1.0)
+
+
+def _sine_spectrum(steps, dt=1e-12, f0=5e10):
+    t = np.arange(steps) * dt
+    freqs, amp = FDTD.spectrum(np.sin(2 * np.pi * f0 * t), dt)
+    return np.asarray(freqs), np.asarray(amp)
+
+
+def test_a_doubled_step_count_gives_the_same_normalised_spectrum():
+    """The raw |rfft| of a steady wave doubles with the step count; the
+    normalised spectrum keeps peak 1 at the same frequency, with the same
+    curve shape around the peak, counted in frequency bins (both runs hold a
+    whole number of periods: 50 and 100)."""
+    f1, raw1 = _sine_spectrum(1000)
+    f2, raw2 = _sine_spectrum(2000)
+    assert raw2.max() / raw1.max() == pytest.approx(2.0, rel=1e-3)
+    (n1,), _ = td_solve.normalise_spectra([raw1], ["z"])
+    (n2,), _ = td_solve.normalise_spectra([raw2], ["z"])
+    k1, k2 = int(n1.argmax()), int(n2.argmax())
+    assert n1[k1] == n2[k2] == 1.0
+    assert f1[k1] == pytest.approx(f2[k2])
+    # The main lobe is [0.5, 1, 0.5] in both; the Hann window's finite-length
+    # leakage differs by under 4e-4 (measured), well inside 1e-3.
+    assert np.allclose(n1[k1 - 3:k1 + 4], n2[k2 - 3:k2 + 4], atol=1e-3)
+
+
+def test_a_probe_with_no_signal_is_flat_zero_with_a_note_never_nan():
+    live = np.array([0.0, 2.0, 4.0, 1.0])
+    out, notes = td_solve.normalise_spectra([live, np.zeros(4)], ["z", "x"])
+    assert np.array_equal(out[0], live / 4.0)
+    assert np.array_equal(out[1], np.zeros(4))
+    assert len(notes) == 1 and "probe 2 (x component)" in notes[0]
+    assert "flat zero" in notes[0]
+
+    out, notes = td_solve.normalise_spectra([np.zeros(3), np.zeros(3)], ["z", "y"])
+    assert all(np.isfinite(a).all() and not a.any() for a in out)
+    assert [n.split(" (")[0] for n in notes] == ["probe 1", "probe 2"]
+
+
+def test_a_silent_probe_reaches_the_manifest_as_zeros_and_a_caveat(monkeypatch):
+    real = FDTD.simulate
+
+    def second_probe_silent(*a, **k):
+        r = real(*a, **k)
+        r["traces"] = np.array(r["traces"], dtype=float)
+        r["traces"][1] = 0.0
+        return r
+
+    monkeypatch.setattr(FDTD, "simulate", second_probe_silent)
+    _, out = _run_with_files()
+    man = _strict_json(out.files["spectrum.json"])
+    assert max(man["probes"][0]["spectrum"]["amplitude"]) == pytest.approx(1.0)
+    assert not any(man["probes"][1]["spectrum"]["amplitude"])
+    assert any(c.startswith("probe 2 (x component)") for c in man["caveats"])
+
+
+def test_the_viewer_labels_the_spectrum_with_the_workers_scale():
+    src = (Path(__file__).resolve().parent.parent / "web/static/tdplot.js").read_text()
+    m = re.search(r"export const SPECTRUM_SCALE = '([^']*)';", src)
+    assert m and m.group(1) == td_solve.SPECTRUM_SCALE
+    assert "${SPECTRUM_SCALE}" in src and "arb. units)', series" not in src.split(
+        "drawSpectra")[1]
 
 
 def test_probe_positions_are_the_snapped_nodes_in_metres():

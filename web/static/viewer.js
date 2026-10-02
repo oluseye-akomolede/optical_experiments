@@ -31,6 +31,8 @@ import { boxCentre, componentShare, componentVolume, float32ToHalf,
 import { surfaceScaleFromGrid, boundsOf as boundsOfPositions }
   from './surface.js';
 import { drawBandDiagram } from './bandplot.js';
+import { decodeTraces, drawSpectra, drawTraces, probeLabel, seriesColour, siPrefix }
+  from './tdplot.js';
 import { bandGaps, bandCount } from './bands.js';
 
 const root = document.getElementById('job');
@@ -143,6 +145,14 @@ function init(root) {
     // skipped for a pc job: it is never entered, and the band branch returns.
     if (data.kind === 'pc') {
       finishBands(data);
+      return;
+    }
+    // A td job is the same shape of problem: it has a trace and a spectrum,
+    // no modes, and /index.json would 404 for it.
+    if (data.kind === 'td') {
+      if (loaded) return;
+      loaded = true;
+      renderTd(data);
       return;
     }
     buildModeTable(data.modes || []);
@@ -1300,6 +1310,59 @@ function formatSeconds(s) {
   if (s < 60) return `${s.toFixed(0)}s`;
   const m = Math.floor(s / 60);
   return `${m}m ${Math.round(s - m * 60)}s`;
+}
+
+// The time-domain panel. The plot geometry is in tdplot.js; this fetches the
+// manifest and the trace and fills the caption, legend and caveats. A failed
+// fetch is NAMED in the caption, never left as an empty card: an empty plot
+// would read as "the probes saw nothing".
+async function renderTd(data) {
+  const card = document.getElementById('td-card');
+  const caption = document.getElementById('td-caption');
+  const legend = document.getElementById('td-legend');
+  const caveats = document.getElementById('td-caveats');
+  if (!card) return;
+  card.hidden = false;
+  caption.textContent = 'Loading the probe traces…';
+  try {
+    const mres = await fetch(data.spectrum_url);
+    if (!mres.ok) throw new Error(`the spectrum manifest returned HTTP ${mres.status}`);
+    const manifest = await mres.json();
+    const tres = await fetch(data.trace_url);
+    if (!tres.ok) throw new Error(`the trace returned HTTP ${tres.status}`);
+    const rows = decodeTraces(await tres.arrayBuffer(), manifest.trace.shape);
+    drawTraces(document.getElementById('td-trace-svg'), rows, manifest.dt_s);
+    drawSpectra(document.getElementById('td-spectrum-svg'), manifest.probes, manifest.band_hz);
+
+    const span = manifest.steps * manifest.dt_s;
+    const t = siPrefix(span);
+    const lo = siPrefix(manifest.band_hz[1]);
+    caption.textContent = `${manifest.probes.length} probe(s), ${manifest.steps} time steps `
+      + `over ${(span / t.factor).toPrecision(3)} ${t.prefix}s; spectrum from `
+      + `${(manifest.band_hz[0] / lo.factor).toPrecision(3)} to `
+      + `${(manifest.band_hz[1] / lo.factor).toPrecision(3)} ${lo.prefix}Hz.`;
+    legend.innerHTML = '';
+    manifest.probes.forEach((p, i) => {
+      const li = document.createElement('li');
+      // The swatch is the line's own colour: without it two probes are two
+      // unlabelled wiggles.
+      const swatch = document.createElement('span');
+      swatch.className = 'td-swatch';
+      swatch.textContent = '■ ';
+      swatch.style.color = seriesColour(i);
+      li.append(swatch, probeLabel(p, i));
+      li.dataset.series = String(i);
+      legend.appendChild(li);
+    });
+    caveats.innerHTML = '';
+    for (const c of manifest.caveats || []) {
+      const li = document.createElement('li');
+      li.textContent = c;
+      caveats.appendChild(li);
+    }
+  } catch (err) {
+    caption.textContent = `The probe traces could not be loaded: ${err.message}.`;
+  }
 }
 
 // The band-diagram panel. The plot geometry is in bandplot.js/bands.js; this
