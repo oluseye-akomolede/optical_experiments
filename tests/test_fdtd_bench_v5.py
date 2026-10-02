@@ -188,21 +188,20 @@ def test_the_upload_layout_path_builds_v5s_film_case_exactly():
     # metal plate pair) laid out as an uploaded part must solve on the same
     # grid and give the same trace as V5's hand-built construction. A full
     # 16 x 11 run at 2 cells/wavelength, 28k steps, matched every V5 line to
-    # the same frequency on both paths (-0.30% .. -1.24% from analytic); here
-    # 400 steps, where a pec mask eating one wall cell already moves the trace.
+    # the same frequency on both paths (-0.30% .. -1.24% from analytic); that
+    # table compares the two paths at a coarse 2 cells per wavelength and is
+    # not an accuracy result. Here 400 steps, where a pec mask eating one wall
+    # cell already moves the trace.
     import numpy as np
     import trimesh
     sys.path.insert(0, str(ROOT / "dockerfiles" / "maxwell_solver"))
     import fdtd
-    import fdtd_grid
     import fdtd_layout
 
     A, B, n, dx = 16, 11, 2.0, 1e-6
     a, b, film = A * dx, B * dx, 0.25 * dx
-    z = fdtd_grid.graded_axis(film, dx, [fdtd_grid.Layer(0.0, film)])
-    nodes = (np.linspace(0, a, A + 1), np.linspace(0, b, B + 1), z)
-    eps, _ = fdtd_grid.average_eps(nodes, lambda p: np.zeros(len(p), int),
-                                   [n * n], samples=1)
+    nodes, spacings, eps = bench.film_grid(A, B, dx, film, n * n)
+    z = nodes[2]
     k = (z.size - 1) // 2
     src, prb = (6, 3, k), (11, 7, max(k - 1, 0), "z")
     centre, bw = 1.2e13, 4e12
@@ -230,6 +229,6 @@ def test_the_upload_layout_path_builds_v5s_film_case_exactly():
                           spacings=spacings, boundary="metal", pec=pec)
         return np.asarray(r["traces"][0], float)
 
-    hand = trace(eps, tuple(np.diff(x) for x in nodes), None)
+    hand = trace(eps, spacings, None)
     assert np.abs(hand).max() > 0
     np.testing.assert_array_equal(trace(lay["eps"], lay["spacings"], lay["pec"]), hand)

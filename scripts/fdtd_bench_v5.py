@@ -198,6 +198,21 @@ def gated_modes(best_overlaps, threshold: float = EXCITABLE):
     return [j for j, best in enumerate(best_overlaps) if best >= threshold]
 
 
+def film_grid(a_cells: int, b_cells: int, dx: float, film: float, eps_r: float):
+    """V5's grid: a uniform a x b plate, z graded through the film alone.
+
+    Returns ``(nodes, spacings, eps)``; raises ``fdtd_grid.GridError`` when
+    the film cannot be graded.
+    """
+    z = fdtd_grid.graded_axis(film, dx, [fdtd_grid.Layer(0.0, film)])
+    nodes = (np.linspace(0, a_cells * dx, a_cells + 1),
+             np.linspace(0, b_cells * dx, b_cells + 1), z)
+    spacings = (np.full(a_cells, dx), np.full(b_cells, dx), np.diff(z))
+    eps, _ = fdtd_grid.average_eps(nodes, lambda p: np.zeros(len(p), int),
+                                   [eps_r], samples=1)
+    return nodes, spacings, eps
+
+
 def film_problem(film: float, dx: float):
     """The quarter-cell rule: why ``film`` is not "far thinner", or None."""
     if film > dx / FAR_THINNER * (1 + 1e-9):
@@ -304,18 +319,15 @@ def main(argv=None) -> int:
         if film_problem(film, dx):
             setup_problems.append(film_problem(film, dx))
         try:
-            z = fdtd_grid.graded_axis(film, dx, [fdtd_grid.Layer(0.0, film)])
+            nodes, spacings, eps = film_grid(args.a_cells, args.b_cells, dx,
+                                             film, eps_r)
         except fdtd_grid.GridError as error:
             print(f"refused: {error}")
             return 2
+        z = nodes[2]
         problems = fdtd_grid.check_axis(z, dx, [fdtd_grid.Layer(0.0, film)])
         setup_problems += [f"z axis: {p}" for p in problems]
-        shape = (args.a_cells + 1, args.b_cells + 1, z.size)
-        spacings = (np.full(args.a_cells, dx), np.full(args.b_cells, dx),
-                    np.diff(z))
-        nodes = (np.linspace(0, a, shape[0]), np.linspace(0, b, shape[1]), z)
-        eps, _ = fdtd_grid.average_eps(nodes, lambda p: np.zeros(len(p), int),
-                                       [eps_r], samples=1)
+        shape = eps.shape
         k_mid = (z.size - 1) // 2
         source = fdtd.Source((source_ij[0], source_ij[1], k_mid), component="z",
                              frequency=centre, bandwidth=bandwidth)
