@@ -130,8 +130,10 @@
 - [x] 6.1a Periodic faces at k = 0 (wrap the curl differences), a boundary per
   axis in the solver API, and a plane wave across periodic transverse faces.
   Built in phase 2 for V4 (lead, 22:15Z). The form option stays in phase 6.
-- [ ] 6.1b A Bloch phase for a given k: cos and sin fields stepped together
-  through a core face hook.
+- [x] 6.1b A Bloch phase for a given k: cos and sin fields stepped together
+  through a core face hook. Solver API only (`bloch=`); a paired run refuses
+  metals and plane waves, and the memory estimate does not yet count the sin
+  set (both belong with the form option).
 - [ ] 6.2 Benchmark V6 against the existing pc band solver: an extruded 2-D
   crystal, TM and TE, kz = 0, frequencies at chosen k-points within 1%, every
   band present.

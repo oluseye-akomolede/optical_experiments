@@ -1188,6 +1188,83 @@ def _take(values, axis: int, index: int):
     return values[tuple(where)]
 
 
+# A Bloch phase within this of 0 or pi (radians, per period) is taken as
+# exactly that: the faces are then real (+1 or -1) and no sin set is stepped.
+BLOCH_SNAP = 1e-12
+
+
+def _bloch_faces(bloch, sides, primal) -> dict:
+    """``{axis: (cos, sin)}`` of the Bloch phase k * period, periodic axes only.
+
+    The field across a periodic axis obeys F(x + L) = exp(i k L) F(x), with L
+    the period (the sum of the axis's ``n-1`` spacings). ``bloch`` is the wave
+    vector ``(kx, ky, kz)`` in rad/m, or ``None`` for k = 0; a non-zero k on
+    an axis that is not periodic is refused. A phase within ``BLOCH_SNAP`` of
+    0 or pi is snapped to it (sin exactly 0), so k = 0 and the zone edge run
+    the real core alone.
+    """
+    if bloch is None:
+        bloch = (0.0, 0.0, 0.0)
+    try:
+        k = tuple(float(v) for v in bloch)
+    except (TypeError, ValueError):
+        raise FDTDError(f"bloch is a wave vector (kx, ky, kz) in rad/m, got "
+                        f"{bloch!r}") from None
+    if len(k) != 3 or not all(math.isfinite(v) for v in k):
+        raise FDTDError(f"bloch is a wave vector (kx, ky, kz) in rad/m, got "
+                        f"{bloch!r}")
+    faces = {}
+    for axis in range(3):
+        if sides[axis] != "periodic":
+            if k[axis] != 0.0:
+                raise FDTDError(
+                    f"a Bloch wave vector along {COMPONENTS[axis]} needs that "
+                    f"axis periodic, got {sides[axis]!r}")
+            continue
+        phase = math.remainder(k[axis] * float(np.sum(primal[axis])),
+                               2.0 * math.pi)            # in [-pi, pi]
+        if abs(phase) <= BLOCH_SNAP:
+            faces[axis] = (1.0, 0.0)
+        elif math.pi - abs(phase) <= BLOCH_SNAP:
+            faces[axis] = (-1.0, 0.0)
+        else:
+            faces[axis] = (math.cos(phase), math.sin(phase))
+    return faces
+
+
+def _wrap(sets, slab: int, faces: dict, shape) -> None:
+    """The face hook: refill the copy slab of every periodic axis.
+
+    ``slab`` 1 is the H ghost at half position ``n-1``, half sample 0 one period
+    ON (times exp(i k L)); ``slab`` 0 is E node 0, node ``n-1`` one period BACK
+    (times exp(-i k L)). Only the two components across the axis are copied.
+    ``sets`` is the cos set, plus the sin set on the paired path, where the
+    copy mixes them: (c + i s)(cos + i sin) = (c cos - s sin) + i (s cos + c sin).
+    With one set, sin is 0 and the copy is a plain one (k = 0) or a sign flip
+    (the zone edge).
+    """
+    family = 1 if slab == 1 else 0
+    for axis, (c, s) in faces.items():
+        n = shape[axis]
+        to, frm = (n - 1, 0) if slab == 1 else (0, n - 1)
+        if slab == 0:
+            s = -s                                  # exp(-i k L)
+        for component in COMPONENTS:
+            if COMPONENTS.index(component) == axis:
+                continue
+            cos_values = sets[0][family][component]
+            if len(sets) == 1:
+                source = _take(cos_values, axis, frm)
+                _set_slab(cos_values, axis, to,
+                          source if c == 1.0 else -source)
+                continue
+            sin_values = sets[1][family][component]
+            re = _take(cos_values, axis, frm)
+            im = _take(sin_values, axis, frm)
+            _set_slab(cos_values, axis, to, c * re - s * im)
+            _set_slab(sin_values, axis, to, s * re + c * im)
+
+
 # Short-lived full-grid arrays alive at the step loop's busiest moment, the Ex
 # update: the stale term_x left by the Hz update, term_y and term_z, and the
 # three expression temporaries (dt*inv_eps[...], the difference, the product).
@@ -1365,7 +1442,7 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
              boundary: str = "metal", pec=None, pml_cells: int = DEFAULT_PML_CELLS,
              xp=None, record_energy: bool = False, energy_region=None,
              record_peak: bool = False, ade_terms=(), check=None,
-             frames=None) -> dict:
+             frames=None, bloch=None) -> dict:
     """Run the grid and return the probe traces.
 
     ``eps_r`` ``(nx, ny, nz)`` is the relative permittivity of each node and it
@@ -1415,6 +1492,18 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     The three components are combined where they are stored, half a cell
     apart, without interpolation: it is a picture of the field, not a
     measurement. It is written into a device array (no sync a step).
+
+    ``bloch`` is a Bloch wave vector ``(kx, ky, kz)`` in rad/m on the periodic
+    axes (``None`` is k = 0): the cell then models an infinite crystal whose
+    field obeys F(x + L) = exp(i k L) F(x). The core stays real float32. At
+    k = 0 and the zone edge (k L = pi) the faces are real and only the cos set
+    runs, so k = 0 is the plain periodic run. Anywhere else a second, sin,
+    set of the six arrays is stepped beside the cos set through the same
+    update, and the face hook (``_wrap``) cross-couples the two at the copy
+    slabs; only the cos set is driven. The result's ``"traces_sin"`` holds the
+    probes on the sin set (``None`` on the real path), energy sums both sets,
+    a frame is the complex field's ``|E|``, and ``peak`` is the cos set's. A
+    paired run refuses a plane wave and polarisation terms (metals).
 
     ``check``, if given, is called as ``check(step)`` before step 0 and every
     ``CHECK_EVERY`` steps after it, on the host; it stops the run by raising
@@ -1562,15 +1651,32 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                     f"the probe cell {probe_cell} is outside the grid {shape} "
                     f"(axis {axis} has {shape[axis]} cells)")
 
+    faces = _bloch_faces(bloch, sides, primal)
+    paired = any(s != 0.0 for _c, s in faces.values())
+    if paired and source.kind == "plane":
+        raise FDTDError(
+            "a plane wave cannot run with a Bloch phase away from k = 0 and "
+            "the zone edge; a Bloch cell is driven by a point source")
+    if paired and terms:
+        raise FDTDError(
+            "a metal (a polarisation term) cannot run with a Bloch phase away "
+            "from k = 0 and the zone edge yet: its polarisation state would "
+            "need a sin copy too")
+
     inv_eps = 1.0 / (EPS0 * eps)
-    Ex = xp.zeros(shape, dtype=f32)
-    Ey = xp.zeros(shape, dtype=f32)
-    Ez = xp.zeros(shape, dtype=f32)
-    Hx = xp.zeros(shape, dtype=f32)
-    Hy = xp.zeros(shape, dtype=f32)
-    Hz = xp.zeros(shape, dtype=f32)
-    field = {"x": Ex, "y": Ey, "z": Ez}
-    h_field = {"x": Hx, "y": Hy, "z": Hz}
+
+    def new_set():
+        """One set of the six field arrays, keyed E x/y/z then H x/y/z."""
+        return ({c: xp.zeros(shape, dtype=f32) for c in COMPONENTS},
+                {c: xp.zeros(shape, dtype=f32) for c in COMPONENTS})
+
+    # The cos set is the physical field and the only one driven; the sin set
+    # exists only on the paired path, where the Bloch faces feed it from the
+    # cos set (see _bloch_faces).
+    sets = [new_set()] + ([new_set()] if paired else [])
+    field, h_field = sets[0]
+    Ex, Ey, Ez = (field[c] for c in COMPONENTS)
+    Hx, Hy, Hz = (h_field[c] for c in COMPONENTS)
 
     for term in terms:
         bind = getattr(term, "bind", None)
@@ -1672,6 +1778,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
         return raw + store                    # kappa = 1
 
     traces = xp.zeros((len(probe_list), n_steps), dtype=f32)
+    traces_sin = (xp.zeros((len(probe_list), n_steps), dtype=f32)
+                  if paired else None)
     energy: list[float] | None = [] if record_energy else None
     peak = ({c: xp.zeros(shape, dtype=f32) for c in COMPONENTS}
             if record_peak else None)
@@ -1729,135 +1837,63 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                      for a, c in enumerate(COMPONENTS)}
         eps64 = xp.asarray(eps, dtype=xp.float64)[region]
 
-    for step in range(n_steps):
-        if check is not None and step % CHECK_EVERY == 0:
-            check(step)
-        t = step * dt
-        if energy is not None:
-            h_before = (Hx.copy(), Hy.copy(), Hz.copy())      # H at n-1/2
-
+    def update_h(f, tag):
+        """Advance one set's H by half a step (E at n to H at n+1/2)."""
+        Ex, Ey, Ez = (f[0][c] for c in COMPONENTS)
+        Hx, Hy, Hz = (f[1][c] for c in COMPONENTS)
         # ---- H from the curl of E (E at n, H advances to n+1/2) ----------
         # Hx at (i, j+1/2, k+1/2): live on the full x range, y <= ny-2, z <= nz-2
         term_z = (Ez[:, 1:, :-1] - Ez[:, :-1, :-1]) / _along(P[1], 1)   # dEz/dy
         term_y = (Ey[:, :-1, 1:] - Ey[:, :-1, :-1]) / _along(P[2], 2)   # dEy/dz
-        term_z = corrected(term_z, ("Hx", "z"), 1, "dual")
-        term_y = corrected(term_y, ("Hx", "y"), 2, "dual")
+        term_z = corrected(term_z, (tag, "Hx", "z"), 1, "dual")
+        term_y = corrected(term_y, (tag, "Hx", "y"), 2, "dual")
         Hx[:, :-1, :-1] -= dt_over_mu0 * (term_z - term_y)
 
         # Hy at (i+1/2, j, k+1/2): live on the full y range, x <= nx-2, z <= nz-2
         term_x = (Ex[:-1, :, 1:] - Ex[:-1, :, :-1]) / _along(P[2], 2)   # dEx/dz
         term_z = (Ez[1:, :, :-1] - Ez[:-1, :, :-1]) / _along(P[0], 0)   # dEz/dx
-        term_x = corrected(term_x, ("Hy", "x"), 2, "dual")
-        term_z = corrected(term_z, ("Hy", "z"), 0, "dual")
+        term_x = corrected(term_x, (tag, "Hy", "x"), 2, "dual")
+        term_z = corrected(term_z, (tag, "Hy", "z"), 0, "dual")
         Hy[:-1, :, :-1] -= dt_over_mu0 * (term_x - term_z)
 
         # Hz at (i+1/2, j+1/2, k): live on the full z range, x <= nx-2, y <= ny-2
         term_y = (Ey[1:, :-1, :] - Ey[:-1, :-1, :]) / _along(P[0], 0)   # dEy/dx
         term_x = (Ex[:-1, 1:, :] - Ex[:-1, :-1, :]) / _along(P[1], 1)   # dEx/dy
-        term_y = corrected(term_y, ("Hz", "y"), 0, "dual")
-        term_x = corrected(term_x, ("Hz", "x"), 1, "dual")
+        term_y = corrected(term_y, (tag, "Hz", "y"), 0, "dual")
+        term_x = corrected(term_x, (tag, "Hz", "x"), 1, "dual")
         Hz[:-1, :-1, :] -= dt_over_mu0 * (term_y - term_x)
 
-        if plane is not None:
-            plane.correct_h(h_field)          # uses the incident E at n
-            plane.advance_h(step)             # incident H to n+1/2
-
-        # Periodic axes: the H samples at HALF positions along the axis have
-        # one more beyond the last, the ghost slot n-1, which is half sample 0
-        # one period on. The E update at node n-1 reads it.
-        for axis in range(3):
-            if periodic[axis]:
-                for component, values in h_field.items():
-                    if COMPONENTS.index(component) != axis:
-                        _set_slab(values, axis, shape[axis] - 1,
-                                  _take(values, axis, 0))
-
-        if energy is not None:
-            # The quadratic the scheme conserves exactly pairs E and H ACROSS
-            # the half step they are staggered by:
-            #     1/2 eps |E^n|^2  +  1/2 mu H^(n+1/2) . H^(n-1/2)
-            # Both E^n and the H pair are in hand RIGHT HERE, between the half
-            # step that moved H and the full step that moves E. Measured one
-            # update later, with E^(n+1), the same expression is the conserved
-            # one plus dt<E^n, curl H^(n+1/2)> -- an O(dt) term that swings with
-            # the field, and the run reads as a solver losing three quarters of
-            # its energy and getting it back. Multiplying H by itself at a
-            # single instant instead ripples at omega*dt/2, the same mistake at
-            # O(dt^2).
-            #
-            # The sum is weighted by cell volume and done in float64, because at
-            # 10 nm neither the product nor the square survives float32: a
-            # squared sample (~1e-36) times a volume (~7.5e-25) is ~1e-61, under
-            # float32's smallest normal (1.2e-38). Both factors are cast, not
-            # just the weights -- the field sample itself is only ~20 orders
-            # above that floor, so squaring it in float32 overflows to zero for
-            # any source much weaker than the one the tests drive with, and the
-            # run then reports a conserved zero for an energetic box.
-            e_total = 0.0
-            for component, values in (("x", Ex), ("y", Ey), ("z", Ez)):
-                wide_values = values[region].astype(xp.float64)
-                e_total += float(xp.sum(
-                    eps64 * e_weights[component] * wide_values * wide_values))
-            h_total = 0.0
-            for index, (component, values) in enumerate(
-                    (("x", Hx), ("y", Hy), ("z", Hz))):
-                now = values[region].astype(xp.float64)
-                before = h_before[index][region].astype(xp.float64)
-                h_total += float(xp.sum(h_weights[component] * now * before))
-            energy.append(0.5 * (EPS0 * e_total + MU0 * h_total))
-
-        for term in terms:                    # dispersive terms see E^n
-            prepare = getattr(term, "prepare", None)
-            if prepare is not None:
-                prepare(field, dt, step)
-
+    def update_e(f, tag):
+        """Advance one set's E by a step (H at n+1/2 to E at n+1)."""
+        Ex, Ey, Ez = (f[0][c] for c in COMPONENTS)
+        Hx, Hy, Hz = (f[1][c] for c in COMPONENTS)
         # ---- E from the curl of H (H at n+1/2, E advances to n+1) --------
         # Each integer-position axis runs over ``nodes`` (1..n-2, or 1..n-1
         # when periodic); see where they are built.
         # Ex at (i+1/2, j, k)
         term_y = (Hz[:-1, sy, sz] - Hz[:-1, ly, sz]) / _along(span[1], 1)
         term_z = (Hy[:-1, sy, sz] - Hy[:-1, sy, lz]) / _along(span[2], 2)
-        term_y = corrected(term_y, ("Ex", "y"), 1, "primal")
-        term_z = corrected(term_z, ("Ex", "z"), 2, "primal")
+        term_y = corrected(term_y, (tag, "Ex", "y"), 1, "primal")
+        term_z = corrected(term_z, (tag, "Ex", "z"), 2, "primal")
         Ex[:-1, sy, sz] += dt * inv_eps[:-1, sy, sz] * (term_y - term_z)
 
         # Ey at (i, j+1/2, k)
         term_z = (Hx[sx, :-1, sz] - Hx[sx, :-1, lz]) / _along(span[2], 2)
         term_x = (Hz[sx, :-1, sz] - Hz[lx, :-1, sz]) / _along(span[0], 0)
-        term_z = corrected(term_z, ("Ey", "z"), 2, "primal")
-        term_x = corrected(term_x, ("Ey", "x"), 0, "primal")
+        term_z = corrected(term_z, (tag, "Ey", "z"), 2, "primal")
+        term_x = corrected(term_x, (tag, "Ey", "x"), 0, "primal")
         Ey[sx, :-1, sz] += dt * inv_eps[sx, :-1, sz] * (term_z - term_x)
 
         # Ez at (i, j, k+1/2)
         term_x = (Hy[sx, sy, :-1] - Hy[lx, sy, :-1]) / _along(span[0], 0)
         term_y = (Hx[sx, sy, :-1] - Hx[sx, ly, :-1]) / _along(span[1], 1)
-        term_x = corrected(term_x, ("Ez", "x"), 0, "primal")
-        term_y = corrected(term_y, ("Ez", "y"), 1, "primal")
+        term_x = corrected(term_x, (tag, "Ez", "x"), 0, "primal")
+        term_y = corrected(term_y, (tag, "Ez", "y"), 1, "primal")
         Ez[sx, sy, :-1] += dt * inv_eps[sx, sy, :-1] * (term_x - term_y)
 
-        if plane is not None:
-            plane.correct_e(field)            # uses the incident H at n+1/2
-            plane.advance_e(step)             # incident E to n+1
-
-        # ---- dispersive materials (phase 2 adds terms; phase 1 has none) --
-        for term in terms:
-            for name, increment in term.advance(field, dt, step).items():
-                if name not in COMPONENTS:
-                    raise FDTDError(
-                        f"the polarisation term {getattr(term, 'name', term)!r} "
-                        f"returned an increment for {name!r}; E components are "
-                        f"{COMPONENTS}")
-                if isinstance(increment, tuple):  # (where, values)
-                    # not ``region``: that name is the energy sum's box
-                    where, values = increment
-                    field[name][where] += values
-                else:
-                    field[name] += increment
-
-        # ---- source ------------------------------------------------------
-        if plane is None:
-            field[source.component][source.cell] += dt * source.value(t)
-
+    def walls(f):
+        """Zero one set's E inside conductors and on the metal faces."""
+        Ex, Ey, Ez = (f[0][c] for c in COMPONENTS)
         # ---- PEC ---------------------------------------------------------
         if keep is not None:
             Ex *= keep
@@ -1883,14 +1919,103 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             Ex[:, :, -1] = 0.0
             Ey[:, :, -1] = 0.0
 
+    for step in range(n_steps):
+        if check is not None and step % CHECK_EVERY == 0:
+            check(step)
+        t = step * dt
+        if energy is not None:
+            h_before = [tuple(f[1][c].copy() for c in COMPONENTS)
+                        for f in sets]                        # H at n-1/2
+
+        for tag, f in enumerate(sets):
+            update_h(f, tag)
+
+        if plane is not None:
+            plane.correct_h(h_field)          # uses the incident E at n
+            plane.advance_h(step)             # incident H to n+1/2
+
+        # Periodic axes: the H samples at HALF positions along the axis have
+        # one more beyond the last, the ghost slot n-1, which is half sample 0
+        # one period on. The E update at node n-1 reads it.
+        _wrap(sets, 1, faces, shape)
+
+        if energy is not None:
+            # The quadratic the scheme conserves exactly pairs E and H ACROSS
+            # the half step they are staggered by:
+            #     1/2 eps |E^n|^2  +  1/2 mu H^(n+1/2) . H^(n-1/2)
+            # Both E^n and the H pair are in hand RIGHT HERE, between the half
+            # step that moved H and the full step that moves E. Measured one
+            # update later, with E^(n+1), the same expression is the conserved
+            # one plus dt<E^n, curl H^(n+1/2)> -- an O(dt) term that swings with
+            # the field, and the run reads as a solver losing three quarters of
+            # its energy and getting it back. Multiplying H by itself at a
+            # single instant instead ripples at omega*dt/2, the same mistake at
+            # O(dt^2).
+            #
+            # The sum is weighted by cell volume and done in float64, because at
+            # 10 nm neither the product nor the square survives float32: a
+            # squared sample (~1e-36) times a volume (~7.5e-25) is ~1e-61, under
+            # float32's smallest normal (1.2e-38). Both factors are cast, not
+            # just the weights -- the field sample itself is only ~20 orders
+            # above that floor, so squaring it in float32 overflows to zero for
+            # any source much weaker than the one the tests drive with, and the
+            # run then reports a conserved zero for an energetic box.
+            #
+            # On the paired path the field is cos + i sin, and the quadratic is
+            # the sum over both sets (|E|^2 = cos^2 + sin^2).
+            e_total = 0.0
+            h_total = 0.0
+            for (e_set, h_set), before_set in zip(sets, h_before):
+                for component in COMPONENTS:
+                    wide_values = e_set[component][region].astype(xp.float64)
+                    e_total += float(xp.sum(eps64 * e_weights[component]
+                                            * wide_values * wide_values))
+                for index, component in enumerate(COMPONENTS):
+                    now = h_set[component][region].astype(xp.float64)
+                    before = before_set[index][region].astype(xp.float64)
+                    h_total += float(xp.sum(h_weights[component] * now
+                                            * before))
+            energy.append(0.5 * (EPS0 * e_total + MU0 * h_total))
+
+        for term in terms:                    # dispersive terms see E^n
+            prepare = getattr(term, "prepare", None)
+            if prepare is not None:
+                prepare(field, dt, step)
+
+        for tag, f in enumerate(sets):
+            update_e(f, tag)
+
+        if plane is not None:
+            plane.correct_e(field)            # uses the incident H at n+1/2
+            plane.advance_e(step)             # incident E to n+1
+
+        # ---- dispersive materials (phase 2 adds terms; phase 1 has none) --
+        for term in terms:
+            for name, increment in term.advance(field, dt, step).items():
+                if name not in COMPONENTS:
+                    raise FDTDError(
+                        f"the polarisation term {getattr(term, 'name', term)!r} "
+                        f"returned an increment for {name!r}; E components are "
+                        f"{COMPONENTS}")
+                if isinstance(increment, tuple):  # (where, values)
+                    # not ``region``: that name is the energy sum's box
+                    where, values = increment
+                    field[name][where] += values
+                else:
+                    field[name] += increment
+
+        # ---- source ------------------------------------------------------
+        if plane is None:
+            field[source.component][source.cell] += dt * source.value(t)
+
+        # ---- PEC ---------------------------------------------------------
+        for f in sets:
+            walls(f)
+
         # Periodic axes: node 0 is node n-1, which the update just advanced
-        # (with every correction, term, source and conductor applied to it).
-        for axis in range(3):
-            if periodic[axis]:
-                for component, values in field.items():
-                    if COMPONENTS.index(component) != axis:
-                        _set_slab(values, axis, 0,
-                                  _take(values, axis, shape[axis] - 1))
+        # (with every correction, term, source and conductor applied to it),
+        # one period back.
+        _wrap(sets, 0, faces, shape)
 
         # ---- probes and energy -------------------------------------------
         for index, (cell, component) in enumerate(probe_list):
@@ -1899,12 +2024,24 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             else:
                 value = field[component][cell]
             traces[index, step] = value
+            if paired:
+                sin_field = sets[1][0]
+                if component == "mag":
+                    value = xp.sqrt(sum(sin_field[c][cell] ** 2
+                                        for c in COMPONENTS))
+                else:
+                    value = sin_field[component][cell]
+                traces_sin[index, step] = value
         if frame_at is not None and step in frame_at:
             # float64: a field of 1e-21 squares to below float32's normal
-            # range and would lose digits before the square root
-            ex, ey, ez = (values[sampled].astype(xp.float64)
-                          for values in (Ex, Ey, Ez))
-            movie[frame_at[step]] = xp.sqrt(ex * ex + ey * ey + ez * ez)
+            # range and would lose digits before the square root. On the
+            # paired path |E| is the complex field's, both sets together.
+            total = 0.0
+            for e_set, _h_set in sets:
+                for c in COMPONENTS:
+                    wide_values = e_set[c][sampled].astype(xp.float64)
+                    total = total + wide_values * wide_values
+            movie[frame_at[step]] = xp.sqrt(total)
         if peak is not None:
             for component in COMPONENTS:
                 xp.maximum(peak[component], xp.abs(field[component]),
@@ -1915,7 +2052,9 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     return {"traces": _host_result(traces, xp), "dt": dt, "steps": n_steps,
             "spacings": [np.array(p) for p in primal], "energy": energy,
             "peak": peak,
-            "frames": None if movie is None else _host_result(movie, xp)}
+            "frames": None if movie is None else _host_result(movie, xp),
+            "traces_sin": (_host_result(traces_sin, xp) if paired
+                           else None)}
 
 
 def _host_result(value, xp):

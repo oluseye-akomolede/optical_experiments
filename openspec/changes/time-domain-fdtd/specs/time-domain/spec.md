@@ -996,6 +996,42 @@ SHALL then model an infinite crystal of that cell. Except at k = 0 and the zone
 edge, the cos and sin fields SHALL be stepped together with cross-coupled face
 updates, through a face hook in the core.
 
+The solver takes `bloch=(kx, ky, kz)` in rad/m; the field obeys
+F(x + L) = exp(i k L) F(x) across each periodic axis of period L (the sum of
+its `n-1` spacings). The core stays real float32. A phase k L within 1e-12 of
+0 or pi runs the real core alone, the copy slabs taking the factor +1 or -1.
+Any other phase steps a second, sin, set of the six field arrays beside the
+cos set through the same update; only the cos set is driven, and the face hook
+fills the H ghost with exp(i k L) times half sample 0 and E node 0 with
+exp(-i k L) times node `n-1`, mixing the two sets. The result adds
+`traces_sin` (the probes on the sin set, absent on the real path); energy sums
+both sets, a frame is the complex field's |E|, and `peak` is the cos set's.
+A non-zero k on an axis that is not periodic, a malformed wave vector, and a
+paired run with a plane wave or a polarisation term (a metal) are refused with
+a message. The form option is a later phase-6 task.
+
+#### Scenario: a Bloch cell is one cell of the supercell
+- **WHEN** a cell with a dielectric rod, graded along x, runs at k = 2 pi p /
+  (M L) on its periodic axes with a point source, and an M-cell supercell runs
+  at k = 0 driven by the same source times cos(k.R) in the cell at R
+- **THEN** in every cell R, every probed E component (seam nodes on every axis
+  included) equals cos(k.R) times the cos trace minus sin(k.R) times the sin
+  trace, within 5e-6 of the peak, for phases paired on two axes, at the zone
+  edge alone, and at the zone edge with a paired axis
+- **AND** a wrong sign on either coupling, an unstepped sin set, a wrong period
+  or a wrong zone-edge sign fails it
+
+#### Scenario: a closed Bloch box conserves energy
+- **WHEN** a pulse runs in a graded box periodic on all three axes with a
+  paired phase on each
+- **THEN** after the source ends the energy summed over both sets varies by
+  less than 1e-5 of its mean
+
+#### Scenario: k = 0 is the plain periodic run
+- **WHEN** a periodic run with an open axis, a conductor, a dielectric, energy,
+  peak and frames is made with `bloch` omitted or zero
+- **THEN** every output is bit-identical to the phase-2 (6.1a) solver's
+
 #### Scenario: benchmark V6
 - **WHEN** a pulse is run in one cell of a 2-D crystal extruded along z, with
   Bloch-periodic x and y faces at a chosen k, periodic z faces with kz = 0, for
