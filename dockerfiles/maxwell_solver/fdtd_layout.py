@@ -9,6 +9,13 @@ combined bounding box, in metres (mesh units x ``length_scale``); ``position``
 and probes are given in it, and ``nodes`` are returned in it. The voxeliser
 works in mesh coordinates, so it is handed the same nodes shifted back by that
 corner.
+
+Film thickness. A conductor wall lands on a node by ``average_eps``'s majority
+rule, and a node on a shared face goes to the conductor. So a film flush
+between two conductor plates keeps exactly its thickness only when grid nodes
+sit on both faces (4 cells for a 4-cell film). On a grid offset from the faces,
+each wall snaps to the nearer node and the film can gain or lose a cell (the
+reviewer measured 5 cells for a 4-cell film at offset 0.013 with dz 0.05).
 """
 from __future__ import annotations
 

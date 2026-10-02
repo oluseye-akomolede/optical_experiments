@@ -227,6 +227,29 @@ def test_the_shared_face_rule_reaches_the_conductor_mask():
     assert face.any() and out["pec"][face].all()
 
 
+@pytest.mark.parametrize("plate", ["pec", "Au"])
+def test_a_film_flush_between_two_plates_keeps_its_full_thickness(plate):
+    """The owner's stack, with both faces off zero: plates on z in [0.1, 0.5]
+    and [0.7, 0.9] um and a film between them. On a grid with nodes on the
+    faces, the conductor walls sit on both faces, so the film spans
+    thickness / dz = 0.2 / 0.05 = 4 cells (3 interior nodes)."""
+    lo = _box((1.0, 1.0, 0.4), (0, 0, 0.3))
+    film = _box((1.0, 1.0, 0.2), (0, 0, 0.6))
+    hi = _box((1.0, 1.0, 0.2), (0, 0, 0.8))
+    xy = np.linspace(-0.6e-6, 0.6e-6, 7)
+    z = np.round(np.arange(21) * 0.05, 12) * 1e-6
+    out = V.voxelise(["lo", "film", "hi"], [lo, film, hi],
+                     {"lo": plate, "film": 1.5, "hi": plate},
+                     (xy, xy, z), boundary="open", length_scale=1e-6)
+    wall = out["pec"] if plate == "pec" else out["metals"][plate]
+    column = wall[3, 3, :]                      # x = y = 0, inside every part
+    k_lo, k_hi = 10, 14                         # z = 0.5 and 0.7 um
+    assert column[k_lo] and column[k_hi]
+    assert not column[k_lo + 1:k_hi].any()
+    assert (k_hi - k_lo) == round(0.2 / 0.05)
+    assert np.allclose(out["eps"][3, 3, k_lo + 1:k_hi], 1.5 ** 2)
+
+
 def test_parts_that_share_volume_are_refused_naming_both():
     a = _box((1.0, 1.0, 1.0), (0, 0, 0))
     b = _box((1.0, 1.0, 1.0), (0.5, 0, 0))

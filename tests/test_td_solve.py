@@ -187,6 +187,32 @@ def test_a_layout_refusal_reaches_the_owner_as_a_verdict():
                           xp=np, free_bytes=PLENTY)
 
 
+def test_an_upload_whose_parts_overlap_fails_naming_both_parts():
+    """Two parts inside the block share volume (x in [2, 2.5] mm). The
+    voxeliser's OverlapError is an FDTDError, so the owner reads its sentence
+    as the job's verdict, with both part names in it."""
+    import trimesh
+
+    lines, base = [], 0
+    for name, lo, hi in [("block", (0, 0, 0), (4, 3, 2)),
+                         ("lens", (0.5, 0.5, 0.5), (2.5, 2.5, 1.5)),
+                         ("prism", (2.0, 0.5, 0.5), (3.5, 2.5, 1.5))]:
+        box = trimesh.creation.box(extents=np.subtract(hi, lo))
+        box.apply_translation(np.add(lo, hi) / 2)
+        lines.append(f"o {name}")
+        lines += [f"v {x!r} {y!r} {z!r}" for x, y, z in box.vertices.tolist()]
+        lines += ["f " + " ".join(str(base + i + 1) for i in f)
+                  for f in box.faces.tolist()]
+        base += len(box.vertices)
+    store = _Store()
+    store.obj = ("\n".join(lines) + "\n").encode()
+    job = _job()
+    job["materials"] = {"block": 1.0, "lens": 1.5, "prism": 2.0}
+    with pytest.raises(td_solve.TDSolveError,
+                       match=r"parts 'lens' and 'prism' overlap"):
+        td_solve.solve_td(job, store, xp=np, free_bytes=PLENTY)
+
+
 # --------------------------------------------------------------------------
 # 4.3: the result files
 
