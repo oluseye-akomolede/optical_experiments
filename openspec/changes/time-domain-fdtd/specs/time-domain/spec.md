@@ -416,8 +416,15 @@ any dielectric, and between two dielectrics to the higher refractive index,
 whatever the file order. The same rule SHALL name the part a source or probe
 sits in. Two parts, neither inside the other, that share volume SHALL be
 refused naming both parts; nested parts are not overlap (the innermost owns
-its volume). The overlap check runs when the scene is voxelised, in the worker,
-so it fails the job readably rather than refusing the upload.
+its volume). The upload SHALL be refused before queueing when a sampled check
+finds shared volume: for each pair neither of which encloses the other, a
+16 x 16 x 16 lattice of cell centres in the intersection of their bounding
+boxes is tested against both parts. Flush neighbours meet in a box of zero
+thickness and SHALL NOT be probed. The lattice can step over a sliver thinner
+than its spacing, so the voxeliser's check on every grid node, in the worker,
+SHALL stay authoritative and fail the job readably. Nesting is decided by an
+exact containment test, asked only where one part's bounding box lies within
+the other's.
 
 #### Scenario: a film's faces go to its plates
 - **WHEN** a dielectric slab and a `pec` (or metal) slab share a face
@@ -444,6 +451,12 @@ so it fails the job readably rather than refusing the upload.
 - **WHEN** two parts, neither enclosing the other, share volume
 - **THEN** the run fails with a message naming both parts; touching or nested
   parts run
+
+#### Scenario: an overlap is refused at upload
+- **WHEN** a td upload holds two parts, neither enclosing the other, that share
+  volume the lattice samples
+- **THEN** the upload is refused before queueing, naming both parts, and no job
+  is created; a flush stack of three parts is queued, with no lattice probed
 
 ### Requirement: The worker SHALL run a time-domain job only with the memory it needs
 

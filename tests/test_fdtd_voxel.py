@@ -265,6 +265,85 @@ def test_touching_and_nested_parts_are_not_overlap():
     assert (V.PartIndex([outer, inner])(np.zeros((1, 3))) == 2).all()
 
 
+# --- the upload-time overlap check (task 5.4e) -------------------------------
+
+def _stack(gap=0.0):
+    """Three slabs stacked flush along z (none nested): bottom, film, top."""
+    return [_box((1.0, 0.8, 0.2), (0, 0, 0.1)),
+            _box((1.0, 0.8, 0.2), (0, 0, 0.3 + gap)),
+            _box((1.0, 0.8, 0.2), (0, 0, 0.5 + 2 * gap))]
+
+
+def test_the_upload_check_refuses_overlap_naming_both_parts():
+    a = _box((1.0, 1.0, 1.0), (0, 0, 0))
+    b = _box((1.0, 1.0, 1.0), (0.5, 0, 0))
+    far = _box((0.2, 0.2, 0.2), (3.0, 0, 0))
+    with pytest.raises(V.OverlapError, match=r"'lens' and 'prism' overlap"):
+        V.refuse_overlap(["lens", "far", "prism"], [a, far, b])
+
+
+def test_the_upload_check_sees_an_overlap_its_box_only_partly_holds():
+    # b turned 30 degrees about z: the two bounding boxes' intersection is
+    # only partly shared volume, so the lattice has to find the shared part
+    import trimesh
+
+    a = _box((1.0, 1.0, 1.0), (0, 0, 0))
+    b = _box((1.0, 1.0, 1.0), (0, 0, 0))
+    b.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 6, [0, 0, 1]))
+    b.apply_translation((1.05, 0.2, 0.1))
+    with pytest.raises(V.OverlapError, match=r"'a' and 'b' overlap"):
+        V.refuse_overlap(["a", "b"], [a, b])
+
+
+def test_the_upload_check_passes_flush_and_nested_parts_probing_nothing_flush(monkeypatch):
+    probed = []
+    real = V.PartIndex._inside
+
+    def counting(self, pts, which=None):
+        probed.append(len(pts))
+        return real(self, pts, which)
+
+    monkeypatch.setattr(V.PartIndex, "_inside", counting)
+    V.refuse_overlap(["bottom", "film", "top"], _stack())
+    assert probed == [], "a flush pair meets in a zero-thickness box: no probe"
+    outer, inner = _box((2.0, 2.0, 2.0)), _box((0.5, 0.5, 0.5))
+    V.refuse_overlap(["outer", "inner"], [outer, inner])
+    assert probed == [], "nested parts are not overlap: no probe"
+    # the control: a stack pressed 0.05 together is probed, and refused
+    with pytest.raises(V.OverlapError, match=r"'bottom' and 'film' overlap"):
+        V.refuse_overlap(["bottom", "film", "top"], _stack(gap=-0.05))
+    assert probed and probed[0] == V.OVERLAP_LATTICE ** 3
+
+
+def test_nesting_asks_the_slow_containment_test_only_where_a_box_fits(monkeypatch):
+    import trimesh
+
+    asked = []
+    real = GEO.part_contains
+
+    def counting(outer, inner, **kw):
+        asked.append(1)
+        return real(outer, inner, **kw)
+
+    monkeypatch.setattr(GEO, "part_contains", counting)
+    tilted = _box((0.4, 0.4, 0.4), (0.2, 0.0, 0.0))
+    tilted.apply_transform(trimesh.transformations.rotation_matrix(0.3, [0, 0, 1]))
+    parts = [_box((2.0, 2.0, 2.0)), tilted, _box((0.4, 0.4, 0.4), (0.3, 0, 0)),
+             _box((0.5, 0.5, 0.5), (5.0, 0, 0))] + _stack()
+    for part in parts[4:]:
+        part.apply_translation((0, 0, 3.0))
+    got = V._encloses(parts)
+    monkeypatch.setattr(GEO, "part_contains", real)
+    n = len(parts)
+    full = [[i != j and real(parts[j], parts[i]) for j in range(n)] for i in range(n)]
+    assert got == [[full[i][j] and not full[j][i] for j in range(n)] for i in range(n)]
+    assert got[1][0] and got[2][0] and not got[1][2]
+    # of 56 ordered pairs only the two small parts' boxes fit in another's
+    # (the big box's): the overlapping small pair, the far box and the flush
+    # stack are never asked
+    assert len(asked) == 2, len(asked)
+
+
 # --- coatings (task 5.4b) ---------------------------------------------------
 
 def _box_distance(lo, hi, pts):

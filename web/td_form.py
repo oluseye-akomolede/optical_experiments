@@ -306,6 +306,9 @@ def plan_request(form, data: bytes, units_scale_m: float) -> dict:
                     + (f"; not in the upload: {', '.join(map(repr, unknown))}"
                        if unknown else "")
                     + f". Its parts are {', '.join(map(repr, names))}.")
+        # sampled, so it fails most overlaps here; the worker's voxeliser
+        # still refuses any it steps over
+        fdtd_layout.fdtd_voxel.refuse_overlap(names, parts)
         planned = fdtd_layout.plan(names, parts, request,
                                    length_scale=units_scale_m,
                                    materials=materials, n_index=n_index)

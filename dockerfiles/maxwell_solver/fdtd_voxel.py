@@ -32,6 +32,7 @@ import mse_geometry as GEO
 OUTSIDE = 0
 _JITTER = np.array([np.sqrt(2.0) - 1.0, np.sqrt(3.0) - 1.5, np.pi - 3.0]) * 1e-6
 _PAIR_BUDGET = 4_000_000     # (rays x candidate faces) per vectorised block
+OVERLAP_LATTICE = 16         # per axis, in each pair's bounding-box intersection
 
 
 class VoxelError(fdtd.FDTDError):
@@ -39,8 +40,23 @@ class VoxelError(fdtd.FDTDError):
 
 
 def _encloses(parts) -> list:
-    """``inside[i][j]``: part ``i`` lies within part ``j`` (and not both ways)."""
-    contains = [[i != j and GEO.part_contains(other, mine)
+    """``inside[i][j]``: part ``i`` lies within part ``j`` (and not both ways).
+
+    ``GEO.part_contains`` is exact but slow (seconds per pair of ~1000-face
+    parts), so a pair is asked only when ``i``'s bounding box lies within
+    ``j``'s: every vertex inside or on ``j`` lies within ``j``'s box, give or
+    take ``point_in_mesh``'s on-surface tolerance (1e-9 of ``j``'s extent, at
+    least 1e-9), which the 1e-8 slack covers. Disjoint, side-by-side and
+    overlapping parts are never asked.
+    """
+    lo = [np.asarray(p.bounds[0], float) for p in parts]
+    hi = [np.asarray(p.bounds[1], float) for p in parts]
+
+    def could(i, j):
+        slack = max(float(np.max(hi[j] - lo[j])), 1.0) * 1e-8
+        return bool(np.all(lo[i] >= lo[j] - slack) and np.all(hi[i] <= hi[j] + slack))
+
+    contains = [[i != j and could(i, j) and GEO.part_contains(other, mine)
                  for j, other in enumerate(parts)] for i, mine in enumerate(parts)]
     return [[contains[i][j] and not contains[j][i] for j in range(len(parts))]
             for i in range(len(parts))]
@@ -130,15 +146,16 @@ class PartIndex:
         hi = np.max([np.max(t.reshape(-1, 3), axis=0) for t in self.tris], axis=0)
         self.shift = _JITTER * max(float(np.max(hi - lo)), 1e-300)
 
-    def _inside(self, pts):
-        """(parts, points) bool: each point inside each part."""
+    def _inside(self, pts, which=None):
+        """(parts, points) bool: each point inside each part (only the parts
+        in ``which``, when given; the other rows stay False)."""
         rays, line = np.unique(pts[:, :2], axis=0, return_inverse=True)
         line = line.reshape(-1)
         by_line = np.argsort(line, kind="stable")
         starts = np.searchsorted(line[by_line], np.arange(len(rays) + 1))
         inside = np.zeros((len(self.tris), len(pts)), dtype=bool)
-        for p, tris in enumerate(self.tris):
-            crossings = _ray_crossings(tris, rays)
+        for p in range(len(self.tris)) if which is None else which:
+            crossings = _ray_crossings(self.tris[p], rays)
             for r in np.flatnonzero([len(z) > 0 for z in crossings]):
                 members = by_line[starts[r]:starts[r + 1]]
                 below = np.searchsorted(crossings[r], pts[members, 2])
@@ -165,11 +182,7 @@ class PartIndex:
         for p, q in self.apart:
             both = strict[p] & strict[q]
             if both.any():
-                at = pts[int(np.flatnonzero(both)[0])]
-                raise OverlapError(
-                    f"parts {self.names[q]!r} and {self.names[p]!r} overlap "
-                    f"(both contain the point {[float(f'{x:.6g}') for x in at]} "
-                    f"in model units): parts may touch, but not share volume.")
+                raise self._overlap(p, q, pts[int(np.flatnonzero(both)[0])])
         if self.priority is not None:
             other = self._deepest(down)
             face = (other != index) & (index > OUTSIDE) & (other > OUTSIDE)
@@ -177,6 +190,44 @@ class PartIndex:
             take = face & (rank[other] > rank[index])
             index[take] = other[take]
         return index
+
+    def _overlap(self, p, q, at):
+        return OverlapError(
+            f"parts {self.names[q]!r} and {self.names[p]!r} overlap "
+            f"(both contain the point {[float(f'{x:.6g}') for x in at]} "
+            f"in model units): parts may touch, but not share volume.")
+
+    def refuse_overlap(self, lattice: int = OVERLAP_LATTICE) -> None:
+        """Fail fast on parts that share volume, before any grid exists.
+
+        Only where two non-nested parts' bounding boxes intersect can they
+        overlap, so only that box is probed, on a ``lattice``^3 lattice of
+        cell centres. Flush neighbours meet in a box of zero thickness, which
+        is skipped at no cost. A lattice can step over a sliver thinner than
+        its spacing: this check is sampled, and the voxeliser's refusal (every
+        grid node tested) stays authoritative.
+        """
+        lo = [t.reshape(-1, 3).min(axis=0) for t in self.tris]
+        hi = [t.reshape(-1, 3).max(axis=0) for t in self.tris]
+        thin = 2.0 * float(np.max(np.abs(self.shift)))
+        frac = (np.arange(lattice) + 0.5) / lattice
+        for p, q in self.apart:
+            a, b = np.maximum(lo[p], lo[q]), np.minimum(hi[p], hi[q])
+            if np.any(b - a <= thin):
+                continue
+            axes = [a[i] + frac * (b[i] - a[i]) for i in range(3)]
+            pts = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+            strict = (self._inside(pts + self.shift, (p, q))
+                      & self._inside(pts - self.shift, (p, q)))
+            both = strict[p] & strict[q]
+            if both.any():
+                raise self._overlap(p, q, pts[int(np.flatnonzero(both)[0])])
+
+
+def refuse_overlap(names, parts, lattice: int = OVERLAP_LATTICE) -> None:
+    """``PartIndex.refuse_overlap`` for an upload's named parts."""
+    if len(parts) > 1:
+        PartIndex(parts, names=names).refuse_overlap(lattice)
 
 
 def _segment_distance2(p, a, b):

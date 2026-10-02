@@ -268,6 +268,18 @@ def test_parts_names_a_non_nested_td_scene_the_way_the_td_post_does(tmp_path):
     assert sorted(job["materials"]) == sorted(body["parts"])
 
 
+def test_parts_that_share_volume_are_refused_at_upload_naming_both(tmp_path):
+    """5.4e: refused before queueing, not failed later in the worker."""
+    lens = _box([0, 0, 0], [0.6, 0.8, 0.6])
+    prism = _box([0.4, 0, 0], [1.0, 0.8, 0.6])
+    flashes = _refused(
+        tmp_path, "'lens' and 'prism' overlap", _obj(("lens", lens), ("prism", prism)),
+        td_boundary="open", td_position="200 400 300", td_probes="800 400 300 z",
+        **{"part_index.block": None, "part_index.cube": None,
+           "part_index.lens": "1.5", "part_index.prism": "2"})
+    assert any("may touch, but not share volume" in m for m in flashes), flashes
+
+
 def test_parts_still_runs_the_cavity_rules_for_a_cavity_upload(tmp_path):
     # the control: the same file without mode=td meets the cavity parser
     status, body = _ask_parts(tmp_path, _plates())

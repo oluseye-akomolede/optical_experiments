@@ -109,12 +109,17 @@
   cavity is refused). Request key `coatings`; a coating picker per part on the
   page, one-part uploads included; the estimate, the TF/SF box and the
   conductor-point refusal all see the shells.
-- [ ] 5.4e Follow-up (lead, 2026-10-02 08:52Z; not in phase 5's critical path):
+- [x] 5.4e Follow-up (lead, 2026-10-02 08:52Z; not in phase 5's critical path):
   an upload-time overlap check that fails fast. Probe only the bounding-box
   intersection of each non-nested pair (a 16^3 lattice, ~0.4 s per pair as the
   reviewer measured; flush neighbours have zero-thickness intersections and
   cost nothing). It is sampled and can miss a sliver, so the worker's
-  voxeliser refusal stays authoritative.
+  voxeliser refusal stays authoritative. Done as
+  `fdtd_voxel.refuse_overlap`, called by `td_form.plan_request`. Measured
+  (VM, best of 3): a 3-part flush stack 0.3 ms; overlapping boxes refused in
+  20 ms. The cost was the exact nesting test (25 s for two 1280-face spheres
+  side by side), now asked only where one bounding box fits in the other:
+  42 ms to refuse two overlapping 1280-face spheres.
 - [x] 5.2 Viewer: field-movie playback in the existing 3-D view, plus trace and
   spectrum plots with axis units.
 - [ ] 5.3 Image smoke test, then an in-browser check against a real finished `td`
