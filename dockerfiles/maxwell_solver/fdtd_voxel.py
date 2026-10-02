@@ -148,12 +148,18 @@ def _material_table(names, materials):
                 raise VoxelError(
                     f"part {name!r}: unknown material {value!r}. Use a "
                     f"refractive index, 'pec', or one of {', '.join(fdtd.METALS)}.")
-        else:
+        elif isinstance(value, (int, float, np.integer, np.floating)) \
+                and not isinstance(value, (bool, np.bool_)):
             n = float(value)
             if not np.isfinite(n) or n < 1.0:
                 raise VoxelError(f"part {name!r}: refractive index {value!r} "
                                  "must be a finite number of at least 1.")
             table.append(("eps", n * n))
+        else:
+            raise VoxelError(
+                f"part {name!r}: material {value!r} is not a refractive index "
+                f"or a material name. Use a number of at least 1, 'pec', or one "
+                f"of {', '.join(fdtd.METALS)}.")
     return table
 
 

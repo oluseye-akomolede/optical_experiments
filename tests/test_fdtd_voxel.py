@@ -154,6 +154,9 @@ def test_a_pec_part_joins_the_conductor_mask():
     ({"a": "unobtainium"}, "unknown material 'unobtainium'"),
     ({"a": 0.5}, "must be a finite number of at least 1"),
     ({"a": float("nan")}, "must be a finite number of at least 1"),
+    ({"a": None}, "material None is not a refractive index"),
+    ({"a": [1.5]}, "material [1.5] is not a refractive index"),
+    ({"a": True}, "material True is not a refractive index"),
 ])
 def test_a_bad_materials_table_is_refused_by_name(materials, needle):
     with pytest.raises(V.VoxelError, match=None) as err:
@@ -167,3 +170,24 @@ def test_an_unknown_boundary_is_refused():
     with pytest.raises(V.VoxelError, match="boundary 'periodic'"):
         V.voxelise(["a"], [_box((1.0, 1.0, 1.0))], {"a": 1.0}, _scene_nodes(),
                    boundary="periodic", length_scale=1e-6)
+
+
+def test_every_conductor_part_and_the_cavity_wall_join_one_mask():
+    """Two PEC posts in a metal cavity: both posts AND the outside are walls."""
+    # posts sit on node lines (x nodes step 0.2 um) so each region samples them
+    wall = _box((2.0, 2.0, 2.0))
+    left = _box((0.4, 0.4, 2.0), (-0.6, 0.0, 0.0))
+    right = _box((0.4, 0.4, 2.0), (0.6, 0.0, 0.0))
+    out = V.voxelise(["wall", "left", "right"], [wall, left, right],
+                     {"wall": 1.0, "left": "pec", "right": "pec"},
+                     _scene_nodes(), boundary="metal", length_scale=1e-6)
+    x, y, z = np.meshgrid(*_scene_nodes(), indexing="ij")
+    inner = (np.abs(y) < 0.1e-6) & (np.abs(z) < 0.9e-6)
+    on_left = inner & (np.abs(x + 0.6e-6) < 0.1e-6)
+    on_right = inner & (np.abs(x - 0.6e-6) < 0.1e-6)
+    gap = inner & (np.abs(x) < 0.2e-6)
+    outside = (np.abs(x) > 1.1e-6) | (np.abs(y) > 1.1e-6) | (np.abs(z) > 1.1e-6)
+    for name, region in [("left", on_left), ("right", on_right),
+                         ("outside", outside)]:
+        assert region.any() and out["pec"][region].all(), name
+    assert gap.any() and not out["pec"][gap].any()
