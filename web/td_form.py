@@ -217,6 +217,14 @@ def plan_request(form, data: bytes, units_scale_m: float) -> dict:
                              f"{n_index:g}.")
     try:
         names, parts = mse_parts.split_obj_parts(data)
+        if materials is None and len(names) > 1:
+            # Never one material for every part: the layout would refuse this
+            # anyway, but in words meant for a developer.
+            raise TDRequestError(
+                f"This object has {len(names)} parts "
+                f"({', '.join(map(repr, names))}), and a time-domain run needs "
+                f"a material for each one. Choosing a material per part is "
+                f"coming soon; until then, upload a single-part object.")
         if materials is not None:
             missing = [n for n in names if n not in materials]
             unknown = [n for n in materials if n not in names]

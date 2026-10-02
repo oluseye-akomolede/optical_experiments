@@ -168,6 +168,15 @@ def test_a_part_with_no_material_is_refused(tmp_path):
     _refused(tmp_path, "no material for 'cube'", **{"part_index.cube": None})
 
 
+def test_a_multi_part_upload_without_materials_is_refused_in_plain_words(tmp_path):
+    """Never one material for every part (lead, 08:15Z): until the page has
+    per-part pickers, a multi-part td upload is refused, naming its parts."""
+    flashes = _refused(tmp_path, "has 2 parts ('block', 'cube')",
+                       **{"part_index.cube": None, "part_index.block": None})
+    assert any("coming soon" in m for m in flashes), flashes
+    assert not any("materials table" in m for m in flashes), flashes
+
+
 def test_an_empty_mesh_is_refused(tmp_path):
     _refused(tmp_path, "empty", data=b"")
 
@@ -438,8 +447,8 @@ def test_the_pages_own_td_defaults_are_accepted(tmp_path):
         fields.pop(hidden)
     fields["td_position"] = "0.5 0.4 0.3"
     fields["td_probes"] = "0.5 0.4 0.5 z"
-    # One part: the page has no materials table yet, so a multi-part upload is
-    # refused ("2 parts need a materials table") -- see the row note.
+    # One part: the page has no per-part pickers yet, so a multi-part upload
+    # is refused in plain words (the multi-part refusal test above).
     block = _obj(("block", _box([0, 0, 0], [1.0, 0.8, 0.6])))
     fields["meshfile"] = (io_bytes(block), "block.obj")
     app, _store, db, _launcher = make_app(tmp_path / "post")
