@@ -34,6 +34,9 @@ import { drawBandDiagram } from './bandplot.js';
 import { decodeTraces, drawSpectra, drawTraces, probeLabel, seriesColour, siPrefix }
   from './tdplot.js';
 import { bandGaps, bandCount } from './bands.js';
+import { decodeFrame, movieLattice, movieScale, MOVIE_THRESHOLD, resampleFrame,
+         scaledFrame, SCALE_PERCENTILE }
+  from './tdmovie.js';
 
 const root = document.getElementById('job');
 if (root) init(root);
@@ -1360,9 +1363,161 @@ async function renderTd(data) {
       li.textContent = c;
       caveats.appendChild(li);
     }
+    // Inside the try: manifest is block-scoped to it. Not awaited, so the
+    // plots show while frames load; any throw from the movie goes to its own
+    // caption instead of leaving it on "Loading".
+    renderTdMovie(manifest, data).catch((err) => {
+      document.getElementById('td-movie-caption').textContent =
+        `The field movie could not be shown: ${err.message}.`;
+    });
   } catch (err) {
     caption.textContent = `The probe traces could not be loaded: ${err.message}.`;
   }
+}
+
+// The field movie: |E| frames drawn with the cavity view's raymarch shader, on
+// their own canvas in the td card. A job with no movie (frames null) says so;
+// a frame that fails to load is named in the caption, never left as a still
+// picture that would read as "the field stopped".
+async function renderTdMovie(manifest, data) {
+  const panel = document.getElementById('td-movie');
+  const caption = document.getElementById('td-movie-caption');
+  if (!panel) return;
+  panel.hidden = false;
+  const frames = manifest.frames;
+  if (!frames || !frames.count) {
+    caption.textContent = 'This run recorded no field movie.';
+    return;
+  }
+  const base = new URL(data.spectrum_url, window.location.href);
+  const decoded = [];
+  try {
+    for (let n = 1; n <= frames.count; n += 1) {
+      caption.textContent = `Loading the field movie: frame ${n} of ${frames.count}…`;
+      const name = `frame_${String(n).padStart(2, '0')}.bin`;
+      const res = await fetch(new URL(name, base));
+      if (!res.ok) throw new Error(`frame ${n} returned HTTP ${res.status}`);
+      decoded.push(decodeFrame(await res.arrayBuffer(), frames.shape));
+    }
+  } catch (err) {
+    caption.textContent = `The field movie could not be loaded: ${err.message}.`;
+    return;
+  }
+
+  const canvas = document.getElementById('td-scene');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: false });
+  const gl = renderer.getContext();
+  if (!gl || !(gl instanceof WebGL2RenderingContext)) {
+    canvas.hidden = true;
+    caption.textContent = 'The field movie needs WebGL2, which this browser does not offer.';
+    return;
+  }
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0b0e12);
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
+  const controls = new OrbitControls(camera, canvas);
+  controls.enableDamping = true;
+
+  // Resampled onto an even lattice once: texture space is uniform and the
+  // run's grid is graded (see tdmovie.js).
+  const lattice = movieLattice(frames.positions_m);
+  const even = decoded.map((f) => resampleFrame(f, lattice));
+  const scale = movieScale(even);
+  const { grid } = lattice;
+  const lo = grid.origin;
+  const size = [0, 1, 2].map((a) => Math.max(grid.spacing[a] * ([grid.nx, grid.ny, grid.nz][a] - 1), 1e-12));
+  const centre = lo.map((v, a) => v + size[a] / 2);
+
+  const material = new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    vertexShader: VERTEX_SHADER,
+    fragmentShader: FRAGMENT_SHADER,
+    uniforms: {
+      uField: { value: null },
+      uVolumeSize: { value: new THREE.Vector3(grid.nx, grid.ny, grid.nz) },
+      uAlphaScale: { value: 4.0 },
+      uThreshold: { value: MOVIE_THRESHOLD },
+      uSigned: { value: false },   // |E| is a magnitude
+      uBoxCentre: { value: new THREE.Vector3(...centre) },
+      uBoxSize: { value: new THREE.Vector3(...size) },
+    },
+    side: THREE.BackSide,
+    transparent: true,
+    depthWrite: false,
+  });
+  const box = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), material);
+  box.scale.set(...size);
+  box.position.set(...centre);
+  scene.add(box);
+  const outline = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
+    new THREE.LineBasicMaterial({ color: 0x5a6b7d }));
+  outline.scale.copy(box.scale);
+  outline.position.copy(box.position);
+  scene.add(outline);
+
+  const distance = Math.max(...size) * 1.35;
+  const unit = 1 / Math.sqrt(3);
+  camera.position.set(centre[0] + distance * unit, centre[1] + distance * unit,
+                      centre[2] + distance * unit);
+  camera.near = distance / 100;
+  camera.far = distance * 100;
+  controls.target.set(...centre);
+  controls.update();
+
+  let texture = null;
+  let current = 0;
+  const slider = document.getElementById('td-movie-frame');
+  const play = document.getElementById('td-movie-play');
+  slider.max = String(frames.count - 1);
+  const t = siPrefix(manifest.steps * manifest.dt_s);
+  function show(i) {
+    current = i;
+    const values = scaledFrame(even[i], scale);
+    const half = new Uint16Array(values.length);
+    for (let k = 0; k < values.length; k += 1) half[k] = float32ToHalf(values[k]);
+    const next = new THREE.Data3DTexture(half, grid.nx, grid.ny, grid.nz);
+    next.format = THREE.RedFormat;
+    next.type = THREE.HalfFloatType;
+    next.minFilter = THREE.LinearFilter;
+    next.magFilter = THREE.LinearFilter;
+    next.unpackAlignment = 1;
+    next.needsUpdate = true;
+    if (texture) texture.dispose();
+    texture = next;
+    material.uniforms.uField.value = texture;
+    slider.value = String(i);
+    const time = frames.steps[i] * manifest.dt_s;
+    caption.textContent = `|E|, frame ${i + 1} of ${frames.count}, `
+      + `t = ${(time / t.factor).toPrecision(3)} ${t.prefix}s. One colour scale for `
+      + `every frame (the ${Math.round(SCALE_PERCENTILE * 100)}th percentile of |E| over the movie); `
+      + `field below ${MOVIE_THRESHOLD} of it is not drawn.`;
+    panel.dataset.frame = String(i);
+  }
+  slider.addEventListener('input', () => show(Number(slider.value)));
+  let timer = null;
+  play.addEventListener('click', () => {
+    if (timer) { clearInterval(timer); timer = null; play.textContent = 'Play'; return; }
+    play.textContent = 'Pause';
+    timer = setInterval(() => show((current + 1) % frames.count), 120);
+  });
+  show(0);
+  if (!scale) caption.textContent += ' Every frame is zero: there is no field to draw.';
+
+  function resize() {
+    const rect = canvas.getBoundingClientRect();
+    renderer.setSize(Math.max(1, rect.width), Math.max(1, rect.height), false);
+    camera.aspect = Math.max(1, rect.width) / Math.max(1, rect.height);
+    camera.updateProjectionMatrix();
+  }
+  window.addEventListener('resize', resize);
+  resize();
+  (function loop() {
+    requestAnimationFrame(loop);
+    controls.update();
+    renderer.render(scene, camera);
+  }());
 }
 
 // The band-diagram panel. The plot geometry is in bandplot.js/bands.js; this

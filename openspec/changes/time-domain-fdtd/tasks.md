@@ -109,7 +109,7 @@
   reviewer measured; flush neighbours have zero-thickness intersections and
   cost nothing). It is sampled and can miss a sliver, so the worker's
   voxeliser refusal stays authoritative.
-- [ ] 5.2 Viewer: field-movie playback in the existing 3-D view, plus trace and
+- [x] 5.2 Viewer: field-movie playback in the existing 3-D view, plus trace and
   spectrum plots with axis units.
 - [ ] 5.3 Image smoke test, then an in-browser check against a real finished `td`
   job in production.
