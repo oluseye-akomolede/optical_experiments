@@ -1217,12 +1217,27 @@ MAX_STEPS = 20_000
 MAX_BYTES = 3.0e9
 MAX_SECONDS = 30 * 60
 
-# Jetson cell-steps per second, from the 6ffa8bd rate table (cupy, 300 steps,
-# 1 M and 4 M cells; queue row 4a5da177): metal 106.69 / 114.10, open
-# 57.53 / 56.82, open + 1/8 gold 47.53 / 46.30 Mcell-steps/s. Each takes the
-# slower of its two rows. Unmeasured setups take the slower measured rate:
-# periodic or mixed faces the open rate, metal walls with a metal the gold rate.
-JETSON_RATES = {"metal": 106.69e6, "open": 56.82e6, "dispersive": 46.30e6}
+# Measured Jetson rates in Mcell-steps/s (scripts/fdtd_rate.py, cupy, 300
+# steps; queue row 4a5da177). Each run is (1 M cells, 4 M cells); "dispersive"
+# is open faces with 1/8 of the box gold. Keep every run here: the rate a run
+# is timed by is derived from them, never typed.
+JETSON_RATE_RUNS = {
+    "6ffa8bd": {"metal": (106.69, 114.10), "open": (57.53, 56.82),
+                "dispersive": (47.53, 46.30)},
+    "836c4b8": {"metal": (106.52, 111.00), "open": (55.73, 55.11),
+                "dispersive": (45.67, 45.30)},
+}
+# Each setup takes the slowest row over every run. Unmeasured setups take the
+# slower measured rate: periodic or mixed faces the open rate, metal walls with
+# a metal the gold rate.
+JETSON_RATES = {
+    setup: 1e6 * min(row for run in JETSON_RATE_RUNS.values()
+                     for row in run[setup])
+    for setup in ("metal", "open", "dispersive")}
+# Run-to-run spread is ~3% under background load. The time estimate divides by
+# this so it errs long: over-estimating only refuses borderline runs, while
+# under-estimating would admit runs over MAX_SECONDS.
+RATE_SAFETY = 0.9
 
 
 class EstimateError(FDTDError):
@@ -1274,7 +1289,7 @@ def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
                                  metals=list(metals.items()),
                                  pec=pec is not None, record_peak=record_peak),
         "setup": setup,
-        "seconds": cells * steps / JETSON_RATES[setup],
+        "seconds": cells * steps / (RATE_SAFETY * JETSON_RATES[setup]),
     }
 
 

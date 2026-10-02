@@ -233,6 +233,14 @@ that exceeded it, and the form lever that reduces it.
 - **THEN** it is timed at the slower measured rate (open, or open with gold),
   so the 30-minute limit never admits a run on a guessed faster rate
 
+#### Scenario: the run time errs long
+- **WHEN** the run time is estimated
+- **THEN** each configuration's rate is the slowest row it measured over every
+  recorded Jetson run, kept in the code as cited data rather than retyped
+- **AND** the estimate divides by a 0.9 safety factor on that rate, since
+  run-to-run spread is about 3% under background load and an under-estimate
+  would admit a run over 30 minutes
+
 #### Scenario: every exceeded limit is named at once
 - **WHEN** a request exceeds more than one limit
 - **THEN** one refusal names each of them, in the order cells, steps, memory,

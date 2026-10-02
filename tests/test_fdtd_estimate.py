@@ -87,7 +87,23 @@ def test_the_estimate_counts_cells_bytes_and_seconds_from_its_parts():
         record_peak=True)
     assert e["setup"] == "dispersive"
     assert e["seconds"] == pytest.approx(
-        e["cells"] * e["steps"] / fdtd.JETSON_RATES["dispersive"])
+        e["cells"] * e["steps"] / (0.9 * 45.30e6))
+
+
+def test_each_rate_is_the_slowest_measured_row_over_both_jetson_runs():
+    # the literal minimums of the two cited runs (row 4a5da177): a faster row,
+    # one run dropped, or a typo in the table moves at least one of these
+    assert fdtd.JETSON_RATES == pytest.approx(
+        {"metal": 106.52e6, "open": 55.11e6, "dispersive": 45.30e6})
+    assert set(fdtd.JETSON_RATE_RUNS) == {"6ffa8bd", "836c4b8"}
+
+
+def test_the_time_estimate_errs_long_by_the_safety_factor():
+    assert fdtd.RATE_SAFETY == 0.9
+    nodes = _graded_nodes()
+    e = fdtd.estimate_run(nodes, duration=3e-15, boundary="metal")
+    assert e["seconds"] == pytest.approx(
+        e["cells"] * e["steps"] / (0.9 * 106.52e6))
 
 
 def _estimate(**over):
