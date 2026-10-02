@@ -1497,6 +1497,10 @@ class _RecordingAPI:
         self.calls.append(("release", job_id, message))
         return {}
 
+    def busy(self, job_id, message=""):
+        self.calls.append(("busy", job_id, message))
+        return {"ok": True, "deferred": True, "failed": False}
+
     def names(self):
         return [c[0] for c in self.calls]
 
@@ -1582,3 +1586,72 @@ def test_the_worker_runs_exactly_the_kinds_the_app_creates():
     sources, not retyped here.
     """
     assert set(W.WORKER_KINDS) == set(DB.KINDS)
+
+
+# ---------------------------------------------------------------------------
+# td outcomes: busy is an uncounted deferral; a td refusal or stop is terminal
+# ---------------------------------------------------------------------------
+
+def _td_errors():
+    sys.path.insert(0, str(Path(W.__file__).resolve().parent))
+    import td_solve
+    return td_solve
+
+
+def test_classify_maps_jetson_busy_to_busy_and_td_stops_to_terminal():
+    td = _td_errors()
+    assert W.classify(td.JetsonBusy("needs 9 GB, 2 GB free")) == "busy"
+    # A TDSolveError is a verdict whatever its cause chain: solve_td raises one
+    # only for a refusal or a stop, and lets a bare device error through. The
+    # first two are the OOM stop as solve_td builds it; those would be terminal
+    # even without the td arm, because the chain says "out of memory" (a GPU
+    # STATUS word). The third is the case the arm exists for, a contract rather
+    # than a path solve_td takes today: a stop whose chain the wrapper-walking
+    # GPU branch reads as an INIT fault, which would release it and loop it.
+    class CUDARuntimeError(RuntimeError):
+        pass
+
+    for message, cause in (
+            ("The Jetson ran out of memory during the run", MemoryError("out of memory")),
+            ("The Jetson ran out of memory during the run",
+             CUDARuntimeError("cudaErrorMemoryAllocation: out of memory")),
+            ("The run was stopped after 45 minutes",
+             CUDARuntimeError("cudaErrorInitializationError: initialization error"))):
+        try:
+            try:
+                raise cause
+            except Exception as inner:
+                raise td.TDSolveError(message) from inner
+        except td.TDSolveError as stop:
+            assert W.classify(stop) == "terminal", (message, str(cause))
+    assert W.classify(td.TDSolveError("stopped after 45 minutes")) == "terminal"
+
+
+def test_a_busy_td_job_is_deferred_not_failed_or_released(tmp_path):
+    td = _td_errors()
+
+    def solve(job, store_in, store_out, stage=None):
+        raise td.JetsonBusy("The Jetson is busy: needs 9.0 GB, 2.0 GB free")
+
+    worker, api = _recording_worker(tmp_path, solve)
+    worker.run_job({"job_id": "t-9", "kind": "td", "tds": {}})
+
+    assert [c[0] for c in api.calls if c[0] in ("busy", "failed", "release")] \
+        == ["busy"], api.names()
+    busy = [c for c in api.calls if c[0] == "busy"][0]
+    assert "9.0 GB" in busy[2], "the deferral carries the owner's sentence"
+
+
+def test_a_td_stop_reaches_the_owner_in_its_own_words(tmp_path):
+    td = _td_errors()
+    said = "The run was stopped after 45 minutes. Increase dx."
+
+    def solve(job, store_in, store_out, stage=None):
+        raise td.TDSolveError(said)
+
+    worker, api = _recording_worker(tmp_path, solve)
+    worker.run_job({"job_id": "t-8", "kind": "td", "tds": {}})
+
+    failed = [c for c in api.calls if c[0] == "failed"]
+    assert [c[2] for c in failed] == [said], api.names()
+    assert "release" not in api.names()

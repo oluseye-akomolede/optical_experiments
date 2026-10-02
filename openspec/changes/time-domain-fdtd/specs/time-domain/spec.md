@@ -340,6 +340,23 @@ limit.
 #### Scenario: an overlong run is stopped
 - **WHEN** a `td` run passes 45 minutes of run time
 - **THEN** it is stopped and the job fails with a message naming the limit
+- **AND** the run time is checked before the first step and every 64 steps
+  after it, on the host without reading any device value, so the stop comes at
+  most 64 steps late and the check adds no device sync; the message names the
+  step reached, the total, and the advice (increase dx or shorten the duration)
+
+#### Scenario: free memory is what a new run can take on the Orin
+- **WHEN** the worker checks free memory before a `td` run
+- **THEN** it compares the estimate with the kernel's MemAvailable (the Orin's
+  GPU shares system RAM) plus the blocks this process's cupy memory pool
+  already holds free, and runs on numpy when no device is present
+
+#### Scenario: a time-domain verdict is never retried
+- **WHEN** a `td` job is refused (layout, mesh, estimate or limits) or stopped
+  (out of memory, 45 minutes)
+- **THEN** it is failed with that message shown to the owner unchanged, never
+  released for another attempt, whatever error it was raised from; a device
+  error the solver does not translate is classified like any other job's
 
 ### Requirement: Dispersive metals SHALL follow their published model
 

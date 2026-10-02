@@ -266,6 +266,21 @@ def classify(exc: BaseException) -> str:
 
     name = type(exc).__name__
 
+    # A td job: ``JetsonBusy`` is no verdict and no failure (the uncounted
+    # deferral), and a ``TDSolveError`` is a verdict on the job with a message
+    # already written for the owner, including the out-of-memory and 45-minute
+    # stops. Today the default arm would also say "terminal" (the OOM stop is
+    # raised FROM the device error, and no branch below matches it); this is
+    # explicit so a new transient branch further down cannot capture it.
+    try:
+        from td_solve import JetsonBusy, TDSolveError  # noqa: PLC0415
+    except ImportError:                       # pragma: no cover
+        JetsonBusy = TDSolveError = ()
+    if JetsonBusy and isinstance(exc, JetsonBusy):
+        return "busy"
+    if TDSolveError and isinstance(exc, TDSolveError):
+        return "terminal"
+
     # --- transient: this worker could not, another one might ---
     if isinstance(exc, LeaseLost):
         # Not a verdict at all: the job was taken from us. Reporting it failed
@@ -566,6 +581,25 @@ class WorkerAPI:
                 # nothing to undo.
                 return
             raise
+
+    def busy(self, job_id: str, message: str = "") -> dict:
+        """Requeue a td job because the Jetson is short of GPU memory.
+
+        Uncounted, unlike ``release``; the app bounds the wait by time and
+        fails the job itself once it is over (``{"failed": True}``).
+        """
+        try:
+            _status, payload = self._request("POST",
+                                             f"/worker/jobs/{job_id}/busy",
+                                             json_body={"message": message[:2000]})
+        except APIError as exc:
+            if exc.status == 409:
+                return {"ok": False, "deferred": False, "failed": False}
+            raise
+        try:
+            return json.loads(payload) if payload else {"ok": True}
+        except ValueError:
+            return {"ok": True}
 
     def release(self, job_id: str, message: str = "") -> dict:
         """Hand the job back with NO verdict, because the reason was transient.
@@ -1071,6 +1105,23 @@ class Worker:
             # app's own response body. On a 5xx the body is where the app's
             # traceback would be, truncated to 500 chars by ``_request``.
             self._log(f"job {job_id}: the app refused a call -- {exc.describe()}")
+        if kind == "busy":
+            # Not a failure: the app requeues the row without counting it and
+            # fails it itself once the wait is over. No failure directory.
+            try:
+                answer = self.api.busy(job_id, message)
+            except APIError as api_exc:
+                self._log(f"could not defer {job_id} ({api_exc}); the lease "
+                          f"will expire and the app will requeue it")
+            else:
+                if answer.get("failed"):
+                    self._log(f"{job_id}: the Jetson stayed busy past the wait; "
+                              f"the app failed it")
+                elif not answer.get("ok", True):
+                    self._log(f"not deferring {job_id}: this worker no longer "
+                              f"holds it")
+            shutil.rmtree(work_dir, ignore_errors=True)
+            return
         if kind == "lease-lost":
             # ``_done`` raises LeaseLost rather than claiming a job it no longer
             # owns, and the app has already reassigned the row. Reporting
@@ -1380,6 +1431,14 @@ def _owner_message(exc: BaseException) -> str:
     """
     if isinstance(exc, WorkerError) and str(exc):
         return str(exc)
+    # A td refusal or stop (and the busy note) is written for the owner, like
+    # ``WorkerError``: the dx/duration advice in it is the part they act on.
+    try:
+        from td_solve import JetsonBusy, TDSolveError  # noqa: PLC0415
+        if isinstance(exc, (JetsonBusy, TDSolveError)) and str(exc):
+            return str(exc)
+    except ImportError:                       # pragma: no cover
+        pass
     try:
         if str(_SOLVER_DIR) not in sys.path:
             sys.path.insert(0, str(_SOLVER_DIR))
