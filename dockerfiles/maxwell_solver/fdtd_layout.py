@@ -14,8 +14,10 @@ Film thickness. A conductor wall lands on a node by ``average_eps``'s majority
 rule, and a node on a shared face goes to the conductor. So a film flush
 between two conductor plates keeps exactly its thickness only when grid nodes
 sit on both faces (4 cells for a 4-cell film). On a grid offset from the faces,
-each wall snaps to the nearer node and the film can gain or lose a cell (the
-reviewer measured 5 cells for a 4-cell film at offset 0.013 with dz 0.05).
+the film reads one cell too thick almost every time: the reviewer measured 5
+cells for a 4-cell film at 19 of 20 offsets and never 3, and a wall landed on
+the nearer node only 21 times in 40, so the walls do not simply snap to the
+nearer node. Task 5.4d aligns grid lines to the faces to remove this.
 """
 from __future__ import annotations
 

@@ -97,7 +97,7 @@
 - [ ] 5.4b Per-part coatings end to end: a material plus a thickness on a
   part's surface, painted by the voxeliser on a grid refined by
   `coating_layers`, offered on the page only once it runs.
-- [ ] 5.4c Follow-up (lead, 2026-10-02 08:52Z; not in phase 5's critical path):
+- [ ] 5.4e Follow-up (lead, 2026-10-02 08:52Z; not in phase 5's critical path):
   an upload-time overlap check that fails fast. Probe only the bounding-box
   intersection of each non-nested pair (a 16^3 lattice, ~0.4 s per pair as the
   reviewer measured; flush neighbours have zero-thickness intersections and
