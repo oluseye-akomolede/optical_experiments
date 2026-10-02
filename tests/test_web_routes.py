@@ -2344,6 +2344,77 @@ def test_the_job_page_renders_the_material_table_it_stored(tmp_path):
     assert "wall" not in html.split('id="materials"')[1].split("</div>")[0]
 
 
+def test_a_td_job_page_renders_a_metal_part_without_a_500(tmp_path):
+    """The page renders every material a td job's table can hold.
+
+    A td job's stored table is a refractive index, the string ``pec``, or a
+    dispersive metal's NAME -- the owner's Au / 1.5 / Au film is exactly this
+    shape. The cavity-era table formatted each value with ``'%g'``, which raised
+    ``TypeError: must be real number, not str`` on the first metal: an
+    unhandled 500 on the deployed page (the owner's job 180cb65f). This app is
+    built with ``TESTING`` on, so the red surfaces here as that TypeError
+    escaping the test client rather than as a 500 status; same defect, one flag
+    apart (see ``test_a_pc_radius_too_big_for_its_cell_is_refused_not_a_500``).
+
+    Rendered through the REAL template and store, not a fake: the defect is in
+    the template's formatting of a stored value, so a test that never renders
+    ``job.html`` against a td row cannot fail on it.
+    """
+    app, _store, db, _launcher = make_app(tmp_path)
+    job_id = str(uuid.uuid4())
+    db.create_job(job_id, "film.obj (time domain)", "um", 1.0, 0,
+                  target=DB.JETSON, kind=DB.TD,
+                  materials={"substrate": "Au", "film": 1.5, "top_lid": "pec"},
+                  tds=dict(_TDS))
+
+    body = app.test_client().get(f"/jobs/{job_id}").get_data(as_text=True)
+
+    table = re.search(r'<table class="materials">(.*?)</table>', body, re.S)
+    assert table is not None, (
+        "the materials table did not render on a td job page; a 200 alone says "
+        "nothing about whether the block was produced"
+    )
+    # Per row, so a page that printed the three values anywhere would not pass:
+    # the question is which material sits against which part.
+    rows = dict(re.findall(r"<tr><td>(.*?)</td><td>(.*?)</td></tr>",
+                           table.group(1)))
+    assert rows == {"substrate": "Au", "film": "1.5",
+                    "top_lid": "perfect conductor (pec)"}, rows
+    # The cavity wording is false for a td run: the index column is not an
+    # index for a metal, and the "meshed to its own resolution" note describes
+    # a cavity's graded mesh, not this. Header and note both name the kind.
+    assert "Refractive index" not in table.group(1)
+
+
+def test_a_coated_part_shows_its_coating_on_the_job_page(tmp_path):
+    """A coating is a material the form accepts, so the page shows it.
+
+    Coatings are NOT in ``job.materials`` -- they live in the stored ``tds``
+    request (a part's base material and its coating are different things, and
+    only the base material goes to the solver's layout table). So this is its
+    own assertion: the page must find them in the request, and a page that
+    rendered only the materials table would silently show a coated part as
+    uncoated.
+    """
+    app, _store, db, _launcher = make_app(tmp_path)
+    job_id = str(uuid.uuid4())
+    tds = dict(_TDS, coatings={"film": ["Au", 20e-9]})
+    # All-float base materials on purpose: the red this test must show is the
+    # ABSENT coatings block, not the metal-formatting TypeError its sibling
+    # covers, so the materials table has to render cleanly here.
+    db.create_job(job_id, "film.obj (time domain)", "um", 1.0, 0,
+                  target=DB.JETSON, kind=DB.TD,
+                  materials={"substrate": 1.5, "film": 1.0}, tds=tds)
+
+    body = app.test_client().get(f"/jobs/{job_id}").get_data(as_text=True)
+
+    block = re.search(r'id="coatings"(.*?)</table>', body, re.S)
+    assert block is not None, "the coating of a coated part is absent from the page"
+    assert "film" in block.group(1) and "Au" in block.group(1)
+    # 20 nm, in the unit the job was typed in (um) and in plain words.
+    assert "0.02" in block.group(1)
+
+
 # ---------------------------------------------------------------------------
 # The photonic-crystal upload: a second form with no file
 # ---------------------------------------------------------------------------

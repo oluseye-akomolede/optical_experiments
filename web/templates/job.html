@@ -61,22 +61,51 @@
      can be told apart: the file on disk is the one the solver read, and a page
      that re-derived the names could show a table the solver never saw while
      every number on it looked right. Sorted by name for a stable order, since
-     JSON object order is not a contract. #}
+     JSON object order is not a contract.
+
+     The VALUE is not always a number. A cavity's table is a per-part index,
+     but a td job's holds an index, the string "pec" or a dispersive metal's
+     NAME -- and the cavity-era `'%g'|format(n)` raised "must be real number,
+     not str" on the first metal, an unhandled 500 on the owner's Au/1.5/Au
+     film. Every value goes through the `material_label` filter (web/app.py),
+     whose fallback renders an unknown shape as its own text rather than
+     raising: a reader meeting a name the page does not know is better than a
+     page that cannot be opened at all. #}
   {% if job.materials and job.kind != 'pc' %}
     <div id="materials">
-      <p class="muted small">
-        This cavity holds {{ job.materials|length }} materials, each meshed to
-        its own resolution (a region's element target is divided by its index,
-        because the wavelength inside is shorter by that factor):
-      </p>
+      {% if job.kind == 'td' %}
+        <p class="muted small">
+          Each part of this time-domain run has its own material. A metal name
+          is the solver's dispersive model for that metal over the run's band,
+          and <em>pec</em> is a perfect conductor, which reflects without loss.
+        </p>
+      {% else %}
+        <p class="muted small">
+          This cavity holds {{ job.materials|length }} materials, each meshed to
+          its own resolution (a region's element target is divided by its index,
+          because the wavelength inside is shorter by that factor):
+        </p>
+      {% endif %}
       <table class="materials">
-        <thead><tr><th>Part</th><th>Refractive index</th></tr></thead>
+        <thead><tr><th>Part</th>
+          <th>{% if job.kind == 'td' %}Material{% else %}Refractive index{% endif %}</th></tr></thead>
         <tbody>
-          {% for part, n in job.materials|dictsort %}
-            <tr><td>{{ part }}</td><td>{{ '%g'|format(n) }}</td></tr>
+          {% for part, value in job.materials|dictsort %}
+            <tr><td>{{ part }}</td><td>{{ value|material_label }}</td></tr>
           {% endfor %}
         </tbody>
       </table>
+      {% if coating_rows %}
+        <table class="materials" id="coatings">
+          <thead><tr><th>Part</th><th>Coating</th><th>Thickness</th></tr></thead>
+          <tbody>
+            {% for c in coating_rows %}
+              <tr><td>{{ c.part }}</td><td>{{ c.material|material_label }}</td>
+                <td>{{ c.thickness }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% endif %}
     </div>
   {% endif %}
 

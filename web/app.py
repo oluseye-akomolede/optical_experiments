@@ -121,6 +121,33 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
 
     app.extensions["mse"] = {"store": store, "db": jobs_db, "jobs": launcher}
 
+    @app.template_filter("material_label")
+    def _material_label(value):
+        """One entry of a job's stored materials table, as the page shows it.
+
+        The column's domain is not just numbers. A cavity's table holds a
+        per-part refractive index; a td job's holds an index, the string
+        ``pec`` (``td_form.parse_materials``) or a dispersive metal's name
+        (``fdtd.METALS`` -- the owner's Au/1.5/Au film). The cavity-era page
+        formatted each value with ``'%g'``, so the first td job with a metal
+        500'd the page with ``TypeError: must be real number, not str``
+        (job 180cb65f on live ``a8d53a3``). Every shape renders here instead,
+        matching the wording the td form itself uses -- "perfect conductor
+        (pec)" for ``pec``, the metal's own name otherwise.
+
+        The last arm is a STRING of last resort rather than a raise: an
+        unrecognised value (a metal from a newer solver set, say) is shown as
+        its own text, because a page that cannot be opened at all is the worse
+        failure. A number keeps ``%g`` so a cavity page is byte-for-byte what
+        it was.
+        """
+        if isinstance(value, bool):        # bool is an int subclass
+            return str(value)
+        if isinstance(value, (int, float)):
+            return "%g" % value
+        text = str(value).strip()
+        return "perfect conductor (pec)" if text == "pec" else text
+
     # -- pages -------------------------------------------------------------
     @app.route("/healthz")
     def healthz():
@@ -267,11 +294,16 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
         # cavity job, so the template's `and pc_request` guard is also the
         # kind guard rather than a second one that could drift from it.
         pc_request = job.get("pcs") if job.get("kind") == DB.PC else None
+        # A td job's coatings, from its stored request (its OWN helper, since a
+        # coating is not in ``job.materials``). Empty for every other kind, so
+        # the template's truthiness guard is the kind guard too.
+        coating_rows = (_coating_rows(job) if job.get("kind") == DB.TD else [])
         return render_template("job.html", job=job,
                               effective_size=_effective_size(job),
                               resolution=_resolution_caption(job, achieved_m),
                               max_edge_overshoot=MAX_EDGE_OVERSHOOT,
                               pc_request=pc_request,
+                              coating_rows=coating_rows,
                               queue_position=jobs_db.queue_position(job_id))
 
     # -- JSON the page polls ----------------------------------------------
@@ -1211,6 +1243,44 @@ def _require_job(jobs_db, job_id):
     if job is None:
         abort(404)
     return job
+
+
+def _coating_rows(job: dict) -> list[dict]:
+    """A td job's coatings, from the STORED request, as the job page shows them.
+
+    Coatings are NOT in ``job.materials``: they live in the stored ``tds``
+    request, because a part's base material and the film on it are different
+    things (only the base material enters the solver's layout table). The job
+    page shows the materials table alone, so without this a coated part would
+    read as uncoated -- the page would silently omit a layer the solve used.
+
+    The thickness is stored in metres: ``td_form.parse_coatings`` parsed it with
+    the unit's own factor, so dividing by that same factor returns the number
+    the owner typed, which is what they can check against the form. Formatted
+    like the page's feature caption (``:g`` in the owner's unit).
+
+    Empty list for a job with no request or no coatings, so the template's
+    guard is truthiness alone.
+    """
+    coats = (job.get("tds") or {}).get("coatings") or {}
+    if not coats:
+        return []
+    unit = job.get("units") or CFG.DEFAULT_UNITS
+    per_m = unit_scale_m(unit)
+    rows = []
+    for part, pair in sorted(coats.items()):
+        try:
+            material, thickness_m = pair
+            thickness = f"{float(thickness_m) / per_m:.4g} {unit}"
+        except (TypeError, ValueError):
+            # A request this build cannot read is shown as it stands rather
+            # than raising: this page's whole defect class is a render that
+            # trusted a shape the data did not guarantee.
+            rows.append({"part": part, "material": pair, "thickness": ""})
+            continue
+        rows.append({"part": part, "material": material,
+                     "thickness": thickness})
+    return rows
 
 
 def _effective_size(job: dict) -> str | None:
