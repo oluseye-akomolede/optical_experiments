@@ -37,6 +37,7 @@ import fields as FLD
 import jobs as JOBS
 import pc_form as PC
 import storage as STORE
+import td_form as TDF
 import worker_api as WORKER
 from meshing import (MAX_EDGE_OVERSHOOT, UploadError, effective_edge_mm,
                      estimate_tets, load_parts, load_surface, parse_parts,
@@ -149,6 +150,8 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
             # it did.
             if request.form.get("mode") == PC.MODE:
                 return _handle_pc_upload(app, store, jobs_db)
+            if request.form.get("mode") == TDF.MODE:
+                return _handle_td_upload(app, store, jobs_db)
             return _handle_upload(app, store, jobs_db)
         return render_template("index.html", jobs=jobs_db.list_jobs(25),
                               units=CFG.UNIT_CHOICES, default_units=CFG.DEFAULT_UNITS,
@@ -1116,6 +1119,65 @@ def _handle_pc_upload(app, store, jobs_db):
         run_tick(store, jobs_db, app.extensions["mse"]["jobs"])
     except Exception as exc:  # noqa: BLE001 - the tick is best-effort
         app.logger.warning("scheduler tick failed after pc upload: %s", exc)
+
+    return redirect(url_for("job_page", job_id=job_id))
+
+
+def _handle_td_upload(app, store, jobs_db):
+    """Validate, cap-check and queue one time-domain request.
+
+    The upload goes through the same size and readability rails as a cavity
+    upload; everything else is :mod:`td_form`, which refuses by name, with the
+    solver's own layout and limits, before the row exists. A td row is created
+    ``target=JETSON`` because the FDTD solver exists nowhere else
+    (``create_job`` refuses any other target).
+    """
+    uploaded = request.files.get("meshfile")
+    if uploaded is None or not uploaded.filename:
+        flash("Please choose a file to upload.")
+        return redirect(url_for("index"))
+    units = request.form.get("units", CFG.DEFAULT_UNITS)
+    if units not in CFG.UNIT_CHOICES:
+        flash("Please choose one of the supported units.")
+        return redirect(url_for("index"))
+    scale_text = (request.form.get("scale") or "").strip()
+    scale = 1.0
+    if scale_text:
+        try:
+            scale = float(scale_text)
+        except ValueError:
+            flash("The scale must be a number, or left blank.")
+            return redirect(url_for("index"))
+        if not (CFG.MIN_SCALE <= scale <= CFG.MAX_SCALE) or scale != scale:
+            flash(f"The scale must be between {CFG.MIN_SCALE:g} and "
+                  f"{CFG.MAX_SCALE:g}.")
+            return redirect(url_for("index"))
+
+    data = uploaded.read()
+    try:
+        validate_upload(uploaded.filename, data, CFG.MAX_UPLOAD_BYTES)
+        planned = TDF.plan_request(request.form, data,
+                                   unit_scale_m(units) * scale)
+    except (UploadError, TDF.TDRequestError) as exc:
+        flash(str(exc))
+        return redirect(url_for("index"))
+
+    job_id = uuid.uuid4()
+    try:
+        store.write(STORE.job_key(job_id, "input.obj"), data)
+    except STORE.StorageError as exc:
+        flash(str(exc))
+        return redirect(url_for("index"))
+    jobs_db.create_job(job_id, TDF.label(planned, uploaded.filename), units,
+                       planned["n_index"], 0, target=DB.JETSON,
+                       est_tets=planned["estimate"]["cells"], scale=scale,
+                       materials=planned["materials"], kind=DB.TD,
+                       tds=planned["tds"])
+
+    try:
+        run_tick(store, jobs_db, app.extensions["mse"]["jobs"])
+    except Exception as exc:  # noqa: BLE001 - the tick is best-effort
+        app.logger.warning("scheduler tick failed after td upload: %s", exc)
 
     return redirect(url_for("job_page", job_id=job_id))
 
