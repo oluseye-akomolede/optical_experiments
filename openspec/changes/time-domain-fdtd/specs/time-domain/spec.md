@@ -381,6 +381,17 @@ plus a metal coating's skin-depth spacing.
   part's own nodes keep its index, and the nodes beyond the shell are vacuum;
   the shell's faces are grid planes when the part's faces are flat
 
+#### Scenario: a node on a coating's face is decided by rule, not rounding
+- **WHEN** a node lies within the grid's face-line tolerance (the tolerance the
+  grid snaps face lines with) of the coated part's surface or of the shell's
+  outer face
+- **THEN** it is on that face, and the shared-face rule decides it: on the
+  part's surface the conductor, else the higher index, of part and coating; on
+  the outer face the coating, unless the space it grows into ranks higher (open
+  space ranks as index 1). So a 50 nm gold coating on a dielectric box is the
+  same number of nodes thick on all six faces, wherever the box sits in the
+  mesh frame
+
 #### Scenario: a coating on a curved part follows its surface
 - **WHEN** a sphere is coated
 - **THEN** the coating's nodes are the ones whose distance from the sphere's

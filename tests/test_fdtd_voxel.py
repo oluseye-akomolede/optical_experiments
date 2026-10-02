@@ -421,6 +421,36 @@ def test_a_coated_part_lays_out_as_a_shell_of_the_coating_over_its_core(coat):
         assert out["pec"] is None and out["metals"] == {}
 
 
+@pytest.mark.parametrize("core, coat, core_face_owner", [
+    (1.5, "Au", "coating"),    # the conductor coating takes the core's face
+    ("pec", 3.0, "core"),      # a conductor core keeps its face
+    (1.5, 3.0, "coating"),     # between dielectrics, the higher index
+    (3.0, 1.5, "core"),
+])
+def test_a_node_on_a_coatings_face_is_decided_by_the_shared_face_rule(
+        core, coat, core_face_owner):
+    """A point within the grid's snap of the core's face, or of the shell's
+    outer face, is on that face whichever way float rounding put it: the
+    shared-face rule decides the core's face, and the coating owns its outer
+    face over open space. The reviewer's 5.4b defect: these went by rounding."""
+    t = 0.1
+    snap = V.grid_snap([np.array([0.0, 4.0])])
+    index_of, _c = V.coated_index(["core"], [_box((1.0, 0.6, 0.8))], {"core": core},
+                                  {"core": (coat, t)}, boundary="open",
+                                  length_scale=1.0, snap=snap)
+    face = np.array([[0.5, 0.05, -0.1], [-0.5, 0.1, 0.2], [0.2, -0.1, 0.4]])
+    normal = np.array([[1.0, 0, 0], [-1.0, 0, 0], [0, 0, 1.0]])
+    owner = {"core": 1, "coating": 2}[core_face_owner]
+    for nudge in (-0.1 * snap, 0.0, 0.1 * snap):
+        on_core = face + nudge * normal
+        on_outer = face + (t + nudge) * normal
+        assert (index_of(on_core) == owner).all(), (nudge, index_of(on_core))
+        assert (index_of(on_outer) == 2).all(), (nudge, index_of(on_outer))
+        # a clear step either way is not on the face
+        assert (index_of(face - 3 * snap * normal) == 1).all()
+        assert (index_of(face + (t + 3 * snap) * normal) == 0).all()
+
+
 def test_a_coating_on_a_curved_part_follows_its_surface():
     sphere = trimesh.creation.icosphere(subdivisions=3, radius=0.5)
     nodes = [np.linspace(-0.8e-6, 0.8e-6, 17)] * 3

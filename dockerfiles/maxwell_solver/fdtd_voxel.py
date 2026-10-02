@@ -308,10 +308,22 @@ class CoatedIndex:
     neighbour that does not enclose it (a neighbour keeps its volume), nor into
     a metal boundary's wall. Where two shells meet, the higher ``priority``
     (``priority_of``) wins, as on a shared face.
+
+    A sample within ``snap`` (part units; ``grid_snap``) of the core's surface
+    or of the shell's outer face is ON that face, and the shared-face rule
+    decides it, not float rounding: on the core's face the coating takes it
+    when its priority is higher than the core's (a gold coating takes a
+    dielectric core's face nodes); on the outer face it takes it unless the
+    space it grows into ranks higher (open space ranks as index 1). So every
+    face of one coating is the same number of nodes thick.
     """
 
-    def __init__(self, finder, coatings, *, paint_outside: bool):
+    def __init__(self, finder, coatings, *, paint_outside: bool, snap: float = 0.0):
         self.finder = finder
+        self.snap = float(snap)
+        prio = finder.priority or [-np.inf] * len(finder.tris)
+        # index 0 is open space (index 1) where a coating can grow into it
+        self.rank = np.array([priority_of(1.0)] + list(prio))
         self.coatings = list(coatings)
         self.parts = len(finder.tris)
         nested = finder.nested
@@ -323,7 +335,8 @@ class CoatedIndex:
         self.box = []
         for p, t, _rank in self.coatings:
             flat = finder.tris[p].reshape(-1, 3)
-            self.box.append((flat.min(axis=0) - t, flat.max(axis=0) + t))
+            reach = t + self.snap
+            self.box.append((flat.min(axis=0) - reach, flat.max(axis=0) + reach))
         self.tris = finder.tris
 
     def __call__(self, points):
@@ -332,19 +345,43 @@ class CoatedIndex:
         index = base.copy()
         # ascending priority, so where shells meet the higher one paints last
         for j in sorted(range(len(self.coatings)), key=lambda j: self.coatings[j][2]):
-            p, t, _prio = self.coatings[j]
+            p, t, prio = self.coatings[j]
             lo, hi = self.box[j]
-            near = (np.isin(base, self.into[j])
+            host = np.isin(base, self.into[j])
+            near = ((host | (base == p + 1))
                     & np.all((pts >= lo) & (pts <= hi), axis=1))
             cand = np.flatnonzero(near)
             if not len(cand):
                 continue
-            # a sample on the shell's outer face is in the shell: the coating
-            # owns its face as a part owns its own
-            reach = t * (1 + 1e-9)
-            hit = cand[surface_distance(self.tris[p], pts[cand], reach) <= reach]
-            index[hit] = self.parts + 1 + j
+            snap, coat = self.snap, self.parts + 1 + j
+            d = surface_distance(self.tris[p], pts[cand], t + snap)
+            grows = host[cand]
+            # on the core's face, where the shell is there (the face's far
+            # side is space the coating grows into): the higher priority of
+            # core and coating
+            core_face = d <= snap
+            face = cand[core_face & ~grows]
+            if len(face):
+                core_face[np.flatnonzero(core_face & ~grows)] = self._borders(
+                    pts[face], j)
+            index[cand[core_face]] = coat if prio > self.rank[p + 1] else p + 1
+            # strictly inside the shell
+            index[cand[grows & ~core_face & (d < t - snap)]] = coat
+            # on the outer face: the coating, unless what it grows into ranks higher
+            outer = grows & ~core_face & (np.abs(d - t) <= snap)
+            index[cand[outer & (prio >= self.rank[base[cand]])]] = coat
         return index
+
+    def _borders(self, pts, j):
+        """For points the finder put in coating ``j``'s part, on its face:
+        does a step either way along the jitter reach space the coating grows
+        into? A step of 4 snaps crosses any axis-aligned face the point is
+        within a snap of (the jitter has every component above 1/4)."""
+        f = self.finder
+        u = f.shift / np.linalg.norm(f.shift)
+        step = max(4.0 * self.snap, 2.0 * float(np.linalg.norm(f.shift)))
+        return np.any([np.isin(f._deepest(f._inside(pts + sign * step * u)),
+                               self.into[j]) for sign in (1.0, -1.0)], axis=0)
 
 
 def _material_table(names, materials):
@@ -418,12 +455,21 @@ def coating_table(names, coatings):
     return out
 
 
+def grid_snap(nodes, length_scale: float = 1.0) -> float:
+    """The distance (part units) within which a node is on a face: the
+    tolerance the grid snaps face lines with (``fdtd_grid.LINE_SNAP`` x the
+    longest axis), so a node the grid put on a face reads as on it."""
+    span = max(float(n[-1] - n[0]) for n in nodes)
+    return fdtd_grid.LINE_SNAP * span / float(length_scale)
+
+
 def coated_index(names, parts, materials, coatings, *, boundary: str,
-                 length_scale: float):
+                 length_scale: float, snap: float = 0.0):
     """The voxeliser's point lookup: ``PartIndex`` (shared-face rule
     included), wrapped in ``CoatedIndex`` when any part is coated. Returns
     ``(index_of, coats)`` with ``coats`` from ``coating_table``; index
-    ``len(parts) + 1 + j`` is ``coats[j]``. Part coordinates."""
+    ``len(parts) + 1 + j`` is ``coats[j]``. Part coordinates; ``snap`` is
+    ``CoatedIndex``'s face tolerance (``grid_snap`` of the grid looked up)."""
     finder = PartIndex(parts, priority=[priority_of(materials[n]) for n in names],
                        names=names)
     coats = coating_table(names, coatings)
@@ -431,7 +477,7 @@ def coated_index(names, parts, materials, coatings, *, boundary: str,
         return finder, coats
     scale = 1.0 / float(length_scale)
     return CoatedIndex(finder, [(p, t * scale, priority_of(m)) for p, m, t in coats],
-                       paint_outside=boundary == "open"), coats
+                       paint_outside=boundary == "open", snap=snap), coats
 
 
 def voxelise(names, parts, materials, nodes, *, boundary: str = "metal",
@@ -456,7 +502,8 @@ def voxelise(names, parts, materials, nodes, *, boundary: str = "metal",
     names = list(names)
     table = _material_table(names, materials)
     finder, coats = coated_index(names, parts, materials, coatings,
-                                 boundary=boundary, length_scale=length_scale)
+                                 boundary=boundary, length_scale=length_scale,
+                                 snap=grid_snap(nodes, length_scale))
     # index 0 (outside) is a conductor for a cavity and vacuum for open space
     outside = ("pec",) if boundary == "metal" else ("eps", 1.0)
     kinds = [outside] + table + [_kind(f"the coating of part {names[p]!r}", m)

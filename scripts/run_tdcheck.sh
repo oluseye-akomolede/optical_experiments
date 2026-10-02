@@ -7,8 +7,9 @@
 #
 # Exit 0 = ALL PASS. Run from the repo root. The solve is tiny and memory-capped;
 # the browser runs in the rendercheck image with --cpus=2 --memory=2g, and the
-# whole check is cut at 10 minutes. The container is named, and removed on any
-# exit, so a killed run leaves none behind.
+# whole check is cut at 10 minutes. The container is named and removed when the
+# script exits or is stopped by INT, TERM or HUP. A SIGKILL of this script runs
+# no trap and leaves the container up: remove it with docker rm -f mse-tdcheck-<pid>.
 set -eu
 IMAGE=${RENDERCHECK_IMAGE:-harbor.arcadia-ecs.local/mode-search-engine/mse-rendercheck:34cba6e}
 DIR=$(mktemp -d)

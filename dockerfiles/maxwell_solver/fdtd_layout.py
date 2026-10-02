@@ -279,12 +279,14 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
             "boundary": boundary, "coatings": coats, "coat_bounds": coat_bounds}
 
 
-def _finder(names, parts, table, coatings, boundary, length_scale):
-    """The voxeliser's own lookup, shared-face rule and coatings included, so
-    a point is named after the part or coating the scene gave it. Returns
-    ``(index_of, coats)`` as ``fdtd_voxel.coated_index`` does."""
+def _finder(names, parts, table, coatings, boundary, length_scale, nodes):
+    """The voxeliser's own lookup, shared-face rule, coatings and face
+    tolerance included, so a point is named after the part or coating the
+    scene gave it. Returns ``(index_of, coats)`` as
+    ``fdtd_voxel.coated_index`` does."""
     return fdtd_voxel.coated_index(names, parts, table, coatings,
-                                   boundary=boundary, length_scale=length_scale)
+                                   boundary=boundary, length_scale=length_scale,
+                                   snap=fdtd_voxel.grid_snap(nodes, length_scale))
 
 
 def _conductor(kind) -> bool:
@@ -347,7 +349,7 @@ def refuse_conductor_points(planned, parts, *, length_scale: float) -> None:
     points = np.array([[nodes[a][c[a]] for a in range(3)] for _, c in where])
     index_of, coats = _finder(names, parts, table,
                               {names[p]: (m, t) for p, m, t in coats},
-                              planned["boundary"], length_scale)
+                              planned["boundary"], length_scale, nodes)
     index = index_of((points + lo) / float(length_scale))
     for (what, _), point, i in zip(where, points, index):
         i = int(i)
@@ -385,7 +387,7 @@ def layout(names, parts, request, *, length_scale: float, materials=None,
         ([("the source position", cell)] if cell else [])
         + [("probe", p[:3]) for p in probes],
         lambda: _finder(names, parts, table, coatings, planned["boundary"],
-                        length_scale))
+                        length_scale, nodes))
     caveats = []
     for name, part in zip(names, parts):
         plo, phi = _bounds([part], 1.0)

@@ -432,6 +432,47 @@ def test_a_gold_coated_core_lays_out_as_a_gold_shell_over_its_core():
     assert np.allclose(out["eps"][far, j, k], 1.0)
 
 
+@pytest.mark.parametrize("offset", [(0.0, 0.0, 0.0), (12.5, 48.4, 58.3),
+                                    (-731.1, 3.7e3, 0.29)])
+def test_every_face_of_a_coating_is_the_same_number_of_nodes_thick(offset):
+    """The reviewer's 12 face planes: 50 nm of gold on a 306 x 333 x 504 nm
+    n = 1.5 box. Every node on the core's six faces and on the shell's six
+    outer faces is gold (the conductor wins a face over the dielectric core
+    and over vacuum), so the shell is the same number of nodes thick on every
+    face. A float comparison decided those nodes face by face: 6, 7 or 8."""
+    size, t = np.array([306.0, 333.0, 504.0]), 50.0
+    lo = np.asarray(offset)
+    names, parts = ["core"], [_box(lo, lo + size)]
+    req = _request(boundary="open", dx_m=100e-9, position=list(size / 2 * 1e-9),
+                   duration_s=2e-15, coatings={"core": ["Au", t * 1e-9]})
+    out = L.layout(names, parts, req, length_scale=1e-9, materials={"core": 1.5})
+    gold, nodes = out["metals"]["Au"], out["nodes"]
+    thick = []
+    for a in range(3):
+        b, c = [i for i in range(3) if i != a]
+        # the face's footprint: nodes strictly inside the core's extent
+        span = [(nodes[i] > 1e-15) & (nodes[i] < size[i] * 1e-9 - 1e-15)
+                for i in (b, c)]
+        for core_face, outer_face in ((0.0, -t), (size[a], size[a] + t)):
+            planes = {}
+            for what, at in (("core", core_face), ("outer", outer_face)):
+                i = _at(nodes[a], at * 1e-9)
+                plane = np.take(gold, i, axis=a)[np.ix_(*span)]
+                planes[what] = int(plane.sum()), plane.size
+                assert plane.all(), (offset, a, at, what, planes[what])
+            lo_i, hi_i = sorted((_at(nodes[a], core_face * 1e-9),
+                                 _at(nodes[a], outer_face * 1e-9)))
+            thick.append(hi_i - lo_i + 1)
+            mid = [int(np.argmin(np.abs(nodes[i] - size[i] / 2 * 1e-9))) for i in (b, c)]
+            line = [slice(None)] * 3
+            line[b], line[c] = mid
+            column = gold[tuple(line)][lo_i:hi_i + 1]
+            assert column.all(), (offset, a, core_face, column)
+            # the nodes just beyond the shell's two faces are not gold
+            assert not gold[tuple(line)][[lo_i - 1, hi_i + 1]].any(), (offset, a)
+    assert len(set(thick)) == 1, (offset, thick)
+
+
 def test_a_dielectric_coating_gets_its_own_thin_layers():
     """No skin depth here, so only the coating rule can put the shell's outer
     faces on the grid and 4 cells across it (a gold coating's skin-depth

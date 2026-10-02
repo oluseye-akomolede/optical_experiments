@@ -108,7 +108,10 @@
   neighbour or a metal boundary's wall (a coating on a part that encloses the
   cavity is refused). Request key `coatings`; a coating picker per part on the
   page, one-part uploads included; the estimate, the TF/SF box and the
-  conductor-point refusal all see the shells.
+  conductor-point refusal all see the shells. Review fix: a node within the
+  grid's face-line tolerance (`fdtd_voxel.grid_snap`) of the core's surface or
+  the shell's outer face is on that face and the shared-face rule decides it;
+  float rounding had made one 50 nm gold coating 6, 7 or 8 nodes thick by face.
 - [x] 5.4e Follow-up (lead, 2026-10-02 08:52Z; not in phase 5's critical path):
   an upload-time overlap check that fails fast. Probe only the bounding-box
   intersection of each non-nested pair (a 16^3 lattice, ~0.4 s per pair as the
@@ -117,9 +120,12 @@
   voxeliser refusal stays authoritative. Done as
   `fdtd_voxel.refuse_overlap`, called by `td_form.plan_request`. Measured
   (VM, best of 3): a 3-part flush stack 0.3 ms; overlapping boxes refused in
-  20 ms. The cost was the exact nesting test (25 s for two 1280-face spheres
-  side by side), now asked only where one bounding box fits in the other:
-  42 ms to refuse two overlapping 1280-face spheres.
+  20 ms. The cost was the exact nesting test, now asked only where one
+  bounding box fits in the other: two 1280-face icospheres (radius 1, centres
+  3 apart) took 1.47 s with every pair asked and take 0.057 ms now (VM, best
+  of 3, re-measured 2026-10-02 after the reviewer's 1.67 s -> 0.1 ms; an
+  earlier "25 s" here did not reproduce and is withdrawn). Refusing two
+  overlapping 1280-face icospheres (centres 1 apart) takes 43 ms.
 - [x] 5.2 Viewer: field-movie playback in the existing 3-D view, plus trace and
   spectrum plots with axis units.
 - [ ] 5.3 Image smoke test, then an in-browser check against a real finished `td`
