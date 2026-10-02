@@ -193,6 +193,16 @@
   <svg id="td-spectrum-svg" class="bands" width="640" height="300"
        preserveAspectRatio="xMidYMid meet"></svg>
   <ul class="muted small" id="td-caveats"></ul>
+  <div id="td-movie" hidden>
+    <h3>Field movie</h3>
+    <p class="muted small" id="td-movie-caption"></p>
+    <canvas id="td-scene" class="scene"></canvas>
+    <p class="small">
+      <button type="button" id="td-movie-play">Play</button>
+      <input type="range" id="td-movie-frame" min="0" max="0" value="0"
+             aria-label="Movie frame">
+    </p>
+  </div>
 </section>
 {% endblock %}
 

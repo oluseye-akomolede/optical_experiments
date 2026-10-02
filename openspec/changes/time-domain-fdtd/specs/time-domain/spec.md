@@ -846,6 +846,27 @@ be fetched SHALL be named in the card's caption, never left as an empty plot.
 - **WHEN** the manifest lists caveats
 - **THEN** each one is listed on the card
 
+### Requirement: A finished time-domain job's page SHALL play its field movie
+The job page SHALL play the run's |E| frames in a 3-D view drawn with the cavity
+view's raymarch shader. Each frame SHALL be resampled from the graded grid onto
+an evenly spaced lattice using `frames.positions_m`, so a thin film is drawn at
+its true width. Every frame SHALL share ONE colour scale (a high percentile of
+|E| over the whole movie), and the caption SHALL state the frame number, its
+time, that scale and the drawing floor, read from the same constants the
+drawing uses. A slider SHALL select any frame and a button SHALL play and pause.
+
+#### Scenario: frames play at their own times
+- **WHEN** the owner opens a finished td job with a recorded movie
+- **THEN** the movie shows frame 1, the slider spans every frame, and moving it
+  to frame n captions frame n at `frames.steps[n-1] × dt_s`
+
+#### Scenario: a movie that cannot be shown says why
+- **WHEN** a frame cannot be fetched, the run recorded no movie, or every frame
+  is zero
+- **THEN** the caption names the failing frame and its HTTP status, says the run
+  recorded no field movie, or says there is no field to draw -- never a still
+  or empty picture with no explanation
+
 ### Requirement: A drawn waveform SHALL be checked against the grid
 
 A `drawn` source SHALL be a list of at most 10 000 dimensionless amplitude

@@ -59,7 +59,7 @@ a { color: var(--accent); }
 .bar-track { height: 6px; background: #0d1116; border-radius: 999px; overflow: hidden; margin: .6rem 0; }
 .bar-fill { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
 .viewer-wrap { position: relative; }
-#scene { width: 100%; height: 46vh; min-height: 260px; display: block;
+#scene, #td-scene { width: 100%; height: 46vh; min-height: 260px; display: block;
          background: #0b0e12; border: 1px solid var(--line); border-radius: 8px; }
 .legend { display: flex; align-items: center; gap: .5rem; margin: .5rem 0;
           font-size: .8em; color: var(--muted); }
@@ -92,5 +92,5 @@ a { color: var(--accent); }
 @media (max-width: 520px) {
   main { padding: .6rem; }
   .card { padding: .75rem; }
-  #scene { height: 38vh; }
+  #scene, #td-scene { height: 38vh; }
 }
