@@ -314,6 +314,16 @@ limit.
 - **THEN** the job stays queued with a "Jetson busy" status and runs once
   memory is free
 
+#### Scenario: waiting for memory does not use up the retries
+- **WHEN** the worker defers a `td` job because the Jetson is busy, any number
+  of times within the 60 minutes
+- **THEN** the job's release count is unchanged (a busy machine is no verdict
+  on the job), the 60 minutes are counted from the FIRST deferral and later
+  deferrals do not restart them, and the job is not handed out again for 60
+  seconds after each deferral, so the worker does not claim it straight back
+- **AND** only a `td` job can be deferred this way, and only by the worker that
+  holds its lease
+
 #### Scenario: a Jetson that stays busy fails readably
 - **WHEN** free memory stays short for 60 minutes
 - **THEN** the job fails with a message saying the Jetson stayed busy, and it was

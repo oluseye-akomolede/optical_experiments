@@ -306,6 +306,22 @@ BEGIN
     ) THEN
         ALTER TABLE mse.jobs ADD COLUMN tds jsonb;
     END IF;
+
+    -- A td job deferred because the Jetson was short of GPU memory: when the
+    -- first deferral happened (the 60-minute wait is measured from it) and the
+    -- time before which the claim query must not hand the job out again.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'busy_since'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN busy_since timestamptz;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs' AND column_name = 'busy_until'
+    ) THEN
+        ALTER TABLE mse.jobs ADD COLUMN busy_until timestamptz;
+    END IF;
 END $$;
 
 -- The claim query scans for the oldest unleased jetson job, so it wants an

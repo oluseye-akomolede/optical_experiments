@@ -78,6 +78,16 @@ def _new_td(store) -> str:
     return job_id
 
 
+def _busy(store, job_id) -> dict:
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT target, status, release_count, busy_since, "
+                    "busy_until, message FROM mse.jobs WHERE job_id = %s",
+                    (job_id,))
+        keys = ("target", "status", "release_count", "busy_since",
+                "busy_until", "message")
+        return dict(zip(keys, cur.fetchone()))
+
+
 def _has_tds(store) -> bool:
     with store._connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM information_schema.columns WHERE "
@@ -112,6 +122,8 @@ def main() -> int:
     with store._connect() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM mse.jobs")
         cur.execute("ALTER TABLE mse.jobs DROP COLUMN IF EXISTS tds")
+        cur.execute("ALTER TABLE mse.jobs DROP COLUMN IF EXISTS busy_since")
+        cur.execute("ALTER TABLE mse.jobs DROP COLUMN IF EXISTS busy_until")
     if _has_tds(store):
         bad.append("INSTRUMENT: tds is still there after DROP COLUMN, so the "
                    "upgrade below proves nothing")
@@ -198,11 +210,61 @@ def main() -> int:
         bad.append(f"the reaper touched the running td row: target={target!r} "
                    f"status={status!r} message={message!r}")
 
+    # 7. Jetson busy (4.2): a deferral requeues without spending a release,
+    #    sits out of the claim for BUSY_RETRY_SECONDS, keeps its first
+    #    busy_since, and fails only once BUSY_WAIT_MINUTES have passed since it.
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM mse.jobs")
+    busy_id = _new_td(store)
+    if store.claim_jetson("td-check", lease_seconds=60) is None:
+        bad.append("INSTRUMENT: the busy row was not claimable to begin with")
+    if store.defer_busy(busy_id, "someone-else", "x") is not None:
+        bad.append("defer_busy accepted a lease this owner does not hold")
+    if store.defer_busy(busy_id, "td-check", "3.1 GB free, 6 GB needed") != "deferred":
+        bad.append("defer_busy did not defer the held td row")
+    first = _busy(store, busy_id)
+    if first["status"] != DB.QUEUED or first["target"] != DB.JETSON:
+        bad.append(f"after a deferral: {first!r}")
+    if first["release_count"] != 0:
+        bad.append(f"a deferral spent a release: release_count={first['release_count']}")
+    if first["busy_since"] is None or first["busy_until"] is None:
+        bad.append(f"a deferral did not set busy_since/busy_until: {first!r}")
+    if "6 GB needed" not in (first["message"] or ""):
+        bad.append(f"the waiting message lost the worker's reason: {first['message']!r}")
+    if store.claim_jetson("td-check", lease_seconds=60) is not None:
+        bad.append("a just-deferred row was claimed straight back (busy_until ignored)")
+    _set(store, busy_id, "busy_until = now() - interval '1 second'")
+    if store.claim_jetson("td-check", lease_seconds=60) is None:
+        bad.append("a deferred row never became claimable again after busy_until")
+    _set(store, busy_id, "busy_since = busy_since - interval '5 minutes'")
+    kept = _busy(store, busy_id)["busy_since"]
+    if store.defer_busy(busy_id, "td-check", "still busy") != "deferred":
+        bad.append("a second deferral inside the wait did not defer")
+    if _busy(store, busy_id)["busy_since"] != kept:
+        bad.append("a second deferral reset busy_since, so the 60-minute wait "
+                   "would never end")
+    _set(store, busy_id, "busy_until = NULL, busy_since = now() - "
+         "make_interval(mins => %s)", (DB.BUSY_WAIT_MINUTES + 1,))
+    store.claim_jetson("td-check", lease_seconds=60)
+    if store.defer_busy(busy_id, "td-check", "still busy") != "failed":
+        bad.append("a deferral past BUSY_WAIT_MINUTES did not fail the job")
+    last = _busy(store, busy_id)
+    if last["status"] != DB.FAILED or last["message"] != DB.BUSY_GAVE_UP_MESSAGE:
+        bad.append(f"after the wait ran out: {last!r}")
+    control = str(uuid.uuid4())
+    store.create_job(control, "c.obj", "mm", 1.0, 10, target=DB.JETSON,
+                     est_tets=1_000)
+    store.claim_jetson("td-check", lease_seconds=60)
+    if store.defer_busy(control, "td-check", "x") is not None:
+        bad.append("defer_busy deferred a cavity row; only td waits for memory")
+
     for line in bad:
         print("FAIL:", line)
     if not bad:
         print("ok: a td row stays on the Jetson through create, both queues, "
-              "release, lease expiry, the abandon pass and the reaper")
+              "release, lease expiry, the abandon pass and the reaper; a busy "
+              "deferral is uncounted, held out, and bounded at "
+              f"{DB.BUSY_WAIT_MINUTES} minutes")
     return 1 if bad else 0
 
 

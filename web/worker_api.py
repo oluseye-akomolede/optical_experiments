@@ -410,6 +410,27 @@ def _register_routes():
                        + (f": {reason}" if reason else ""))
         return jsonify({"ok": True, "released": True, "failed": False})
 
+    @bp.post("/worker/jobs/<job_id>/busy")
+    def busy(job_id):
+        """Requeue a td job the Jetson has no memory for yet, without a retry.
+
+        Not ``/release``: a busy machine is no verdict on the job, so the
+        release count is left alone and the wait is bounded by time instead
+        (``DB.BUSY_WAIT_MINUTES``, then the app fails it). See ``defer_busy``.
+        """
+        owner = _require_worker()
+        body = request.get_json(silent=True) or {}
+        reason = str(body.get("message", ""))[:2000]
+        outcome = _deps()["jobs_db"].defer_busy(job_id, owner, reason)
+        if outcome is None:
+            abort(409, description="this worker does not hold the lease on a "
+                                   "td job with this id")
+        failed = outcome == "failed"
+        _deps()["log"](f"[mse-web] worker {owner} deferred {job_id} (Jetson "
+                       f"busy)" + (f": {reason}" if reason else "")
+                       + ("; waited too long, failed" if failed else ""))
+        return jsonify({"ok": True, "deferred": not failed, "failed": failed})
+
 
 
 

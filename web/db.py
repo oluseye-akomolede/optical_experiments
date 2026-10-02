@@ -67,6 +67,25 @@ KINDS = (CAVITY, PC, TD)
 #: of cycling through the GPU queue forever.
 MAX_RELEASES = 3
 
+#: How long a td job may wait as "Jetson busy" (short of GPU memory at start)
+#: before it fails, measured from its first deferral; and how long each
+#: deferral keeps it out of the claim query. The spec's 60 minutes.
+BUSY_WAIT_MINUTES = 60
+BUSY_RETRY_SECONDS = 60
+BUSY_STAGE = "Jetson busy"
+BUSY_GAVE_UP_MESSAGE = (
+    f"The Jetson stayed short of GPU memory for {BUSY_WAIT_MINUTES} minutes "
+    "(other work was using it), so this run never started. Please try again "
+    "later."
+)
+
+
+def _busy_message(reason: str) -> str:
+    """The row's message while a td job waits for GPU memory."""
+    reason = (reason or "not enough free GPU memory to start").strip()
+    return (f"waiting: the Jetson is busy ({reason}); it will try again for up "
+            f"to {BUSY_WAIT_MINUTES} minutes")
+
 
 def releases_are_terminal(count: int, bound: int = MAX_RELEASES) -> bool:
     """Whether ``count`` releases have used up the allowance and the job is done.
@@ -692,6 +711,10 @@ class JobStore:
                 "kind, pcs, tds "
                 "FROM mse.jobs "
                 "WHERE target = %s AND status = %s AND lease_owner IS NULL "
+                # A td job the worker just deferred as "Jetson busy" sits out
+                # until ``busy_until``, or the same worker would claim it again
+                # at once and spin. Every other row has busy_until NULL.
+                "AND (busy_until IS NULL OR busy_until <= now()) "
                 "ORDER BY created_at "
                 "FOR UPDATE SKIP LOCKED LIMIT 1",
                 (JETSON, QUEUED),
@@ -988,6 +1011,61 @@ class JobStore:
                 (FAILED, FAILED,
                  _terminal_message(message, row[0]),
                  str(job_id), owner),
+            )
+            return "failed"
+
+    def defer_busy(self, job_id, owner: str, message: str = "") -> str | None:
+        """Put a td job back in the queue because the Jetson is short of memory.
+
+        Returns ``"deferred"``, ``"failed"`` (it has waited ``BUSY_WAIT_MINUTES``
+        since its first deferral) or ``None`` (not this owner's lease, or not a
+        td job -- the caller answers 409).
+
+        NOT a release. A busy Jetson says nothing about the job, so
+        ``release_count`` is left alone: three deferrals would otherwise fail a
+        job that never ran. The bound here is the wall-clock wait instead,
+        measured from ``busy_since``, which the first deferral sets and later
+        ones keep. ``busy_until`` holds the job out of the claim query for
+        ``BUSY_RETRY_SECONDS``, so the worker that just deferred it does not
+        claim it straight back. ``target`` is not touched: a td job stays on the
+        Jetson queue, the only place it can run.
+
+        One statement for the deferral, with the bound in its WHERE, for the
+        reason ``release_jetson`` is one: the database makes the comparison, so
+        a deferral after the deadline matches nothing and takes the failure
+        branch.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL, "
+                "status = %s, stage = %s, message = %s, "
+                "busy_since = COALESCE(busy_since, now()), "
+                "busy_until = now() + make_interval(secs => %s) "
+                "WHERE job_id = %s AND lease_owner = %s AND kind = %s "
+                "AND (busy_since IS NULL "
+                "     OR busy_since > now() - make_interval(mins => %s)) "
+                "RETURNING busy_since",
+                (QUEUED, BUSY_STAGE, _busy_message(message),
+                 float(BUSY_RETRY_SECONDS), str(job_id), owner, TD,
+                 int(BUSY_WAIT_MINUTES)),
+            )
+            if cur.fetchone() is not None:
+                return "deferred"
+            # Zero rows: not ours, not td, or past the wait. Only the last fails.
+            cur.execute(
+                "SELECT busy_since <= now() - make_interval(mins => %s) "
+                "FROM mse.jobs WHERE job_id = %s AND lease_owner = %s "
+                "AND kind = %s",
+                (int(BUSY_WAIT_MINUTES), str(job_id), owner, TD),
+            )
+            row = cur.fetchone()
+            if row is None or not row[0]:
+                return None
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
+                "finished_at = now(), lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (FAILED, FAILED, BUSY_GAVE_UP_MESSAGE, str(job_id), owner),
             )
             return "failed"
 

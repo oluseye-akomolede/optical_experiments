@@ -655,6 +655,24 @@ class LeaseDb(RoutingDb):
         return bool(job and job.get("lease_owner") == owner
                     and not job.get("lease_expired"))
 
+    def defer_busy(self, job_id, owner, message=""):
+        # Modelled on web/db.py, including the two branches a double is most
+        # tempted to skip: a non-td row is refused (None), and the wait is
+        # bounded. ``busy_minutes`` stands in for now() - busy_since; tests set
+        # it to put a row past the bound. release_count is never touched.
+        job = self.jobs.get(str(job_id))
+        if not job or job.get("lease_owner") != owner or job.get("kind") != DB.TD:
+            return None
+        if job.get("busy_minutes", 0) >= DB.BUSY_WAIT_MINUTES:
+            job.update(status=DB.FAILED, stage=DB.FAILED,
+                       message=DB.BUSY_GAVE_UP_MESSAGE,
+                       lease_owner=None, lease_expires_at=None)
+            return "failed"
+        job.setdefault("busy_minutes", 0)
+        job.update(lease_owner=None, lease_expires_at=None, status=DB.QUEUED,
+                   stage=DB.BUSY_STAGE, message=DB._busy_message(message))
+        return "deferred"
+
     def release_jetson(self, job_id, owner, message=""):
         job = self.jobs.get(str(job_id))
         if not job or job.get("lease_owner") != owner:
@@ -2917,3 +2935,46 @@ def test_the_real_store_refuses_a_td_job_off_the_jetson():
     with pytest.raises(ValueError, match="Jetson only"):
         store.create_job("job-td", "u.obj", "um", 1.0, 0, target=DB.CLUSTER,
                          kind=DB.TD, tds=dict(_TDS))
+
+
+def _td_job(db, job_id="td-1"):
+    db.create_job(job_id, "u.obj", "um", 1.0, 0, target=DB.JETSON,
+                  est_tets=1_000, kind=DB.TD,
+                  tds={"boundary": "open", "source_kind": "point"})
+    db.jobs[job_id]["lease_owner"] = WORKER.owner_id("tok-abc-123")
+    return db.jobs[job_id]
+
+
+def test_busy_requeues_a_td_job_without_spending_a_release(tmp_path, worker):
+    """4.2: a Jetson short of GPU memory is no verdict on the job."""
+    client, db, _store = worker
+    _td_job(db)
+    resp = client.post("/worker/jobs/td-1/busy", headers=_auth(),
+                       json={"message": "3.1 GB free, 6.0 GB needed"})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "deferred": True, "failed": False}
+    row = db.jobs["td-1"]
+    assert row["status"] == DB.QUEUED and row["lease_owner"] is None
+    assert row["release_count"] == 0, "a busy deferral must not spend a release"
+    assert row["stage"] == DB.BUSY_STAGE
+    assert "6.0 GB needed" in row["message"]
+    assert f"{DB.BUSY_WAIT_MINUTES} minutes" in row["message"]
+
+
+def test_busy_on_a_lease_this_worker_does_not_hold_is_409(tmp_path, worker):
+    client, db, _store = worker
+    _td_job(db)["lease_owner"] = "w-someone-else"
+    resp = client.post("/worker/jobs/td-1/busy", headers=_auth(), json={})
+    assert resp.status_code == 409
+    assert db.jobs["td-1"]["lease_owner"] == "w-someone-else"
+
+
+def test_busy_past_the_wait_fails_the_job_readably(tmp_path, worker):
+    client, db, _store = worker
+    _td_job(db)["busy_minutes"] = DB.BUSY_WAIT_MINUTES
+    resp = client.post("/worker/jobs/td-1/busy", headers=_auth(), json={})
+    assert resp.get_json() == {"ok": True, "deferred": False, "failed": True}
+    row = db.jobs["td-1"]
+    assert row["status"] == DB.FAILED
+    assert row["message"] == DB.BUSY_GAVE_UP_MESSAGE
+    assert "60 minutes" in row["message"], "the owner is told how long it waited"
