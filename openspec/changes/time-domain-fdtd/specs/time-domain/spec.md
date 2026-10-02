@@ -221,6 +221,45 @@ that exceeded it, and the form lever that reduces it.
 - **THEN** the page shows the refusal with the byte estimate, the limit and the
   lever, and the server does not respond 500
 
+#### Scenario: the estimate counts the steps the run will take
+- **WHEN** a run's dt is lowered below 0.99 of Courant by a dispersive metal
+- **THEN** the estimate's step count uses that lowered dt, the same dt the
+  solver reports, and a duration of a whole number of steps is not rounded up
+  by floating-point noise
+
+#### Scenario: an unmeasured configuration is timed at the slower rate
+- **WHEN** a run's configuration has no row of its own in the Jetson rate table
+  (periodic or mixed faces, or metal walls with a dispersive metal)
+- **THEN** it is timed at the slower measured rate (open, or open with gold),
+  so the 30-minute limit never admits a run on a guessed faster rate
+
+#### Scenario: the run time errs long
+- **WHEN** the run time is estimated
+- **THEN** each configuration's rate is the slowest row it measured over every
+  recorded Jetson run, kept in the code as cited data rather than retyped
+- **AND** the estimate divides by a 0.9 safety factor on that rate, since
+  run-to-run spread is about 3% under background load and an under-estimate
+  would admit a run over 30 minutes
+
+#### Scenario: every exceeded limit is named at once
+- **WHEN** a request exceeds more than one limit
+- **THEN** one refusal names each of them, in the order cells, steps, memory,
+  time, and a value exactly at a limit is admitted
+
+#### Scenario: the memory estimate is checked against the solver's real peak
+- **WHEN** the solver runs a tiny grid with metal, open or periodic faces, a
+  conductor mask, the peak-field record or a Lorentz-Drude metal
+- **THEN** the host-measured peak is between 0.8 and 1.0 of the estimate (the
+  estimate includes the device allocator's cached blocks, which numpy does not
+  keep), and each option's measured increment within 15% of its estimated
+  increment
+- **AND** every row of the Jetson rate table (metal, open and open-plus-gold at
+  1 M and 4 M cells) measures between 0.9 and 1.0 of the estimate, so the
+  memory refusal never admits a run the device cannot hold
+- **AND** a rate script measures cell-steps/s and peak device memory for metal,
+  open and open-plus-gold runs at about 1 M and 4 M cells on the Jetson, beside
+  the estimate, and the run-time limit's rates come from those measurements
+
 ### Requirement: The worker SHALL run a time-domain job only with the memory it needs
 
 The worker SHALL run at most one GPU job at a time when one of them is `td`.
@@ -307,6 +346,10 @@ refused before it is queued.
 - **AND** it exits 2 without running when the pulse band leaves the metal's
   fit, and exits 2 rather than passing when the setup has fewer than 4 cells
   per skin depth or a slab under 10 skin depths
+- **AND** it fails unless the judged bins span the band it checked the metal
+  and skin depths over, each end within one bin and with no hole, since a
+  shorter record gives fewer, wider bins over the same band
+- **AND** it runs with the solver's default 10-cell CPML
 
 #### Scenario: a metal slab across periodic faces is uniform
 - **WHEN** a plane wave meets a metal slab that spans every periodic axis
@@ -325,6 +368,31 @@ neighbour spacing ratio of at most 1.3.
 - **THEN** every such layer has at least 4 cells across it and every neighbour
   spacing ratio is at most 1.3
 
+#### Scenario: a layer can cap its own spacing
+- **WHEN** a layer carries a spacing (a metal surface gets its skin depth at the
+  top of the band divided by 4, a curved coating its thickness divided by 4)
+- **THEN** no cell inside the layer is wider than that spacing, and the layer's
+  edges are grid nodes
+
+#### Scenario: a coating follows the region's shape
+- **WHEN** a region spanning lo..hi on an axis is coated with thickness t
+- **THEN** a region with flat faces normal to that axis adds the two thin layers
+  lo−t..lo and hi..hi+t, and any other region adds one layer lo−t..hi+t capped at
+  t/4, so a curved coating costs more cells than a flat one
+
+#### Scenario: a grading that cannot converge is refused
+- **WHEN** repairing neighbour-ratio violations grows an axis past a fixed
+  multiple of its first node count, or does not settle within the repair limit
+- **THEN** the builder raises a named grid error instead of refining further
+
+#### Scenario: a cut cell takes the volume average
+- **WHEN** a node's dual cell (halfway to each neighbour, clipped at the domain
+  ends) is split between materials
+- **THEN** its permittivity is the average over the dielectric samples of that
+  cell; a node at least half of whose samples are one metal is that metal's
+  node; a node with no dielectric sample gets permittivity 1; and nothing
+  outside the domain is sampled
+
 #### Scenario: benchmark V5
 - **WHEN** a dielectric film of index n, far thinner than the coarse cell,
   fills the gap between two PEC plates of lateral size a × b with PEC side walls,
@@ -332,6 +400,44 @@ neighbour spacing ratio of at most 1.3.
 - **THEN** its resonances are within 1% of the parallel-plate lateral modes
   f = (c/2n)·√((m/a)² + (p/b)²) with m, p ≥ 1, which depend on n and not on the
   film thickness, and every such mode in the pulse band appears
+
+#### Scenario: how the V5 bench decides
+- **WHEN** the V5 bench judges a run
+- **THEN** "far thinner" means at most a quarter of the coarse cell; the film is
+  run at two thicknesses and both are gated against the same modes; peaks are
+  matched to modes one to one, closest first; a peak more than 1% from every mode
+  of the family fails the run; a mode whose source × probe overlap is under 0.05
+  is listed as not gated; and a setup whose grid dispersion at the top of the band
+  exceeds half the tolerance, or whose film axis breaks the builder's rules, exits
+  2 (not a spec setup) unless the run already failed
+
+### Requirement: The upload's parts SHALL be voxelised onto the grid
+
+Each sample of a node's dual cell SHALL take the material of the innermost
+uploaded part containing it. Outside every part the grid SHALL be a conductor
+for `metal` and vacuum for `open`. Every part SHALL be given a material: a
+refractive index of at least 1, `pec`, or one of the Rakić metals.
+
+#### Scenario: nested parts in any file order
+- **WHEN** an upload holds a part nested inside another, in either file order
+- **THEN** every sample inside the inner part takes the inner part's material,
+  matching the cavity tool's winding-number test point for point
+
+#### Scenario: a sample on a mesh edge's line
+- **WHEN** an axis-aligned part puts its edges on the grid's sample lines
+- **THEN** those samples are classified as the winding-number test classifies
+  them (queries are shifted ~1e-6 of the scene size so no ray meets an edge)
+
+#### Scenario: outside the shape
+- **WHEN** a `metal` run is voxelised
+- **THEN** every node whose cell lies outside the parts is in the conductor mask;
+  for an `open` run those nodes are vacuum (permittivity 1)
+
+#### Scenario: a materials table that does not fit the upload
+- **WHEN** the table leaves a part out, names a part the file lacks, gives an
+  unknown material name, or gives an index below 1 or not finite
+- **THEN** the run is refused with a message naming the part(s) and, for a
+  mismatch, the file's parts
 
 ### Requirement: A drawn waveform SHALL be checked against the grid
 

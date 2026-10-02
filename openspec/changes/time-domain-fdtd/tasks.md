@@ -1,6 +1,6 @@
 ## 1. Solver core (phase 1)
 
-- [ ] 1.1 `dockerfiles/maxwell_solver/fdtd.py`: a Yee update on an array module `xp` (numpy | cupy),
+- [x] 1.1 `dockerfiles/maxwell_solver/fdtd.py`: a Yee update on an array module `xp` (numpy | cupy),
   float32, on a **graded tensor-product grid**: per-axis primal and dual spacing
   arrays (a uniform grid is just the special case). PEC is applied by zeroing
   tangential E on the conductor mask. A CPML of 10 cells is used on open faces.
@@ -8,14 +8,14 @@
   The E update carries an **auxiliary polarisation-current hook** (a list of
   per-material ADE terms, empty in phase 1), so dispersive metals add terms
   without changing the core.
-- [ ] 1.2 Point source: a soft E-component current, with `cw` (smooth ramp) and
+- [x] 1.2 Point source: a soft E-component current, with `cw` (smooth ramp) and
   `pulse` (Gaussian) profiles.
-- [ ] 1.3 Probes return float32 traces. The spectrum is computed by rfft of a
+- [x] 1.3 Probes return float32 traces. The spectrum is computed by rfft of a
   windowed trace.
-- [ ] 1.4 Tiny tests (≤ 24³ cells, numpy) cover the update's energy conservation
+- [x] 1.4 Tiny tests (≤ 24³ cells, numpy) cover the update's energy conservation
   in a closed PEC box, and that the source profile sits at the requested
   frequency.
-- [ ] 1.5 Benchmark V1 (metal box pulse versus the analytic frequencies, and
+- [x] 1.5 Benchmark V1 (metal box pulse versus the analytic frequencies, and
   versus the cavity solver) and V2 (CW 1/r). These run on the Jetson bench
   (tier 2), and the lead runs them.
 
@@ -47,17 +47,18 @@
 
 ## 3. Geometry, estimate and caps (phase 3)
 
-- [ ] 3.0 Graded-grid builder (≥ 4 cells per thin layer or skin depth, neighbour
+- [x] 3.0 Graded-grid builder (≥ 4 cells per thin layer or skin depth, neighbour
   ratio ≤ 1.3), sub-cell averaging at cut cells, and coatings (material +
   thickness on a region's surface). A unit check of the builder's own rules.
-  Benchmark V5 (parallel-plate lateral modes).
-- [ ] 3.1 Voxelise the upload's regions to an index map. Cells outside the shape
+  Benchmark V5 (parallel-plate lateral modes): script and its tests; the Jetson
+  run is the lead's.
+- [x] 3.1 Voxelise the upload's regions to an index map. Cells outside the shape
   are metal (`metal`) or vacuum plus a gap (`open`).
-- [ ] 3.2 Estimate cells, steps, memory and run time from the form. Refuse above
+- [x] 3.2 Estimate cells, steps, memory and run time from the form. Refuse above
   8 M cells, 20 000 steps, 3.0 GB or 30 minutes, naming the limit, the value and
   the lever to change.
-- [ ] 3.3 Every refusal type raised by the form or the geometry is caught by the
-  route (no 500 responses).
+- 3.3 moved to 5.1a: there is no time-domain route until phase 5, so the
+  route-level refusal test lands with the route.
 
 ## 4. Job kind `td` (phase 4)
 
@@ -77,6 +78,13 @@
 
 - [ ] 5.1 Form: boundary, source kind, profile, f, bandwidth, position,
   polarisation, duration, probes and dx.
+- [ ] 5.1a (was 3.3) Every refusal raised by the form, the geometry or the
+  limits comes back as the route's refusal response, never a 500. Counting
+  raise sites is not enough (an implicit TypeError from bad input has none):
+  the route test feeds each malformed input end to end, namely a null material,
+  a list material, an empty mesh, an open/non-manifold surface, a zero-size
+  part, NaN coordinates, a zero length scale, a one-node axis, a NaN
+  duration, a mesh-library failure, and each limit broken.
 - [ ] 5.2 Viewer: field-movie playback in the existing 3-D view, plus trace and
   spectrum plots with axis units.
 - [ ] 5.3 Image smoke test, then an in-browser check against a real finished `td`
