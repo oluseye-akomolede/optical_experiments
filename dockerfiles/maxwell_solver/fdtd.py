@@ -1847,9 +1847,10 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                         f"the polarisation term {getattr(term, 'name', term)!r} "
                         f"returned an increment for {name!r}; E components are "
                         f"{COMPONENTS}")
-                if isinstance(increment, tuple):  # (region, values)
-                    region, values = increment
-                    field[name][region] += values
+                if isinstance(increment, tuple):  # (where, values)
+                    # not ``region``: that name is the energy sum's box
+                    where, values = increment
+                    field[name][where] += values
                 else:
                     field[name] += increment
 
