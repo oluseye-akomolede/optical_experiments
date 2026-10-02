@@ -342,6 +342,98 @@ def test_the_memory_gate_counts_the_field_movie(monkeypatch):
     assert est["bytes"] == with_movie == out["estimate"]["bytes"]
 
 
+class _Pool:
+    def free_bytes(self):
+        return 12_345
+
+
+class _PoolXp:
+    def get_default_memory_pool(self):
+        return _Pool()
+
+
+def test_free_memory_adds_the_blocks_cupys_pool_already_holds(tmp_path):
+    """MemAvailable alone undercounts a warm worker: the pool's free blocks
+    are reusable by this process but the kernel counts them as used."""
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal: 8000000 kB\nMemAvailable: 1000 kB\n")
+    assert td_solve.available_bytes(_PoolXp(), meminfo) == 1000 * 1024 + 12_345
+    assert td_solve.available_bytes(np, meminfo) == 1000 * 1024
+
+
+# --- the run in its own process ------------------------------------------
+
+import td_child_targets as TARGETS  # noqa: E402
+
+
+class _Stages:
+    def __init__(self):
+        self.seen = []
+
+    @property
+    def stage(self):
+        return self.seen[-1] if self.seen else None
+
+    @stage.setter
+    def stage(self, name):
+        self.seen.append(name)
+
+
+def test_a_tiny_job_runs_in_its_own_process_and_writes_its_files(tmp_path):
+    """Positive control: the real solve in a spawned child, a real store."""
+    import mse_storage
+    store = mse_storage.LocalStore(tmp_path)
+    store.write("jobs/j1/input.obj", _obj())
+    stages = _Stages()
+    out = td_solve.solve_td_isolated(_job(), store, store, stages)
+    assert "result" not in out, "the arrays stay in the files"
+    assert out["files"][0] == "trace.bin" and out["files"][-1] == "spectrum.json"
+    for name in out["files"]:
+        assert (tmp_path / "jobs" / "j1" / name).is_file(), name
+    assert "writing results" in stages.seen, stages.seen
+
+
+def test_a_kernel_kill_of_the_run_is_the_out_of_memory_verdict():
+    stages = _Stages()
+    with pytest.raises(td_solve.TDSolveError) as info:
+        td_solve.solve_td_isolated(_job(), None, None, stages, run=TARGETS.killed)
+    assert str(info.value) == td_solve.oom_message()
+    assert "ran out of memory" in str(info.value)
+    assert stages.seen == ["solving"]
+
+
+def test_a_stop_signal_does_not_end_the_run():
+    """systemd sends SIGTERM to the whole cgroup; the child finishes anyway."""
+    out = td_solve.solve_td_isolated(_job(), None, None, None,
+                                     run=TARGETS.sigterm_then_finish)
+    assert out["files"] == ["trace.bin"] and "result" not in out
+
+
+def test_a_childs_error_keeps_its_type_and_its_cause():
+    """The worker's classify walks the cause chain: a GPU-init failure
+    wrapped in another error is transient, and only the chain says so."""
+    import mse_worker
+    with pytest.raises(ValueError, match="could not start") as info:
+        td_solve.solve_td_isolated(_job(), None, None, None,
+                                   run=TARGETS.gpu_init_failure)
+    assert "cudaErrorInitializationError" in str(info.value.__cause__)
+    assert mse_worker.classify(info.value) == "transient"
+
+
+def test_an_unpicklable_error_keeps_its_name_and_text():
+    with pytest.raises(RuntimeError, match="half open") as info:
+        td_solve.solve_td_isolated(_job(), None, None, None,
+                                   run=TARGETS.unpicklable)
+    assert type(info.value).__name__ == "Odd"
+
+
+def test_busy_in_the_child_is_busy_in_the_parent():
+    import mse_worker
+    with pytest.raises(td_solve.JetsonBusy) as info:
+        td_solve.solve_td_isolated(_job(), None, None, None, run=TARGETS.busy)
+    assert mse_worker.classify(info.value) == "busy"
+
+
 def test_the_worker_uploads_every_file_the_td_solve_writes(tmp_path):
     """Through the worker's real enumerator and allow-list, not a copy."""
     import mse_worker

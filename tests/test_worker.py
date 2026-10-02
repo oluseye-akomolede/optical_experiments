@@ -1563,12 +1563,16 @@ def test_a_td_job_fetches_its_upload_and_is_never_meshing(tmp_path):
 
 
 def test_real_solve_dispatches_td_to_its_own_module(monkeypatch):
-    """``real_solve`` sends kind='td' to ``td_solve.solve_td`` -- not the cavity."""
+    """``real_solve`` sends kind='td' to ``td_solve`` -- not the cavity -- and
+    runs it in a child process (``solve_td_isolated``), never ``solve_td`` in
+    the worker's own, where a kernel OOM kill would take the worker down."""
     import types
 
     calls = []
     fake = types.ModuleType("td_solve")
-    fake.solve_td = lambda job, store_in, store_out, stage: calls.append(job) or "ok"
+    fake.solve_td_isolated = (
+        lambda job, store_in, store_out, stage: calls.append(job) or "ok")
+    fake.solve_td = lambda *a, **k: pytest.fail("ran in the worker's process")
     monkeypatch.setitem(sys.modules, "td_solve", fake)
     pc_calls = []
     _install_fake_pc_solve(monkeypatch, pc_calls)
@@ -1640,6 +1644,25 @@ def test_a_busy_td_job_is_deferred_not_failed_or_released(tmp_path):
         == ["busy"], api.names()
     busy = [c for c in api.calls if c[0] == "busy"][0]
     assert "9.0 GB" in busy[2], "the deferral carries the owner's sentence"
+
+
+def test_a_kernel_oom_kill_fails_the_td_job_once_never_a_release(tmp_path):
+    """The kernel's SIGKILL leaves no exception; the child's exit status does.
+    RED with the td solve in the worker's own process: the worker dies, the
+    lease expires and the app requeues it as a counted release."""
+    import td_child_targets
+    import td_solve
+
+    def solve(job, store_in, store_out, stage=None):
+        return td_solve.solve_td_isolated(job, store_in, store_out, stage,
+                                          run=td_child_targets.killed)
+
+    worker, api = _recording_worker(tmp_path, solve)
+    worker.run_job({"job_id": "t-9", "kind": "td", "tds": {}})
+
+    failed = [c for c in api.calls if c[0] == "failed"]
+    assert [c[2] for c in failed] == [td_solve.oom_message()], api.names()
+    assert "release" not in api.names()
 
 
 def test_a_td_stop_reaches_the_owner_in_its_own_words(tmp_path):

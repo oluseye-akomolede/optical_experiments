@@ -31,6 +31,9 @@ name with a path separator.
 from __future__ import annotations
 
 import json
+import multiprocessing
+import pickle
+import signal
 import sys
 import time
 
@@ -123,11 +126,12 @@ def _backend():
     return numpy
 
 
-def available_bytes(xp) -> int:
+def available_bytes(xp, meminfo="/proc/meminfo") -> int:
     """Memory a new run can take. The Orin's GPU shares system RAM, so this
     is the kernel's MemAvailable, plus the blocks cupy's pool already holds
-    for this process (free to reuse, but not counted by the kernel)."""
-    with open("/proc/meminfo") as fh:
+    for this process (free to reuse, but not counted by the kernel).
+    ``meminfo`` is a seam for the tests."""
+    with open(meminfo) as fh:
         for line in fh:
             if line.startswith("MemAvailable:"):
                 free = int(line.split()[1]) * 1024
@@ -151,6 +155,15 @@ def is_out_of_memory(exc: BaseException) -> bool:
 
 def _gb(n) -> str:
     return f"{n / 1e9:.1f} GB"
+
+
+def oom_message(need=None) -> str:
+    """The owner's sentence for a run that ran out of memory: raised in the
+    run (``need`` known) or a kernel kill seen from outside (``need`` not)."""
+    needed = "" if need is None else f" (it needed about {_gb(need)})"
+    return (f"The Jetson ran out of memory during the run{needed}; another job "
+            f"probably started after this one was checked. Please submit it "
+            f"again.")
 
 
 def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
@@ -227,10 +240,7 @@ def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
         raise
     except Exception as exc:  # noqa: BLE001 - only OOM is translated
         if is_out_of_memory(exc):
-            raise TDSolveError(
-                f"The Jetson ran out of memory during the run (it needed about "
-                f"{_gb(est['bytes'])}; another job probably started after this "
-                f"one was checked). Please submit it again.") from exc
+            raise TDSolveError(oom_message(est["bytes"])) from exc
         raise
     caveats = list(lay["caveats"])
     names = []
@@ -241,6 +251,145 @@ def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
                               caveats, plan)
     return {"job_id": job_id, "kind": "td", "modes": [], "result": result,
             "estimate": est, "caveats": caveats, "files": names}
+
+
+
+# ---------------------------------------------------------------------------
+# The run in its own process
+# ---------------------------------------------------------------------------
+# On the Orin the GPU shares system RAM, so a run that outgrows memory is
+# often not a MemoryError at all: the kernel's OOM killer (the cgroup's
+# MemoryMax, or the whole box) sends SIGKILL, and no except clause anywhere
+# sees it. In the worker's own process that killed the worker, the lease
+# expired, and the app requeued the job as a counted release -- retried up to
+# the cap instead of failed once with the reason. In a child, the killer picks
+# the child (it holds the memory), and the parent, still holding the lease,
+# reads exit status -9 and fails the job with the OOM sentence.
+#
+# -9 is read as out-of-memory because nothing else sends it to this child
+# alone: a systemd stop's final SIGKILL takes the whole cgroup, parent too, so
+# no parent is left to misread it. The unit's ``OOMPolicy=continue`` is what
+# keeps systemd from stopping the service when the kernel kills the child.
+
+class _PipeStage:
+    """The child's ``stage``: each assignment goes up the pipe, so the
+    parent's heartbeat reports what the child is doing."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    @property
+    def stage(self):
+        return None
+
+    @stage.setter
+    def stage(self, name):
+        self._conn.send(("stage", name))
+
+
+def _chain(exc: BaseException) -> list:
+    """``exc`` and its causes, each as (pickle or None, type name, message).
+
+    Pickling an exception drops ``__cause__``/``__context__``, and the
+    worker's ``classify`` walks that chain (a GPU-init failure wrapped in
+    another error is transient), so every link travels separately."""
+    out, seen, node = [], set(), exc
+    while node is not None and len(out) < 10 and id(node) not in seen:
+        seen.add(id(node))
+        try:
+            blob = pickle.dumps(node)
+            pickle.loads(blob)
+        except Exception:  # noqa: BLE001 - unpicklable: name and text travel
+            blob = None
+        out.append((blob, type(node).__name__, str(node)))
+        node = node.__cause__ or node.__context__
+    return out
+
+
+def _rebuild(links: list) -> BaseException:
+    """The parent's copy of the child's exception, causes re-linked. A link
+    that cannot be unpickled here becomes a RuntimeError subclass of the same
+    NAME, which is what ``classify``'s name checks read."""
+    nodes = []
+    for blob, name, text in links:
+        exc = None
+        if blob is not None:
+            try:
+                exc = pickle.loads(blob)
+            except Exception:  # noqa: BLE001 - fall back to the name
+                exc = None
+        if exc is None:
+            exc = type(name, (RuntimeError,), {"__module__": __name__})(text)
+        nodes.append(exc)
+    for exc, cause in zip(nodes, nodes[1:]):
+        exc.__cause__ = cause
+    return nodes[0]
+
+
+def _child(conn, job, store_in, store_out, run=None):
+    """The child's whole life: run the solve, send one outcome, exit.
+
+    SIGTERM and SIGINT are ignored, as they are in effect for an in-process
+    solve (the worker's handler only sets a flag it reads after the solve): a
+    systemd stop sends them to the whole cgroup, and a child that died of
+    them would turn an operator's restart into a failed job."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    run = solve_td if run is None else run
+    try:
+        out = run(job, store_in, store_out, _PipeStage(conn))
+        # The traces and frames are in the files already; only the summary
+        # crosses back.
+        conn.send(("ok", {k: v for k, v in out.items() if k != "result"}))
+    except BaseException as exc:  # noqa: BLE001 - every outcome is reported
+        conn.send(("error", _chain(exc)))
+    finally:
+        conn.close()
+
+
+def solve_td_isolated(job: dict, store_in, store_out=None, stage=None, *,
+                      run=None, context=None, poll_s=1.0) -> dict:
+    """``solve_td`` in a spawned child; its outcome, raised or returned here.
+
+    Spawned, never forked: a forked copy of a process that has touched CUDA
+    cannot use the GPU. ``run`` (a module-level function, run in the child
+    instead of ``solve_td``) and ``context`` are seams for the tests."""
+    ctx = context or multiprocessing.get_context("spawn")
+    receive, send = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_child, args=(send, job, store_in, store_out, run),
+                       daemon=True)
+    proc.start()
+    send.close()
+    outcome = None
+    try:
+        while outcome is None:
+            if receive.poll(poll_s):
+                try:
+                    message = receive.recv()
+                except EOFError:  # the child is gone without an outcome
+                    break
+                if message[0] == "stage":
+                    if stage is not None:
+                        stage.stage = message[1]
+                else:
+                    outcome = message
+            elif not proc.is_alive() and not receive.poll(0):
+                break
+    finally:
+        receive.close()
+        proc.join(60)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+    if outcome is None:
+        if proc.exitcode == -signal.SIGKILL:
+            raise TDSolveError(oom_message())
+        raise TDSolveError(
+            f"The time-domain solver stopped unexpectedly (exit status "
+            f"{proc.exitcode}) and left no result. Please report this job.")
+    if outcome[0] == "error":
+        raise _rebuild(outcome[1])
+    return outcome[1]
 
 
 def spectrum_band(request: dict, band_top_hz: float) -> tuple:

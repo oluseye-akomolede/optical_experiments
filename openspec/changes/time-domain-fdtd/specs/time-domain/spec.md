@@ -337,6 +337,20 @@ limit.
 - **WHEN** the device runs out of memory during a `td` run
 - **THEN** the job fails with a message naming the memory shortage
 
+#### Scenario: a kernel out-of-memory kill fails the job once
+- **WHEN** the kernel's OOM killer ends a `td` run with SIGKILL (on the Orin
+  the GPU shares system RAM, so this, not an exception, is a common way to run
+  out of memory)
+- **THEN** the job fails once with the out-of-memory message, and is never
+  requeued as a counted release
+- **AND** this holds because the run solves in a spawned child process, with
+  the worker (holding the lease) reading exit status -9 as out of memory; the
+  child ignores SIGTERM and SIGINT, so a service stop does not end a run; an
+  error raised in the child reaches the worker's classifier with its type (or
+  its type's name, when it cannot be pickled) and its cause chain; and the
+  worker's unit sets `OOMPolicy=continue`, so systemd does not stop the
+  service when the child is killed
+
 #### Scenario: an overlong run is stopped
 - **WHEN** a `td` run passes 45 minutes of run time
 - **THEN** it is stopped and the job fails with a message naming the limit
