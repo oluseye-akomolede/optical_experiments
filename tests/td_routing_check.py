@@ -81,10 +81,10 @@ def _new_td(store) -> str:
 def _busy(store, job_id) -> dict:
     with store._connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT target, status, release_count, busy_since, "
-                    "busy_until, message FROM mse.jobs WHERE job_id = %s",
-                    (job_id,))
+                    "busy_until, message, lease_owner, finished_at "
+                    "FROM mse.jobs WHERE job_id = %s", (job_id,))
         keys = ("target", "status", "release_count", "busy_since",
-                "busy_until", "message")
+                "busy_until", "message", "lease_owner", "finished_at")
         return dict(zip(keys, cur.fetchone()))
 
 
@@ -251,6 +251,35 @@ def main() -> int:
     last = _busy(store, busy_id)
     if last["status"] != DB.FAILED or last["message"] != DB.BUSY_GAVE_UP_MESSAGE:
         bad.append(f"after the wait ran out: {last!r}")
+    if last["lease_owner"] is not None or last["finished_at"] is None:
+        bad.append(f"giving up kept the lease or left finished_at unset: {last!r}")
+    # 7b. A requeue (release or lease expiry) starts a fresh wait: a busy_since
+    #     left from an earlier wait would fail the next deferral at once.
+    for how in ("release", "expiry"):
+        with store._connect() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM mse.jobs")
+        again = _new_td(store)
+        store.claim_jetson("td-check", lease_seconds=60)
+        store.defer_busy(again, "td-check", "busy once")
+        _set(store, again, "busy_until = NULL, busy_since = now() - "
+             "make_interval(mins => %s)", (DB.BUSY_WAIT_MINUTES + 1,))
+        if store.claim_jetson("td-check", lease_seconds=60) is None:
+            bad.append(f"INSTRUMENT ({how}): the stale-wait row was not claimable")
+        if how == "release":
+            store.release_jetson(again, "td-check", "worker restarted")
+        else:
+            _set(store, again, "lease_expires_at = now() - interval '1 second'")
+            store.reclaim_expired_leases()
+        row = _busy(store, again)
+        if row["status"] != DB.QUEUED:
+            bad.append(f"INSTRUMENT ({how}): the row was not requeued: {row!r}")
+        if row["busy_since"] is not None or row["busy_until"] is not None:
+            bad.append(f"the {how} requeue kept busy_since/busy_until: {row!r}")
+        store.claim_jetson("td-check", lease_seconds=60)
+        verdict = store.defer_busy(again, "td-check", "busy again")
+        if verdict != "deferred":
+            bad.append(f"after the {how} requeue a busy deferral was {verdict!r}, "
+                       "not a fresh wait")
     control = str(uuid.uuid4())
     store.create_job(control, "c.obj", "mm", 1.0, 10, target=DB.JETSON,
                      est_tets=1_000)

@@ -2937,7 +2937,7 @@ def test_the_real_store_refuses_a_td_job_off_the_jetson():
                          kind=DB.TD, tds=dict(_TDS))
 
 
-def _td_job(db, job_id="td-1"):
+def _busy_td_job(db, job_id="td-1"):
     db.create_job(job_id, "u.obj", "um", 1.0, 0, target=DB.JETSON,
                   est_tets=1_000, kind=DB.TD,
                   tds={"boundary": "open", "source_kind": "point"})
@@ -2948,7 +2948,7 @@ def _td_job(db, job_id="td-1"):
 def test_busy_requeues_a_td_job_without_spending_a_release(tmp_path, worker):
     """4.2: a Jetson short of GPU memory is no verdict on the job."""
     client, db, _store = worker
-    _td_job(db)
+    _busy_td_job(db)
     resp = client.post("/worker/jobs/td-1/busy", headers=_auth(),
                        json={"message": "3.1 GB free, 6.0 GB needed"})
     assert resp.status_code == 200
@@ -2963,7 +2963,7 @@ def test_busy_requeues_a_td_job_without_spending_a_release(tmp_path, worker):
 
 def test_busy_on_a_lease_this_worker_does_not_hold_is_409(tmp_path, worker):
     client, db, _store = worker
-    _td_job(db)["lease_owner"] = "w-someone-else"
+    _busy_td_job(db)["lease_owner"] = "w-someone-else"
     resp = client.post("/worker/jobs/td-1/busy", headers=_auth(), json={})
     assert resp.status_code == 409
     assert db.jobs["td-1"]["lease_owner"] == "w-someone-else"
@@ -2971,7 +2971,7 @@ def test_busy_on_a_lease_this_worker_does_not_hold_is_409(tmp_path, worker):
 
 def test_busy_past_the_wait_fails_the_job_readably(tmp_path, worker):
     client, db, _store = worker
-    _td_job(db)["busy_minutes"] = DB.BUSY_WAIT_MINUTES
+    _busy_td_job(db)["busy_minutes"] = DB.BUSY_WAIT_MINUTES
     resp = client.post("/worker/jobs/td-1/busy", headers=_auth(), json={})
     assert resp.get_json() == {"ok": True, "deferred": False, "failed": True}
     row = db.jobs["td-1"]

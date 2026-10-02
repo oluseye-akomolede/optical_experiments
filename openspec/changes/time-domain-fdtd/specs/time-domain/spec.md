@@ -323,11 +323,15 @@ limit.
   seconds after each deferral, so the worker does not claim it straight back
 - **AND** only a `td` job can be deferred this way, and only by the worker that
   holds its lease
+- **AND** a release or an expired lease requeues the job with a fresh wait: a
+  deferral after that starts a new 60 minutes, so an old wait cannot fail it
 
 #### Scenario: a Jetson that stays busy fails readably
 - **WHEN** free memory stays short for 60 minutes
 - **THEN** the job fails with a message saying the Jetson stayed busy, and it was
   never moved to the cluster queue
+- **AND** it is finished like any failed job: its lease is released and its
+  finish time is set
 
 #### Scenario: memory taken mid-run fails readably
 - **WHEN** the device runs out of memory during a `td` run

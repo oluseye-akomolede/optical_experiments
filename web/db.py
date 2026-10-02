@@ -538,7 +538,8 @@ class JobStore:
                 "UPDATE mse.jobs SET lease_owner = NULL, "
                 "lease_expires_at = NULL, status = %s, stage = %s, "
                 "gpu_queued_at = now(), message = %s, "
-                "release_count = release_count + 1 "
+                "release_count = release_count + 1, "
+                "busy_since = NULL, busy_until = NULL "
                 "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
                 "AND status = %s "
                 "AND release_count < %s "
@@ -959,7 +960,8 @@ class JobStore:
             cur.execute(
                 "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL, "
                 "status = %s, stage = %s, gpu_queued_at = now(), "
-                "release_count = release_count + 1 "
+                "release_count = release_count + 1, "
+                "busy_since = NULL, busy_until = NULL "
                 "WHERE job_id = %s AND lease_owner = %s AND release_count < %s "
                 "RETURNING release_count",
                 (QUEUED, "queued", str(job_id), owner, MAX_RELEASES),
