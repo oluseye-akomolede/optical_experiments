@@ -407,9 +407,11 @@ refused before it is queued.
 
 ### Requirement: Thin layers SHALL be resolved, not lost
 
-The grid SHALL place at least 4 cells across every layer thinner than the
-coarse cell, or across the metal skin depth where that is thinner, with a
-neighbour spacing ratio of at most 1.3.
+The grid SHALL place at least 4 cells across every layer it is given that is
+thinner than the coarse cell, or across the metal skin depth where that is
+thinner, with a neighbour spacing ratio of at most 1.3. For a `td` upload the
+layers are the ones the layout rule detects; a thin feature it does not
+detect is reported by a caveat on the result, not resolved.
 
 #### Scenario: the grid builder keeps its own rules
 - **WHEN** the grid builder is given layers thinner than the coarse cell
@@ -511,16 +513,29 @@ run that is solved.
 - **Plane wave.** The TF/SF box is the bounding box grown by the 3-cell
   clearance on every side. A plane wave with `metal` is refused, as in phase 2.
 - **Cells.** The coarse cell is `dx_m`. On each axis a part whose
-  bounding-box extent is under 4 `dx_m` adds a layer over that extent. A metal
+  bounding-box extent is under 4 `dx_m` adds a layer over that extent with
+  spacing a quarter of the extent, so it has at least 4 cells across. A metal
   part adds, on each axis, a layer 3 skin depths deep inside each of its two
   bounding-box faces (the whole extent when it is thinner than 6), with spacing
-  a quarter of the skin depth at the top of the source band. The top of the
-  band is `frequency_hz + bandwidth` for a pulse and `frequency_hz` for `cw`
-  and `drawn`. Curved thin shells are not detected; they are voxelised at the
-  grid they get, and the estimate counts that grid.
+  a quarter of the skin depth at the top of the source band; where both apply
+  the smaller spacing wins. The skin depth is `fdtd_grid.skin_depth(metal, f)`
+  = c / (2π f κ), κ the imaginary part of √ε(f) of the Rakić model; the worker
+  and the estimate both call that function. The top of the band is
+  `frequency_hz + bandwidth` for a pulse and `frequency_hz` for `cw` and
+  `drawn`.
+- **Thin shells.** The layers above are the only thin features the layout
+  detects (axis-aligned extents and metal bounding-box faces). A curved thin
+  shell is voxelised at the grid it gets, and the estimate counts that grid;
+  the result carries the caveat "thin curved features are resolved only at
+  the coarse cell" whenever a part is not a box (its volume is under 0.99
+  of its bounding box's), since its thin walls may not be refined. The
+  thin-layer requirement applies to the detected layers.
 - **Refusals.** A probe or point-source position outside the grid, and a
   boundary other than `metal` or `open`, are refused before anything is
-  allocated, naming the value. Periodic boundaries stay a phase 6 option.
+  allocated, naming the value. A point source or probe whose nearest node is a
+  conductor (the `metal` boundary's outside, a `pec` part, or a Rakić-metal
+  part's interior) is refused, naming the position and the part, since its
+  source would inject nothing and its trace would read as "no response". Periodic boundaries stay a phase 6 option.
 
 #### Scenario: the frame is the bounding box's corner in metres
 - **WHEN** a one-part box spanning 2..6 mm in x is laid out with units `mm`
@@ -536,6 +551,22 @@ run that is solved.
 #### Scenario: separate objects need no wall
 - **WHEN** an `open` upload holds two closed parts, neither inside the other
 - **THEN** it is laid out without the cavity solver's one-wall refusal
+
+#### Scenario: a part thinner than 4 cells gets 4 cells
+- **WHEN** a dielectric plate 1.5 `dx_m` thick lies in `open` space
+- **THEN** at least 4 cells lie across the plate and no cell across it is wider
+  than a quarter of its thickness
+
+#### Scenario: a curved part carries the thin-feature caveat
+- **WHEN** a part is not a box (a sphere, say)
+- **THEN** the result carries the caveat that thin curved features are resolved
+  only at the coarse cell, and a box-only upload carries no such caveat
+
+#### Scenario: a source or probe inside a conductor is refused
+- **WHEN** a point source or probe sits on a conductor node (outside the parts
+  with `metal`, inside a `pec` part, or inside a Rakić-metal part)
+- **THEN** the job is refused before allocation, naming the position and the
+  part (or the metal boundary)
 
 #### Scenario: a probe off the grid is named
 - **WHEN** a probe lies outside the laid-out grid
