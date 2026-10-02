@@ -201,11 +201,15 @@ export function drawTraces(svg, rows, dt, { width = 640, height = 300 } = {}) {
                    yLabel: 'field component (arb. units)', series });
 }
 
-/** Each probe's amplitude spectrum over the manifest's band. */
+/** How the worker scales the spectra (td_solve.SPECTRUM_SCALE). */
+export const SPECTRUM_SCALE = 'largest peak = 1';
+
+/** Each probe's amplitude spectrum over the manifest's band, already scaled
+ *  by the worker so the largest peak across all probes is 1. */
 export function drawSpectra(svg, probes, band, { width = 640, height = 300 } = {}) {
   const series = probes.map((p) => p.spectrum.frequency_hz.map((f, i) => [f, p.spectrum.amplitude[i]]));
   const [, yHi] = range(probes.map((p) => p.spectrum.amplitude));
   drawFrame(svg, { width, height, xLo: band[0], xHi: band[1], yLo: 0, yHi,
                    xUnit: { name: 'frequency', unit: 'Hz' },
-                   yLabel: 'spectral amplitude (arb. units)', series });
+                   yLabel: `spectral amplitude (${SPECTRUM_SCALE})`, series });
 }

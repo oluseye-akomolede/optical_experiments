@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import types
@@ -329,7 +330,76 @@ def test_each_probes_spectrum_spans_the_pulse_band_and_peaks_in_it():
         want_f, want_a = FDTD.spectrum(np.asarray(res["result"]["traces"])[p],
                                        man["dt_s"])
         keep = (want_f >= lo) & (want_f <= hi)
-        assert np.allclose(a, np.asarray(want_a)[keep], rtol=1e-6)
+        raw = [np.asarray(FDTD.spectrum(t, man["dt_s"])[1])[keep]
+               for t in np.asarray(res["result"]["traces"])]
+        peak = max(r.max() for r in raw)
+        assert peak != pytest.approx(1.0), "fixture: the raw peak must not be 1"
+        assert np.allclose(a, np.asarray(want_a)[keep] / peak, rtol=1e-6)
+    assert man["spectrum_scale"] == "largest peak = 1"
+    assert max(max(p["spectrum"]["amplitude"]) for p in man["probes"]) \
+        == pytest.approx(1.0)
+
+
+def _sine_spectrum(steps, dt=1e-12, f0=5e10):
+    t = np.arange(steps) * dt
+    freqs, amp = FDTD.spectrum(np.sin(2 * np.pi * f0 * t), dt)
+    return np.asarray(freqs), np.asarray(amp)
+
+
+def test_a_doubled_step_count_gives_the_same_normalised_spectrum():
+    """The raw |rfft| of a steady wave doubles with the step count; the
+    normalised spectrum keeps peak 1 at the same frequency, with the same
+    curve shape around the peak, counted in frequency bins (both runs hold a
+    whole number of periods: 50 and 100)."""
+    f1, raw1 = _sine_spectrum(1000)
+    f2, raw2 = _sine_spectrum(2000)
+    assert raw2.max() / raw1.max() == pytest.approx(2.0, rel=1e-3)
+    (n1,), _ = td_solve.normalise_spectra([raw1], ["z"])
+    (n2,), _ = td_solve.normalise_spectra([raw2], ["z"])
+    k1, k2 = int(n1.argmax()), int(n2.argmax())
+    assert n1[k1] == n2[k2] == 1.0
+    assert f1[k1] == pytest.approx(f2[k2])
+    # The main lobe is [0.5, 1, 0.5] in both; the Hann window's finite-length
+    # leakage differs by under 4e-4 (measured), well inside 1e-3.
+    assert np.allclose(n1[k1 - 3:k1 + 4], n2[k2 - 3:k2 + 4], atol=1e-3)
+
+
+def test_a_probe_with_no_signal_is_flat_zero_with_a_note_never_nan():
+    live = np.array([0.0, 2.0, 4.0, 1.0])
+    out, notes = td_solve.normalise_spectra([live, np.zeros(4)], ["z", "x"])
+    assert np.array_equal(out[0], live / 4.0)
+    assert np.array_equal(out[1], np.zeros(4))
+    assert len(notes) == 1 and "probe 2 (x component)" in notes[0]
+    assert "flat zero" in notes[0]
+
+    out, notes = td_solve.normalise_spectra([np.zeros(3), np.zeros(3)], ["z", "y"])
+    assert all(np.isfinite(a).all() and not a.any() for a in out)
+    assert [n.split(" (")[0] for n in notes] == ["probe 1", "probe 2"]
+
+
+def test_a_silent_probe_reaches_the_manifest_as_zeros_and_a_caveat(monkeypatch):
+    real = FDTD.simulate
+
+    def second_probe_silent(*a, **k):
+        r = real(*a, **k)
+        r["traces"] = np.array(r["traces"], dtype=float)
+        r["traces"][1] = 0.0
+        return r
+
+    monkeypatch.setattr(FDTD, "simulate", second_probe_silent)
+    _, out = _run_with_files()
+    man = _strict_json(out.files["spectrum.json"])
+    assert max(man["probes"][0]["spectrum"]["amplitude"]) == pytest.approx(1.0)
+    assert not any(man["probes"][1]["spectrum"]["amplitude"])
+    assert any(c.startswith("probe 2 (x component)") for c in man["caveats"])
+
+
+def test_the_viewer_labels_the_spectrum_with_the_workers_scale():
+    src = (Path(__file__).resolve().parent.parent / "web/static/tdplot.js").read_text()
+    m = re.search(r"export const SPECTRUM_SCALE = '([^']*)';", src)
+    assert m and m.group(1) == td_solve.SPECTRUM_SCALE
+    assert "${SPECTRUM_SCALE}" in src and "arb. units)', series" not in src.split(
+        "drawSpectra")[1]
 
 
 def test_probe_positions_are_the_snapped_nodes_in_metres():

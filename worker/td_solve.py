@@ -445,6 +445,30 @@ def solve_td_isolated(job: dict, store_in, store_out=None, stage=None, *,
     return outcome[1]
 
 
+#: How the manifest's spectra are scaled; the viewer labels its axis with it.
+SPECTRUM_SCALE = "largest peak = 1"
+
+
+def normalise_spectra(amps: list, components: list) -> tuple:
+    """Scale every probe's in-band spectrum by the largest peak across all
+    probes, so the curves compare with one another and do not grow with the
+    step count (a raw |rfft| does). Returns ``(spectra, notes)``.
+
+    A probe with no signal in the band (the source cannot excite its
+    component there) stays flat zero with a plain note; when no probe has
+    any, nothing is divided, so nothing becomes NaN.
+    """
+    amps = [np.asarray(a, dtype=float) for a in amps]
+    peak = max((float(a.max()) for a in amps if a.size), default=0.0)
+    notes = [f"probe {p + 1} ({components[p]} component) recorded no signal in "
+             f"the band, so its spectrum is flat zero: the source does not "
+             f"excite that field component there."
+             for p, a in enumerate(amps) if not (a.size and a.max() > 0)]
+    if peak > 0:
+        amps = [a / peak for a in amps]
+    return amps, notes
+
+
 def spectrum_band(request: dict, band_top_hz: float) -> tuple:
     """The band ``spectrum.json`` keeps (Hz): the pulse's ``f ± bandwidth``,
     otherwise 0 to twice the source frequency, so a cw or drawn source's line
@@ -509,19 +533,22 @@ def write_results(store_out, job_id: str, result: dict, lay: dict,
                  frame_positions(lay, plan["stride"], frames.shape[1:]))
     f_lo, f_hi = spectrum_band(request, lay["band_top_hz"])
     origin = [float(v) for v in lay["origin_m"]]
-    probes = []
+    probes, amps = [], []
     for p, probe in enumerate(lay["probes"]):
         cell, component = tuple(int(i) for i in probe[:3]), probe[3]
         freqs, amp = fdtd.spectrum(traces[p], dt)
         keep = (freqs >= f_lo) & (freqs <= f_hi)
         amp = np.asarray(amp)[keep]
         _finite(f"probe {p + 1} spectrum", amp)
+        amps.append(amp)
         probes.append({
             "cell": list(cell), "component": component,
             "position_m": [origin[a] + float(lay["nodes"][a][cell[a]])
                            for a in range(3)],
-            "spectrum": {"frequency_hz": [float(f) for f in freqs[keep]],
-                         "amplitude": [float(v) for v in amp]}})
+            "spectrum": {"frequency_hz": [float(f) for f in freqs[keep]]}})
+    amps, notes = normalise_spectra(amps, [p["component"] for p in probes])
+    for probe, amp in zip(probes, amps):
+        probe["spectrum"]["amplitude"] = [float(v) for v in amp]
     names = []
     store_out.write(key(TRACE_NAME), np.ascontiguousarray(traces).tobytes())
     names.append(TRACE_NAME)
@@ -543,7 +570,8 @@ def write_results(store_out, job_id: str, result: dict, lay: dict,
             "stride": [int(k) for k in plan.get("stride", [])],
             "positions_m": positions,
             "quantity": "|E|"},
-        "caveats": list(caveats)}
+        "spectrum_scale": SPECTRUM_SCALE,
+        "caveats": list(caveats) + notes}
     store_out.write(key(SPECTRUM_NAME),
                     json.dumps(manifest, allow_nan=False).encode())
     names.append(SPECTRUM_NAME)
