@@ -49,7 +49,9 @@
 // with no page errors). A wait FAILs on a STALL -- no progress for stallMs(),
 // 20x the slowest frame measured here, floor 90 s -- and every timed-out wait
 // records a FAIL naming what the page showed and threw, instead of ending the
-// run with no verdict at all.
+// run with no verdict at all. A run the runner cuts for outliving its cap
+// (scripts/run_tdcheck.sh) prints one plain HARNESS TIMED OUT line rather than
+// a stack trace about a closed page.
 //
 // Inputs: TD_DIR (default /work). scripts/run_tdcheck.sh builds the fixture
 // inputs and runs this, bounded.
@@ -64,6 +66,26 @@ const DIR = process.env.TD_DIR || '/work';
 const fails = [];
 const ok = (c, msg) => { console.log(`${c ? 'PASS' : 'FAIL'}  ${msg}`); if (!c) fails.push(msg); };
 const TYPES = { '.js': 'application/javascript', '.css': 'text/css', '.json': 'application/json' };
+// A run the runner cuts (its `timeout`, scripts/run_tdcheck.sh) used to end
+// with Node's own stack trace about the page having closed: the symptom, not
+// what happened. Say it in plain words instead, and do it with writeSync --
+// process.exit() does not wait for a buffered write, and this process's stdout
+// is a pipe to docker. The rejection case covers the same cut from the other
+// side: the container being stopped closes the browser before the check's own
+// wait can see the stall, so it reads as a closed page rather than a timeout.
+const cut = (why) => {
+  fs.writeSync(1, `HARNESS TIMED OUT: ${why}; the check was cut while it still had ${fails.length} FAIL and had not finished.\n`);
+  process.exit(124);
+};
+process.on('SIGTERM', () => cut('the runner stopped this container'));
+process.on('SIGINT', () => cut('an interrupt stopped this container'));
+process.on('unhandledRejection', (e) => {
+  const detail = e && e.message ? e.message : String(e);
+  fs.writeSync(1, `HARNESS ERROR: ${detail}\n` +
+    'HARNESS ERROR: the check threw before it finished, so its verdict is incomplete'
+    + (fails.length ? ` (${fails.length} FAIL so far)` : '') + '.\n');
+  process.exit(1);
+});
 // The page's own plotting rules: the axis units, the tick factor, the trace
 // decode and the spectrum's scale claim are this module's, not a copy of them
 // written out again here. Imported from TD_DIR, so it is the file the page was

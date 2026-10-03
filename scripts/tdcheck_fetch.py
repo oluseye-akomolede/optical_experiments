@@ -81,12 +81,24 @@ def resolve(base, job):
                                 get(base + "/").decode("utf8", "replace")))
 
 
+#: A movie recorded before three-digit names existed has no ``frames.digits``
+#: key at all, and its files are two digits wide (``worker/td_solve.py``). The
+#: page's viewer and the check read the same key with the same default, so a
+#: mirror built here names exactly the files that page will ask for.
+FRAME_DIGITS_DEFAULT = 2
+
+
+def frame_digits(frames):
+    """The digit width of ``frames``, from the manifest or the pre-120 two."""
+    return frames.get("digits") or FRAME_DIGITS_DEFAULT
+
+
 def frame_names(man):
     """The frame file names, from the manifest's own count and digit width."""
     frames = man.get("frames")
     if not frames:
         return []
-    return [f"frame_{n:0{frames['digits']}d}.bin"
+    return [f"frame_{n:0{frame_digits(frames)}d}.bin"
             for n in range(1, frames["count"] + 1)]
 
 
@@ -152,7 +164,7 @@ def main(base, job, out_dir):
         f.write_bytes(body)
     print(f"job {job_id} probes {len(man['probes'])} steps {man['steps']} "
           f"dt_s {man['dt_s']!r} band_hz {man['band_hz']} "
-          f"frames {man['frames'] and (man['frames']['count'], man['frames']['digits'])} "
+          f"frames {man['frames'] and (man['frames']['count'], frame_digits(man['frames']))} "
           f"files {len(names)} ({total / 1e6:.1f} MB) outline {len(outline) / 1e6:.3f} MB "
           f"static {len(assets)} -> {out}")
 

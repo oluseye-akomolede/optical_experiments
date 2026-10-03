@@ -9,7 +9,9 @@
 #
 # Exit 0 = ALL PASS. Run from the repo root. The solve is tiny and memory-capped;
 # the browser runs in the rendercheck image with --cpus=2 --memory=2g, and the
-# whole check is cut at 10 minutes. The container is named and removed when the
+# whole check is cut at a cap derived from the movie's frame count (see CAP
+# below; TDCHECK_TIMEOUT overrides it and the cap is printed). The container is
+# named and removed when the
 # script exits or is stopped by INT, TERM or HUP. A SIGKILL of this script runs
 # no trap and leaves the container up: remove it with docker rm -f mse-tdcheck-<pid>.
 #
@@ -63,10 +65,35 @@ if [ -n "$REV" ]; then
   echo "viewer.js from $REV"
 fi
 
-timeout 600 $DOCKER run --rm --name "$NAME" \
+# The cap. The check draws every movie frame through software WebGL in this
+# 2-CPU container, so its cost follows the movie's length: a fixed 600 s cut a
+# CORRECT run -- a 120-frame open-boundary mirror of a real production job
+# (180cb65f) needed ~740 s on this loaded VM and died at rc=124 after 45 PASS.
+# 12 s a frame is ~2x the slowest per-frame cost measured here (740 s / 120 =
+# 6.2 s, against 2.2 s on an idle VM), and the floor keeps a short movie
+# bounded. A mirror that is not a movie at all (no manifest to read) is given
+# the solver's own maximum.
+FRAMES=120
+if [ -r "$DIR/files/spectrum.json" ]; then
+  FRAMES=$(.venv-mse/bin/python -c 'import json,sys
+frames = json.load(open(sys.argv[1])).get("frames") or {}
+print(int(frames.get("count") or 120))' "$DIR/files/spectrum.json" 2>/dev/null || echo 120)
+fi
+CAP=${TDCHECK_TIMEOUT:-$(( 180 + 12 * FRAMES ))}
+echo "cap: ${CAP}s for ${FRAMES} frames (TDCHECK_TIMEOUT overrides)"
+
+timeout "$CAP" $DOCKER run --rm --name "$NAME" \
   --cpus=2 --memory=2g -v "$DIR:/work:ro" \
   -v "$(pwd)/$CHECK:/opt/rendercheck/tdcheck.mjs:ro" \
   --entrypoint node "$IMAGE" /opt/rendercheck/tdcheck.mjs &
 # waited on, not run in the foreground: sh runs a trap only after a foreground
 # command ends, so a TERM to this script would otherwise wait out the browser
-wait $!
+rc=0
+wait $! || rc=$?
+if [ "$rc" = 124 ]; then
+  # 124 is timeout(1)'s own status, not a verdict from the page: name the cap
+  # and the frame count, so a run cut short is never read as a failed page.
+  echo "harness timed out after ${CAP}s (${FRAMES} frames; TDCHECK_TIMEOUT=${TDCHECK_TIMEOUT:-unset}): the check was cut while still running" >&2
+  exit 124
+fi
+exit "$rc"

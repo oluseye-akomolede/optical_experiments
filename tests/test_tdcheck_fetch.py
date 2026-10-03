@@ -8,8 +8,10 @@ place where a wrong answer looks like a right one:
   must stop, not pick one: a mirror of the wrong job is a check of the wrong
   page, and it would pass.
 * **What is fetched.** The frame file names come from the manifest's own count
-  and digit width, so an old two-digit run and a 120-frame run both name files
-  that exist.
+  and digit width -- and from the two-digit default when a movie predates that
+  key -- so an old two-digit run and a 120-frame run both name files that
+  exist. Reading the key outright raised KeyError on a pre-three-digit job, so
+  the mirror died before it downloaded anything.
 * **What is a request.** The static bundle is crawled for the page's own code.
   A JavaScript string that merely *looks* like a path is not a request --
   ``vendor/three.module.min.js`` holds ``"+t.width+"`` and a GLSL colour-space
@@ -84,6 +86,12 @@ def test_frame_names_follow_the_manifests_own_count_and_width():
     two = {"frames": {"count": 60, "digits": 2}}
     assert mod.frame_names(two)[0] == "frame_01.bin"
     assert mod.frame_names(two)[-1] == "frame_60.bin"
+    # A movie recorded before the key existed says nothing about the width, and
+    # its files are two digits wide. Indexing the key raised KeyError, so the
+    # mirror of such a job died before it downloaded anything; the page's viewer
+    # defaults the same way, and a mirror must name the files the page asks for.
+    old = {"frames": {"count": 9}}
+    assert mod.frame_names(old) == [f"frame_{n:02d}.bin" for n in range(1, 10)]
     # A job with no movie has no frames to fetch, and that is not an error.
     assert mod.frame_names({"frames": None}) == []
     assert mod.frame_names({}) == []
