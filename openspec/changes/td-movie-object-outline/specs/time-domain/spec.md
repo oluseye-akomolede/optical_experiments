@@ -10,11 +10,14 @@ surfaces -- in the same 3-D view as the field, on every frame it shows, while
 playing and while scrubbing. The outline's parts SHALL be placed by the job's
 own `units` and `scale` alone (the upload's own coordinates multiplied by
 `unit_scale(units) x scale`), with no further translation and no further
-scaling: the movie's frames are stored in exactly that frame, whose origin is
-the parts' combined bounding-box minimum. A job whose outline cannot be built
-or fetched SHALL still play its movie and SHALL say in the caption that the
-object outline could not be drawn and why -- never a movie with no object and
-no explanation, and never a movie that stops.
+scaling: the movie's frames are stored in that same absolute frame -- the
+upload's own metres, whose origin is the parts' combined bounding-box minimum --
+so the outline needs no offset. The positions a frame samples MAY extend past
+the object: an open boundary's scene is sampled with pad cells on every side of
+the object, and those belong to the field's domain, not to the object. A job
+whose outline cannot be built or fetched SHALL still play its movie and SHALL
+say in the caption that the object outline could not be drawn and why -- never a
+movie with no object and no explanation, and never a movie that stops.
 
 Why: the owner asked for the uploaded object to be visible during the movies
 (2026-10-02), and a frame drawn without it is a field in an empty box -- the
@@ -80,35 +83,40 @@ reported, and a check that only counts pixels cannot tell the two apart.
 
 ### Requirement: The render check SHALL verify the outline on every sampled frame
 
-The render check SHALL read the box the page states it drew and require it to
-be the box the manifest's own sample positions span, within one grid cell, for
-a mirrored real job -- so a unit, a scale or a translation error in the
-outline's frame is a failure and not a matter of opinion. It SHALL further
-draw every frame it samples on the same page twice: once with the outline and
-once with the outline route answering 404, the two runs differing in nothing
-else, and require each sampled frame to gain a substantial number of pixels
-from the outline -- including a frame reached by playing the movie, not only
-by scrubbing -- while the run without the outline still draws its field. The
-share of the frame's own lit pixels the outline must add SHALL be a kind floor
-well below what a drawn object measures, not a pass mark set at the
+The render check SHALL read the box the page states it drew and require it,
+within one grid cell, to be the box the outline artifact's own vertices span (so
+a viewer that translated, rescaled or dropped a part is a failure, not a matter
+of opinion), and SHALL require that same box to lie inside the box the
+manifest's sample positions span, within one grid cell, on a mirrored real job
+-- because a unit or a whole-frame error puts the object outside the field it
+was solved in. It SHALL NOT require the drawn box to equal the sampled box: an
+open boundary's samples carry pad cells past the object on every side and the
+manifest records no boundary, so equality there would fail a correct job. It
+SHALL further draw every frame it samples on the same page twice: once with the
+outline and once with the outline route answering 404, the two runs differing in
+nothing else, and require each sampled frame to gain a substantial number of
+pixels from the outline -- including a frame reached by playing the movie, not
+only by scrubbing -- while the run without the outline still draws its field.
+The share of the frame's own lit pixels the outline must add SHALL be a kind
+floor well below what a drawn object measures, not a pass mark set at the
 measurement.
 
 Why: a box compared against a centred object would pass for an outline drawn in
-the grid's frame or shifted to the box's centre, so the comparison is only worth
-making on an object that is off-centre -- the check's own fixture is therefore
-two parts, the second at negative x, and the mirrored real job (the owner's film
-job) is the same case on production's own artifacts. The pixel pair is what
-shows the object is drawn rather than merely described and placed: the stated
-box is read from the group the page built, which it builds whether or not it
-adds it to the scene.
+the sampled frame or shifted to the box's centre, so the comparison is only
+worth making on an object that is off-centre -- the check's own fixture is
+therefore two parts, the second at negative x, and the mirrored real job (the
+owner's film job) is the same case on production's own artifacts. The pixel pair
+is what shows the object is drawn rather than merely described and placed: the
+stated box is read from the group the page built, which it builds whether or not
+it adds it to the scene.
 
-#### Scenario: the outline sits on the field's own frame
+#### Scenario: the outline is drawn where the object is
 
 - **WHEN** the check runs against a mirror whose object is not centred in its
   domain
-- **THEN** the box the page states for the outline and the box the manifest's
-  positions span agree within one grid cell, and a translated or rescaled
-  outline FAILs naming the axis
+- **THEN** the box the page states agrees with the outline artifact's own vertex
+  box within one grid cell, and a translated, rescaled or partly dropped outline
+  FAILs naming the axis and the two numbers
 
 #### Scenario: the outline is drawn, not merely present
 

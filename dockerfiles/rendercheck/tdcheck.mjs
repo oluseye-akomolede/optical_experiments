@@ -3,11 +3,14 @@
 // web/static) fed the files a real solve wrote: the trace and spectrum plots
 // and the field movie, as written and in each failure case (caveats, trace
 // 502, a frame 502, no movie, an all-zero movie, a throw after every frame has
-// loaded). The uploaded object's outline is checked the same way: where the
-// page says it drew it against the manifest's own sample positions, and every
-// sampled frame drawn twice -- with the outline and with the outline route
-// answering 404 -- so the pixels it adds are the outline's and nothing else.
-// Nothing is fetched from the network.
+// loaded). The uploaded object's outline is checked the same way: the box the
+// page says it drew against the box the outline artifact's own vertices span
+// (its glTF accessor min/max, so a viewer that moved or dropped something
+// disagrees), that box INSIDE the box the manifest's sample positions span (on
+// an open boundary the samples carry pad cells past the object, so equality
+// there would fail a correct job), and every sampled frame drawn twice -- with
+// the outline and with the outline route answering 404 -- so the pixels it
+// adds are the outline's and nothing else. Nothing is fetched from the network.
 //
 // TD_DIR holds a job whose data a real solve wrote, not a job this check
 // imagines: scripts/tdcheck_fixture.py writes a tiny solve, and
@@ -35,6 +38,18 @@
 // several moves stale (measured: two pages open at once made one frame's
 // with-outline and without-outline shots identical, because the read was of a
 // canvas from before that frame).
+//
+// Waits on the page's progress are PROGRESS-BASED, for that same reason: the
+// movie's frames cost on the order of a second each on the open-boundary
+// fixture in this 2-CPU container (software WebGL, no GPU) and this VM is
+// shared with every other rig, so a wall-clock budget on "the movie has played
+// on" is really a budget on how busy the machine is -- which is how this
+// check's first open-boundary run failed (review row 2026-10-03: the same
+// mirror ran the play through in three seconds when the wait was taken out,
+// with no page errors). A wait FAILs on a STALL -- no progress for stallMs(),
+// 20x the slowest frame measured here, floor 90 s -- and every timed-out wait
+// records a FAIL naming what the page showed and threw, instead of ending the
+// run with no verdict at all.
 //
 // Inputs: TD_DIR (default /work). scripts/run_tdcheck.sh builds the fixture
 // inputs and runs this, bounded.
@@ -178,6 +193,66 @@ function outlineBox(text) {
 }
 const fmtBox = (box) => box.map(([lo, hi], a) => `${'xyz'[a]} ${lo}..${hi}`).join(', ');
 
+/** The vertex box the outline FILE itself carries -- every mesh primitive's
+ *  POSITION accessor min/max unioned -- in the file's own units (this job's
+ *  metres). glTF requires min/max on an accessor and this file's nodes carry no
+ *  transforms, so no matrix walk is needed; a node that grows one, or an
+ *  accessor without min/max, is a *reason* rather than a measurement -- this
+ *  check refuses to place what it cannot read.
+ *
+ *  Read from the outline artifact rather than derived from the manifest,
+ *  because the manifest records the SAMPLED positions, which on the product's
+ *  default open boundary carry OPEN_PAD_CELLS*dx of padding past the object on
+ *  every side (fdtd_layout.py:204). Treating those as the object's box is what
+ *  a review row rejected on 2026-10-03, and it failed a correct open job.
+ *  Returns {box} or {why}. */
+function glbBox(bytes) {
+  const buf = Buffer.from(bytes);
+  if (buf.length < 20 || buf.readUInt32LE(0) !== 0x46546c67) return { why: 'it is not a glb' };
+  let at = 12, json = null;
+  while (at + 8 <= buf.length && !json) {
+    const len = buf.readUInt32LE(at), type = buf.readUInt32LE(at + 4);
+    if (type === 0x4e4f534a) {
+      try {
+        json = JSON.parse(buf.subarray(at + 8, at + 8 + len).toString('utf8'));
+      } catch (e) {
+        return { why: `its JSON chunk will not parse (${e.message})` };
+      }
+    }
+    at += 8 + len;
+  }
+  if (!json) return { why: 'it has no JSON chunk' };
+  const moved = (json.nodes || []).find((n) => n
+    && (n.matrix || n.translation || n.rotation || n.scale));
+  if (moved) {
+    return { why: `its node ${JSON.stringify(moved.name === undefined ? '?' : moved.name)} `
+                  + 'carries a transform this check cannot place' };
+  }
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  let prims = 0;
+  for (const mesh of json.meshes || []) {
+    for (const prim of mesh.primitives || []) {
+      const index = prim.attributes && prim.attributes.POSITION;
+      const acc = index == null ? null : (json.accessors || [])[index];
+      if (!acc || !Array.isArray(acc.min) || !Array.isArray(acc.max)
+          || acc.min.length !== 3 || acc.max.length !== 3) {
+        return { why: 'a primitive has no POSITION accessor min/max' };
+      }
+      prims += 1;
+      for (let a = 0; a < 3; a += 1) {
+        lo[a] = Math.min(lo[a], Number(acc.min[a]));
+        hi[a] = Math.max(hi[a], Number(acc.max[a]));
+      }
+    }
+  }
+  const box = lo.map((v, a) => [v, hi[a]]);
+  if (!prims || !box.flat().every(Number.isFinite)) {
+    return { why: 'it states no POSITION accessor min/max' };
+  }
+  if (!box.every(([a, b]) => b > a)) return { why: `its own box is degenerate: ${fmtBox(box)}` };
+  return { box };
+}
+
 /** A canvas shot decoded to RGBA pixels (pixels.mjs widens RGB to RGBA). */
 async function shotPixels(shot) {
   const { data, width, height } = await decodePng(Buffer.from(shot.url.split(',')[1], 'base64'));
@@ -246,31 +321,75 @@ const setFrame = (page, i) => page.evaluate((n) => {
   s.dispatchEvent(new Event('input', { bubbles: true }));
 }, i);
 
+/** Wait until a number read from the page gets to `want`, FAILing only if it
+ *  STANDS STILL for stallMs() -- not if the run as a whole is slow.
+ *
+ *  Why this shape: the page is a software-rendered point cloud (no GPU in this
+ *  container), driven by requestAnimationFrame, and it is measured drawing on
+ *  the order of a second per frame on the open-boundary mirror while this VM is
+ *  shared with every other rig. A wall-clock budget on "the movie has played
+ *  three frames" is therefore a budget on how busy the machine is: this check's
+ *  first open-boundary run was reported as "the check never finishes on an open
+ *  mirror" (review row 2026-10-03), while a run of the same mirror with the
+ *  wait taken out showed the page playing frame 0 -> 1 -> 3 in three seconds
+ *  with no page errors -- the page was alive and the constant was wrong. The
+ *  same mirror, at the same point, passes this wait where that one aborted.
+ *
+ *  Progress, not elapsed time, is what a stalled page cannot fake: the counter
+ *  has to move before the deadline counts again, and a page that stops is
+ *  FAILed by name with the value it stopped at and any error it threw.
+ *  stallMs() is derived from the page's own slowest measured frame rather than
+ *  tuned to one fixture: 20 frames of slack, floor 90 s. */
+let frameCostMs = 0;                          // the slowest drawn frame yet seen
+const stallMs = () => Math.max(90000, 20 * frameCostMs);
+
+async function waitAdvance(page, read, from, want, what, errors) {
+  let last = from, movedAt = Date.now();
+  for (;;) {
+    let now;
+    try {
+      now = await page.evaluate(read);
+    } catch (e) {
+      ok(false, `the page stopped answering while waiting for ${what}: ${String(e.message).split('\n')[0]}`);
+      return null;
+    }
+    if (Number(now) > last) { last = Number(now); movedAt = Date.now(); }
+    if (last >= want) return last;
+    if (Date.now() - movedAt > stallMs()) {
+      const errs = errors && errors.length ? `; page errors: ${JSON.stringify(errors)}` : '';
+      ok(false, `${what} stood still for ${Math.round(stallMs() / 1000)} s at ${last} of ${want}${errs}`);
+      return null;
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
 /** The movie canvas after the page's own loop has drawn one further frame.
  *  Counted through requestAnimationFrame (the loop renders in the same
  *  callback that advances the count), then read with toDataURL: with
  *  preserveDrawingBuffer forced from the page's first context, that returns
  *  the frame the loop last drew, and needs no animation frame of its own.
  *  Null (and a recorded FAIL) if no frame arrives, so a stalled loop is named
- *  instead of looking like two identical pictures. */
-async function drawnShot(page, what) {
-  // Read the page that is on top. A backgrounded page has its animation frames
-  // throttled, so a shot of one is a shot of whatever it last drew: an older
-  // canvas, indistinguishable from "the thing is not drawn". Measured on this
-  // check: with the outline page left in the background while a second page was
-  // open, one read came back a canvas from before the last frame change and the
-  // two runs were identical on that frame. The outline samples below are taken
-  // one page at a time for the same reason; this keeps a read honest whichever
-  // page opened last.
+ *  instead of looking like two identical pictures.
+ *
+ *  Read the page that is on top. A backgrounded page has its animation frames
+ *  throttled, so a shot of one is a shot of whatever it last drew: an older
+ *  canvas, indistinguishable from "the thing is not drawn". Measured on this
+ *  check: with the outline page left in the background while a second page was
+ *  open, one read came back a canvas from before the last frame change and the
+ *  two runs were identical on that frame. The outline samples below are taken
+ *  one page at a time for the same reason; this keeps a read honest whichever
+ *  page opened last. */
+async function drawnShot(page, what, errors) {
   await page.bringToFront();
   const n = await page.evaluate(() => window.__tdFrames || 0);
-  try {
-    await page.waitForFunction((k) => (window.__tdFrames || 0) > k, n,
-                               { polling: 100, timeout: 90000 });
-  } catch {
-    ok(false, `the page's render loop drew no frame for ${what} in 90 s`);
-    return null;
-  }
+  const t0 = Date.now();
+  const got = await waitAdvance(page, () => window.__tdFrames || 0, n, n + 1,
+                               `the render loop to draw ${what}`, errors);
+  if (got === null) return null;
+  // This frame's cost is the page's own, not the harness's assumption: the next
+  // wait's floor scales with it.
+  frameCostMs = Math.max(frameCostMs, Date.now() - t0);
   return page.evaluate(() => {
     const c = document.getElementById('td-scene');
     return { w: c.width, h: c.height, url: c.toDataURL('image/png') };
@@ -348,7 +467,17 @@ async function open(browser, { caveats = null, traceStatus = 200, frameStatus = 
   await page.waitForFunction(() => {
     const c = document.getElementById('td-caption');
     return c && c.textContent && !c.textContent.startsWith('Loading');
-  }, null, { polling: 100, timeout: 30000 });
+  }, null, { polling: 100, timeout: 30000 }).catch(async () => {
+    // A wait that times out is a FAIL that names what the page showed and threw,
+    // never a bare abort that ends the run without a verdict. (This check's
+    // first open-boundary run ended exactly that way, and the review row had to
+    // ask "page or harness?" -- review row 2026-10-03.)
+    const cap = await page.evaluate(() => (document.getElementById('td-caption') || {}).textContent);
+    ok(false, `the field caption is still ${JSON.stringify(cap)} after 30 s; page errors: ${JSON.stringify(errors)}`);
+    await browser.close();
+    console.log(`${fails.length} FAILED`);
+    process.exit(1);
+  });
   if (traceStatus === 200) {
     await page.waitForFunction(() => {
       const c = document.getElementById('td-movie-caption');
@@ -484,48 +613,78 @@ if (!FR || !FR.count) {
     outline: document.getElementById('td-movie').dataset.outline }));
   ok(st.shown, 'the movie panel is shown');
   ok(st.max === String(FR.count - 1), `slider spans every frame: max ${st.max}`);
-  // --- the object outline sits on the field, not near it -------------------
-  // The owner's ask: the uploaded object drawn over the field. The page states
-  // where it drew the outline (the dataset entry, the world box of the group it
-  // actually added), and this compares that with the box the manifest's own
-  // sample positions span -- the field's frame, in metres. One cell of slack is
-  // for the grid's outermost samples, which need not land exactly on the
-  // upload's face; a unit, a scale or a translation error is 1000x to 100% of
-  // the object, far outside it.
+  // --- the object outline sits on the object, inside the field -------------
+  // The owner's ask: the uploaded object drawn over the field. Two comparisons,
+  // because they catch different things and neither alone is enough:
+  //
+  //   1. the box the PAGE states it drew, against the box the outline FILE's
+  //      own vertices span (decoded from the mirror's outline.glb -- the very
+  //      bytes the page fetched). The page built its box by walking the file it
+  //      loaded, so a viewer that translated, rescaled or dropped a part
+  //      disagrees here, and nothing server-side can hide it.
+  //   2. the outline file's box, inside the box the MANIFEST's sample positions
+  //      span. Containment, not equality, and deliberately so: the samples are
+  //      where the field was computed, which on the default open boundary is
+  //      the object plus OPEN_PAD_CELLS*dx of padding on every side (16 cells
+  //      today; fdtd_layout.py:204), and on metal is the object's own box. The
+  //      manifest records no boundary, so this check cannot tell which of the
+  //      two it is holding and must not assume either -- an earlier version of
+  //      this check compared the drawn box to the samples directly and so
+  //      FAILED a correct open job (the review row of 2026-10-03). Containment
+  //      is the one relation that is true on both, and it still catches a unit,
+  //      a scale or a whole-frame translation: those put the object outside the
+  //      field, or the field's 1000th.
+  //
+  // One cell of slack is the grid's own step, read from the manifest's
+  // positions: the outermost samples need not land exactly on the upload's
+  // face. A real displacement is a large fraction of the object, not a cell.
   //
   // WHY THE FIXTURE'S UPLOAD IS TWO PARTS, the second at negative x: a single
   // block starting at its own origin has the same numbers in the object's frame
   // and in the grid's (the offset is zero), so comparing the two was an
   // identity that could not fail -- the trap this row names. With the offset
   // part, the grid's frame is 2 mm from the object's and the object's box is
-  // smaller than the domain's, so an outline left in the grid's frame and an
-  // outline centred on the domain instead of on its own coordinates are both
-  // far outside one cell. tests/test_web_routes.py's outline box is neither
-  // centred nor cubic for the same reason, and a mirror of a real job whose
-  // object is offset in its domain is the same case on production's artifacts.
+  // smaller than the sampled box, so an outline left in the mesh's frame, an
+  // outline centred on the domain instead of on its own coordinates, and an
+  // outline scaled by the wrong unit all land outside one cell -- and neither
+  // comparison above is an identity.
   const wantBox = positionsBox(FR.positions_m);
   const drewBox = outlineBox(st.outline);
-  if (wantBox) {
-    ok(drewBox, `the movie says where it drew the outline (${JSON.stringify(st.outline)})`);
-    if (drewBox) {
-      const cell = fineStep(FR.positions_m);
-      const wrong = [];
-      for (let a = 0; a < 3; a += 1) {
-        for (const end of ['min', 'max']) {
-          const d = Math.abs(drewBox[end][a] - wantBox[a][end === 'min' ? 0 : 1]);
-          if (!(d <= cell)) {
-            wrong.push(`${'xyz'[a]} ${end} ${drewBox[end][a]} vs ${wantBox[a][end === 'min' ? 0 : 1]} `
-                       + `(${d} > one cell ${cell})`);
-          }
+  const file = glbBox(fs.readFileSync(path.join(DIR, 'outline.glb')));
+  ok(!file.why, `the mirror's outline.glb states the object's own box (${file.why || fmtBox(file.box)})`);
+  ok(drewBox, `the movie says where it drew the outline (${JSON.stringify(st.outline)})`);
+  const cell = fineStep(FR.positions_m);
+  if (drewBox && file.box) {
+    const drew = [0, 1, 2].map((a) => [drewBox.min[a], drewBox.max[a]]);
+    const wrong = [];
+    for (let a = 0; a < 3; a += 1) {
+      for (const end of [0, 1]) {
+        const d = Math.abs(drew[a][end] - file.box[a][end]);
+        if (!(d <= cell)) {
+          wrong.push(`${'xyz'[a]} ${end ? 'max' : 'min'} ${drew[a][end]} vs ${file.box[a][end]} `
+                     + `(${d} > one cell ${cell})`);
         }
       }
-      const drewPairs = [0, 1, 2].map((a) => [drewBox.min[a], drewBox.max[a]]);
-      ok(wrong.length === 0,
-         'the outline is drawn on the object the field was solved on, within one '
-         + `cell (${cell} m): outline ${fmtBox(drewPairs)} `
-         + `against the manifest's positions ${fmtBox(wantBox)}`
-         + (wrong.length ? ` -- ${wrong.join('; ')}` : ''));
     }
+    ok(wrong.length === 0,
+       'the page drew the outline where the outline file puts the object, within '
+       + `one cell (${cell} m): page ${fmtBox(drew)} against the file ${fmtBox(file.box)}`
+       + (wrong.length ? ` -- ${wrong.join('; ')}` : ''));
+  }
+  if (file.box && wantBox) {
+    const outside = [];
+    for (let a = 0; a < 3; a += 1) {
+      if (!(file.box[a][0] >= wantBox[a][0] - cell) || !(file.box[a][1] <= wantBox[a][1] + cell)) {
+        outside.push(`${'xyz'[a]} ${file.box[a][0]}..${file.box[a][1]} not inside `
+                     + `${wantBox[a][0]}..${wantBox[a][1]}`);
+      }
+    }
+    ok(outside.length === 0,
+       'the object sits inside the field the manifest sampled, within one cell '
+       + `(${cell} m): outline ${fmtBox(file.box)} against the samples ${fmtBox(wantBox)}`
+       + ' (the samples carry the open boundary\'s pad cells past the object; on metal they '
+       + 'are the object)'
+       + (outside.length ? ` -- ${outside.join('; ')}` : ''));
   }
   // The frames on disk must be exactly the ones the manifest names: a mirror
   // with a hole in it would otherwise reach the page as a 404 the page names,
@@ -579,18 +738,23 @@ if (!FR || !FR.count) {
   ok(capLast.startsWith(head(last + 1)) && capLast.includes(wantTime(last)),
      `the last frame is at the window's end (${frameTimes[last]}): ${capLast}`);
   await setFrame(page, mid);
-  const midShot = await drawnShot(page, `frame ${mid + 1}`);
+  const midShot = await drawnShot(page, `frame ${mid + 1}`, errors);
   await setFrame(page, 0);
-  const firstShot = await drawnShot(page, 'frame 1');
+  const firstShot = await drawnShot(page, 'frame 1', errors);
   if (midShot && firstShot) {
     ok(midShot.w > 8 && midShot.h > 8,
        `the movie canvas is drawn at a real size (${midShot.w}x${midShot.h})`);
     ok(midShot.url !== firstShot.url, 'two frames draw two different pictures');
   }
   await page.evaluate(() => document.getElementById('td-movie-play').click());
-  await page.waitForFunction(() => Number(document.getElementById('td-movie').dataset.frame) >= 3, null,
-                             { polling: 100, timeout: 30000 });
-  ok(await page.textContent('#td-movie-play') === 'Pause', 'play advances the frames and offers Pause');
+  // Two more frames than the page is on now, read at the click: the play is
+  // asserted as MOVEMENT, so it cannot pass on a page that was already past 3.
+  const playFrom = Number(await page.evaluate(() => document.getElementById('td-movie').dataset.frame));
+  const reached = await waitAdvance(page, () => Number(document.getElementById('td-movie').dataset.frame),
+                                    playFrom, playFrom + 2, 'the movie to play on', errors);
+  if (reached !== null) {
+    ok(await page.textContent('#td-movie-play') === 'Pause', 'play advances the frames and offers Pause');
+  }
   // Stop the play where it got to: the frame it reached is one of the frames
   // the outline is checked on below, because "while the movie plays" is what
   // the owner asked for. The stop is asserted, not assumed -- a timer still
@@ -620,7 +784,7 @@ if (!FR || !FR.count) {
   const withIt = [];
   for (const [i, what] of sampleFrames) {
     await setFrame(page, i);
-    const shot = await drawnShot(page, what);
+    const shot = await drawnShot(page, what, errors);
     // What the page says about itself at the moment of its own read: a canvas
     // that disagrees with the page's stated frame is a rendering staleness, not
     // an outline that was never drawn, and the two want different fixes.
@@ -642,7 +806,7 @@ if (!FR || !FR.count) {
   const withoutIt = [];
   for (const [i, what] of sampleFrames) {
     await setFrame(off.page, i);
-    withoutIt.push(await drawnShot(off.page, `${what}, with no outline to draw`));
+    withoutIt.push(await drawnShot(off.page, `${what}, with no outline to draw`, off.errors));
   }
   await off.page.close();
   for (let k = 0; k < sampleFrames.length; k += 1) {
@@ -670,7 +834,7 @@ if (!FR || !FR.count) {
   const zc = await z.page.textContent('#td-movie-caption');
   ok(zc.endsWith('Every frame is zero: there is no field to draw.'), `an all-zero movie says so: ${zc}`);
   await setFrame(z.page, mid);
-  zeroShot = await drawnShot(z.page, 'the all-zero frame');
+  zeroShot = await drawnShot(z.page, 'the all-zero frame', z.errors);
   ok(zeroShot && midShot && zeroShot.url !== midShot.url,
      `the real frame ${mid + 1} draws field the all-zero movie does not`);
   await z.page.close();

@@ -5,10 +5,17 @@ files; the Flask app renders the done job page and status, and serves every
 result file through its real routes. web/static is copied beside them.
 The solve is a 120-frame window, so the three-digit frame names and a caption
 about a window (not the whole run) are exercised.
+The scene's boundary is TDCHECK_BOUNDARY (default "metal"). It is a knob
+because the two boundaries put the manifest's sampled positions in *different*
+relations to the object -- metal samples the object's own box, open samples
+OPEN_PAD_CELLS * dx of padding on every side of it -- so a check of where the
+outline is can only be trusted if it has been run against both. Metal is the
+default because the repo's own job fixture is metal (tests/test_td_solve._job).
 Run from the repo root, memory-capped:
   (ulimit -v 4194304; .venv-mse/bin/python scripts/tdcheck_fixture.py DIR)
+  TDCHECK_BOUNDARY=open (ulimit -v 4194304; .venv-mse/bin/python ... DIR)
 """
-import io, json, pathlib, shutil, sys
+import io, json, os, pathlib, shutil, sys
 import numpy as np
 import trimesh
 sys.path[:0] = ["tests"]
@@ -73,8 +80,12 @@ solve_store = _FixtureStore()
 # vacuum, which is what a cavity is.
 PLACED = {"position": [3e-3, 1.5e-3, 1e-3],
           "probes": [[5e-3, 1.5e-3, 1e-3, "z"], [4e-3, 2e-3, 1e-3, "z"]]}
+#: The scene's boundary, for the two mirrors the check is run against. The
+#: positions above are in the parts' frame either way (the frame's origin is the
+#: parts' minimum corner on both), so the same scene solves under both.
+BOUNDARY = os.environ.get("TDCHECK_BOUNDARY", "metal")
 _res, out = T._run_with_files(solve_store, job_changes={"materials": {"block": 1.5, "pin": 1.5}},
-                              **WINDOW, **PLACED)
+                              **WINDOW, **PLACED, boundary=BOUNDARY)
 app, store, db, _l = W.make_app(out_dir / "_store")
 # The row's own units and scale must be the ones the solve above was given
 # (test_td_solve._job: units "mm", scale 1.0), or the outline the page fetches
@@ -108,4 +119,4 @@ shutil.copytree("web/static", out_dir / "static", dirs_exist_ok=True)
 man = json.loads((files / "spectrum.json").read_text())
 scene = trimesh.load(io.BytesIO(r.data), file_type="glb")
 box = np.asarray(scene.bounds, dtype=float)
-print("job", job_id, "probes", len(man["probes"]), "steps", man["steps"], "caveats", len(man["caveats"]), "frames", man["frames"]["count"], man["frames"]["shape"], "digits", man["frames"]["digits"], "first", frame_names[0], "last", frame_names[-1], "outline", len(scene.geometry), "parts", box[0].tolist(), box[1].tolist())
+print("job", job_id, "boundary", BOUNDARY, "probes", len(man["probes"]), "steps", man["steps"], "caveats", len(man["caveats"]), "frames", man["frames"]["count"], man["frames"]["shape"], "digits", man["frames"]["digits"], "first", frame_names[0], "last", frame_names[-1], "outline", len(scene.geometry), "parts", box[0].tolist(), box[1].tolist(), "manifest_positions_x", [min(man["frames"]["positions_m"][0]), max(man["frames"]["positions_m"][0])])

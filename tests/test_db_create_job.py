@@ -133,7 +133,10 @@ def test_create_job_with_a_pc_request_sends_it_as_json_and_says_pc():
 
 
 #: A complete td request: every key the worker reads. Built from the worker's
-#: own list so this fixture cannot fall behind it.
+#: own list so this fixture cannot fall behind it -- the optional keys are
+#: filled in from that list rather than retyped, because retyping is exactly
+#: how it fell behind them (the movie window's three keys, unset in the fixture
+#: while the worker read them, left this file red at 3cfe20a).
 def _td_request():
     import td_solve
     values = {"boundary": "open", "source_kind": "point", "profile": "pulse",
@@ -142,6 +145,8 @@ def _td_request():
               "polarisation": "z", "samples": None, "sample_duration_s": None,
               "duration_s": 2.0e-13, "probes": [[1e-7, 0.0, 0.0, "z"]],
               "dx_m": 2.0e-8, "coatings": None}
+    for key in td_solve.OPTIONAL_KEYS:
+        values.setdefault(key, None)   # a job need not ask for a movie
     assert set(values) == set(td_solve.REQUEST_KEYS)
     return values
 

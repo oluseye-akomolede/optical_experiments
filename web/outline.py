@@ -8,12 +8,21 @@ the td worker writes no surface at all.
 
 WHAT THE MOVIE'S FRAME ACTUALLY IS, read from the worker rather than assumed:
 the worker solves with ``length_scale = unit_scale(units) * scale`` and stores
-every frame position as ``origin_m[a] + nodes[a][cell]``, where ``origin_m`` is
-the parts' combined bounding-box minimum. Those two cancel, so the positions a
-frame's samples sit at are the upload's own coordinates times ``length_scale``,
-with no offset. The outline's whole transform is therefore one multiply -- and
-the same multiply is right for a metal and an open scene alike, since an open
-scene's padding is already taken back out of the nodes.
+every frame position as ``origin_m[a] + nodes[a][cell]`` -- absolute metres,
+``origin_m`` being the parts' combined bounding-box minimum -- so a sample and
+the upload's own coordinates times ``length_scale`` are the same frame, and the
+outline's whole transform is one multiply with no offset.
+
+The frame is NOT the object's own box, and a reader must not take it for one:
+``fdtd_layout`` samples an open scene over the object PLUS
+``OPEN_PAD_CELLS * dx`` on each side (16 cells at the values both boundaries
+share today -- BOX_CLEARANCE + 3 + DEFAULT_PML_CELLS) and none on metal, and the
+manifest records the samples, not the object. So the positions a frame samples
+bound the object and, on open, the padding around it. This outline is the
+object, and only the object. No padding belongs in the transform either way: the
+pad moves which points the field was sampled at, never where the object is --
+but it does mean a check must not use the sampled positions as the object's box
+(a review row of 2026-10-03 was exactly that mistake).
 
 WHY A ROUTE AND NOT A FILE THE WORKER WRITES. Every job's raw upload is kept at
 ``jobs/<id>/input.obj``, so deriving the outline when it is asked for gives jobs

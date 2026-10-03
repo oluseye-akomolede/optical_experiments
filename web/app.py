@@ -395,8 +395,10 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
         read back as a result file, which is the whole point: a td job solved
         before this route existed has no outline file, and this gives it one
         with no re-run and no change to the worker. The glb is in METRES at the
-        job's own unit scale -- a single multiply, no offset, because the movie's
-        frames are stored in exactly that frame (see web/outline.py).
+        job's own unit scale -- a single multiply, no offset, because a frame's
+        stored positions and the upload's own coordinates are the same absolute
+        frame (see web/outline.py; note the stored positions may extend past the
+        object by an open boundary's pad cells, which the object has no part in).
 
         A job whose outline cannot be built answers 404, not 500: no stored
         upload and an upload this cannot draw are both "there is nothing to

@@ -46,7 +46,12 @@
       1622..20748 lit pixels of field (the floor is 1/64 of those, 26..325).
 - [ ] Measured green on a mirror of a REAL job (the owner's film job or another
       finished td job whose parts are offset inside their domain) -- the fixture
-      cannot see a translation to its own box's centre, that mirror can.
+      cannot see a translation to its own box's centre, that mirror can. NOT
+      DONE, and it cannot be done from the builder's seat: a job mirror carries
+      ``outline.glb`` only once the route this change adds is deployed, and the
+      raw upload it is derived from has no route at all (only the store does).
+      It is the lead's to run after deploy; no real-job numbers are claimed
+      anywhere in this change until that run exists as a log.
 - [x] Mutation-proved in the browser against that same mirror, one mutant at a
       time, source confirmed present in each run before it was judged:
       `scene.add(group)` commented out -- the four pixel checks FAIL, each
