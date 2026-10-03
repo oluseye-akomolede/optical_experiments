@@ -3,7 +3,11 @@
 // web/static) fed the files a real solve wrote: the trace and spectrum plots
 // and the field movie, as written and in each failure case (caveats, trace
 // 502, a frame 502, no movie, an all-zero movie, a throw after every frame has
-// loaded). Nothing is fetched from the network.
+// loaded). The uploaded object's outline is checked the same way: where the
+// page says it drew it against the manifest's own sample positions, and every
+// sampled frame drawn twice -- with the outline and with the outline route
+// answering 404 -- so the pixels it adds are the outline's and nothing else.
+// Nothing is fetched from the network.
 //
 // TD_DIR holds a job whose data a real solve wrote, not a job this check
 // imagines: scripts/tdcheck_fixture.py writes a tiny solve, and
@@ -26,6 +30,11 @@
 // and fired inside one evaluate, and the canvas is read with toDataURL against
 // a context forced to preserveDrawingBuffer, after the page's own loop has
 // drawn a further frame -- counted below, so the read never races the loop.
+// And the pages are read one at a time, bringing each to the front first: a
+// backgrounded page has its animation frames throttled, so its canvas can be
+// several moves stale (measured: two pages open at once made one frame's
+// with-outline and without-outline shots identical, because the read was of a
+// canvas from before that frame).
 //
 // Inputs: TD_DIR (default /work). scripts/run_tdcheck.sh builds the fixture
 // inputs and runs this, bounded.
@@ -54,6 +63,15 @@ const { decodeTraces, siPrefix, axisExponent, exponentText, SPECTRUM_SCALE } =
 const { SCALE_PERCENTILE, MOVIE_THRESHOLD } =
   await import(pathToFileURL(path.join(DIR, 'static/tdmovie.js')).href).catch((e) => {
     console.log(`FAIL  TD_DIR (${DIR}) has no readable static/tdmovie.js: ${e.message}`);
+    return process.exit(1);
+  });
+// The pixel reading is the rendercheck image's own pixels.mjs (the Dockerfile
+// COPYs it beside this file, which run_tdcheck.sh mounts), so "a lit pixel" and
+// "a changed pixel" mean here exactly what they mean in the other render
+// checks instead of a second definition written out again.
+const { decodePng, distanceFromBackground, LIT_DISTANCE } =
+  await import('./pixels.mjs').catch((e) => {
+    console.log(`FAIL  no readable pixels.mjs beside tdcheck.mjs: ${e.message}`);
     return process.exit(1);
   });
 
@@ -89,6 +107,13 @@ const CAVEATS = ['thin curved features are resolved only at the coarse cell'];
 // served, not from constants here: whether the run recorded one at all, the
 // frame count, the name width, and the spacing the caption is expected to
 // report. A fixture may be any window of any run.
+// How many pixels a frame must gain when the outline is drawn: a share of that
+// frame's own lit field pixels, because the outline's edges cross the object,
+// which is where the field is -- so a larger frame demands a longer line rather
+// than the same count. The floor is a *kind* test (an object-sized mark, not a
+// stray antialiased pixel) and is deliberately far below what a drawn outline
+// measures: the measured count is printed in the check's own message.
+const OUTLINE_SHARE = 1 / 64;
 const FR = manifest.frames || null;
 const DIGITS = (FR && FR.digits) || 2;
 const frameName = (n) => `frame_${String(n).padStart(DIGITS, '0')}.bin`;
@@ -120,6 +145,83 @@ function fineStep(positions) {
   }
   return Number.isFinite(s) ? s : null;
 }
+/** The movie's own frame, as the manifest's positions bound it: [[min,max] per
+ *  axis] in metres, or null when the manifest lists no positions. A reduce, not
+ *  a spread: a real job's axis holds tens of thousands of samples and a spread
+ *  of that length is a call-stack overflow, not a measurement. */
+function positionsBox(positions) {
+  if (!Array.isArray(positions) || !positions.length) return null;
+  const box = positions.map((axis) => {
+    let lo = Infinity, hi = -Infinity;
+    for (const v of axis || []) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) continue;
+      if (n < lo) lo = n;
+      if (n > hi) hi = n;
+    }
+    return Number.isFinite(lo) ? [lo, hi] : null;
+  });
+  return box.every(Boolean) ? box : null;
+}
+/** Where the page says it drew the outline: ``minx,miny,minz;maxx,maxy,maxz``
+ *  in metres, the dataset entry the movie renderer writes. Null (and a reason)
+ *  when it states something else -- including 'none', which is what a page
+ *  that could not draw the outline says. */
+function outlineBox(text) {
+  const m = /^([-\d.eE,]+);([-\d.eE,]+)$/.exec(String(text || ''));
+  if (!m) return null;
+  const nums = (t) => t.split(',').map(Number);
+  const box = { min: nums(m[1]), max: nums(m[2]) };
+  if (box.min.length !== 3 || box.max.length !== 3
+      || [...box.min, ...box.max].some((v) => !Number.isFinite(v))) return null;
+  return box;
+}
+const fmtBox = (box) => box.map(([lo, hi], a) => `${'xyz'[a]} ${lo}..${hi}`).join(', ');
+
+/** A canvas shot decoded to RGBA pixels (pixels.mjs widens RGB to RGBA). */
+async function shotPixels(shot) {
+  const { data, width, height } = await decodePng(Buffer.from(shot.url.split(',')[1], 'base64'));
+  return { data, width, height };
+}
+/** Pixels two shots of the same size disagree on anywhere in RGB, or -1 when
+ *  they are not the same size (which is itself a difference, not a pass). */
+function differingPixels(a, b) {
+  if (a.width !== b.width || a.height !== b.height) return -1;
+  let n = 0;
+  for (let i = 0; i < a.width * a.height; i += 1) {
+    const o = i * 4;
+    if (a.data[o] !== b.data[o] || a.data[o + 1] !== b.data[o + 1]
+        || a.data[o + 2] !== b.data[o + 2]) n += 1;
+  }
+  return n;
+}
+/** A short fingerprint of a shot, so a failing comparison says WHAT the two
+ *  pictures were and not only that they agreed. A digest, not a dump: the
+ *  images cannot be written out of the container (the mirror is mounted
+ *  read-only), and "identical" is only half a diagnosis. */
+function imageDigest(img) {
+  let h = 2166136261;
+  for (let i = 0; i < img.data.length; i += 4) {
+    h = Math.imul(h ^ (img.data[i] + img.data[i + 1] * 3 + img.data[i + 2] * 7), 16777619);
+  }
+  const at = (x, y) => {
+    const k = (y * img.width + x) * 4;
+    return `${img.data[k]},${img.data[k + 1]},${img.data[k + 2]}`;
+  };
+  return `${img.width}x${img.height} lit ${litPixels(img)} centre rgb(${at(img.width >> 1, img.height >> 1)})`
+    + ` corner rgb(${at(0, 0)}) hash ${(h >>> 0).toString(16)}`;
+}
+
+/** Pixels clear of the page's background by more than the lit threshold. */
+function litPixels(img) {
+  let n = 0;
+  for (let i = 0; i < img.width * img.height; i += 1) {
+    const o = i * 4;
+    if (distanceFromBackground(img.data[o], img.data[o + 1], img.data[o + 2]) > LIT_DISTANCE) n += 1;
+  }
+  return n;
+}
+
 /** A legend line's position in metres, read through the page's own prefixes:
  *  {metres, tokens, prefix}, or {error} naming what the line does not state. */
 function legendPosition(text) {
@@ -152,6 +254,15 @@ const setFrame = (page, i) => page.evaluate((n) => {
  *  Null (and a recorded FAIL) if no frame arrives, so a stalled loop is named
  *  instead of looking like two identical pictures. */
 async function drawnShot(page, what) {
+  // Read the page that is on top. A backgrounded page has its animation frames
+  // throttled, so a shot of one is a shot of whatever it last drew: an older
+  // canvas, indistinguishable from "the thing is not drawn". Measured on this
+  // check: with the outline page left in the background while a second page was
+  // open, one read came back a canvas from before the last frame change and the
+  // two runs were identical on that frame. The outline samples below are taken
+  // one page at a time for the same reason; this keeps a read honest whichever
+  // page opened last.
+  await page.bringToFront();
   const n = await page.evaluate(() => window.__tdFrames || 0);
   try {
     await page.waitForFunction((k) => (window.__tdFrames || 0) > k, n,
@@ -167,7 +278,8 @@ async function drawnShot(page, what) {
 }
 
 async function open(browser, { caveats = null, traceStatus = 200, frameStatus = 200, noMovie = false,
-                               zeroFrames = false, noPositions = false } = {}) {
+                               zeroFrames = false, noPositions = false,
+                               outlineStatus = 200 } = {}) {
   const page = await browser.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
@@ -208,6 +320,15 @@ async function open(browser, { caveats = null, traceStatus = 200, frameStatus = 
       if (traceStatus !== 200) return route.fulfill({ status: traceStatus, body: 'storage down' });
       return route.fulfill({ body: fs.readFileSync(path.join(DIR, 'files/trace.bin')),
                              contentType: 'application/octet-stream' });
+    }
+    // The object outline the page draws over the field. The 404 arm is the
+    // control the outline checks below are measured against: with it, the only
+    // difference between two runs of the same page is whether the outline was
+    // drawn at all.
+    if (p.endsWith('/outline.glb')) {
+      if (outlineStatus !== 200) return route.fulfill({ status: outlineStatus, body: 'no outline' });
+      return route.fulfill({ body: fs.readFileSync(path.join(DIR, 'outline.glb')),
+                             contentType: 'model/gltf-binary' });
     }
     const fm = p.match(/\/files\/(frame_\d{2,3}\.bin)$/);
     if (fm) {
@@ -359,9 +480,53 @@ if (!FR || !FR.count) {
     shown: !document.getElementById('td-movie').hidden,
     caption: document.getElementById('td-movie-caption').textContent,
     max: document.getElementById('td-movie-frame').max,
-    frame: document.getElementById('td-movie').dataset.frame }));
+    frame: document.getElementById('td-movie').dataset.frame,
+    outline: document.getElementById('td-movie').dataset.outline }));
   ok(st.shown, 'the movie panel is shown');
   ok(st.max === String(FR.count - 1), `slider spans every frame: max ${st.max}`);
+  // --- the object outline sits on the field, not near it -------------------
+  // The owner's ask: the uploaded object drawn over the field. The page states
+  // where it drew the outline (the dataset entry, the world box of the group it
+  // actually added), and this compares that with the box the manifest's own
+  // sample positions span -- the field's frame, in metres. One cell of slack is
+  // for the grid's outermost samples, which need not land exactly on the
+  // upload's face; a unit, a scale or a translation error is 1000x to 100% of
+  // the object, far outside it.
+  //
+  // WHY THE FIXTURE'S UPLOAD IS TWO PARTS, the second at negative x: a single
+  // block starting at its own origin has the same numbers in the object's frame
+  // and in the grid's (the offset is zero), so comparing the two was an
+  // identity that could not fail -- the trap this row names. With the offset
+  // part, the grid's frame is 2 mm from the object's and the object's box is
+  // smaller than the domain's, so an outline left in the grid's frame and an
+  // outline centred on the domain instead of on its own coordinates are both
+  // far outside one cell. tests/test_web_routes.py's outline box is neither
+  // centred nor cubic for the same reason, and a mirror of a real job whose
+  // object is offset in its domain is the same case on production's artifacts.
+  const wantBox = positionsBox(FR.positions_m);
+  const drewBox = outlineBox(st.outline);
+  if (wantBox) {
+    ok(drewBox, `the movie says where it drew the outline (${JSON.stringify(st.outline)})`);
+    if (drewBox) {
+      const cell = fineStep(FR.positions_m);
+      const wrong = [];
+      for (let a = 0; a < 3; a += 1) {
+        for (const end of ['min', 'max']) {
+          const d = Math.abs(drewBox[end][a] - wantBox[a][end === 'min' ? 0 : 1]);
+          if (!(d <= cell)) {
+            wrong.push(`${'xyz'[a]} ${end} ${drewBox[end][a]} vs ${wantBox[a][end === 'min' ? 0 : 1]} `
+                       + `(${d} > one cell ${cell})`);
+          }
+        }
+      }
+      const drewPairs = [0, 1, 2].map((a) => [drewBox.min[a], drewBox.max[a]]);
+      ok(wrong.length === 0,
+         'the outline is drawn on the object the field was solved on, within one '
+         + `cell (${cell} m): outline ${fmtBox(drewPairs)} `
+         + `against the manifest's positions ${fmtBox(wantBox)}`
+         + (wrong.length ? ` -- ${wrong.join('; ')}` : ''));
+    }
+  }
   // The frames on disk must be exactly the ones the manifest names: a mirror
   // with a hole in it would otherwise reach the page as a 404 the page names,
   // reading as a page defect rather than as an incomplete mirror.
@@ -426,7 +591,81 @@ if (!FR || !FR.count) {
   await page.waitForFunction(() => Number(document.getElementById('td-movie').dataset.frame) >= 3, null,
                              { polling: 100, timeout: 30000 });
   ok(await page.textContent('#td-movie-play') === 'Pause', 'play advances the frames and offers Pause');
+  // Stop the play where it got to: the frame it reached is one of the frames
+  // the outline is checked on below, because "while the movie plays" is what
+  // the owner asked for. The stop is asserted, not assumed -- a timer still
+  // running would move the frame under the pixel read and make it a race.
+  await page.evaluate(() => document.getElementById('td-movie-play').click());
+  ok(await page.textContent('#td-movie-play') === 'Play', 'the second click stops the play');
+  const playedFrame = Number(await page.evaluate(
+    () => document.getElementById('td-movie').dataset.frame));
+  // --- the outline is DRAWN on the field, on every frame it is asked for ----
+  // The same page is opened again with the outline route answering 404: same
+  // manifest, same code, same browser, deterministic drawing, so the pixels the
+  // two runs disagree on are the outline's and nothing else. Both halves are
+  // needed. The control alone would be satisfied by a field that merely stopped
+  // being drawn; the outline run alone says nothing about what the pixels
+  // changed from. Play while the movie plays too, not only while scrubbing.
+  //
+  // THE TWO RUNS ARE SERIAL, one page open at a time. Measured: with both pages
+  // open at once, the page in the background had its animation frames throttled
+  // -- one read came back a canvas from before the last move, and the two runs
+  // were identical on that frame -- which reads as a FAIL that says nothing
+  // about the page. One page at a time leaves every read with the browser to
+  // itself. The frames played through are the same either way, so the runs are
+  // still the same picture with and without the outline.
+  const sampleFrames = [[0, 'the first frame'], [mid, `frame ${mid + 1} of ${FR.count}`],
+                        [last, 'the last frame'],
+                        [playedFrame, `the frame playing reached (${playedFrame + 1} of ${FR.count})`]];
+  const withIt = [];
+  for (const [i, what] of sampleFrames) {
+    await setFrame(page, i);
+    const shot = await drawnShot(page, what);
+    // What the page says about itself at the moment of its own read: a canvas
+    // that disagrees with the page's stated frame is a rendering staleness, not
+    // an outline that was never drawn, and the two want different fixes.
+    const said = await page.evaluate(() => {
+      const p = document.getElementById('td-movie');
+      return `frame ${Number(p.dataset.frame) + 1}, outline ${p.dataset.outline === 'none'
+        ? 'none' : p.dataset.outline ? 'stated' : 'unstated'}`;
+    });
+    withIt.push({ shot, said });
+  }
   await page.close();
+  const off = await open(browser, { outlineStatus: 404 });
+  const offState = await off.page.evaluate(() => ({
+    outline: document.getElementById('td-movie').dataset.outline,
+    caption: document.getElementById('td-movie-caption').textContent }));
+  ok(offState.outline === 'none' && /outline could not be drawn/.test(offState.caption),
+     'the control run names the outline it did not draw, so a pixel difference below is the '
+     + `outline's: ${offState.outline} -- ${offState.caption}`);
+  const withoutIt = [];
+  for (const [i, what] of sampleFrames) {
+    await setFrame(off.page, i);
+    withoutIt.push(await drawnShot(off.page, `${what}, with no outline to draw`));
+  }
+  await off.page.close();
+  for (let k = 0; k < sampleFrames.length; k += 1) {
+    const [, what] = sampleFrames[k];
+    if (!withIt[k].shot || !withoutIt[k]) continue;   // drawnShot named the failure
+    const [a, b] = [await shotPixels(withIt[k].shot), await shotPixels(withoutIt[k])];
+    const fieldPixels = litPixels(b);
+    ok(fieldPixels > 0, `the control run still draws the field on ${what} (${fieldPixels} lit px), `
+       + 'so what changes below is the outline and not a frame that went blank');
+    const changed = differingPixels(a, b);
+    const need = Math.max(1, Math.ceil(OUTLINE_SHARE * fieldPixels));
+    if (!(changed >= need)) {
+      // Only on the way to a FAIL: what the two pictures actually were, so the
+      // next reader is not left with "identical" and a question. In a passing
+      // run these lines are noise.
+      console.log(`      with the outline: ${imageDigest(a)}`);
+      console.log(`      without it:       ${imageDigest(b)}`);
+      console.log(`      the page said:    ${withIt[k].said}`);
+    }
+    ok(changed >= need, `the outline is drawn on ${what}: ${changed} pixels of that frame differ `
+       + `when no outline is drawn (of ${a.width}x${a.height}; ${fieldPixels} lit px in the `
+       + `control, ${need} needed)`);
+  }
   const z = await open(browser, { zeroFrames: true });
   const zc = await z.page.textContent('#td-movie-caption');
   ok(zc.endsWith('Every frame is zero: there is no field to draw.'), `an all-zero movie says so: ${zc}`);

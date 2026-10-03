@@ -255,10 +255,15 @@ test('the loader collects parts before adding them, so it never re-parents in a 
   const collected = /const\s+parts\s*=\s*\[\][\s\S]{0,200}?traverse\(/.exec(VIEWER);
   assert.ok(collected,
     'the loader no longer collects into a `parts` array before the walk');
-  // `for (const part of parts)` occurs twice in the file, so this must anchor
-  // on the one that adds to the group -- the collect-then-add loop. Matching
-  // either one would let the loop be emptied while this stayed green.
-  const addAfter = /for\s*\(\s*const\s+part\s+of\s+parts\s*\)\s*\{[\s\S]*?surfaceGroup\.add\(\s*part\s*\)/.exec(VIEWER);
+  // `for (const part of parts)` occurs more than once in the file, so this must
+  // anchor on the one that adds to the group -- the collect-then-add loop.
+  // Matching another one would let the loop be emptied while this stayed green.
+  // The add itself moved into outlineGroup when the td movie began drawing the
+  // same outline, so the property is now two links, and both are checked: the
+  // loop that puts every part INTO the group, and the call that hands the
+  // collected parts to it. Either one missing leaves the outline silently
+  // absent -- the whole point of this guard.
+  const addAfter = /for\s*\(\s*const\s+part\s+of\s+parts\s*\)\s*\{[\s\S]*?group\.add\(\s*part\s*\)/.exec(VIEWER);
   assert.ok(addAfter,
     'the parts are never added after the walk: collect-then-add must end with ' +
     'every part reaching the group, or the outline is silently missing');
@@ -268,6 +273,38 @@ test('the loader collects parts before adding them, so it never re-parents in a 
     'the add-after-the-walk loop was found BEFORE the walk -- the regex has ' +
     'latched onto the wrong `for (const part of parts)` and this guard is ' +
     'checking a loop that is not the collect-then-add one');
+  // Inside the loader's own body, so this cannot be satisfied by the td movie's
+  // separate copy of the same two calls.
+  const surfaceBody = /function addSurface\(id\)\s*\{([\s\S]*?)\n  \}/.exec(VIEWER);
+  assert.ok(surfaceBody, 'addSurface has moved or changed shape; this guard ' +
+                         'needs re-pointing or it checks nothing');
+  const handedOver = /\.then\(\s*glbMeshParts\s*\)[\s\S]*?outlineGroup\(\s*parts\s*\)/.exec(surfaceBody[1]);
+  assert.ok(handedOver,
+    'the collected parts are never handed to outlineGroup: the walk\'s output ' +
+    'must flow into the group builder, or the outline is silently absent');
+});
+
+// ---------------------------------------------------------------------------
+// SCOPE. The td movie draws the same outline as the cavity view, and it is a
+// different top-level function -- so the two helpers it calls must be reachable
+// from it. This is the defect that SHIPPED and the browser check caught: with
+// glbMeshParts/outlineGroup declared INSIDE loadFieldData, the movie's call
+// threw "glbMeshParts is not defined", the movie's own catch turned that into
+// a caption, and every frame drew its field with no object on it. A regex
+// cannot run scope, so what is asserted here is the exact shape that made it a
+// ReferenceError -- one top-level declaration and no nested copy. The
+// behavioural proof stays where it was made: tdcheck, in a real browser, with
+// outline pixels required on every sampled frame.
+test('the td movie can reach the outline helpers it calls', () => {
+  for (const name of ['glbMeshParts', 'outlineGroup']) {
+    assert.ok(new RegExp(`\\nfunction ${name}\\(`).test(VIEWER),
+      `${name} has no top-level declaration, so a function outside loadFieldData ` +
+      'that calls it throws "not defined" and draws no outline');
+    assert.ok(!new RegExp(`^\\s+function ${name}\\(`, 'm').test(VIEWER),
+      `${name} is declared inside another function as well; the td movie would ` +
+      'resolve the top-level one, so edits to the nested copy would change ' +
+      'nothing the movie draws');
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -300,6 +337,20 @@ test('the surface loader reports each way it can fail to draw, through surfaceNo
   assert.ok(addSurface,
     'addSurface has moved or changed shape, so this test is not driving it; ' +
     're-point the extraction at the new definition rather than deleting this');
+  // addSurface delegates the glb walk to glbMeshParts and the drawing to
+  // outlineGroup (both were factored out so the td movie can draw the same
+  // outline). They are rebuilt from the real source, in the same scope, for the
+  // same reason every other name here is: a stub with its own behaviour would
+  // let this test pass while the shipped code did something else. They are
+  // TOP-LEVEL definitions (`\n}` closes them), as test 5 requires.
+  const glbMeshParts = /function glbMeshParts\(buffer\)\s*\{([\s\S]*?)\n\}/.exec(VIEWER);
+  assert.ok(glbMeshParts,
+    'glbMeshParts has moved or changed shape; addSurface no longer walks the ' +
+    'glb itself, so re-point this extraction rather than deleting it');
+  const outlineGroup = /function outlineGroup\(parts\)\s*\{([\s\S]*?)\n\}/.exec(VIEWER);
+  assert.ok(outlineGroup,
+    'outlineGroup has moved or changed shape; addSurface no longer builds the ' +
+    'group itself, so re-point this extraction rather than deleting it');
   const surfaceNote = /function surfaceNote\(text\)\s*\{([\s\S]*?)\n  \}/.exec(VIEWER);
   assert.ok(surfaceNote,
     'surfaceNote has moved or changed shape, and it is the thing under test');
@@ -432,7 +483,9 @@ test('the surface loader reports each way it can fail to draw, through surfaceNo
         'id', 'fetch', 'GLTFLoader', 'THREE', 'scene', 'manifest', 'bounds',
         'surfaceGroup', 'surfaceParts', 'clearSurface', 'surfaceNote',
         'surfaceScaleFromGrid', 'boundsOfPositions', 'surfacePositions',
-        `function addSurface(id) {${addSurface[1]}}\nreturn addSurface(id);`);
+        `function glbMeshParts(buffer) {${glbMeshParts[1]}}\n`
+        + `function outlineGroup(parts) {${outlineGroup[1]}}\n`
+        + `function addSurface(id) {${addSurface[1]}}\nreturn addSurface(id);`);
 
       // The chain is not returned by the real function, so expose it by having
       // the wrapper await nothing and instead reading the note after the
@@ -496,5 +549,19 @@ test('the surface loader reports each way it can fail to draw, through surfaceNo
     assert.match(r.note, /could not be matched|no unit conversion/i,
       'the conversion note does not say the size could not be matched to the ' +
       'grid');
+  }).then(() => {
+    // -- branch 4: the CONTROL. Every branch above asserts something is
+    // ABSENT (no scene.add, an empty note). An absence assertion cannot fail at
+    // a loader that draws nothing at all -- so drive the same world one more
+    // time with everything healthy and require the drawing to actually happen.
+    // Without this, deleting the drawing code would leave branches 1-3 green.
+    return run({ fetchFails: false, gltfMeshes: 1 });
+  }).then((r) => {
+    assert.equal(r.sceneAdds.length, 1,
+      'a healthy surface reached no scene.add: the three failure branches ' +
+      'above prove nothing, because this loader never draws anything');
+    assert.equal(r.note, '',
+      'a healthy surface still left a note, so the note cannot be read as ' +
+      '"there is a problem"');
   });
 });

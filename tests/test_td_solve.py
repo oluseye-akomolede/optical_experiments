@@ -325,11 +325,22 @@ def _strict_json(data):
 TWO_PROBES = [[3e-3, 1.5e-3, 1e-3, "z"], [2e-3, 2e-3, 1e-3, "x"]]
 
 
-def _run_with_files(**changes):
+def _run_with_files(store=None, job_changes=None, **changes):
+    """Run the fixture job with a file-writing store.
+
+    ``store`` and ``job_changes`` are for callers whose job must differ from
+    this file's own: scripts/tdcheck_fixture.py passes a two-part upload whose
+    parts do not start at the upload's origin (so the movie's outline can be
+    told from the grid's frame) and the materials table those parts need.
+    ``changes`` goes into the tds request, as the tests below use it; both
+    default to this file's own job, so the unit tests are unaffected.
+    """
     out = _OutStore()
     changes.setdefault("dx_m", 0.5e-3)  # a non-square grid (1 mm gives 5^3)
-    res = td_solve.solve_td(_job(probes=TWO_PROBES, **changes), _Store(), out,
-                            xp=np, free_bytes=PLENTY)
+    changes.setdefault("probes", TWO_PROBES)
+    job = _job(**changes)
+    job.update(job_changes or {})
+    res = td_solve.solve_td(job, store or _Store(), out, xp=np, free_bytes=PLENTY)
     return res, out
 
 

@@ -529,6 +529,58 @@ void main() {
 }
 `;
 
+// Parse a glb into its meshes. COLLECT FIRST, ADD AFTER. Do not
+// `scene.add(child)` inside the walk. three.js's Object3D.traverse iterates
+// the LIVE children array with a length bound read before the loop:
+//     const e = this.children; for (let n=0,i=e.length; n<i; n++) e[n].traverse(t)
+// re-parenting a child splices it out of `e` while `i` stays put, so the last
+// iteration reads a hole and calls `.traverse` on `undefined` -- "Cannot read
+// properties of undefined (reading 'traverse')", which is the error the
+// cavity's surface had on a 2-part model. Collecting into an array and adding
+// afterwards never mutates the array being walked.
+//
+// TOP LEVEL, deliberately: the td movie below draws the same outline, and it is
+// a different top-level function. Nested inside loadFieldData these two were
+// unreachable from it -- the call threw "glbMeshParts is not defined", the
+// movie's own catch turned it into a caption, and the object was simply absent
+// from every frame. Nothing here reads loadFieldData's state (only THREE and
+// GLTFLoader, both page globals), so there is nothing to keep it in scope for.
+function glbMeshParts(buffer) {
+  return new Promise((resolve, reject) => {
+    new GLTFLoader().parse(buffer, '', (gltf) => {
+      const parts = [];
+      gltf.scene.traverse((child) => { if (child.isMesh) parts.push(child); });
+      resolve(parts);
+    }, reject);
+  });
+}
+
+// The outline the owner asked for, in both views: silhouette/edge lines over
+// a faint shade, so the shape reads even where the field is faint. The parts
+// are put INTO the group (and get their material here), so a caller that
+// wants to hold them for disposal gets them back from `group.children`.
+// EdgesGeometry is computed on the part's own geometry before any scaling, so
+// it is scale-invariant -- which is what makes this reusable by the td movie,
+// where the parts are already in metres and are drawn unscaled.
+function outlineGroup(parts) {
+  const group = new THREE.Group();
+  for (const part of parts) {
+    part.material = new THREE.MeshBasicMaterial({
+      color: 0x9fb6cc, transparent: true, opacity: 0.10,
+      side: THREE.DoubleSide, depthWrite: false,
+    });
+    const edges = new THREE.LineSegments(
+      new THREE.EdgesGeometry(part.geometry, 20),
+      new THREE.LineBasicMaterial({
+        color: 0xd8e6f2, transparent: true, opacity: 0.55,
+        depthWrite: false,
+      }));
+    part.add(edges);
+    group.add(part);
+  }
+  return group;
+}
+
 function loadFieldData(jobId, statusData) {
   const canvas = document.getElementById('scene');
   const fallback = document.getElementById('viewer-fallback');
@@ -723,23 +775,10 @@ function loadFieldData(jobId, statusData) {
   function addSurface(id) {
     fetch(`/jobs/${id}/files/surface.glb`)
       .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(r.status))))
-      .then((buffer) => new Promise((resolve, reject) => {
-        new GLTFLoader().parse(buffer, '', resolve, reject);
-      }))
-      .then((gltf) => {
+      .then(glbMeshParts)
+      .then((parts) => {
         clearSurface();
 
-        // COLLECT FIRST, ADD AFTER. Do not `scene.add(child)` inside the walk.
-        // three.js's Object3D.traverse iterates the LIVE children array with a
-        // length bound read before the loop:
-        //     const e = this.children; for (let n=0,i=e.length; n<i; n++) e[n].traverse(t)
-        // re-parenting a child splices it out of `e` while `i` stays put, so the
-        // last iteration reads a hole and calls `.traverse` on `undefined` --
-        // "Cannot read properties of undefined (reading 'traverse')", which is
-        // the error this had on a 2-part model. Collecting into an array and
-        // adding afterwards never mutates the array being walked.
-        const parts = [];
-        gltf.scene.traverse((child) => { if (child.isMesh) parts.push(child); });
         if (!parts.length) {
           surfaceNote('The surface file contained no mesh, so no outline is drawn.');
           return;
@@ -754,6 +793,11 @@ function loadFieldData(jobId, statusData) {
         // the conversion from the grid's own extent over the surface's, so the
         // object that is DRAWN and the object the field was SOLVED on are the
         // same object -- the one shared conversion the row's ask calls for.
+        //
+        // This is the CAVITY's conversion and stays the cavity's. It works by
+        // matching the surface's own box to the grid's and then centring it,
+        // which is only right while a mesh is centred on its own bbox. The td
+        // movie has an exact frame instead -- see addObjectOutline.
         const grid = manifest && manifest.grid;
         const surfBounds = boundsOfPositions(surfacePositions(parts));
         const scale = surfaceScaleFromGrid(grid, surfBounds && surfBounds.size);
@@ -765,26 +809,8 @@ function loadFieldData(jobId, statusData) {
           return;
         }
 
-        surfaceGroup = new THREE.Group();
-        for (const part of parts) {
-          // The outline the row asked for: silhouette/edge lines over a faint
-          // shade, so the shape reads even where the field is faint. EdgesGeometry
-          // is computed on the part's own geometry before any scaling, so it is
-          // scale-invariant.
-          part.material = new THREE.MeshBasicMaterial({
-            color: 0x9fb6cc, transparent: true, opacity: 0.10,
-            side: THREE.DoubleSide, depthWrite: false,
-          });
-          const edges = new THREE.LineSegments(
-            new THREE.EdgesGeometry(part.geometry, 20),
-            new THREE.LineBasicMaterial({
-              color: 0xd8e6f2, transparent: true, opacity: 0.55,
-              depthWrite: false,
-            }));
-          part.add(edges);
-          surfaceGroup.add(part);
-          surfaceParts.push(part);
-        }
+        surfaceGroup = outlineGroup(parts);
+        surfaceParts = parts.slice();
         // Scale the surface into the grid's units, and move it to the grid box's
         // centre. The surface is built centred on its own origin and the grid box
         // is centred on bounds.centre, so this puts the outline on the same
@@ -1492,6 +1518,47 @@ async function renderTdMovie(manifest, data) {
   outline.position.copy(box.position);
   scene.add(outline);
 
+  // The uploaded object, drawn over the field. The owner's ask: their object
+  // visible throughout the movie, on every frame and while it plays.
+  //
+  // Its frame is EXACT, so nothing here is guessed. The route (web/outline.py)
+  // hands back the upload already multiplied into the absolute metres that
+  // frames.positions_m are in -- the same length_scale the worker solved with --
+  // so the parts are added unscaled and unmoved. The cavity view's
+  // ratio-and-centre conversion is deliberately NOT reused: it recovers a
+  // factor by matching the surface's own box to the grid's and then centres the
+  // mesh, which only comes out right for a mesh centred on its own bbox.
+  //
+  // The outline is a nicety, not the product: a job without one still plays.
+  // But "no outline" must not read as "no object", so a failure is named in the
+  // caption -- in a variable, because show() rewrites the caption on every
+  // frame and a note appended once would be gone at frame 1.
+  let outlineNote = '';
+  try {
+    if (!data.outline_url) throw new Error('this job has no outline');
+    const res = await fetch(data.outline_url);
+    if (!res.ok) throw new Error(`the outline returned HTTP ${res.status}`);
+    const parts = await glbMeshParts(await res.arrayBuffer());
+    if (!parts.length) throw new Error('the outline file has no mesh');
+    const group = outlineGroup(parts);
+    // Draw over the field. The volume is a transparent BackSide shell that
+    // writes no depth, and three.js sorts the transparent pass by renderOrder
+    // first, so lifting the whole object above it is enough. renderOrder is per
+    // object and is NOT inherited, so every descendant is set.
+    group.traverse((o) => { o.renderOrder = 2; });
+    scene.add(group);
+    // What was drawn, as a world box: the page's own numbers for where the
+    // object sits, so a check can compare it with the manifest's positions box
+    // rather than judging a screenshot by eye.
+    const world = new THREE.Box3().setFromObject(group);
+    panel.dataset.outline = [world.min, world.max]
+      .map((v) => `${v.x},${v.y},${v.z}`).join(';');
+  } catch (err) {
+    panel.dataset.outline = 'none';
+    outlineNote = ' The object outline could not be drawn ('
+      + `${err && err.message ? err.message : err}).`;
+  }
+
   const distance = Math.max(...size) * 1.35;
   const unit = 1 / Math.sqrt(3);
   camera.position.set(centre[0] + distance * unit, centre[1] + distance * unit,
@@ -1529,7 +1596,8 @@ async function renderTdMovie(manifest, data) {
       + spacingNote
       + ` One colour scale for every frame (the ${Math.round(SCALE_PERCENTILE * 100)}th`
       + ` percentile of |E| over the movie); field below ${MOVIE_THRESHOLD} of it`
-      + ` is not drawn.`;
+      + ` is not drawn.`
+      + outlineNote;
     panel.dataset.frame = String(i);
   }
   slider.addEventListener('input', () => show(Number(slider.value)));

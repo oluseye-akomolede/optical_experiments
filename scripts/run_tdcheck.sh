@@ -43,8 +43,8 @@ if [ -n "$MIRROR" ]; then
   # The list is every file tdcheck.mjs reads by name -- tests/test_run_tdcheck.py
   # derives it from that file's own source and fails if the check grows a read
   # this misses -- plus the page's entry module and the movie module it imports.
-  for f in job.html status.json files/spectrum.json files/trace.bin files \
-           static/tdplot.js static/viewer.js static/tdmovie.js; do
+  for f in job.html status.json outline.glb files/spectrum.json files/trace.bin \
+           files static/tdplot.js static/viewer.js static/tdmovie.js; do
     [ -r "$MIRROR/$f" ] || { echo "not a job mirror: $MIRROR/$f is not readable" >&2; exit 2; }
   done
   echo "mirror: $MIRROR"

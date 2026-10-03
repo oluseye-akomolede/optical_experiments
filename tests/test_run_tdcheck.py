@@ -34,7 +34,8 @@ LIST = re.compile(r"for f in ([^;]*); do")
 
 #: A few of the check's reads, named so a rename this test cannot follow is a
 #: failure here rather than a derivation that silently agrees with itself.
-PINNED = {"job.html", "status.json", "files/spectrum.json", "files/trace.bin"}
+PINNED = {"job.html", "status.json", "outline.glb",
+          "files/spectrum.json", "files/trace.bin"}
 
 
 def reads() -> set[str]:
@@ -61,11 +62,20 @@ def test_the_runner_refuses_a_mirror_missing_any_file_the_check_reads():
 
 
 def test_the_refusal_names_the_hole_and_starts_nothing(tmp_path):
-    """The forced case: a mirror with every listed file but ``trace.bin``."""
+    """The forced case: a mirror with every listed file but ``trace.bin``.
+
+    The mirror is built from run_tdcheck.sh's own pre-check list rather than a
+    second copy of it here: a file the runner starts demanding later is then
+    present for every other case automatically, and this test keeps forcing the
+    one hole it means to force instead of going red on whichever entry was
+    added last.
+    """
     mirror = tmp_path / "mirror"
-    for f in ["job.html", "status.json", "files/spectrum.json",
-              "static/tdplot.js", "static/viewer.js", "static/tdmovie.js"]:
+    for f in sorted(listed() - {"files/trace.bin"}):
         p = mirror / f
+        if any(other.startswith(f + "/") for other in listed()):
+            p.mkdir(parents=True, exist_ok=True)     # a listed directory, e.g. files
+            continue
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("x")
     marker = tmp_path / "docker-argv"

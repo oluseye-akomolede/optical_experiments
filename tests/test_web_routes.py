@@ -9,6 +9,7 @@ failure, and a Job is deleted once its result is recorded.
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import sys
@@ -28,6 +29,7 @@ import config as CFG  # noqa: E402
 import db as DB  # noqa: E402
 import fields as FLD  # noqa: E402
 import jobs as JOBS  # noqa: E402
+import outline as OUTLINE  # noqa: E402
 import storage as STORE  # noqa: E402
 
 
@@ -2754,19 +2756,19 @@ _TDS = {"boundary": "open", "source_kind": "point", "profile": "pulse",
         "frequency_hz": 4.0e14, "bandwidth": 0.5, "td_unit": "um"}
 
 
-def _done_td_job(db):
+def _done_td_job(db, units="nm", scale=1.0):
     job_id = str(uuid.uuid4())
-    db.create_job(job_id, "box.obj", "nm", 1.0, 0, target=DB.JETSON,
-                  kind=DB.TD, tds=dict(_TDS))
+    db.create_job(job_id, "box.obj", units, 1.0, 0, target=DB.JETSON,
+                  kind=DB.TD, tds=dict(_TDS), scale=scale)
     db.jobs[job_id].update(status=DB.DONE, stage=DB.DONE,
                            finished_at="2026-10-02T09:00:00+00:00")
     return job_id
 
 
 def test_a_done_td_status_points_at_its_own_results_not_modes(tmp_path):
-    """A finished td job's status names the spectrum and the trace, and none of
-    the cavity keys: ``modes: []`` would read as "found no modes", and the
-    manifest/surface URLs name files a td job never writes.
+    """A finished td job's status names the spectrum, the trace and the object
+    outline, and none of the cavity keys: ``modes: []`` would read as "found no
+    modes", and the manifest/surface URLs name files a td job never writes.
 
     Mutation that must turn this red: delete the ``DB.TD`` branch in job_status.
     """
@@ -2778,8 +2780,154 @@ def test_a_done_td_status_points_at_its_own_results_not_modes(tmp_path):
     assert body["kind"] == DB.TD
     assert body["spectrum_url"] == f"/jobs/{job_id}/files/spectrum.json"
     assert body["trace_url"] == f"/jobs/{job_id}/files/trace.bin"
+    assert body["outline_url"] == f"/jobs/{job_id}/outline.glb"
     for key in ("modes", "manifest_url", "surface_url", "bands"):
         assert key not in body, f"a td status must not carry {key!r}"
+
+
+#: The td movie's object outline. A box that is neither cubic nor centred on
+#: the origin, in its own units: the two ways a frame bug hides. Its absolute
+#: corner is (5, 3.5, 2) mm, so an outline translated to the mesh's own origin
+#: (as the cavity's surface is built) or to the grid box's centre lands
+#: somewhere else, and unequal extents tell an axis mix-up from a unit one.
+_OUTLINE_BOX_CENTRE_MM = (7.0, 5.0, 3.0)
+_OUTLINE_BOX_EXTENTS_MM = (4.0, 3.0, 2.0)
+
+
+def _outline_box_bytes():
+    box = trimesh.creation.box(extents=list(_OUTLINE_BOX_EXTENTS_MM))
+    box.apply_translation(_OUTLINE_BOX_CENTRE_MM)
+    return box.export(file_type="obj").encode()
+
+
+def test_the_outline_route_puts_the_object_where_the_field_is(tmp_path):
+    """The outline is the upload in the manifest's own frame: absolute metres,
+    times the job's unit scale and free scale, plus nothing.
+
+    The transform has one term because that is what the worker's own algebra
+    gives -- ``fdtd_layout``'s nodes are absolute metres measured from the
+    parts' bounding-box corner, and ``td_solve.py`` stores
+    ``origin_m + node``, so ``frames.positions_m`` is the upload's coordinates
+    times ``unit_scale(units) x scale`` with no offset. This test pins that:
+    ``mm`` and ``scale=2`` move the box by 2e-3, and the box's own offset is
+    preserved rather than replaced.
+
+    Mutation that must turn this red: drop the ``length_scale`` multiply in
+    web/outline.py (1000x too big), use the mesh's own origin as the frame (the
+    corner goes to 0), centre it on the grid box, or feed ``scale`` alone
+    without the unit.
+    """
+    app, store, db, _l = make_app(tmp_path)
+    job_id = _done_td_job(db, units="mm", scale=2.0)
+    store.write(STORE.job_key(job_id, "input.obj"), _outline_box_bytes())
+
+    res = app.test_client().get(f"/jobs/{job_id}/outline.glb")
+
+    assert res.status_code == 200
+    assert res.mimetype == "model/gltf-binary"
+    scene = trimesh.load(io.BytesIO(res.data), file_type="glb")
+    factor = 1e-3 * 2.0
+    want = np.array([[5.0, 3.5, 2.0], [9.0, 6.5, 4.0]]) * factor
+    got = np.asarray(scene.bounds, dtype=float)
+    # glTF stores float32, so a coordinate is exact only to about 1e-7
+    # relative. 1e-6 leaves that room while staying 1000x finer than the
+    # smallest bug this can catch (a missed unit is a factor of 1000).
+    assert got == pytest.approx(want, rel=1e-6), got.tolist()
+
+
+def _two_part_obj_bytes():
+    """Two disjoint boxes as an .obj, in groups of their own names."""
+    plate = trimesh.creation.box(extents=[4.0, 3.0, 0.5])
+    plate.apply_translation([2.0, 1.5, 0.25])
+    pin = trimesh.creation.box(extents=[1.0, 1.0, 3.0])
+    pin.apply_translation([3.5, 1.0, 2.0])
+    return (trimesh.Scene({"plate": plate, "pin": pin})
+            .export(file_type="obj").encode())
+
+
+def test_the_outline_draws_every_part_of_a_multi_part_upload(tmp_path):
+    """Both parts come back, not just one.
+
+    The cavity view kept only the last mesh of a multi-part surface, so every
+    other part drew with no outline at all. A td upload may be several parts by
+    design (the owner's film is offset plates), so the outline must carry them
+    all -- and each where the upload put it, not stacked at one place.
+
+    Mutation that must turn this red: keep only the largest part (2 -> 1).
+
+    SCOPE, because it is easy to over-read: this fixture's group names are
+    distinct, and ``mse_parts.parse_obj_groups`` refuses a repeated group name
+    outright, so a name COLLISION never reaches ``_scene_geometries`` through
+    this route. It is guarded anyway (the scene dict is keyed by that name, and
+    the parser's refusal is not what this function's contract says), and the
+    guard has its own direct test below rather than a mutation claimed here.
+    """
+    app, store, db, _l = make_app(tmp_path)
+    job_id = _done_td_job(db, units="mm", scale=1.0)
+    store.write(STORE.job_key(job_id, "input.obj"), _two_part_obj_bytes())
+
+    res = app.test_client().get(f"/jobs/{job_id}/outline.glb")
+
+    assert res.status_code == 200
+    scene = trimesh.load(io.BytesIO(res.data), file_type="glb")
+    assert len(scene.geometry) == 2, sorted(scene.geometry)
+    # Each part is on its own side of the gap between them: a part stacked at
+    # the other's place would still count two geometries but show one shape.
+    tops = sorted(float(g.bounds[1][2]) for g in scene.geometry.values())
+    assert tops[0] == pytest.approx(0.5e-3, rel=1e-6)   # the plate's top
+    assert tops[1] == pytest.approx(3.5e-3, rel=1e-6)   # the pin's top
+
+
+def test_two_parts_of_the_same_name_both_survive_into_the_scene():
+    """A repeated part name does not lose a part.
+
+    Driven directly, because the route above cannot reach this: the parser
+    refuses a file that names one group twice. But ``_scene_geometries`` keys a
+    DICT by the part name, so the moment anything upstream relaxes that refusal
+    -- or a caller passes names from anywhere else -- the second part would
+    land on the first and draw as one shape, silently. The contract is checked
+    where it lives: two parts in, two geometries out, and the second's key is
+    still recognisably tied to the name it came from.
+
+    Mutation that must turn this red: drop the ``if key in out`` uniqueness in
+    web/outline.py.
+    """
+    plate = trimesh.creation.box(extents=[4.0, 3.0, 0.5])
+    other = trimesh.creation.box(extents=[1.0, 1.0, 3.0])
+    geometry = OUTLINE._scene_geometries(["plate", "plate"], [plate, other])
+    assert len(geometry) == 2, sorted(geometry)
+    assert list(geometry)[0] == "plate", sorted(geometry)
+    # The two mesh objects are the ones handed in, not one of them twice.
+    assert {id(g) for g in geometry.values()} == {id(plate), id(other)}
+
+
+def test_the_outline_route_answers_404_rather_than_500_when_it_cannot_draw(tmp_path):
+    """Three ways to have no outline -- no stored upload, an upload that is not
+    a mesh, and a job that has not finished -- are all an answer, not a fault.
+    The page names the reason instead of drawing nothing.
+
+    The last line is the control this test needs: the same route with a valid
+    upload stored answers 200, so the three 404s are the checks above failing
+    and not a route that never answers anything.
+    """
+    app, store, db, _l = make_app(tmp_path)
+    client = app.test_client()
+
+    no_upload = _done_td_job(db)
+    assert client.get(f"/jobs/{no_upload}/outline.glb").status_code == 404
+
+    junk = _done_td_job(db)
+    store.write(STORE.job_key(junk, "input.obj"), b"not an obj at all\n")
+    assert client.get(f"/jobs/{junk}/outline.glb").status_code == 404
+
+    running = str(uuid.uuid4())
+    db.create_job(running, "box.obj", "mm", 1.0, 0, kind=DB.TD, tds=dict(_TDS))
+    store.write(STORE.job_key(running, "input.obj"), _outline_box_bytes())
+    assert client.get(f"/jobs/{running}/outline.glb").status_code == 404
+
+    good = _done_td_job(db, units="mm", scale=2.0)
+    store.write(STORE.job_key(good, "input.obj"), _outline_box_bytes())
+    assert client.get(f"/jobs/{good}/outline.glb").status_code == 200
 
 
 def test_the_files_route_serves_every_td_result(tmp_path):

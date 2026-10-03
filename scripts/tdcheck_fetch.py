@@ -18,6 +18,8 @@ TD_DIR:
 
   job.html      /jobs/<id>, the real page
   status.json   /jobs/<id>/status, the payload the page runs on
+  outline.glb   the object outline, at the URL status.json itself names -- so
+                the mirror holds whatever that page will actually fetch
   files/        every result file the manifest names: spectrum.json, trace.bin
                 and the frames (names taken from the manifest's own count and
                 digit width, not from a constant here)
@@ -122,7 +124,18 @@ def main(base, job, out_dir):
     job_url = f"{base}/jobs/{job_id}"
     page = get(job_url)
     (out / "job.html").write_bytes(page)
-    (out / "status.json").write_bytes(get(f"{job_url}/status"))
+    status = get(f"{job_url}/status")
+    (out / "status.json").write_bytes(status)
+    # The outline's URL comes from the payload the page itself runs on, so the
+    # mirror holds the file that page will ask for. An older app names none:
+    # say so here, where the app's age is the fact, rather than mirroring a
+    # page whose outline check is then guaranteed to fail.
+    outline_url = json.loads(status).get("outline_url")
+    if not outline_url:
+        sys.exit(f"tdcheck_fetch: {job_url}/status names no outline_url: the "
+                 "deployed app predates the object outline")
+    outline = get(urllib.parse.urljoin(job_url, outline_url))
+    (out / "outline.glb").write_bytes(outline)
     spectrum = get(f"{job_url}/files/spectrum.json")
     (out / "files/spectrum.json").write_bytes(spectrum)
     man = json.loads(spectrum)
@@ -140,7 +153,8 @@ def main(base, job, out_dir):
     print(f"job {job_id} probes {len(man['probes'])} steps {man['steps']} "
           f"dt_s {man['dt_s']!r} band_hz {man['band_hz']} "
           f"frames {man['frames'] and (man['frames']['count'], man['frames']['digits'])} "
-          f"files {len(names)} ({total / 1e6:.1f} MB) static {len(assets)} -> {out}")
+          f"files {len(names)} ({total / 1e6:.1f} MB) outline {len(outline) / 1e6:.3f} MB "
+          f"static {len(assets)} -> {out}")
 
 
 if __name__ == "__main__":

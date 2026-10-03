@@ -35,6 +35,7 @@ import config as CFG
 import db as DB
 import fields as FLD
 import jobs as JOBS
+import outline as OUTLINE
 import pc_form as PC
 import storage as STORE
 import td_form as TDF
@@ -341,6 +342,12 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
                                                   name="spectrum.json")
                 payload["trace_url"] = url_for("job_file", job_id=job_id,
                                                name="trace.bin")
+                # The outline of the uploaded object, drawn over the movie. Its
+                # own route, not files/: a td job stores no surface file, this
+                # is derived from the upload on request (web/outline.py), and
+                # deriving it is what lets a job solved before this existed show
+                # its outline without a re-run.
+                payload["outline_url"] = url_for("job_outline", job_id=job_id)
             else:
                 payload["modes"] = jobs_db.list_modes(job_id)
                 payload["manifest_url"] = url_for("job_file", job_id=job_id,
@@ -378,6 +385,40 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
                              conditional=True)
         return send_file(_bytes_io(data), mimetype=_mimetype(name),
                          download_name=name, conditional=True)
+
+    # -- the td movie's object outline ------------------------------------
+    @app.route("/jobs/<job_id>/outline.glb")
+    def job_outline(job_id):
+        """The uploaded object, in the frame the field movie is drawn in.
+
+        Derived from the job's stored ``input.obj`` on every request rather than
+        read back as a result file, which is the whole point: a td job solved
+        before this route existed has no outline file, and this gives it one
+        with no re-run and no change to the worker. The glb is in METRES at the
+        job's own unit scale -- a single multiply, no offset, because the movie's
+        frames are stored in exactly that frame (see web/outline.py).
+
+        A job whose outline cannot be built answers 404, not 500: no stored
+        upload and an upload this cannot draw are both "there is nothing to
+        draw", which is what the page's caption tells the reader in words. The
+        reason for the second is logged, where a reader can find it.
+        """
+        job = _require_job(jobs_db, job_id)
+        if job["status"] != DB.DONE:
+            abort(404)
+        try:
+            data = store.read(STORE.job_key(job_id, "input.obj"))
+        except FileNotFoundError:
+            abort(404)
+        except STORE.StorageError:
+            abort(502)
+        try:
+            glb = OUTLINE.outline_glb(data, job.get("units"), job.get("scale"))
+        except OUTLINE.OutlineError as exc:
+            app.logger.warning("no outline for job %s: %s", job_id, exc)
+            abort(404)
+        return send_file(_bytes_io(glb), mimetype="model/gltf-binary",
+                         download_name="outline.glb")
 
     # -- derived payloads the viewer needs --------------------------------
     #
