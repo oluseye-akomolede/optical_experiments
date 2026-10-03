@@ -66,13 +66,13 @@ if [ -n "$REV" ]; then
 fi
 
 # The cap. The check draws every movie frame through software WebGL in this
-# 2-CPU container, so its cost follows the movie's length: a fixed 600 s cut a
-# CORRECT run -- a 120-frame open-boundary mirror of a real production job
-# (180cb65f) needed ~740 s on this loaded VM and died at rc=124 after 45 PASS.
-# 12 s a frame is ~2x the slowest per-frame cost measured here (740 s / 120 =
-# 6.2 s, against 2.2 s on an idle VM), and the floor keeps a short movie
-# bounded. A mirror that is not a movie at all (no manifest to read) is given
-# the solver's own maximum.
+# 2-CPU container, so its cost follows the movie's length, and a fixed 600 s is
+# not enough: the real production job 180cb65f (60 frames, two-digit names) was
+# killed at rc=124 after 45 PASS, and the 120-frame open-boundary fixture
+# mirror here needed ~740 s on this loaded VM. 12 s a frame is ~2x the slowest
+# per-frame cost measured on that fixture (740 s / 120 = 6.2 s, against 2.2 s
+# on an idle VM), and the floor keeps a short movie bounded. A mirror that is
+# not a movie at all (no manifest to read) is given the solver's own maximum.
 FRAMES=120
 if [ -r "$DIR/files/spectrum.json" ]; then
   FRAMES=$(.venv-mse/bin/python -c 'import json,sys

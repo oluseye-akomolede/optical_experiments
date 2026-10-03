@@ -30,8 +30,9 @@ own length -- `180 + 12 x frames` seconds, where `frames` is the mirror
 manifest's `frames.count` (the solver's own 120-frame maximum when there is no
 manifest to read) -- SHALL print the cap it chose, and SHALL let
 `TDCHECK_TIMEOUT` override it. A fixed cap is not enough: the check draws every
-frame through the container's software renderer, so a correct 120-frame
-open-boundary mirror of a real production job outlived a fixed 600 s on this
+frame through the container's software renderer, so a correct run outlives
+600 s -- the real job 180cb65f (60 frames, two-digit names) was cut after
+45 PASS, and the 120-frame open-boundary fixture mirror needed ~740 s on this
 loaded VM. A run the cap cuts SHALL be reported as a cut run, never as a page
 defect: the runner SHALL print `harness timed out after <cap>s (<frames> frames;
 ...)` and exit 124, the status `timeout(1)` itself reports, and `tdcheck.mjs`

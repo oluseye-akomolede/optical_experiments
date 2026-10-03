@@ -126,9 +126,10 @@ def test_the_refusal_names_the_hole_and_starts_nothing(tmp_path):
 def test_the_cap_follows_the_movies_own_frame_count(tmp_path):
     """What bounds the run is the movie's length, not a constant.
 
-    Measured: a fixed 600 s cut a CORRECT run -- a 120-frame open-boundary
-    mirror of a real production job needed ~740 s on this loaded VM -- while a
-    short movie finishes in a fraction of that. The cap is derived from the
+    Measured: a fixed 600 s is not enough for a correct run -- the real job
+    180cb65f (60 frames, two-digit names) was cut after 45 PASS, and the
+    120-frame open-boundary fixture mirror needed ~740 s on this loaded VM --
+    while a short movie finishes in a fraction of that. The cap is derived from the
     manifest the mirror holds, and the runner says the number it chose.
     """
     for count in (1, 60, 120):

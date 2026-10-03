@@ -13,10 +13,11 @@ defects:
   never built -- "could not make a mirror" looks like "nothing to check".
 * `scripts/run_tdcheck.sh` cuts the whole check at a fixed `timeout 600`. The
   check draws every movie frame through software WebGL in a 2-CPU container, so
-  its cost follows the movie's length: a 120-frame open-boundary mirror of a
-  real job needed ~740 s on this loaded VM and was killed at rc=124 after 45
-  PASS, with Node's last words a stack trace about a closed page. A cut run read
-  as a broken page.
+  its cost follows the movie's length, and a fixed 600 s is not enough: the
+  real job 180cb65f (60 frames, two-digit names) was killed at rc=124 after 45
+  PASS, with Node's last words a stack trace about a closed page, and
+  the 120-frame open-boundary fixture mirror here needed ~740 s on this loaded
+  VM. A cut run read as a broken page.
 
 ## What changes
 
@@ -25,8 +26,8 @@ defects:
 * The runner derives its cap from the movie: `180 + 12 x frames` seconds, read
   from the mirror's own manifest (the solver's 120-frame maximum when there is
   no manifest to read), overridable with `TDCHECK_TIMEOUT`, and printed. 12 s a
-  frame is ~2x the slowest per-frame cost measured here (740 s / 120 = 6.2 s,
-  against 2.2 s on an idle VM).
+  frame is ~2x the slowest per-frame cost measured on the 120-frame fixture
+  here (740 s / 120 = 6.2 s, against 2.2 s on an idle VM).
 * A run the cap cuts says so: the runner prints `harness timed out after Ns (M
   frames; ...)` and exits 124, and `tdcheck.mjs` prints a plain `HARNESS TIMED
   OUT` line and exits 124 on the signal that stops it, instead of exiting with a
