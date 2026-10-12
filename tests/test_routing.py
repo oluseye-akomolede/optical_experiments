@@ -1804,10 +1804,9 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
 
     So the assertion is not "the estimate grew". It is that the estimate and the
     count TetGen actually returns agree within the fitted coefficient's own
-    slack -- and the multi-part estimate is asserted to be EXACTLY the one-part
-    formula at h_min (here 8x the one-part count at h, because the core's index
-    halves the edge), which is what makes this a test of the multi-part branch
-    rather than of arithmetic both paths share.
+    slack -- and the multi-part estimate is asserted to be EXACTLY the per-region
+    sum (the wall at h, the core at h/2), which is what makes this a test of the
+    multi-part branch rather than of arithmetic both paths share.
     """
     parts, merged = _nested_parts()
     materials = {"wall": 1.0, "core": 2.0}
@@ -1827,41 +1826,58 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
     )
 
     ratio = estimate / actual
-    # The slack is the coefficient's own: EST_TETS_C is calibrated against real
-    # tetrahedralizations to within a small factor, and the whole point is that
-    # the TWO PATHS share it. A ratio near 1.5 is the fitted factor; a ratio of
-    # 0.15 is not a slack, it is the wrong formula.
-    assert 0.5 <= ratio <= 3.0, (
+    # The slack is the coefficient's own -- but a GRADED mesh's is WIDER, and
+    # that is a measured fact rather than a concession. EST_TETS_C is fitted
+    # against UNIFORM tetrahedralizations, where every tet sits at one edge. A
+    # sizing field grades, so the coarse region carries a TRANSITION: between
+    # the fine region's edge and the coarse one TetGen must step through
+    # intermediate sizes, and the tets in that band are finer than the region's
+    # target. The transition is intrinsic to a smooth field and its size scales
+    # with the edge ratio, so the per-region sum is a LOWER BOUND -- measured
+    # 0.37-0.46x on the nested fixtures (this 6/2 box 0.37, a 6/4 box 0.42 with
+    # a finer core, the matrix's shapes 0.39-0.46). The floor below is set under
+    # the worst measured case, and it is still far from 0.15 -- the wrong-formula
+    # floor -- so a collapse to the uniform rule (which would push the ratio
+    # toward 1.0, not 0.4) still fails here.
+    assert 0.25 <= ratio <= 3.0, (
         f"the estimate ({estimate:,}) and the mesh ({actual:,}) disagree by "
         f"{ratio:.2f}x -- the app would route this job on a number the mesher "
         f"does not confirm"
     )
 
-    # THE DISCRIMINATOR. Under the uniform rule the multi-part estimate IS the
-    # one-part formula evaluated at h_min, so the discriminating claim is about
-    # the EDGE, not about two formulas existing: this object has a core at n=2 in
-    # a wall at n=1, so h_min = h/2 and the estimate must be the one-part count
-    # at that finer edge -- 2^3 = 8x the one-part count at h, same volume, same
-    # coefficient. A branch that forgot the index (leaving h_min = h) gives 1x; a
-    # branch that squared the edge instead of cubing gives 2x or 4x.
-    #
-    # This is deliberately NOT `one_part != estimate` as a bare inequality: that
-    # passes for any accidental difference. It is the exact factor, which names
-    # the mechanism.
+    # THE DISCRIMINATOR. The multi-part estimate is the ONE-PART FORMULA SUMMED
+    # PER REGION, each region at ITS OWN edge -- the same ``region_edges`` the
+    # mesher builds from. This object is a core at n=2 in a wall at n=1, so the
+    # wall's edge is h and the core's is h/2. A branch that priced the whole
+    # cavity at h (the old uniform rule's wall edge) would land on the one-part
+    # count at h; a branch that priced every region at h/2 would be 8x it. The
+    # exact per-region sum names which one ran, and BOTH collapses are named
+    # below so neither can pass as a slack.
     one_part_at_h = MESH.estimate_tets(merged, 3, "mm")
-    assert one_part_at_h != estimate, (
-        f"the one-part and multi-part estimates are both {estimate:,}, so this "
-        f"test cannot tell whether the multi-part branch ran at all"
-    )
     h = COMMON.effective_edge_m(merged, n_modes=3, units="mm")
     plan = COMMON.region_plan(parts, materials, h, "mm")
-    h_min = plan[0]["edge_units"]
     v_cavity = sum(info["filled_volume_m3"] for info in plan.values())
-    expected = int(MESH.EST_TETS_C * v_cavity / (h_min ** 3))
+    per_region = sum(
+        info["filled_volume_m3"] / (info["edge_m"] ** 3) for info in plan.values()
+    )
+    expected = int(MESH.EST_TETS_C * per_region)
     assert estimate == expected, (
-        f"the multi-part estimate ({estimate:,}) is not the one-part formula at "
-        f"h_min ({expected:,}); the two paths must share the expression and the "
-        f"calibration constant, or the route and the mesh disagree"
+        f"the multi-part estimate ({estimate:,}) is not the per-region sum "
+        f"(c * sum_r V_r / h_r^3 = {expected:,}); the two paths must share the "
+        f"expression and the calibration constant, or the route and the mesh "
+        f"disagree"
+    )
+    # Not the OLD rule: the whole cavity priced at the wall's edge.
+    assert estimate > one_part_at_h, (
+        f"the estimate ({estimate:,}) is not above the one-part count at h "
+        f"({one_part_at_h:,}), so the core's finer edge never entered -- the "
+        f"uniform rule is back"
+    )
+    # Not the OTHER collapse: every region priced at the finest edge.
+    all_fine = int(MESH.EST_TETS_C * v_cavity / (plan[1]["edge_m"] ** 3))
+    assert estimate < all_fine, (
+        f"the estimate ({estimate:,}) is not below pricing the whole cavity at "
+        f"the core's edge ({all_fine:,}), so the wall was not kept coarse"
     )
 
     # THE VOLUME IS THE FILLED SUM, NOT THE MERGED SURFACE'S ENCLOSED VOLUME.
@@ -1886,62 +1902,64 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
         f"the filled sum is {v_cavity:g} m^3, not 216 mm^3 -- 6^3 with the 2^3 "
         f"core removed"
     )
-    octave = (h / h_min) ** 3
+    octave = (h / plan[1]["edge_m"]) ** 3
     assert octave == pytest.approx(8.0, rel=1e-9), (
-        f"h/h_min cubed is {octave:g}, not 8 -- the fixture no longer has the "
+        f"h/h_core cubed is {octave:g}, not 8 -- the fixture no longer has the "
         f"n=2-in-n=1 shape this test is built on"
     )
-    # THE 8x, MEASURED AGAINST THE EXACT ONE-PART EXPRESSION, NOT ITS ROUNDED
-    # COUNT. `estimate_tets` returns `int(c*V/h^3)`, so comparing against
-    # `one_part_at_h * 8 * (vc/me)` would multiply an ALREADY-TRUNCATED integer:
-    # the one-part count is int(2971.4508) = 2971, and 2971*8*(216/224) = 22919.1
-    # against the true 22922.6 -- a 3.5-element gap invented entirely by where the
-    # int() sits. The claim is about the FORMULA (the multi-part path is the
-    # one-part formula at h_min on the filled volume), so both sides are compared
-    # before truncation and the code's own int() is asserted separately below.
-    exact_one_part = (MESH.EST_TETS_C * merged_enclosed / (h ** 3))
-    exact_multi = MESH.EST_TETS_C * v_cavity / (h_min ** 3)
-    assert exact_multi == pytest.approx(exact_one_part * 8.0 * (v_cavity / merged_enclosed),
-                                        rel=1e-12), (
-        f"the multi-part formula ({exact_multi:.4f}) is not the one-part formula "
-        f"({exact_one_part:.4f}) rescaled by the two real changes -- the edge "
-        f"({h/h_min:g}x finer, so 8x the count) and the volume ({v_cavity/merged_enclosed:.6f}x, "
-        f"because the merged surface double-counts the nested core). That identity "
-        f"IS the uniform rule."
+    # THE PER-REGION SUM, BEFORE TRUNCATION. `estimate_tets_by_region` returns
+    # `int(c*sum_r V_r/h_r^3)`, so the claim is about the SUM, compared before
+    # the code's own int(). Previously this was the identity
+    # ``exact_multi == exact_one_part * 8 * (v_cavity/merged_enclosed)`` -- the
+    # multi-part figure was the one-part formula at h_min rescaled by the edge
+    # and the volume. Under the graded rule that identity is GONE: the wall is
+    # priced at h, not h_min, so only the core carries the 8x. The replacement
+    # names the graded mechanism instead: the wall at h plus the core at h/2.
+    exact_wall = MESH.EST_TETS_C * plan[0]["filled_volume_m3"] / (plan[0]["edge_m"] ** 3)
+    exact_core = MESH.EST_TETS_C * plan[1]["filled_volume_m3"] / (plan[1]["edge_m"] ** 3)
+    exact_graded = exact_wall + exact_core
+    assert estimate == int(exact_graded), (
+        f"the estimate ({estimate:,}) is not int({exact_graded:.4f}) = "
+        f"{int(exact_graded):,}, the wall at h plus the core at h/2; the branch is "
+        f"not the per-region sum"
     )
-    # ...and the code's own truncation is the one it should be.
-    assert estimate == int(exact_multi), (
-        f"the estimate ({estimate:,}) is not int({exact_multi:.4f}) = "
-        f"{int(exact_multi):,}; the branch is not computing the one-part formula "
-        f"at h_min on the filled volume"
+    # The core is 8x finer than the wall and tiny, yet it is the wall's term that
+    # dominates -- a fixture-shape guard so the "wall stayed coarse" claim above
+    # cannot quietly become vacuous if the volumes move.
+    assert exact_wall > exact_core, (
+        "the wall's term is not the larger one; this fixture's shape has drifted"
     )
 
 
-def test_every_region_is_meshed_at_h_min_the_finest_region_edge():
-    """The uniform rule: ONE edge for the whole cavity, the finest region's.
+def test_each_region_gets_its_own_edge_and_the_finest_is_unchanged():
+    """The graded rule: a region's edge is its own, floored at the finest.
 
     THIS TEST HAS ASSERTED THREE DIFFERENT MODELS, and the history is the point.
     It first required ``effective_edge_m`` to return ``min(h / n_region)`` --
     the finest region's edge applied as the GLOBAL -- which meshed the WALL at
     the core's resolution and refused a GPU-sized upload as cluster-sized. Then
     it required the opposite: the global stays the WALL's edge and each region
-    is fined RELATIVE to it. That model is right about the physics and cannot be
-    implemented here: TetGen's per-region volume, ``add_region``'s ``max_vol``,
-    was measured INERT on a nested PLC -- a nine-order sweep left the region's
-    own element count byte-identical.
+    is fined RELATIVE to it -- implemented as a UNIFORM mesh at ``h_min``,
+    because TetGen's per-region volume, ``add_region``'s ``max_vol``, was
+    measured INERT on a nested PLC (a nine-order sweep left the region's own
+    element count byte-identical).
 
-    So the model is now UNIFORM: every region is meshed at ``h_min = min_r(h *
-    n_wall / n_r)``, floored at ``h``. ``effective_edge_m`` still returns the
-    WEYL edge (index-independent, as its own docstring says); ``h_min`` lives in
-    ``region_plan``, which the mesher AND the estimate both call.
+    Now each region gets its OWN edge, delivered by TetGen's SIZING FUNCTION --
+    a different mechanism, and a real one. ``effective_edge_m`` still returns
+    the Weyl edge (index-independent, as its own docstring says); the per-region
+    rule lives in ``mse_common.region_edges``, which the mesher AND the estimate
+    both call. ``h_min`` -- the finest region's edge -- is UNCHANGED from the
+    uniform rule, so the resolution the cavity is solved at does not move.
 
-    Three claims, each with its mutation named:
+    Claims, each with its mutation named:
       * ``effective_edge_m`` does not move with either index. Mutation: make
         ``target_edge_length`` fold ``n_index`` in.
-      * a denser core moves the plan's single edge DOWN, by exactly
-        ``n_wall/n_core``. Mutation: collapse the ratio to 1.
-      * a LESS dense core does not move it UP. Mutation: drop the ``min(h, ...)``
-        floor, so a vacuum core coarsens the wall.
+      * a denser core gets a finer edge, by exactly ``n_wall/n_core``, while the
+        wall keeps h. Mutation: collapse the ratio to 1.
+      * a LESS dense core does not coarsen anything: its edge floors at h, and
+        the wall's is unchanged. Mutation: drop the ``min(h, ...)`` floor, so a
+        vacuum core coarsens the whole cavity.
+      * the base is a METRE edge (the space ``region_edges`` documents).
     """
     parts, merged = _nested_parts()
 
@@ -1960,35 +1978,46 @@ def test_every_region_is_meshed_at_h_min_the_finest_region_edge():
             f"{vacuum:.6g}; it is index-independent by design"
         )
 
-    base = vacuum / MESHSOLVER.unit_scale("mm")
+    # The base is the METRE edge -- the space ``region_edges`` documents and the
+    # mesher passes. Passing upload units here (as this test used to) is the
+    # unit-space bug the clamp made fatal.
+    base = vacuum
 
-    # Equal indices: the plan's one edge IS the Weyl edge.
+    # Equal indices: every region's edge IS the Weyl edge -- and so the plan is
+    # NOT graded, which is what keeps a mesh whose regions share an index on the
+    # byte-identical uniform path.
     eq = COMMON.region_plan(parts, {"wall": 1.0, "core": 1.0}, base, "mm")
-    assert {round(i["edge_units"], 12) for i in eq.values()} == {round(base, 12)}, (
-        f"equal indices must give one edge equal to h, got "
-        f"{[i['edge_units'] for i in eq.values()]}"
+    assert {round(i["edge_m"], 12) for i in eq.values()} == {round(base, 12)}, (
+        f"equal indices must give every region the edge h, got "
+        f"{[i['edge_m'] for i in eq.values()]}"
     )
 
-    # A DENSER core pulls the single edge down by exactly n_wall/n_core.
+    # A DENSER core gets a FINER edge; the wall keeps h.
     dense = COMMON.region_plan(parts, {"wall": 1.0, "core": 4.0}, base, "mm")
-    edges = {i["edge_units"] for i in dense.values()}
-    assert len(edges) == 1, (
-        f"the plan must report ONE edge for every region, got {edges}"
+    assert dense[0]["edge_m"] == pytest.approx(base, rel=1e-9), (
+        f"the wall's edge moved to {dense[0]['edge_m']:.6g} from h={base:.6g}; "
+        f"a denser CORE must not change the WALL"
     )
-    assert next(iter(edges)) == pytest.approx(base / 4.0, rel=1e-9), (
-        f"a core of n=4 must mesh the cavity at h*n_wall/n_core = "
-        f"{base / 4.0:.6g}, got {next(iter(edges)):.6g}"
+    assert dense[1]["edge_m"] == pytest.approx(base / 4.0, rel=1e-9), (
+        f"a core of n=4 must get h*n_wall/n_core = {base / 4.0:.6g}, got "
+        f"{dense[1]['edge_m']:.6g}"
     )
+    # The finest region edge is the core's -- unchanged from the uniform rule,
+    # which is the accuracy claim: a graded mesh solves the fine region at the
+    # exact edge a uniform mesh would have used for everything.
+    assert min(i["edge_m"] for i in dense.values()) == pytest.approx(base / 4.0)
 
-    # A LESS dense core must NOT coarsen the wall: h_min is a floor.
+    # A LESS dense core must NOT coarsen anything: its edge floors at h, and the
+    # wall is untouched.
     thin = COMMON.region_plan(parts, {"wall": 1.0, "core": 0.25}, base, "mm")
-    thin_edges = {i["edge_units"] for i in thin.values()}
-    assert len(thin_edges) == 1
-    assert next(iter(thin_edges)) == pytest.approx(base, rel=1e-9), (
-        f"a core of n=0.25 must not coarsen the cavity past h={base:.6g}; got "
-        f"{next(iter(thin_edges)):.6g} -- h_min is a resolution floor, not a "
-        f"function of the densest region alone"
+    assert thin[1]["edge_m"] == pytest.approx(base, rel=1e-9), (
+        f"a core of n=0.25 must not coarsen past h={base:.6g}; got "
+        f"{thin[1]['edge_m']:.6g} -- h is a resolution floor, not a function of "
+        f"the densest region alone"
     )
+    assert thin[0]["edge_m"] == pytest.approx(base, rel=1e-9)
+    # ...so an all-floor plan is NOT graded, and takes the uniform path.
+    assert {round(i["edge_m"], 12) for i in thin.values()} == {round(base, 12)}
 
 
 def _region_median_edges(points_m, tets, region_of_tet):
@@ -2034,19 +2063,20 @@ def test_the_matrix_holds_with_real_tetgen_and_no_steiner_cap():
         a change confined to the core was invisible. The assertion below is on
         the CORE'S OWN median edge.
 
-    The claims, under the uniform rule:
+    The claims, under the GRADED rule:
 
-    1. THE RESOLUTION REQUIREMENT. Each region r must be meshed no coarser than
-       its own required edge ``h * n_wall / n_r``. Since ``h_min`` is
-       ``min(h, h*n_wall/n_max)`` and ``n_r <= n_max``, the tightest case is
-       ``r = argmax n`` -- so proving the tightest case proves them all, and
-       the test asserts it on the DENSEST region's measured median edge, which
-       is what actually failed under the old model.
-    2. THE ESTIMATE AGREES. ``est / actual`` sits in the same band the one-part
-       calibration is fitted to, because under (i') the two are the SAME
-       expression at the same edge on the same volume. A band of [0.5, 3.0]
-       would be too loose to catch a wrong formula; the one-part fit is
-       conservative (~1.0-2.0 measured), so the band here is the same shape.
+    1. THE RESOLUTION REQUIREMENT, per region, on EACH region's OWN edge. The
+       rule is ``edge_r = max(min(h * n_wall / n_r, thickness_r), h_min)`` with
+       ``h_min = min_r`` of the ramp, so the wall keeps ``h``, a region denser
+       than the wall gets a finer edge, and the finest one is never moved (the
+       floor pins it). Every region's measured median edge must be within the
+       mesh's own overshoot of ITS target -- undershoot on the dense region
+       stops being the only thing checked.
+    2. THE ESTIMATE AGREES, in the band the per-region sum is calibrated to. A
+       GRADED mesh is a LOWER bound (the sizing field's transition refines the
+       coarse region past its target -- see
+       ``test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds``),
+       so the floor is that measured worst case, not the uniform fit's.
 
     Cost: the feature floor is set to 0.9 mm so the whole matrix is a few
     thousand to ~140k tets -- tier 1, seconds, no cluster.
@@ -2065,10 +2095,28 @@ def test_the_matrix_holds_with_real_tetgen_and_no_steiner_cap():
         for n_core in (1.0, 2.0, 3.5):
             materials = {"wall": n_wall, "core": n_core}
             plan = COMMON.region_plan(parts, materials, h_base, "mm")
-            h_min = plan[0]["edge_units"]
-            assert all(
-                info["edge_units"] == h_min for info in plan.values()
-            ), "the uniform rule means ONE edge for every region"
+            h_edge = {rid: info["edge_m"] for rid, info in plan.items()}
+            h_min = min(h_edge.values())
+            # The ONE rule, restated from the plan's OWN fields so a rule change
+            # is caught here rather than silently absorbed: every edge is
+            # max(min(ramp, thickness), h_min).
+            for info in plan.values():
+                assert info["edge_m"] == pytest.approx(
+                    max(min(info["unclamped_m"], info["thickness_m"]), h_min),
+                    rel=1e-12,
+                ), f"n_wall={n_wall} n_core={n_core}: plan edge breaks the rule"
+            # The RAMP itself: the wall at h, a region denser than the wall at
+            # h*n_wall/n_r -- floored at h, so a LESS dense region stays at h.
+            for rid, info in plan.items():
+                n_r = materials["wall" if rid == 0 else "core"]
+                assert info["unclamped_m"] == pytest.approx(
+                    min(h_base, h_base * n_wall / n_r), rel=1e-12
+                ), f"n_wall={n_wall} n_core={n_core}: ramp wrong for region {rid}"
+            graded = len({round(v, 12) for v in h_edge.values()}) > 1
+            # No cell in THIS fixture is thin enough to clamp: the core's
+            # thickness proxy is 0.667 mm and every core ramp here is finer. The
+            # clamp is proven on its own thin-shell fixture below.
+            assert not any(info["unclamped_m"] > info["edge_m"] for info in plan.values())
 
             points, tets, region_of_tet = MESHSOLVER.tetrahedralize(
                 merged, "mm", n_modes=3, n_index=1.0, max_tets=500_000,
@@ -2089,51 +2137,62 @@ def test_the_matrix_holds_with_real_tetgen_and_no_steiner_cap():
                 min_feature_m=min_feature_m,
             )
             rows.append((n_wall, n_core, {
-                "h_min_m": h_min, "n_tets": actual, "est": est,
+                "h_min_m": h_min, "graded": graded, "n_tets": actual, "est": est,
                 "wall": med[0], "core": med[1],
+                "wall_edge": h_edge[0], "core_edge": h_edge[1],
             }))
 
-            # 1. THE RESOLUTION REQUIREMENT, on the DENSEST region (the core
-            #    here, since n_core >= n_wall in every cell that has one). Its
-            #    required edge is h * n_wall / n_core; its achieved median edge
-            #    must be no coarser than that, times the mesh's own overshoot.
+            # 1. THE RESOLUTION REQUIREMENT, on EACH region's OWN required edge
+            #    -- which under the graded rule is that region's plan edge, not a
+            #    single h_min. Its achieved median edge must be no coarser than
+            #    that, times the mesh's own overshoot.
             #
-            #    BOTH SIDES ARE IN SURFACE UNITS. A previous version compared a
+            #    BOTH SIDES ARE IN METRES. A previous version compared a
             #    metre-space bound against a number it had already divided by
             #    1000, so every cell passed at ~1e-6 against ~0.9 -- a vacuous
-            #    green. The lower bound below proves the bound can fail.
-            h_core_required_m = h_base * n_wall / n_core
-            achieved_core = med[1][0]
-            assert achieved_core <= h_core_required_m * MESHSOLVER.MAX_EDGE_OVERSHOOT, (
-                f"n_wall={n_wall} n_core={n_core}: the core is meshed at "
-                f"{achieved_core * 1e3:.4f} mm but needs "
-                f"{h_core_required_m * 1e3:.4f} mm (h_min="
-                f"{h_min * 1e3:.4f} mm); the densest region is under-resolved, "
-                f"which is the exact failure (i) would have shipped"
-            )
-            # POSITIVE CONTROL: the median edge must also be no finer than a
-            # small fraction of the requirement. Without this half, a bound
-            # written ``achieved <= required`` is satisfied by ANY fine mesh --
-            # including one built at a 1000x-too-small edge, which is exactly
-            # the unit bug this test already shipped once. Requiring the edge
-            # to be within [required/10, required*overshoot] pins it from BOTH
-            # sides, so a mesh at the wrong SCALE fails here even though it
-            # would pass the upper bound alone.
-            assert achieved_core >= h_core_required_m / 10.0, (
-                f"n_wall={n_wall} n_core={n_core}: the core's median edge "
-                f"{achieved_core * 1e3:.5f} mm is more than 10x FINER than "
-                f"required ({h_core_required_m * 1e3:.5f} mm); that is not a mesh "
-                f"this code asks for, it is a scale error, and the upper bound "
-                f"alone would accept it"
-            )
-            assert med[1][1] > 0, (
-                f"n_wall={n_wall} n_core={n_core}: the core got no tets at all, "
-                f"so every other number here is about the wall only"
-            )
+            #    green. The lower bounds below prove the bounds can fail.
+            for rid, (achieved_region, n_region_tets) in med.items():
+                required = h_edge[rid]
+                assert achieved_region <= required * MESHSOLVER.MAX_EDGE_OVERSHOOT, (
+                    f"n_wall={n_wall} n_core={n_core}: region {rid} is meshed at "
+                    f"{achieved_region * 1e3:.4f} mm but its own edge requires "
+                    f"{required * 1e3:.4f} mm; a region is under-resolved"
+                )
+                # POSITIVE CONTROL: also no finer than a small fraction of the
+                # requirement. Without this half, ``achieved <= required`` is
+                # satisfied by ANY fine mesh -- including one built at a
+                # 1000x-too-small edge, the unit bug this test already shipped
+                # once. Pinning from BOTH sides makes a wrong-scale mesh fail.
+                assert achieved_region >= required / 10.0, (
+                    f"n_wall={n_wall} n_core={n_core}: region {rid}'s median edge "
+                    f"{achieved_region * 1e3:.5f} mm is >10x FINER than required "
+                    f"({required * 1e3:.5f} mm) -- a scale error, not a mesh"
+                )
+                assert n_region_tets > 0, (
+                    f"n_wall={n_wall} n_core={n_core}: region {rid} got no tets, "
+                    f"so every number here is about the other region only"
+                )
+            # THE GRADING IS REAL. On a cell whose plan is graded, the core's
+            # achieved edge must actually be finer than the wall's -- the
+            # sizing field delivered the per-region edges, not a uniform mesh.
+            # This is the claim the whole feature rests on, asserted on the
+            # built mesh rather than on the plan.
+            if graded:
+                assert med[1][0] < med[0][0], (
+                    f"n_wall={n_wall} n_core={n_core}: the plan is graded (core "
+                    f"edge {h_edge[1] * 1e3:.4f} mm < wall {h_edge[0] * 1e3:.4f} "
+                    f"mm) but the built mesh is not -- the core's median edge "
+                    f"{med[1][0] * 1e3:.4f} mm is not finer than the wall's "
+                    f"{med[0][0] * 1e3:.4f} mm. The sizing field did not grade."
+                )
 
-            # 2. THE ESTIMATE. Same band the one-part calibration is fitted to.
+            # 2. THE ESTIMATE. The per-region sum shares the one-part
+            #    calibration, but a GRADED mesh carries a transition (see
+            #    ``test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds``),
+            #    so the band's floor is the measured worst case, not the
+            #    uniform fit's.
             ratio = est / actual
-            assert 0.5 <= ratio <= 3.0, (
+            assert 0.25 <= ratio <= 3.0, (
                 f"n_wall={n_wall} n_core={n_core}: est {est:,} vs actual "
                 f"{actual:,} is {ratio:.3f}x, outside the calibrated band"
             )
@@ -2144,18 +2203,28 @@ def test_the_matrix_holds_with_real_tetgen_and_no_steiner_cap():
     # ``med`` is in metres; printing at 1e3 gives mm, and the label says so.
     report = "\n".join(
         f"  n_wall={nw:>3} n_core={nc:>3}  h_min={r['h_min_m'] * 1e3:7.4f}mm  "
+        f"graded={str(r['graded']):>5}  "
         f"n={r['n_tets']:>7,}  est={r['est']:>7,}  "
-        f"wall(med {r['wall'][0] * 1e3:7.4f}mm, {r['wall'][1]:>6,} tets)  "
-        f"core(med {r['core'][0] * 1e3:7.4f}mm, {r['core'][1]:>6,} tets)"
+        f"wall(tgt {r['wall_edge'] * 1e3:7.4f}mm, med {r['wall'][0] * 1e3:7.4f}mm, "
+        f"{r['wall'][1]:>6,} tets)  "
+        f"core(tgt {r['core_edge'] * 1e3:7.4f}mm, med {r['core'][0] * 1e3:7.4f}mm, "
+        f"{r['core'][1]:>6,} tets)"
         for nw, nc, r in rows
     )
     print("\nMATRIX (real TetGen, no steinerleft cap):\n" + report)
 
     # A collapse detector, not decoration: the rows must not all share a count.
+    # With grading, the cells that are NOT graded (every region at h, so the
+    # mesh is the uniform one) legitimately share a count; the graded cells
+    # carry the per-region edges and must differ.
     counts = {r["n_tets"] for _nw, _nc, r in rows}
     assert len(counts) >= 3, (
         f"only {len(counts)} distinct tet counts across nine cells -- a cap or a "
         f"collapsed edge is bounding every run the same way:\n{report}"
+    )
+    assert sum(r["graded"] for _nw, _nc, r in rows) >= 3, (
+        f"fewer than three cells graded, so the graded arm is barely exercised "
+        f"by this matrix:\n{report}"
     )
 
 
@@ -2183,15 +2252,29 @@ def test_equal_indices_give_the_same_count_as_the_one_part_mesh():
         merged, n_modes=3, units="mm", min_feature_m=min_feature_m
     )
     plan = COMMON.region_plan(parts, materials, h_base, "mm")
-    assert plan[0]["edge_units"] == pytest.approx(h_base, rel=1e-12), (
-        "equal indices must leave h_min at h, or this test is not comparing "
-        "like with like"
+    assert [info["edge_m"] for info in plan.values()] == pytest.approx(
+        [h_base, h_base], rel=1e-12
+    ), (
+        "equal indices must leave every edge at h, or this test is not "
+        "comparing like with like"
     )
-
+    # And the MESHER must route down the UNGRADED arm: one edge everywhere is
+    # exactly today's mesh, which is the byte-identity requirement this test is
+    # the control for. ``graded`` is the mesher's own verdict, read back from
+    # its report AFTER the run, so a mesher that took the sizing-field path on
+    # equal indices is caught here instead of passing on a coincidentally equal
+    # count.
     _p_multi, tets_multi, region_of_tet = MESHSOLVER.tetrahedralize(
         merged, "mm", n_modes=3, n_index=1.0, max_tets=500_000,
         min_feature_m=min_feature_m, verbose=False,
         materials=materials, parts=parts,
+    )
+    assert MESHSOLVER.LAST_MESH_REPORT is not None and (
+        MESHSOLVER.LAST_MESH_REPORT["graded"] is False
+    ), (
+        "equal indices must not take the sizing-field path; its PLC differs "
+        "from the uniform call's (a background tetrahedralization of its own), "
+        "and NOT taking it is what makes this comparison meaningful"
     )
     _p_one, tets_one = MESHSOLVER.tetrahedralize(
         merged, "mm", n_modes=3, n_index=1.0, max_tets=500_000,
@@ -2389,10 +2472,13 @@ def test_meshing_at_the_walls_edge_leaves_the_dense_core_unresolved(monkeypatch)
     # THE ANCHOR: prove the mutation is applied before believing the red.
     original = COMMON.region_edges
 
-    def wall_edge_only(h, n_wall, materials, parts_):
-        # The mutation: every region at the wall's edge, no n_wall/n_max factor.
-        return {int(r): float(h) for r in
-                parts_.region_materials(materials)}
+    def wall_edge_only(h, n_wall, materials, parts_, units):
+        # The mutation: every region at the wall's edge, no n_wall/n_max factor
+        # and no thickness clamp. Same shape as the real rule's return, so the
+        # mutation exercises the CALLER rather than die on a KeyError.
+        return {int(r): {"edge": float(h), "unclamped": float(h),
+                         "thickness_m": float("inf")}
+                for r in parts_.region_materials(materials)}
 
     # Apply it where region_plan reads it -- mse_common's own module global.
     monkeypatch.setattr(COMMON, "region_edges", wall_edge_only)
@@ -2404,7 +2490,7 @@ def test_meshing_at_the_walls_edge_leaves_the_dense_core_unresolved(monkeypatch)
     materials = {"wall": n_wall, "core": n_core}
 
     # Under the mutation the planned edge is h, not h*2/3.5.
-    mutated_h_min = COMMON.region_plan(parts, materials, h_base, "mm")[0]["edge_units"]
+    mutated_h_min = COMMON.region_plan(parts, materials, h_base, "mm")[0]["edge_m"]
     assert mutated_h_min == pytest.approx(h_base, rel=1e-12), (
         f"the mutation must leave the edge at the wall's h={h_base:.4f}, got "
         f"{mutated_h_min:.4f}"

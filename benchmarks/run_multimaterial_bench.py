@@ -374,10 +374,43 @@ def _run_case(label: str, n_core: float | None, *, n_modes: int, grid: int,
     a_eff, b_eff, ab_eff = _effective_radii(parts, n_core, units="mm")
     _n, ref = _analytic(n_core, ab_eff)
     _n_ideal, ref_ideal = _analytic(n_core, A_OVER_B)
+
+    # THE UNIFORM REFERENCE -- what this SAME object costs when every region is
+    # meshed at the fine region's edge. That is the count grading is claiming to
+    # beat, so it is MEASURED (a real mesh of the same bytes, one part, at that
+    # edge) rather than taken from the estimate, which is a fitted lower bound
+    # for a graded mesh and says nothing about the uniform one.
+    #
+    # Mesh-only: the case's own solve above already established the spectrum, and
+    # a second solve would cost minutes of GPU for a number the mesh alone gives.
+    # Read the graded report BEFORE this runs -- ``tetrahedralize`` overwrites
+    # ``MESH.LAST_MESH_REPORT`` on every call, and a one-part mesh overwrites it
+    # with ``None``.
+    mesh_block = modes_json.get("mesh")
+    fine_units = (target_units / float(n_core)) if n_core else None
+    uniform_n_tets = None
+    uniform_error = None
+    if n_core is not None:
+        try:
+            merged_uniform = SOLVER.PARTS.merged_surface(parts)
+            _up, utets, _ur = MESH.tetrahedralize(
+                merged_uniform, "mm", n_modes=n_modes, n_index=1.0,
+                max_tets=600_000, min_feature_m=fine_units * 1e-3,
+                verbose=False, materials=None, parts=None)
+            uniform_n_tets = int(utets.shape[0])
+        except Exception as exc:  # noqa: BLE001 - a failed REFERENCE is data
+            uniform_error = f"{type(exc).__name__}: {exc}"
     return {
         "label": label,
         "n_core": n_core,
         "n_tets": summary["n_tets"],
+        "uniform_n_tets": uniform_n_tets,
+        "uniform_error": uniform_error,
+        "tets_vs_uniform": (
+            uniform_n_tets and summary["n_tets"] / uniform_n_tets
+        ),
+        "fine_edge_units": fine_units,
+        "mesh": mesh_block,
         "elapsed_s": elapsed,
         "kb_computed": kb.tolist(),
         "reference": [{"kb": k, "l": l, "family": f, "multiplicity": m}
@@ -482,6 +515,14 @@ def main(argv: list[str]) -> int:
         report["cases"].append(case)
         print(f"[bench] {label}: {case['n_tets']:,} tets, "
               f"{case['elapsed_s']:.1f}s, backend {case['solver_backend']}")
+        if case.get("uniform_n_tets"):
+            print(f"[bench] {label}: {case['n_tets']:,} vs "
+                  f"{case['uniform_n_tets']:,} tets for the same object meshed "
+                  f"uniformly at {case['fine_edge_units']:.4g} mm -- "
+                  f"{case['tets_vs_uniform']*100:.1f}% of uniform")
+        elif case.get("uniform_error"):
+            print(f"[bench] {label}: no uniform reference; the reference mesh "
+                  f"RAISED: {case['uniform_error']}")
         # The geometry the score is taken at, and the ideal it would be taken at
         # if the mesh were not faceted. Both, because the gap between them is
         # the mesh generator's cost and not the solver's error -- printing only
@@ -513,6 +554,51 @@ def main(argv: list[str]) -> int:
             print(f"[bench] {label}: *** {len(score['count_mismatches'])} "
                   f"multiplet(s) short of modes below the cutoff ***")
         print()
+
+    # THE ACCEPTANCE CRITERIA, stated as pass/fail rather than left for the
+    # reader to compute. Two claims are being made for grading: the frequencies
+    # do not get worse (the dense core's error stays within twice the empty
+    # sphere's) and the mesh does get cheaper (fewer tets than the same object
+    # meshed uniformly at the fine edge). The empty case is the baseline for the
+    # first because it is the same object with no grading decision to make --
+    # its error is the harness's own faceting floor.
+    by_label = {c["label"]: c for c in report["cases"] if "score" in c}
+    baseline = by_label.get("empty", {}).get("score", {}).get("worst_rel_error")
+    print("-" * 60)
+    print("[bench] ACCEPTANCE (worst matched multiplet error, vs the empty "
+          "sphere's; tets vs a uniform mesh of the same object)")
+    if baseline is None:
+        # An absent baseline is a MISSING MEASUREMENT, not a pass and not a
+        # silent skip: the error criterion cannot be decided without the control
+        # case, and a report that printed only the tets half would read as if
+        # the error half had been fine.
+        print("[bench]   NO empty-sphere baseline in this run, so the error "
+              "criterion is UNMEASURED -- re-run including the 'empty' case")
+    else:
+        print(f"[bench]   empty (baseline): worst {baseline*100:.3f}%")
+    for c in report["cases"]:
+        score = c.get("score") or {}
+        worst = score.get("worst_rel_error")
+        if c["label"] != "empty":
+            if worst is None:
+                print(f"[bench]   {c['label']}: no scored modes -- error "
+                      f"criterion UNMEASURED")
+            elif baseline is None:
+                print(f"[bench]   {c['label']}: worst {worst*100:.3f}% -- "
+                      f"NO BASELINE to compare it against")
+            else:
+                err_ok = worst <= 2.0 * baseline
+                print(f"[bench]   {c['label']}: worst {worst*100:.3f}% "
+                      f"({worst/baseline:.2f}x the empty sphere) -> "
+                      f"{'PASS' if err_ok else 'FAIL'} (<= 2.00x)")
+        ratio = c.get("tets_vs_uniform")
+        if ratio is not None:
+            print(f"[bench]   {c['label']}: {ratio*100:.1f}% of uniform tets -> "
+                  f"{'PASS' if ratio < 1.0 else 'FAIL'} (< 100%)")
+        elif c["label"] != "empty":
+            print(f"[bench]   {c['label']}: tets vs uniform UNMEASURED "
+                  f"({c.get('uniform_error') or 'the reference was not built'})")
+    print("=" * 60)
 
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=2))

@@ -9,6 +9,7 @@ failure, and a Job is deleted once its result is recorded.
 
 from __future__ import annotations
 
+import html as HTML
 import io
 import json
 import re
@@ -306,7 +307,8 @@ class FakeDb:
         return requeued
 
     # set a job up as finished, with a mode table and field files on disk
-    def finish(self, job_id, store, n_modes=2, achieved_median_edge_m=None):
+    def finish(self, job_id, store, n_modes=2, achieved_median_edge_m=None,
+               mesh=None):
         grid = {"nx": 4, "ny": 3, "nz": 2, "origin": [0.0, 0.0, 0.0],
                 "spacing": [1.0, 1.0, 1.0]}
         self.jobs[str(job_id)].update(status=DB.DONE, stage=DB.DONE,
@@ -327,6 +329,11 @@ class FakeDb:
         # the "no measurement yet" branch behind a null.
         if achieved_median_edge_m is not None:
             manifest["achieved_median_edge_m"] = achieved_median_edge_m
+        # Only when the solver had regions to report, mirroring write_results:
+        # a one-part job's manifest has NO ``mesh`` key, which is what makes the
+        # "nothing new for a single-material job" control a real control.
+        if mesh is not None:
+            manifest["mesh"] = mesh
         store.write(STORE.job_key(job_id, "modes.json"),
                     json.dumps(manifest).encode())
         store.write(STORE.job_key(job_id, "surface.glb"), b"glTF")
@@ -770,6 +777,95 @@ def test_the_job_page_reports_the_achieved_edge_once_the_run_is_finished(tmp_pat
     manifest = FLD.load_modes_json(
         store.read(STORE.job_key(job["job_id"], "modes.json")))
     assert manifest["achieved_median_edge_m"] == achieved_m
+
+
+def test_the_job_page_states_how_a_graded_mesh_was_graded(tmp_path):
+    """A graded job's page shows each region's resolution and the caveats.
+
+    The block is the SOLVER's own record (``modes.json``'s ``mesh``), read back
+    through the real route. The page must not re-derive it: the request says what
+    was ASKED for and the block says what was BUILT, and only the second is right
+    about the mesh the frequencies rest on.
+
+    The control is the other half. A uniform multi-region job also carries a
+    block (``graded`` false), and it must show NOTHING new -- otherwise a page
+    that rendered the table unconditionally would pass a graded-only assertion
+    while telling every uniform job that it had been graded.
+    """
+    app, store, db, _launcher = make_app(tmp_path)
+    client = app.test_client()
+    box = trimesh.creation.box(extents=[6.0, 6.0, 6.0])
+    upload(client, data=box.export(file_type="obj").encode(), units="mm")
+    (job,) = db.jobs.values()
+
+    graded_block = {
+        "graded": True, "fine_region": 1,
+        "target_edge_m": 2.545e-4, "target_edge_units": 0.2545,
+        "coarse_edge_m": 1.8e-3,
+        "achieved_edge_m": 3.0e-3, "fine_achieved_edge_m": 2.795e-4,
+        "regions": {
+            "0": {"part": "wall", "n": 2.0, "target_edge_m": 1.8e-3,
+                  "target_edge_units": 1.8, "unclamped_edge_m": 1.8e-3,
+                  "thickness_m": 1.6e-3, "clamped": False,
+                  "filled_volume_m3": 2.0e-7,
+                  "achieved_edge_m": 1.79e-3, "achieved_edge_units": 1.79,
+                  "tets": 900},
+            "1": {"part": "core", "n": 3.5, "target_edge_m": 2.545e-4,
+                  "target_edge_units": 0.2545, "unclamped_edge_m": 1.0286e-3,
+                  "thickness_m": 6.6e-4, "clamped": True,
+                  "filled_volume_m3": 8.0e-9,
+                  "achieved_edge_m": 2.795e-4, "achieved_edge_units": 0.2795,
+                  "tets": 62},
+        },
+        "caveats": ["the mesh is GRADED: region 1 is meshed at 0.2545 mm",
+                    "region 1 ('core') was held to 0.2545 mm, FINER than the "
+                    "1.0286 mm its material index asks for"],
+    }
+    db.finish(job["job_id"], store, mesh=graded_block)
+
+    body = client.get(f"/jobs/{job['job_id']}").get_data(as_text=True)
+    assert 'id="mesh-grading"' in body, (
+        "a graded job's page does not report the grading at all"
+    )
+    flat = " ".join(HTML.unescape(body).split())
+    # Each region's resolution, in the OWNER'S unit, both from the solver's own
+    # numbers -- the target it was asked for and the median it achieved.
+    assert "1.8 mm" in flat and "1.79 mm" in flat, flat
+    assert "0.2545 mm" in flat and "0.2795 mm" in flat, flat
+    # The caveats are the mesher's sentences, printed rather than re-worded.
+    # Unescaped first: the mesher names a part with ``repr``, so a real caveat
+    # carries quotes, and a page whose escaping was broken would otherwise read
+    # as a missing caveat rather than as a rendering fault.
+    for note in graded_block["caveats"]:
+        assert " ".join(note.split()) in flat, f"caveat not shown: {note!r}"
+    # The finest region is held to what a uniform mesh would give it. That is the
+    # claim that keeps the frequency accuracy from moving, so the page makes it.
+    assert "same size a uniform mesh" in flat, flat
+
+    # THE CONTROL: the same page with a NOT-graded block shows none of it.
+    app2, store2, db2, _l2 = make_app(tmp_path / "uniform")
+    client2 = app2.test_client()
+    upload(client2, data=box.export(file_type="obj").encode(), units="mm")
+    (job2,) = db2.jobs.values()
+    uniform_block = dict(graded_block, graded=False,
+                         caveats=[], fine_region=0)
+    db2.finish(job2["job_id"], store2, mesh=uniform_block)
+    body2 = client2.get(f"/jobs/{job2['job_id']}").get_data(as_text=True)
+    flat2 = " ".join(body2.split())
+    assert 'id="mesh-grading"' not in body2, (
+        "a uniform job's page claims its mesh was graded"
+    )
+    assert "0.2545 mm" not in flat2, (
+        "a uniform job's page shows per-region resolutions it does not have"
+    )
+    # And a job with NO block at all (a one-part mesh) is equally untouched.
+    app3, store3, db3, _l3 = make_app(tmp_path / "onepart")
+    client3 = app3.test_client()
+    upload(client3, data=box.export(file_type="obj").encode(), units="mm")
+    (job3,) = db3.jobs.values()
+    db3.finish(job3["job_id"], store3)
+    body3 = client3.get(f"/jobs/{job3['job_id']}").get_data(as_text=True)
+    assert 'id="mesh-grading"' not in body3
 
 
 def test_the_achieved_caption_honours_the_feature_unit_not_the_objects(tmp_path):
