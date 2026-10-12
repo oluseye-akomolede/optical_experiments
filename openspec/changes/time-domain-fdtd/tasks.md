@@ -142,11 +142,6 @@
   through a core face hook. Solver API only (`bloch=`); a paired run refuses
   metals and plane waves, and the memory estimate does not yet count the sin
   set (both belong with the form option).
-- [ ] 6.2 Benchmark V6 against the existing pc band solver: an extruded 2-D
-  crystal, TM and TE, kz = 0, frequencies at chosen k-points within 1%, every
-  band present.
-  Bench `scripts/fdtd_bench_v6.py` written, with the homogeneous |k + G| / n
-  check at six k (tier-1 `--tiny`: four k, 26 s, in tests/test_fdtd_bench_v6.py).
-  Crystal lines also pass a two-resolution convergence gate (48 and 64
-  cells, eps sampled 9 per cell edge, 150 periods recorded).
-  Ticked when the lead's six Jetson commands (its docstring) all exit 0.
+- 6.2 Benchmark V6: NOT DONE here. Moved, with its three spec scenarios, to the
+  open change `td-bloch-v6-benchmark` (lead, 2026-10-12) so that this change
+  archives only behaviour that was verified; the full Jetson run never passed.

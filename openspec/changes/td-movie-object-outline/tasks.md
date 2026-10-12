@@ -44,14 +44,16 @@
       last frame and the frame Play reached differs by 44934 of its 834x331
       pixels when the outline is not drawn, against a control that still draws
       1622..20748 lit pixels of field (the floor is 1/64 of those, 26..325).
-- [ ] Measured green on a mirror of a REAL job (the owner's film job or another
+- [x] Measured green on a mirror of a REAL job (the owner's film job or another
       finished td job whose parts are offset inside their domain) -- the fixture
-      cannot see a translation to its own box's centre, that mirror can. NOT
-      DONE, and it cannot be done from the builder's seat: a job mirror carries
-      ``outline.glb`` only once the route this change adds is deployed, and the
-      raw upload it is derived from has no route at all (only the store does).
-      It is the lead's to run after deploy; no real-job numbers are claimed
-      anywhere in this change until that run exists as a log.
+      cannot see a translation to its own box's centre, that mirror can.
+      Lead, 2026-10-12 13:1xZ, main 2fb19da against prod mse-web:5aaf9f0: a
+      fresh mirror of the owner's job 180cb65f (60 frames, two-digit names, open
+      boundary) through `scripts/tdcheck_fetch.py` and
+      `scripts/run_tdcheck.sh --dir`: 53 PASS, 0 FAIL, ALL PASS, exit 0, under
+      the movie-derived cap. The placement check held within one cell
+      (9.09e-9 m): page x 0..1.0e-6, y 0..8.0e-7, z 0..2.5e-7 m, the outline
+      file's own box, inside the sampled field (x -3.2e-7..1.32e-6 m).
 - [x] Mutation-proved in the browser against that same mirror, one mutant at a
       time, source confirmed present in each run before it was judged:
       `scene.add(group)` commented out -- the four pixel checks FAIL, each
@@ -64,13 +66,15 @@
 ## Spec and hand-off
 
 - [x] `openspec validate --all --strict` (16 items passed, 0 failed). Note for
-      the archive: this change's `time-domain` delta is ADDED-only, so it is the
-      one that creates `openspec/specs/time-domain/`; `td-movie-window` is still
-      unarchived and its MODIFIED delta against that same (not yet existing)
-      spec is refused if it is archived first.
+      the archive (corrected by the lead, 2026-10-12): `time-domain-fdtd` is the
+      change that creates `openspec/specs/time-domain/` and archives first; this
+      change's `time-domain` delta is ADDED-only and goes next; `td-movie-window`
+      follows, since its MODIFIED delta needs the requirements `time-domain-fdtd`
+      adds.
 - [x] Tier 1 green: `tests/test_td_solve.py tests/test_web_routes.py
       tests/test_run_tdcheck.py` 200 passed, and all 14 `tests/js/*.mjs`
       147 pass / 0 fail (each file run on its own: `node --test tests/js/`
       discovers nothing).
-- [ ] Commit locally, report the sha to the lead. The lead pushes, deploys and
+- [x] Commit locally, report the sha to the lead. The lead pushes, deploys and
       re-mirrors a real job for the browser proof (the mirror needs prod).
+      Shipped as 8e4c659 + 5aaf9f0, live as mse-web:5aaf9f0 (2026-10-03).
