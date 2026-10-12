@@ -4,68 +4,109 @@
 
 ### Requirement: A multi-material cavity SHALL be meshed to a per-region target edge
 
-Each region SHALL be meshed to its own target edge `h_r = min(h, h * n_wall /
-n_r)`, where `h` is the wall's edge from the enclosed volume and the index ratio
-is the physics: a region denser than the wall is finer, one less dense is not
-coarser than the wall. The per-region edges SHALL come from ONE helper that both
-the mesher and the web estimate read, so the edge a region is built to and the
-edge the route was decided on cannot drift apart. The smallest of the per-region
-edges SHALL be the finest region's edge `h_min`, identical to the edge the
-uniform rule used, so the resolution the cavity is solved at does not move.
+Each region SHALL be meshed to its own target edge
+
+    edge_r = max(min(h * n_wall / n_r, thickness_r), h_min)
+
+in METRES, where `h` is the wall's edge from the enclosed volume, the index ratio
+is the physics (a region denser than the wall is finer; one less dense is not
+coarser than the wall), `thickness_r` is the region's thickness clamp, and
+`h_min = min_r` of the ramp `min(h, h * n_wall / n_r)` is the FINEST region's
+edge. The floor at `h_min` SHALL guarantee the finest region is never moved, so
+the finest region is held to exactly the edge the uniform rule gives it today and
+the resolution the cavity is solved at does not move.
+
+The per-region edges SHALL come from ONE helper (`region_edges`, reached through
+`region_plan`) that both the mesher and the web estimate read, so the edge a
+region is built to and the edge the route was decided on cannot drift apart. That
+helper SHALL take and return METRES; the mesher converts to the upload's units at
+its own boundary.
 
 The mesher SHALL realise the per-region targets with TetGen's mesh-sizing
-FUNCTION (a background mesh carrying each region's target, `bgmesh=`), and SHALL
-NOT pass `fixedvolume` or a global `maxvolume` alongside it: either one overrides
-the field and silently meshes uniformly. Where the per-region edges are all
-equal, the mesher SHALL use the existing fixed-volume path unchanged. Source:
-`dockerfiles/maxwell_solver/mse_common.py`,
+FUNCTION -- the `-m` switch, reached through the library's PUBLIC
+`tetrahedralize(bgmesh=<pyvista.UnstructuredGrid>)` route, the grid carrying each
+node's target in point data `target_size` on linear tetrahedra -- and SHALL NOT
+pass `fixedvolume` or a positive `maxvolume` alongside it: either one overrides
+the field and silently meshes uniformly, and the mesher SHALL refuse to build a
+field whose switch set carries them. The background grid SHALL be packed by the
+public route (`pyvista.UnstructuredGrid` with point data `target_size`), not by
+hand: a background grid TetGen's field does not recognise was measured to ABORT
+the process (SIGABRT, not a Python exception, so not catchable) rather than mesh
+ungraded, and the public route is the one whose input contract is documented.
+Where the per-region edges are all equal, the mesher SHALL use the existing
+fixed-volume path unchanged, so an equal-index or one-part mesh is the mesh of
+today byte for byte. Source: `dockerfiles/maxwell_solver/mse_common.py`,
 `dockerfiles/maxwell_solver/mse_meshing.py`.
 
 #### Scenario: a cavity whose core is denser than its wall
 - **WHEN** the upload's regions do not all share one index
 - **THEN** the wall's elements are coarser than the core's
-- **AND** the core's achieved median edge is within the overshoot allowance of
-  `h_min`
-- **AND** neither `fixedvolume` nor a global `maxvolume` accompanies the field
+- **AND** each region's achieved median edge is within the overshoot allowance of
+  ITS OWN target edge, and the finest region's within that of `h_min`
+- **AND** neither `fixedvolume` nor a positive global `maxvolume` accompanies the
+  field
 
 #### Scenario: every region shares one index
 - **WHEN** a multi-part upload's regions all have the same index
-- **THEN** the per-region edges are equal and the mesh is built by the existing
-  fixed-volume path, byte for byte
+- **THEN** the per-region edges are equal, `graded` is false, and the mesh is
+  built by the existing fixed-volume path, byte for byte
 
 #### Scenario: a single-material upload
 - **WHEN** the upload has one part
 - **THEN** nothing changes: the grading helper is not consulted and the mesh is
   the mesh of today
 
-## ADDED Requirements
+### Requirement: A region's target SHALL be clamped under its own thickness
 
-### Requirement: A coarse region's target SHALL be clamped under its own thickness
-
-A region's target edge SHALL be clamped to `CLAMP_THICKNESS_FRACTION *
-2 * V_filled / A_boundary`, where `V_filled` is the region's FILLED volume and
-`A_boundary` is its own surface area plus every child's. The clamp SHALL never
-lower the finest region (it is never applied below `h_min`), and SHALL NOT
-invert the ordering of the regions. When the clamp lowers a region's target, the
-job's caveats SHALL say so, naming the region and the edge it was clamped to.
-Source: `dockerfiles/maxwell_solver/mse_common.py`.
+A region's target edge SHALL be clamped to `CLAMP_THICKNESS_FRACTION * 2 *
+V_filled_r / (A_boundary_r * scale^2)` in METRES, where `V_filled_r` is the
+region's FILLED volume, `A_boundary_r` is its own surface area plus every child's
+(in surface units), and `scale` converts the area to square metres. The clamp
+SHALL only ever lower a target toward FINE (`min` against the ramp), and the
+floor at `h_min` SHALL re-raise it, so the clamp can never coarsen a region and
+never moves the finest region. When the clamp lowers a region's target, the job's
+caveats SHALL say so, naming the region, the target it was given and the edge the
+ramp asked for. Source: `dockerfiles/maxwell_solver/mse_common.py`.
 
 Measured basis: the sizing field stops being honoured when a target approaches
 the thickness of the region it describes. On three nested-cube fixtures the mesh
 collapsed -- the FINE region losing its resolution too -- at 1.9-3x the shell's
-thickness, while a target under the thickness held. Background-mesh resolution
-was tested as the cause and refuted: 0.22 vs 0.08/0.05/0.04 gave identical
-collapses (128 elements, core edge 0.1768 in every case).
+thickness, while a target under the thickness held. The background mesh's own
+RESOLUTION was tested as the cause and refuted: 0.22 against 0.08/0.05/0.04 gave
+identical collapses (128 elements, core edge 0.1768 in every case), so the clamp
+is on the target, not on the background mesh's step.
 
 #### Scenario: the coarse target exceeds the region's thickness
-- **WHEN** the graded edge for a coarse region exceeds the clamp
+- **WHEN** the graded edge for a region exceeds its clamp
 - **THEN** it is lowered to the clamp and the job's caveats name the region
+- **AND** it is never lowered below `h_min` -- the finest region's edge, the one
+  a uniform mesh gives today -- so no clamp can coarsen the cavity's resolution
 
 #### Scenario: the clamp does not bite
 - **WHEN** every region's graded edge is under its clamp
 - **THEN** no caveat is written
 
 ## MODIFIED Requirements
+
+### Requirement: The interior element size follows Weyl's law from enclosed volume
+
+The target element size SHALL derive from the ENCLOSED volume (not the bounding
+box) via Weyl's law, at a fixed number of edges per wavelength, and SHALL be
+lowered (never raised) by the owner-declared smallest feature. That edge is the
+WALL's edge, and the edge the whole cavity is meshed to while every region shares
+one index. For a multi-region cavity it SHALL be refined per region, never
+coarsened: the wall keeps it, a region denser than the wall is meshed finer in
+proportion to its index, and no region is meshed coarser than the wall. Source:
+`dockerfiles/maxwell_solver/mse_common.py`.
+
+#### Scenario: a smallest feature is declared
+- **WHEN** the declared feature is smaller than the physics-derived edge
+- **THEN** the target edge is lowered to the feature
+
+#### Scenario: a multi-region cavity
+- **WHEN** the upload's regions do not all share one index
+- **THEN** no region is meshed coarser than the Weyl edge, and the region a
+  uniform mesh would have given that edge still receives exactly it
 
 ### Requirement: The surface can floor the mesh, so an over-refined surface is decimated
 
@@ -89,11 +130,14 @@ for a uniform mesh. Source: `dockerfiles/maxwell_solver/mse_meshing.py`.
 
 ### Requirement: An achieved resolution worse than allowed is a failure
 
-The mesher SHALL measure the achieved element edge (median) of the FINEST region
--- the tets carrying that region's attribute, not the whole mesh, whose median a
-graded mesh's coarse regions dominate -- and SHALL FAIL if it overshoots that
-region's target by more than the allowed fraction; showing wrong frequencies with
-confidence is worse than no answer. Source:
+The mesher SHALL measure the achieved element edge (median) of a region from the
+tets carrying that region's attribute -- never the whole mesh, whose median a
+graded mesh's coarse regions dominate -- and SHALL FAIL if the FINEST region
+overshoots its target by more than the allowed fraction; showing wrong
+frequencies with confidence is worse than no answer. The finest region's target
+IS `h_min`, the edge a uniform mesh gives that region today, and the allowance
+SHALL never be looser than the uniform mesh's own, so grading cannot spend
+resolution the cavity was previously solved at. Source:
 `dockerfiles/maxwell_solver/mse_meshing.py`.
 
 #### Scenario: the achieved edge overshoots
@@ -104,6 +148,7 @@ confidence is worse than no answer. Source:
 - **WHEN** the mesh is graded
 - **THEN** the check is made on the finest region's own tets, so a coarse wall
   cannot hide or fake the resolution the core was solved at
+- **AND** the finest region is held to the same edge a uniform mesh gives it
 
 ### Requirement: The solver writes a defined artifact set
 

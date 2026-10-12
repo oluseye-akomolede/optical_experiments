@@ -20,15 +20,24 @@
 
 ## 2. The mesher (`mse_meshing.py`)
 
-- [ ] 2.1 `_region_plan` carries the per-region edges (`h_r_units`) beside the
-      seeds, converted to the scaled surface's units once.
-- [ ] 2.2 `_sizing_background_mesh(parts, plan, canonical_offset,
-      canonical_scale, ...)`: a coarse tetrahedralization of the canonical
-      cavity with `point_data["target_size"]` set per node from the region
-      containing it. Public route only (`tet.TetGen`, `bgmesh=`), no private
-      binding calls.
+- [ ] 2.1 `_region_plan` carries the per-region targets in METRES (`edge_m`,
+      `h_min_m`, `coarse_edge_m`, `unclamped_m`, `thickness_m`, `clamped`)
+      beside the seeds, and `h_min_units = h_min_m / unit_scale` converts to the
+      scaled surface's units once. The METRE space is not cosmetic: the thickness
+      clamp divides by an area, so a rule that mixed the caller's upload units
+      with metres would scale the clamp by the wrong power of the unit.
+- [ ] 2.2 `_sizing_background(plan, vertices, faces, canonical_offset,
+      canonical_scale, units)` returns the `(points, tets, sizes)` triple: a
+      coarse tetrahedralization of the canonical cavity with each node sized to
+      the finest region adjacent to it (fallback: the coarse edge).
+      `_sizing_background_grid(bg_points, bg_tets, bg_sizes)` packs that into a
+      `pyvista.UnstructuredGrid` for TetGen's PUBLIC `bgmesh=` route
+      (`point_data["target_size"]`). No private binding call on the path taken.
+      Cost, measured on the 6 mm fixture: the background must be as fine as the
+      fine edge, and it is ~19x the final mesh's tet count (8.6k-580k tets,
+      up to 17 s). Recorded, not hidden; it is the price of the field.
 - [ ] 2.3 `tetrahedralize` branches: plan edges all equal -> the existing
-      call, untouched (byte-identical); otherwise `bgmesh=` and NEITHER
+      call, untouched (byte-identical); otherwise the sizing field with NEITHER
       `fixedvolume` NOR a global `maxvolume`. A guard raises if either is passed
       alongside the field.
 - [ ] 2.4 `achieved_edge_length(points, tets, mask=None)`: restrict the median to
@@ -36,9 +45,12 @@
       `MAX_EDGE_OVERSHOOT * h_min`.
 - [ ] 2.5 The decimation target for a graded mesh is the COARSE edge (`max_r
       h_r`); unchanged (finest edge) for a uniform mesh.
-- [ ] 2.6 The mesh report: `graded`, per-region `{name, target_units,
-      achieved_units, filled_volume_m3}`, and `caveats` (the clamp when it bit).
-      `LAST_ACHIEVED_EDGE_M` keeps its meaning for the uniform path.
+- [ ] 2.6 The mesh report: `graded`, per-region `{target_edge_m,
+      unclamped_edge_m, thickness_m, achieved_edge_m, filled_volume_m3, name}`,
+      and `caveats` (the clamp when it bit, in plain English). Top level:
+      `fine_region`, `target_edge_m`, `target_edge_units`, `coarse_edge_m`,
+      `achieved_edge_m`, `fine_achieved_edge_m`. `LAST_ACHIEVED_EDGE_M` keeps its
+      meaning for the uniform path.
 
 ## 3. The artifacts and the page
 

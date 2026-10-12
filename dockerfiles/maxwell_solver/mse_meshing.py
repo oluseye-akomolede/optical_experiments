@@ -341,6 +341,22 @@ def decimate_to_edge_length(surface, edge_length: float, verbose: bool = True):
 # nowhere else for it to travel.
 LAST_ACHIEVED_EDGE_M: float | None = None
 
+# The per-region record of the LAST tetrahedralize() for a MULTI-material
+# upload -- targets, achieved edges, and the clamp caveats -- or ``None`` for a
+# one-part mesh. The solver writes it into modes.json's ``mesh`` block, which is
+# how the owner's page can say how the mesh was graded, and say plainly when the
+# thickness clamp held a region FINER than its index asks for (the clamp pulls a
+# target UNDER the region's thickness, which is finer, never coarser). Same module
+# state as LAST_ACHIEVED_EDGE_M, for the same reason.
+LAST_MESH_REPORT: dict | None = None
+
+#: The point-data name TetGen's background-mesh reader looks for. It is tetgen's
+#: own constant (``tetgen.pytetgen.MTR_POINTDATA_KEY``), re-spelled here so the
+#: mesher does not import a private module path for one string; a mismatch is a
+#: ``ValueError`` from tetgen rather than a silently ungraded mesh, but the two
+#: are pinned equal by ``test_meshing_guard`` all the same.
+TETGEN_MTR_POINTDATA_KEY = "target_size"
+
 
 def tetrahedralize(
     surface,
@@ -474,48 +490,53 @@ def tetrahedralize(
             flush=True,
         )
 
+    # --- the REGION PLAN, resolved before decimation ------------------------
+    #
+    # For a multi-part upload every region now gets its OWN edge, from
+    # ``mse_common.region_edges`` (the one helper the web estimate reads too).
+    # ``edge_m`` goes in as METRES; the plan hands back the finest region edge in
+    # the scaled surface's units. A region less dense than the wall keeps the
+    # wall's edge, a denser one gets a finer edge, and a coarse one is clamped
+    # under its own thickness -- the negative the clamp guards.
+    #
+    # This block runs BEFORE decimation because the decimation target depends on
+    # it: a graded mesh decimates its surface to the COARSE edge, or the fine
+    # facets left over from the finest region would floor the coarse ones. A
+    # uniform mesh still decimates to ``h_min_units``, which is what it did
+    # before this block moved.
+    region_plan = None
+    graded = False
+    multi = parts is not None and getattr(parts, "is_multi", False)
+    if multi:
+        region_plan = _region_plan(parts, materials, edge_m, units, verbose)
+        graded = region_plan["graded"]
+        edge_units = region_plan["h_min_units"]
+    decimate_units = region_plan["decimate_units"] if multi else edge_units
+
     # An over-fine surface floors the interior element size no matter what
     # maxvolume asks for, which is how an ordinary CAD or scan upload gets
     # refused as "too large". Coarsen it toward the target edge first.
     surface, decimation_note = decimate_to_edge_length(
-        surface, edge_units, verbose=verbose
+        surface, decimate_units, verbose=verbose
     )
     if verbose and decimation_note:
         print(f"[mse] {decimation_note}", flush=True)
-
-    # --- the FINEST REGION EDGE, resolved before maxvolume ------------------
-    #
-    # For a multi-part upload EVERY region is meshed at ``h_min`` -- the finest
-    # region edge -- and ``maxvolume`` is its volume. That is the whole of the
-    # uniform rule, and it is what makes one global number do the job a
-    # per-region volume list cannot: see ``mse_common.region_edges`` for the
-    # measurement (a nine-order sweep of a region's ``max_vol`` moved that
-    # region's element count by exactly zero on a nested PLC).
-    #
-    # ``edge_units`` is the wall's edge for the one-part path and for the wall
-    # region's own target; a denser region pulls it DOWN here, so the cavity is
-    # resolved for the densest part and the wall is over-resolved -- the
-    # deliberate price of correctness. For n_max <= n_wall this is
-    # ``edge_units`` exactly, so an upload whose densest part IS the wall meshes
-    # at the wall's edge, and the one-part path (which never reaches here) is
-    # untouched.
-    region_plan = None
-    multi = parts is not None and getattr(parts, "is_multi", False)
-    if multi:
-        region_plan = _region_plan(parts, materials, edge_units, units, verbose)
-        edge_units = region_plan["h_min_units"]
 
     maxvolume = target_maxvolume(surface, edge_units)
 
     # The merged-PLC face count was already checked against the parts in the
     # ``multi`` branch above; this note stays next to ``maxvolume`` because that
-    # is the quantity it is about: the global ``maxvolume`` is now the SAME
-    # quantity for both paths -- one edge, one volume -- and the region branch
-    # differs only by ``regionattrib`` (which tags each tet with its part) and by
-    # ``docheck`` (TetGen's own overlap instrument). The one-part branch keeps
-    # its exact call, so its meshes stay byte-identical; for a multi-part upload
-    # whose densest region is the wall, ``edge_units`` here is the value the
-    # one-part path would have used.
+    # is the quantity it is about. For the one-part path and for a multi-part
+    # mesh whose regions all land on ONE edge it is the SAME quantity --
+    # one edge, one volume -- and the region branch differs only by
+    # ``regionattrib`` (which tags each tet with its part) and by ``docheck``
+    # (TetGen's own overlap instrument). The one-part branch keeps its exact
+    # call, so its meshes stay byte-identical; so does a multi-part upload whose
+    # regions share an index, because ``graded`` is then False.
+    #
+    # A GRADED mesh does not use ``maxvolume`` at all: the sizing field sets
+    # every region's edge, and a global volume beside the field would cap the
+    # fine region at the coarse target (see ``_sizing_field_switches``).
 
     vertices = np.asarray(surface.vertices, dtype=float)
     faces = np.asarray(surface.faces, dtype=np.int32)
@@ -565,6 +586,26 @@ def tetrahedralize(
     # ``edge_length * scale`` multiplied a user-units edge by a metres-per-unit
     # factor, giving metres of an object this function never meshed.
     allowed_edge = MAX_EDGE_OVERSHOOT * edge_m
+    # A GRADED mesh is held at its FINEST region, to the edge a uniform mesh
+    # gives that region today. The probe compared the graded core against
+    # uniform's MEASURED core edge rather than against h_core; ``h_min`` is that
+    # measured edge's product-side expression -- the edge a uniform mesh builds
+    # the finest region at -- under the same 1.6x allowance the uniform path
+    # uses. It is never LOOSER than ``allowed_edge`` (``h_min <= edge_m``), so
+    # this can only tighten acceptance, never accept a coarser fine region.
+    fine_allowed_edge = (
+        MAX_EDGE_OVERSHOOT * region_plan["h_min_m"] if graded else allowed_edge
+    )
+    # The sizing field for a graded mesh: a coarse background tetrahedralization
+    # of the same PLC whose nodes carry per-region target edges. Built ONCE -- it
+    # depends on the geometry and the plan, not on the attempt (a graded mesh does
+    # not retry; see below).
+    sizing_field = (
+        _sizing_background(
+            region_plan, vertices, faces, canonical_offset, canonical_scale, units
+        )
+        if graded else None
+    )
 
     n_tets, tets, points = 0, None, None
     achieved = 0.0
@@ -586,6 +627,24 @@ def tetrahedralize(
                 order=1, mindihedral=20, minratio=2.0,
                 maxvolume=maxvolume, fixedvolume=True,
             )
+        elif graded:
+            # THE SIZING-FIELD BRANCH. Each region gets its OWN edge from the
+            # background mesh's per-node targets, so this is the one arm that
+            # does NOT pass a global ``maxvolume`` -- see ``_sizing_field_
+            # switches`` for why that pair (and ``fixedvolume``) cannot ride
+            # beside the field. The region SEEDS are still placed from the parts
+            # so each tet is TAGGED with its region, which is what the per-region
+            # achieved-edge check reads.
+            switches = _sizing_field_switches()
+            _check_sizing_field_switches(switches)
+            for region_id, seed_canonical in _region_requests(
+                region_plan, canonical_offset, canonical_scale
+            ):
+                tet.add_region(region_id, tuple(seed_canonical))
+            bg_points, bg_tets, bg_sizes = sizing_field
+            tet.tetrahedralize(**switches,
+                               bgmesh=_sizing_background_grid(
+                                   bg_points, bg_tets, bg_sizes))
         else:
             # docheck=True is the OVERLAP instrument. TetGen checks its own PLC
             # for self-intersections and refuses a surface that has them, which
@@ -698,11 +757,57 @@ def tetrahedralize(
             raise MeshingError("tetrahedralization produced no elements")
 
         achieved = achieved_edge_length(points * unit_scale_m, tets)
+        # For a GRADED mesh the ACCEPTANCE is the FINE region's own achieved
+        # edge, not the whole cavity's. The wall is SUPPOSED to be coarse, so a
+        # whole-mesh median would hide a fine region that silently lost its
+        # resolution -- the exact failure the sizing field's clamp guards. The
+        # fine region is the one the cavity is SOLVED at, so its miss is the
+        # mesh's miss. Measured on ``points * unit_scale_m``: the same space as
+        # ``fine_allowed_edge``.
+        if graded:
+            fine_mask = attrib == region_plan["fine_region"]
+            fine_achieved = (
+                achieved_edge_length(points * unit_scale_m, tets, mask=fine_mask)
+                if fine_mask.any() else float("inf")
+            )
+            checked_achieved = fine_achieved
+            checked_limit = fine_allowed_edge
+        else:
+            checked_achieved = achieved
+            checked_limit = allowed_edge
         over_cap = n_tets > max_tets
-        too_coarse = achieved > allowed_edge
+        too_coarse = checked_achieved > checked_limit
 
         if not over_cap and not too_coarse:
             break
+
+        if graded:
+            # A graded mesh does NOT retry: the sizing field, not ``maxvolume``,
+            # sets the region edges, so raising a global volume would change
+            # nothing and cost a full tetrahedralization per pass. Refine-or-
+            # refuse happens ONCE, on the fine region.
+            if too_coarse and not enforce_resolution:
+                if verbose:
+                    print(
+                        f"[mse] WARNING: the fine region is "
+                        f"{checked_achieved / checked_limit:.1f}x coarser than "
+                        f"the resolution rule allows; solving anyway because "
+                        "enforce_resolution was disabled",
+                        flush=True,
+                    )
+                break
+            if too_coarse:
+                raise MeshingError(
+                    _coarse_message(
+                        n_modes, checked_achieved,
+                        checked_limit / MAX_EDGE_OVERSHOOT, units,
+                    )
+                )
+            raise MeshingError(
+                f"this graded object would need about {n_tets:,} elements, "
+                f"above the {max_tets:,} limit. Try a smaller or simpler object, "
+                "or fewer modes."
+            )
 
         if too_coarse and not enforce_resolution:
             # The bench's --allow-coarse path: chart the accuracy trade-off
@@ -811,35 +916,168 @@ def tetrahedralize(
         region_of_tet = np.zeros(n_tets, dtype=np.int64)
     else:
         region_of_tet = attrib.astype(np.int64, copy=True)
+    # The per-region record the job carries. It is what lets the owner's page
+    # say how the mesh was graded -- and, when the thickness clamp bit, say so
+    # plainly, because a clamped region is meshed FINER than its index alone
+    # would ask for and the owner should hear that from the page rather than
+    # only from an element count that looks higher than expected. ``None`` for a
+    # one-part mesh: one region has nothing to grade and the page shows nothing
+    # new.
+    global LAST_MESH_REPORT
+    LAST_MESH_REPORT = (
+        _mesh_report(region_plan, region_of_tet, points_m, tets, units,
+                     achieved, decimation_note)
+        if region_plan is not None else None
+    )
     return points_m, tets, region_of_tet
 
 
-def _region_plan(parts, materials, edge_units: float, units: str,
+def _mesh_report(region_plan, region_of_tet, points_m, tets, units,
+                 achieved, decimation_note=None) -> dict:
+    """The ``mesh`` block a multi-part job carries: targets, achieved, caveats.
+
+    One entry per region with the edge it was ASKED for and the edge it GOT
+    (median over its own tets), plus the thickness-clamp facts and, when the
+    clamp or the grading actually moved something, a plain-English caveat. The
+    ``target_edge_m`` at the top is the FINEST region's edge -- the single
+    number the job is solved at, which for a uniform mesh is the whole mesh's
+    edge and for a graded one is unchanged from what a uniform mesh would use.
+    """
+    edge_m = region_plan["edge_m"]
+    unclamped_m = region_plan["unclamped_m"]
+    thickness_m = region_plan["thickness_m"]
+    clamped = region_plan["clamped"]
+    shared = region_plan["shared"]
+    unit_scale_m = unit_scale(units)
+
+    regions = {}
+    for region_id in sorted(edge_m):
+        info = shared[region_id]
+        mask = region_of_tet == region_id
+        n_region_tets = int(np.count_nonzero(mask))
+        achieved_region_m = (
+            achieved_edge_length(points_m, tets, mask=mask)
+            if n_region_tets else None
+        )
+        regions[str(region_id)] = {
+            "part": info["part"],
+            "n": float(info["n"]),
+            "target_edge_m": float(edge_m[region_id]),
+            "target_edge_units": float(edge_m[region_id] / unit_scale_m),
+            "unclamped_edge_m": float(unclamped_m[region_id]),
+            "thickness_m": float(thickness_m[region_id]),
+            "clamped": bool(clamped.get(region_id, False)),
+            "filled_volume_m3": float(info["filled_volume_m3"]),
+            "achieved_edge_m": (
+                float(achieved_region_m) if achieved_region_m is not None else None
+            ),
+            # The same measurement in the upload's own units, beside the target
+            # it was asked for in those units. Converted HERE rather than at the
+            # page: the report is the one place that knows `units`, and a
+            # template doing arithmetic on a metres figure is a second, silent
+            # copy of this conversion.
+            "achieved_edge_units": (
+                float(achieved_region_m / unit_scale_m)
+                if achieved_region_m is not None else None
+            ),
+            "tets": n_region_tets,
+        }
+
+    caveats = []
+    if region_plan["graded"]:
+        fine = region_plan["fine_region"]
+        caveats.append(
+            f"the mesh is GRADED: region {fine} "
+            f"({regions[str(fine)]['part']!r}, the finest) is meshed at "
+            f"{regions[str(fine)]['target_edge_units']:.4g} {units} and the "
+            f"coarser regions are meshed coarser, so the element count is lower "
+            "than a uniform mesh at that edge"
+        )
+    for region_id in sorted(edge_m):
+        if clamped.get(region_id, False):
+            entry = regions[str(region_id)]
+            caveats.append(
+                f"region {region_id} ({entry['part']!r}) was held to "
+                f"{entry['target_edge_units']:.4g} {units}, FINER than the "
+                f"{entry['unclamped_edge_m'] / unit_scale_m:.4g} {units} its "
+                "material index asks for: a target that approaches the region's "
+                f"{entry['thickness_m'] / unit_scale_m:.4g} {units} thickness "
+                "makes TetGen's sizing field collapse and lose the fine region "
+                "entirely, so the target is pulled UNDER the thickness"
+            )
+    if decimation_note:
+        caveats.append(
+            f"the surface was coarsened ({decimation_note}) to the coarsest "
+            f"region edge ({region_plan['coarse_edge_m'] / unit_scale_m:.4g} "
+            f"{units}) so the coarse regions are not floored by the surface's "
+            "fine facets"
+        )
+
+    fine_region = region_plan["fine_region"]
+    fine_achieved = regions[str(fine_region)]["achieved_edge_m"]
+    return {
+        "graded": bool(region_plan["graded"]),
+        "fine_region": int(fine_region),
+        "target_edge_m": float(region_plan["h_min_m"]),
+        "target_edge_units": float(region_plan["h_min_units"]),
+        "coarse_edge_m": float(region_plan["coarse_edge_m"]),
+        "achieved_edge_m": float(achieved),
+        "fine_achieved_edge_m": (
+            float(fine_achieved) if fine_achieved is not None else None
+        ),
+        "regions": regions,
+        "caveats": caveats,
+    }
+
+
+def _region_plan(parts, materials, edge_m: float, units: str,
                  verbose: bool) -> dict:
-    """The resolution plan for a multi-part upload, under the uniform rule.
+    """The resolution plan for a multi-part upload, under the graded rule.
 
     Returns a dict the mesher reads:
 
         region_of_part   region id per part, from the PartSet
         seeds_units      per-region seed point, in the SCALED surface's units
-        h_min_units      the ONE edge the whole cavity is meshed at
+        h_min_units      the FINEST region's edge, in the scaled surface's units
+        h_min_m          the same, in metres
+        coarse_edge_m    the COARSEST region's edge, in metres
+        edge_m           {region id: its own target edge, in metres}
+        unclamped_m      {region id: the edge the ramp asked for, before the clamp}
+        thickness_m      {region id: the thickness the coarse target was clamped under}
+        clamped          {region id: True} for regions the clamp actually bit
+        fine_region      the region id the cavity is SOLVED at (argmin of edge_m)
+        coarse_region    the region id the mesh is COARSEST in (argmax of edge_m)
+        graded           True when the regions do NOT all land on one edge
+        decimate_units   the target for ``decimate_to_edge_length``: the coarse
+                         edge when graded (so the surface does not floor the
+                         coarse regions), else ``h_min_units`` -- which is what
+                         the uniform rule used, so a uniform mesh is unchanged
+        decimate_would_move  True when grading makes the decimation target differ
+                         from ``h_min_units`` (the caveat's trigger)
 
     ``materials`` maps part name -> n and must name every part. A region with no
     material is refused rather than defaulted, because the default would be
     vacuum and the owner would get frequencies for a cavity that is partly empty
     with nothing saying so.
 
-    ``h_min_units`` is ``min_r(edge_units * n_wall / n_r)``, floored at
-    ``edge_units`` -- the finest region edge. See
-    :func:`mse_common.region_edges` for why the mesher uses ONE edge rather than
-    a per-region volume list: the per-region mechanism is not realisable in this
-    TetGen build (measured inert over nine orders on a nested PLC).
+    EACH REGION GETS ITS OWN EDGE, ``min(h, h * n_wall / n_r)`` clamped under the
+    region's own thickness; :func:`mse_common.region_edges` is the ONE place that
+    rule lives, and the estimate reads it too. ``h_min_units`` is ``min_r`` of
+    those edges -- the finest region edge, floored, and UNCHANGED from the
+    uniform rule, so the resolution the cavity is SOLVED at does not move.
 
-    There is deliberately NO per-region volume in the plan. Producing one and
-    passing it to ``add_region`` is the shape that LOOKED like it worked and
-    did not -- a plan whose numbers are correct and whose effect is nil. If a
-    future TetGen makes per-region grading possible, this is the function to
-    change, and the row records the measurement that would have to be redone.
+    WHAT THIS REPLACED, and the measurement that still stands: the previous rule
+    meshed EVERY region at ``h_min``, because the per-region mechanism was
+    believed unavailable -- TetGen's per-region volume through ``add_region``'s
+    ``max_vol``, measured INERT over nine orders on a nested PLC. That negative
+    is still guarded (no per-region volume is produced here). The SIZING
+    FUNCTION is a different mechanism and it grades: measured 2,813 tets against
+    39,454 uniform with the fine region's median edge 0.0432 against 0.0433.
+
+    ``edge_m`` arrives in METRES. It used to be upload units -- harmless only
+    while the rule divided by a bare index ratio; the thickness clamp mixes it
+    with a length, so the space is now a behaviour. The mesher converts to units
+    at its own boundary.
     """
     # The per-region fill and edge come from ``mse_common.region_plan`` -- the
     # SAME call the web app's estimate makes. Deriving them here instead would
@@ -848,38 +1086,80 @@ def _region_plan(parts, materials, edge_units: float, units: str,
     # mesh, and if they disagree the route is decided for a job nobody runs.
     # ``units`` goes in: without it ``region_plan`` converted every part's
     # volume as if it were written in mm, so the mesher's own verbose figures
-    # were wrong by the cube of the unit ratio for any non-mm upload. The edge
-    # beside them was always true, so the two disagreed silently.
-    shared = region_plan_by_region(parts, materials, edge_units, units)
+    # were wrong by the cube of the unit ratio for any non-mm upload.
+    shared = region_plan_by_region(parts, materials, edge_m, units)
     region_of_part = parts.region_of_part
+    unit_scale_m = unit_scale(units)
 
-    # Every region is meshed at the same edge. Resolved as a MIN over the plan
-    # rather than recomputed from the materials, so the value here is the value
-    # the estimate used even if the two ever disagree about how to get it.
-    h_min_units = min(float(info["edge_units"]) for info in shared.values())
+    edge_m_by_region = {int(rid): float(info["edge_m"]) for rid, info in shared.items()}
+    unclamped_m = {int(rid): float(info["unclamped_m"]) for rid, info in shared.items()}
+    thickness_m = {int(rid): float(info["thickness_m"]) for rid, info in shared.items()}
+    # ``edge_m`` is BELOW ``unclamped_m`` exactly when the clamp bit. Compared in
+    # metres with a relative floor, because both are floats derived from geometry
+    # and an equality test on the raw values would be a coin flip.
+    clamped = {
+        rid: edge_m_by_region[rid] < unclamped_m[rid] * (1.0 - 1e-9)
+        for rid in edge_m_by_region
+    }
+    h_min_m = min(edge_m_by_region.values())
+    h_min_units = h_min_m / unit_scale_m
+    coarse_edge_m = max(edge_m_by_region.values())
+    fine_region = min(edge_m_by_region, key=lambda rid: edge_m_by_region[rid])
+    coarse_region = max(edge_m_by_region, key=lambda rid: edge_m_by_region[rid])
+    # GRADED means the regions do not all land on ONE edge. Compared with a
+    # relative tolerance: a mesh whose regions share an index AND a thickness
+    # must take the uniform path byte for byte, so a float that merely wobbles
+    # in the last bit must not switch it to the sizing field.
+    tol = 1e-9 * max(h_min_m, 1.0)
+    graded = (coarse_edge_m - h_min_m) > tol
+    coarse_edge_units = coarse_edge_m / unit_scale_m
+    decimate_units = coarse_edge_units if graded else h_min_units
 
     seeds_units = {}
     for part_index, region_id in enumerate(region_of_part):
         seeds_units[region_id] = np.asarray(parts.seeds[part_index], dtype=float)
 
     if verbose:
+        kind = "graded" if graded else "uniform"
         print(
-            f"[mse] uniform region edge h_min = {h_min_units:.4g} {units} "
-            f"for all {len(region_of_part)} region(s)",
+            f"[mse] {kind} region edges, h_min = {h_min_units:.4g} {units} "
+            f"(fine region {fine_region}), coarse = {coarse_edge_units:.4g} "
+            f"{units} (region {coarse_region}), "
+            f"for {len(region_of_part)} region(s)",
             flush=True,
         )
         for part_index, region_id in enumerate(region_of_part):
-            info = shared[int(region_id)]
+            rid = int(region_id)
+            info = shared[rid]
+            note = ""
+            if clamped.get(rid):
+                note = (
+                    f" -- CLAMPED from {unclamped_m[rid] / unit_scale_m:.4g} "
+                    f"{units} under its {thickness_m[rid] / unit_scale_m:.4g} "
+                    f"{units} thickness"
+                )
             print(
-                f"[mse] region {region_id}: part {info['part']!r}, "
-                f"n={materials[info['part']]:g}, fills "
-                f"{info['filled_volume_m3']:.4g} m3",
+                f"[mse] region {rid}: part {info['part']!r}, "
+                f"n={materials[info['part']]:g}, edge "
+                f"{edge_m_by_region[rid] / unit_scale_m:.4g} {units}, fills "
+                f"{info['filled_volume_m3']:.4g} m3{note}",
                 flush=True,
             )
     return {
         "region_of_part": region_of_part,
         "seeds_units": seeds_units,
         "h_min_units": h_min_units,
+        "h_min_m": h_min_m,
+        "coarse_edge_m": coarse_edge_m,
+        "edge_m": edge_m_by_region,
+        "unclamped_m": unclamped_m,
+        "thickness_m": thickness_m,
+        "clamped": clamped,
+        "fine_region": int(fine_region),
+        "coarse_region": int(coarse_region),
+        "graded": bool(graded),
+        "decimate_units": decimate_units,
+        "decimate_would_move": bool(graded and decimate_units != h_min_units),
         "shared": shared,
     }
 
@@ -887,11 +1167,11 @@ def _region_plan(parts, materials, edge_units: float, units: str,
 def _region_requests(region_plan, canonical_offset, canonical_scale):
     """``(region_id, seed)`` pairs in the canonical frame.
 
-    ONLY the seeds. There is no per-region volume, because the mesher computes
-    none: every region is meshed at the one global ``h_min`` (see
-    ``_region_plan`` and ``mse_common.region_edges``). TetGen still needs the
-    seeds -- they are how it decides which part each tet lies in, which is what
-    the region ATTRIBUTE is for -- but they carry no size.
+    ONLY the seeds. There is no per-region volume, because the mesher passes
+    none: a region's EDGE is delivered by the sizing field's per-node targets
+    (``_sizing_background``), not by ``add_region``'s ``max_vol``. TetGen still
+    needs the seeds -- they are how it decides which part each tet lies in, which
+    is what the region ATTRIBUTE is for -- but they carry no size.
 
     The seeds are mapped with the same affine the vertices get, and ``add_region``
     must receive the point in the frame TetGen is actually meshing, or a seed
@@ -904,7 +1184,7 @@ def _region_requests(region_plan, canonical_offset, canonical_scale):
     the whole mesh at the coarsest region's resolution. Rewriting it to
     absolute per-region volumes did NOT fix that, because the region volume
     itself turned out to be inert on nested input (nine-order measurement on the
-    row). The uniform rule removes the quantity entirely rather than computing
+    row). The sizing field removes the quantity entirely rather than computing
     it correctly for a mechanism that cannot use it.
     """
     out = []
@@ -916,8 +1196,193 @@ def _region_requests(region_plan, canonical_offset, canonical_scale):
     return out
 
 
-def achieved_edge_length(points_m: np.ndarray, tets: np.ndarray) -> float:
-    """Median edge length of the tetrahedralization, in metres."""
+def _sizing_field_switches() -> dict:
+    """The Tetrahedralize switches for a GRADED mesh, in ONE place.
+
+    The sizing field (TetGen's ``-m``/``metric``) sets every region's edge from
+    the background mesh's per-node values, so a global ``maxvolume`` or
+    ``fixedvolume=True`` must NOT ride beside it -- both are measured negatives,
+    not style choices:
+
+    * a positive ``maxvolume`` caps the WHOLE mesh, so the coarse wall's volume
+      would cap the fine region at the coarse target -- grading silently lost;
+    * ``fixedvolume=True`` makes that cap BINDING rather than a hint.
+
+    ``metric=True`` is the other half: it tells TetGen the background mesh's
+    third array carries LENGTHS, which is what the background grid's
+    ``target_size`` point data supplies. Without it the values are read as the
+    wrong quantity and the field grades nothing. Every switch here is held by a
+    test (``test_meshing_guard``) and by ``_check_sizing_field_switches`` below,
+    so a later edit that adds ``maxvolume`` back fails rather than quietly
+    un-grading every multi-material job.
+    """
+    return dict(
+        order=1, mindihedral=20, minratio=2.0,
+        maxvolume=0.0, fixedvolume=False,
+        metric=True, regionattrib=True, docheck=True,
+    )
+
+
+def _check_sizing_field_switches(switches: dict) -> None:
+    """Refuse the switches a sizing field cannot share a call with.
+
+    Called on the dict right before ``tetrahedralize``, so the guard runs on the
+    values the mesh is actually built with -- not on a copy a test keeps beside
+    the real one.
+    """
+    if switches.get("fixedvolume"):
+        raise MeshingError(
+            "a graded mesh sets each region's edge with TetGen's sizing field, "
+            "so it cannot pass fixedvolume=True: that makes a global maxvolume "
+            "binding and caps the fine region at the coarse target."
+        )
+    if float(switches.get("maxvolume", 0.0)) > 0.0:
+        raise MeshingError(
+            "a graded mesh sets each region's edge with TetGen's sizing field, "
+            "so it cannot pass a positive global maxvolume: that volume caps "
+            "every region, including the fine one."
+        )
+    if not switches.get("metric"):
+        raise MeshingError(
+            "a graded mesh needs metric=True so TetGen reads the background "
+            "mesh's values as edge LENGTHS; without it the field grades nothing."
+        )
+
+
+def _sizing_background_grid(bg_points: np.ndarray, bg_tets: np.ndarray,
+                            bg_sizes: np.ndarray) -> "pyvista.UnstructuredGrid":
+    """The background mesh as the grid TetGen's PUBLIC sizing-field route wants.
+
+    ``TetGen.tetrahedralize(bgmesh=...)`` accepts a ``pyvista.UnstructuredGrid``
+    of linear tetrahedra whose point data carries ``target_size``; tetgen's own
+    ``_process_bgmesh`` then reads exactly the three arrays this function is
+    handed and calls ``load_bgmesh_from_arrays``. Building the grid here rather
+    than reaching for that binding directly keeps the mesher on the library's
+    documented surface: the three-array call is a private member, and a rename
+    or an argument-order change there would be a silent wrong-field instead of
+    an ImportError. The cost is one VTK object per graded mesh, over a few
+    hundred nodes -- and pyvista is already a declared dependency of this image
+    (``requirements.txt``), used by the decimation helper beside this one.
+
+    The cell array carries VTK's prefix format: each tetrahedron is
+    ``[4, i0, i1, i2, i3]``, and ``MTR_POINTDATA_KEY`` ("target_size") is the
+    name tetgen looks for. Both are pinned by ``test_meshing_guard``, because
+    either being wrong is a silently ungraded mesh, not an error.
+    """
+    import pyvista as pv
+
+    n_cells = int(bg_tets.shape[0])
+    prefix = np.full((n_cells, 1), 4, dtype=np.int64)
+    cells = np.hstack([prefix, bg_tets.astype(np.int64)]).ravel()
+    grid = pv.UnstructuredGrid(
+        cells,
+        np.full(n_cells, pv.CellType.TETRA, dtype=np.uint8),
+        np.ascontiguousarray(bg_points, dtype=np.float64),
+    )
+    grid.point_data[TETGEN_MTR_POINTDATA_KEY] = np.ascontiguousarray(
+        bg_sizes, dtype=np.float64)
+    return grid
+
+
+def _sizing_background(plan: dict, vertices: np.ndarray, faces: np.ndarray,
+                       canonical_offset: np.ndarray, canonical_scale: float,
+                       units: str):
+    """``(bg_points, bg_tets, bg_sizes)`` for a graded mesh, in the canonical frame.
+
+    The sizing field is a background tetrahedralization whose NODES carry target
+    edges; this builds one from the SAME PLC the mesh is built from, so it
+    covers exactly the meshed volume and needs no separate bounding box.
+
+    Per-node target: the region the node falls in, taken from the background
+    mesh's OWN region attributes (the same ``add_region`` seeds the main mesh
+    uses -- so the containment is TetGen's, not a second opinion). A node
+    adjacent to several regions gets the FINEST one, the conservative choice: a
+    fine tet near a boundary is cheaper to over-resolve than a coarse one in the
+    fine region. A node TetGen could not place falls back to the COARSE edge.
+
+    Resolution of the background mesh: cells no larger than ``min(coarse/2,
+    fine)``. ``coarse/2`` so every region spans at least one background cell; the
+    ``fine`` cap so a fine region at least one of its own edges wide still
+    contains a node -- without it a thin dense layer would get no fine node and
+    would silently mesh coarse. Background resolution was tested as the cause of
+    the clamp COLLAPSE and REFUTED (identical collapse at 0.22 and at
+    0.08/0.05/0.04 canonical), so this is a grading-quality choice, not the
+    clamp's mechanism.
+    """
+    import tetgen
+
+    unit_scale_m = unit_scale(units)
+
+    def canonical(edge_m: float) -> float:
+        return edge_m / unit_scale_m * canonical_scale
+
+    edge_canonical = {
+        int(rid): canonical(float(h)) for rid, h in plan["edge_m"].items()
+    }
+    coarse_canonical = max(edge_canonical.values())
+    fine_canonical = min(edge_canonical.values())
+    bg_edge = min(0.5 * coarse_canonical, fine_canonical)
+    # A regular tetrahedron's volume for that edge -- the same relation
+    # ``target_maxvolume`` uses, so the background's cell size and the mesh's
+    # are described the same way.
+    bg_volume = (bg_edge ** 3) / (6.0 * np.sqrt(2.0))
+
+    bg = tetgen.TetGen(vertices, faces)
+    for region_id, seed_canonical in _region_requests(
+        plan, canonical_offset, canonical_scale
+    ):
+        bg.add_region(region_id, tuple(seed_canonical))
+    bg.tetrahedralize(
+        order=1, mindihedral=20, minratio=2.0,
+        maxvolume=bg_volume, fixedvolume=True, regionattrib=True,
+    )
+    bg_points = np.asarray(bg.node, dtype=float)[:, :3]
+    bg_tets = np.asarray(bg.elem, dtype=np.int64)[:, :4]
+    attrib = np.asarray(bg.attributes, dtype=np.int64).reshape(-1)
+    if attrib.shape[0] != bg_tets.shape[0]:
+        raise MeshingError(
+            f"internal error: the sizing background mesh got {attrib.shape[0]} "
+            f"region attributes for {bg_tets.shape[0]} tetrahedra"
+        )
+    node_region = np.full(bg_points.shape[0], -1, dtype=np.int64)
+    for tet_index in range(bg_tets.shape[0]):
+        region_id = int(attrib[tet_index])
+        if region_id not in edge_canonical:
+            continue
+        for node in bg_tets[tet_index]:
+            current = int(node_region[node])
+            if current < 0 or edge_canonical[region_id] < edge_canonical[current]:
+                node_region[node] = region_id
+    sizes = np.array(
+        [
+            edge_canonical[int(rid)] if rid >= 0 else coarse_canonical
+            for rid in node_region
+        ],
+        dtype=float,
+    )
+    return bg_points, bg_tets, sizes
+
+
+def achieved_edge_length(points_m: np.ndarray, tets: np.ndarray,
+                         mask: np.ndarray | None = None) -> float:
+    """Median edge length of the tetrahedralization, in metres.
+
+    ``mask`` restricts the measure to a SUBSET of the tets. A graded mesh needs
+    this: the number that decides acceptance is the FINE region's own achieved
+    edge, because the wall is supposed to be coarse and a whole-mesh median
+    would hide a fine region that lost its resolution. An empty selection is a
+    measurement of nothing, so it RAISES rather than returning ``nan`` -- a
+    fine region the field never reached is a failure to surface, not a zero to
+    average in.
+    """
+    if mask is not None:
+        tets = tets[np.asarray(mask, dtype=bool)]
+        if tets.shape[0] == 0:
+            raise MeshingError(
+                "the fine region's achieved edge was asked for, but the mesh "
+                "has no tetrahedron in it: the sizing field never reached the "
+                "region it was targeting, so the mesh is not graded at all."
+            )
     xyz = points_m[tets]
     local = np.array([(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)])
     lengths = np.linalg.norm(

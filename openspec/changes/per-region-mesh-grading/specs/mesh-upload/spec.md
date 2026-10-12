@@ -18,6 +18,14 @@ same number as the one-part expression `V_cavity / h_min^3` when the edges are
 equal. The estimate SHALL use the same per-region edges the mesher builds to, so
 the route decided on cannot be the route for a mesh nobody builds.
 
+For a GRADED mesh the estimate is a LOWER bound on the real element count, not a
+conservative one: the sizing field's transition between the fine and the coarse
+edge refines the coarse region past its target, and the element count is
+superlinear in edge length, so the sum under-counts. Measured at 0.37-0.46x the
+built count on nested-box fixtures, worst for thin walls. The refusal threshold's
+safety margin is therefore REDUCED (not removed) for a multi-material upload, and
+this is recorded rather than hidden behind the coefficient.
+
 The estimate SHALL return `0`, meaning "do not route on this", when the surface
 is unusable or the formula fails -- not a small number. Source: `web/meshing.py`,
 `dockerfiles/maxwell_solver/mse_common.py`, `web/config.py`.

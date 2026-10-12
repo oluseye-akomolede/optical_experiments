@@ -76,6 +76,26 @@ TETGEN_VOLUME_SLACK = 4.0
 #: requested modes, and the frequencies would be wrong without anything failing.
 MAX_EDGE_OVERSHOOT = 1.6
 
+#: A coarse region's target edge may not approach the THICKNESS of the region it
+#: describes. Past that cliff, TetGen's mesh-sizing function stops being honoured
+#: and it fails the WRONG way: the fine region loses its resolution too, so the
+#: whole mesh collapses and the job fails a check it should never have met.
+#:
+#: The length used is the region's own thickness proxy ``2 * V_filled /
+#: A_boundary`` (see ``region_boundary_area``): a slab's volume is thickness x
+#: area, so for a thin shell this IS the thickness, and for a fat region it
+#: under-estimates it, which clamps sooner and errs toward the finer, safer mesh.
+#: MEASURED on nested-cube fixtures (wall 2.0, canonical frame, tetgen 0.8.4):
+#: shell 0.375 held at h_wall 0.70 and collapsed at 1.00; shell 0.15 held at 0.30
+#: and collapsed at 0.45 -- a cliff at 1.9-3x the shell's thickness, and
+#: independent of the background mesh's resolution (0.22 vs 0.08/0.05/0.04
+#: canonical gave an identical 128-element collapse, so that is not the cause).
+#: This proxy is 0.309 and 0.147 for those two fixtures, so 1.0 x it sits under
+#: both cliffs with a 2-3x margin. A region's edge never falls below ``h_min``
+#: for it, so the finest region -- the one the cavity is solved at -- is never
+#: clamped and no run is silently made coarser.
+CLAMP_THICKNESS_FRACTION = 1.0
+
 #: default element cap. Chosen so a worst-case solve stays well under the 14Gi
 #: container limit; the lead calibrates the real figure on the Jetson.
 #:
@@ -337,43 +357,80 @@ def estimate_tet_count(surface, edge_length: float) -> tuple[int, float]:
     return int(volume / max(maxvolume, 1e-30)), volume
 
 
-def region_edges(h: float, n_wall: float, materials: dict, parts) -> dict:
-    """``{region_id: h_r}`` -- the per-region target edge for a multi-part mesh.
+def region_boundary_area(parts, part_index: int) -> float:
+    """Area of the REGION's boundary, in the parts' own units squared.
+
+    The region ``part_index`` bounds is the part MINUS everything nested inside
+    it, so its boundary is the part's own closed surface plus every nested
+    part's -- the SAME set ``PartSet.filled_volume_m3`` subtracts volumes for,
+    because both describe that one region. ``trimesh`` computes the area the
+    same way it computes the volume used there, so the pair cannot disagree
+    about the object.
+
+    It exists for one use: the thickness proxy ``2 * V_filled / A_boundary``
+    that ``region_edges`` clamps a coarse target under. A slab's volume is
+    thickness x area, so for a thin shell this is the thickness itself; for a
+    fat region it under-estimates the thickness (a cube of side ``s`` gives
+    ``s/3``), which clamps sooner and errs toward the finer, safer mesh.
+    """
+    total = 0.0
+    for index in [part_index, *parts.children_of(part_index)]:
+        total += abs(float(parts.parts[index].area))
+    return float(total)
+
+
+def region_edges(h: float, n_wall: float, materials: dict, parts,
+                 units: str) -> dict:
+    """``{region_id: {...}}`` -- the per-region target edge for a multi-part mesh.
 
     THE ONE HELPER. The mesher and the web estimate both call this, so the
     edge a region is built to and the edge the route was decided on cannot
-    drift apart. ``min`` over the values it returns is ``h_min``, the SINGLE
-    edge the whole cavity is meshed at -- see below.
+    drift apart. ``min`` of ``edge`` over the values is ``h_min``: the edge the
+    whole cavity used to be meshed at, and still the resolution FLOOR.
 
-    THE RULE: UNIFORM AT THE FINEST REGION EDGE. Every region gets the same
-    edge,
+    THE RULE: EACH REGION AT ITS OWN EDGE, CLAMPED UNDER ITS OWN THICKNESS.
 
-        h_min = min_r ( h * n_wall / n_r )  ==  h * n_wall / max_r(n_r)
+        raw_r = min(h, h * n_wall / n_r)            -- the physics, per region
+        thickness_r = CLAMP_THICKNESS_FRACTION * 2 * V_filled_r / A_boundary_r
+        edge_r = max(min(raw_r, thickness_r), h_min)
 
-    and never coarser than ``h`` (the wall's own edge is ``h`` by construction,
-    so the min is at most ``h``). A dense region therefore sets the resolution
-    for the WHOLE cavity, wall included -- denser than necessary in the wall,
-    which is the deliberate price.
+    ``min(h, ...)`` keeps a region LESS dense than the wall from coarsening it
+    (``h_min`` is a resolution floor, not a function of the densest region
+    alone). ``max(..., h_min)`` is what the floor guarantees the callers: no
+    region is ever given an edge finer than ``h_min``, so the finest region --
+    the one the cavity is SOLVED at -- is never clamped and ``h_min`` does not
+    move from the uniform rule. A region with no denser neighbour keeps ``h``.
 
-    WHY UNIFORM, and what this replaced. The previous rule gave each region
-    ``h * n_wall / n_r`` as its OWN target, on the theory that a region denser
-    than the wall should be finer and a less dense one coarser. That theory is
-    sound and the mechanism to implement it is NOT AVAILABLE in this build:
-    TetGen's per-region volume, supplied through ``add_region``'s ``max_vol``,
-    was measured INERT on a nested PLC -- a nine-order sweep of the core's
-    region volume moved the core's own element count by exactly zero, with
-    identical totals under ``varvolume=True``, ``fixedvolume=True``, and with
-    neither flag. (Hand-built PLC, no application code involved; the numbers
-    and the two instrument errors that hid this for a session are on the row.)
-    So a per-region TARGET that the mesher cannot realise is a target that
-    misleads the estimate -- which is the whole defect this function exists to
-    prevent.
+    WHY THE CLAMP. A region's target is delivered by TetGen's mesh-sizing
+    FUNCTION (``-m``), a background mesh whose nodes carry the target edge, and
+    the field stops being honoured when a target approaches the thickness of
+    the region it describes -- failing the WRONG way: the fine region loses its
+    resolution too, so the job fails its achieved-edge check rather than
+    shipping a coarse answer. Measured on nested cubes (canonical frame, tetgen
+    0.8.4): shell 0.375 held at h_wall 0.70, collapsed at 1.00; shell 0.15 held
+    at 0.30, collapsed at 0.45 -- a cliff at 1.9-3x the thickness, and
+    background-mesh resolution was tested as the cause and REFUTED (identical
+    collapse at 0.22 and at 0.08/0.05/0.04). ``CLAMP_THICKNESS_FRACTION``
+    carries the margin.
 
-    Meshing everything at ``h_min`` realises the resolution requirement with a
-    mechanism that provably works (a single global ``maxvolume``, the same one
-    the one-part path uses), and it keeps the estimate on the SAME calibrated
-    constant as the one-part path -- one formula, one calibration, no new
-    fitting.
+    WHAT THIS REPLACED. The previous rule meshed every region at ``h_min``
+    because the mechanism to grade them was believed unavailable: TetGen's
+    per-region volume, through ``add_region``'s ``max_vol``, was measured INERT
+    on a nested PLC -- a nine-order sweep of the core's region volume moved the
+    core's own element count by exactly zero, with identical totals under
+    ``varvolume=True``, ``fixedvolume=True``, and with neither flag. THAT
+    MEASUREMENT STANDS and its negative is still guarded (that call is not
+    made here). What it does not cover is the sizing function, a DIFFERENT
+    mechanism, which does grade: measured on the nested cube, 2,813 tets
+    against 39,454 uniform with the core's median edge 0.0432 against 0.0433.
+    So a region denser than the wall now gets a finer edge, the wall keeps
+    ``h``, and the estimate follows the mesh instead of pricing a mesh nobody
+    builds.
+
+    ``units`` is the UPLOAD's unit and has no default, for the same reason
+    ``filled_volume_m3`` has none: it converts the volume the clamp's thickness
+    proxy is built from. ``h`` is in METRES, and so is everything this
+    function returns -- the caller converts at its own boundary.
 
     ``n_wall`` is still required: it is what converts a region's index into a
     length relative to the wall's medium, and without it ``h * n_wall / n_r``
@@ -395,17 +452,61 @@ def region_edges(h: float, n_wall: float, materials: dict, parts) -> dict:
             "a multi-part mesh needs at least one region with a refractive "
             "index to mesh to, and this upload has none."
         )
-    # ONE edge for every region. `min(h, ...)` rather than the raw ratio so a
-    # region LESS dense than the wall cannot coarsen the wall: h_min is a
-    # resolution floor for the cavity, not a function of the densest region
-    # alone.
-    h_min = min(float(h), float(h) * float(n_wall) / n_max)
-    return {int(region_id): h_min for region_id in by_region}
+    h = float(h)
+    if not np.isfinite(h) or h <= 0:
+        # The clamp is the first thing in this function that MIXES two length
+        # spaces -- the edge and the region's thickness -- so the space the edge
+        # arrives in is now a behaviour, not a formality. Refusing a
+        # non-length is the cheap half of that; the callers' docstrings are the
+        # other half, and ``test_routing`` pins the metres.
+        raise MeshingError(
+            f"region_edges needs the base edge in METRES and got {h:g}."
+        )
+    scale = unit_scale(units)
+    # The floor: the finest region's own raw edge. `min(h, ...)` rather than
+    # the raw ratio so a region LESS dense than the wall cannot coarsen the
+    # cavity past h.
+    h_min = min(h, h * float(n_wall) / n_max)
+    # Per REGION, not per part: a region is a material and two parts may share
+    # one, so the region's fill and boundary are the sums over its parts. The
+    # edge itself is uniform within a region (same n, same material), so only
+    # the geometry needs summing.
+    volume_m3: dict = {}
+    area_units2: dict = {}
+    for part_index, region_id in enumerate(parts.region_of_part):
+        region_id = int(region_id)
+        volume_m3[region_id] = (
+            volume_m3.get(region_id, 0.0)
+            + parts.filled_volume_m3(part_index, units)
+        )
+        area_units2[region_id] = (
+            area_units2.get(region_id, 0.0)
+            + region_boundary_area(parts, part_index)
+        )
+    out = {}
+    for region_id in by_region:
+        region_id = int(region_id)
+        n_region = float(by_region[region_id])
+        raw = min(h, h * float(n_wall) / n_region)
+        area = area_units2.get(region_id, 0.0)
+        # 2*V/A in metres: the volume is cubic metres by construction, the area
+        # is the parts' own units squared -- scaled by scale^2 to match.
+        thickness_m = (
+            CLAMP_THICKNESS_FRACTION * 2.0 * volume_m3.get(region_id, 0.0)
+            / (area * scale * scale)
+            if area > 0 else float("inf")
+        )
+        out[region_id] = {
+            "edge": max(min(raw, thickness_m), h_min),
+            "unclamped": raw,
+            "thickness_m": thickness_m,
+        }
+    return out
 
 
-def region_plan(parts, materials, edge_units: float, units: str,
+def region_plan(parts, materials, edge_m: float, units: str,
                 n_wall: float | None = None) -> dict:
-    """Per-region ``(edge_units, filled_volume_m3)`` for a multi-part upload.
+    """Per-region ``(edge_m, filled_volume_m3)`` for a multi-part upload.
 
     ONE expression, called by BOTH the mesher and the web app's ``estimate_tets``.
     They answer the same question -- how fine the mesh is, and how much material
@@ -414,19 +515,30 @@ def region_plan(parts, materials, edge_units: float, units: str,
     mesh parameters from different places, the app's route decision and the mesh
     the solver builds disagree, and the estimate is what routes.
 
-    UNDER THE UNIFORM RULE the two quantities are:
+    ``edge_m`` IS METRES, and the name says so because it used to say
+    ``edge_units`` while holding metres: the mesher fed it UPLOAD UNITS and the
+    web fed it metres, which was harmless only while the rule divided by a bare
+    index ratio. The thickness clamp mixes the edge with a thickness, so the two
+    spaces stopped being interchangeable. The mesher now passes metres and
+    converts at its own boundary; see ``estimate_tets_by_region`` for what the
+    old ambiguity cost.
 
-    * ``edge_units`` is the SAME for every region: ``h_min``, the finest region
-      edge (``edge_units * n_wall / max n_r``, floored at ``edge_units``). The
-      whole cavity is meshed at it -- see ``region_edges`` for why per-region
-      targets are not realisable in this TetGen build, which is why the plan
-      reports one edge and not a distinct edge per region.
+    UNDER THE GRADED RULE the two quantities are:
+
+    * ``edge_m`` is the region's OWN target edge, ``min(h, h * n_wall /
+      n_r)`` clamped under the region's thickness -- ``region_edges`` is the one
+      place that rule lives. ``min`` over the plan's edges is ``h_min``, the
+      finest region's edge, and it does not move from the uniform rule: the
+      finest region is never clamped.
     * the volume is the region's FILLED volume, not its enclosed one:
       ``PartSet.filled_volume_m3`` subtracts everything nested inside it. The
-      wall's enclosed volume counts its core twice. (The estimate now works on
-      the total cavity volume rather than summing ``V_r / h_r^3``, but the
-      filled volume is still what the estimate must convert, and the per-region
-      figure is what the mesher's own verbose line reports.)
+      wall's enclosed volume counts its core twice. The estimate sums
+      ``V_r / h_r^3`` over the regions, which is the one-part expression when
+      the edges are equal.
+    * ``unclamped_m`` and ``thickness_m`` are what makes the clamp
+      REPORTABLE: the edge the ramp asked for before the clamp, and the region's
+      thickness proxy. ``edge_m`` is below ``unclamped_m`` exactly when
+      the clamp bit, which is when the job's caveats name the region.
 
     ``n_region`` comes from ``materials`` (part name -> n, naming every part).
     A region with no material is REFUSED by ``PartSet.region_materials`` rather
@@ -437,7 +549,7 @@ def region_plan(parts, materials, edge_units: float, units: str,
     ``PartSet.filled_volume_m3``, which converts the region volume to cubic
     metres. There is no default here for the same reason there is none there:
     with one, a caller that forgot the argument silently got millimetres while
-    ``edge_units`` beside it stayed true metres, making the estimate wrong by
+    the edge beside it stayed true metres, making the estimate wrong by
     the cube of the unit ratio -- for inches, 17,000x UNDER, which routes a job
     to the cluster that the GPU would have solved. Measured through the real
     upload on one physical object: mm 51,187 (GPU), in 3 (cluster), um 5.1e13
@@ -457,37 +569,47 @@ def region_plan(parts, materials, edge_units: float, units: str,
                 "must contain every other part."
             )
         n_wall = float(by_region[int(parts.region_of_part[wall_index])])
-    edges = region_edges(edge_units, n_wall, materials, parts)
+    edges = region_edges(edge_m, n_wall, materials, parts, units)
     out = {}
     for part_index, region_id in enumerate(parts.region_of_part):
+        info = edges[int(region_id)]
         out[int(region_id)] = {
             "part": parts.names[part_index],
-            "edge_units": edges[int(region_id)],
+            "edge_m": info["edge"],
             "filled_volume_m3": parts.filled_volume_m3(part_index, units),
             "n": float(by_region[region_id]),
+            # For the record the job carries: what the ramp asked for before the
+            # thickness clamp, and the thickness it was clamped under. A region
+            # whose ``unclamped_m`` is bigger than ``edge_m`` was
+            # clamped, and the job's caveats say so.
+            "unclamped_m": info["unclamped"],
+            "thickness_m": info["thickness_m"],
         }
     return out
 
 
-def estimate_tets_by_region(parts, materials, edge_units: float,
+def estimate_tets_by_region(parts, materials, edge_m: float,
                             surface, units: str, c: float) -> int:
     """Weyl-free element estimate for a multi-part upload.
 
-    THE ONE-PART FORMULA, on the whole cavity, at ``h_min``:
+    THE ONE-PART FORMULA, PER REGION:
 
-        est = c * V_cavity / h_min^3
+        est = c * sum_r V_r / h_r^3
 
-    This is deliberately NOT a per-region sum any more. Under the uniform rule
-    every region is meshed at the SAME edge, so ``sum_r V_r / h_min^3`` is
-    ``V_cavity / h_min^3`` -- algebraically the one-part expression. Writing it
-    as the one-part expression is the point: the mesh and the estimate then
-    agree through the calibration constant ``c`` that the one-part path already
-    has, with NO new fitting, and there is no second formula that could drift
-    from the first.
+    with every region at its own planned edge, from the same ``region_edges``
+    the mesher builds to. The estimate is what ROUTES the job, so one that kept
+    pricing a uniform mesh would send a graded job to the cluster for elements
+    it no longer has.
 
-    ``V_cavity`` is the sum of the regions' FILLED volumes, which is the
-    cavity's own volume with no double counting (a nested part's every point is
-    inside its parent, so summing enclosed volumes would count the core twice).
+    WHEN EVERY REGION LANDS ON ONE EDGE -- the one-part case, and any multi-part
+    upload whose regions share an index -- the code takes the one-part
+    expression ``c * V_cavity / h_min^3`` BIT FOR BIT rather than summing. The
+    two are algebraically identical there but round differently, and this is the
+    number that routes a job, so it must not move by a rounding step when
+    nothing was graded. ``V_cavity`` is the sum of the regions' FILLED volumes,
+    which is the cavity's own volume with no double counting (a nested part's
+    every point is inside its parent, so summing enclosed volumes would count
+    the core twice).
 
     UNITS -- NO CONVERSION HAPPENS HERE, and that is a measured claim, not a
     stylistic one. This function produced a 2.3e13-element estimate for a 19k
@@ -501,8 +623,8 @@ def estimate_tets_by_region(parts, materials, edge_units: float,
 
     ``effective_edge_m`` returns METRES (1.018e-3 m is 1.018 mm, the right edge
     for a 6 mm box), and ``region_edges`` divides by a bare index ratio, so the
-    plan's ``edge_units`` is in the SAME metres -- the name says "units" but the
-    value is metres, because that is what the caller feeds it. ``filled_volume_m3``
+    plan's ``edge_m`` is in the SAME metres -- the argument is named for the
+    space it holds, which it was not while this bug lived. ``filled_volume_m3``
     is cubic metres by construction. So the pair is already coherent and
     ``unit_scale`` here applies the factor a SECOND time, making the count wrong
     by ``1/scale^3`` = 1e9 for mm. That is the "one quantity, two spaces" shape
@@ -512,13 +634,8 @@ def estimate_tets_by_region(parts, materials, edge_units: float,
     ``c`` is the SAME constant the one-part estimate uses -- passed in, never
     re-derived here, so the two paths cannot disagree about it.
     """
-    plan = region_plan(parts, materials, edge_units, units)
-    h_m = None
-    v_m3 = 0.0
-    for info in plan.values():
-        h_m = info["edge_units"] if h_m is None else h_m
-        v_m3 += float(info["filled_volume_m3"])
-    if h_m is None:
+    plan = region_plan(parts, materials, edge_m, units)
+    if not plan:
         # No regions at all -- not a multi-part upload. Refuse rather than
         # return 0, which would look like "a tiny job" and route it to the GPU.
         raise MeshingError(
@@ -526,12 +643,26 @@ def estimate_tets_by_region(parts, materials, edge_units: float,
             "this is the one-part path's job and calling it here would route "
             "a job on a number of zero."
         )
-    h_m = float(h_m)
-    if not (h_m > 0) or not (v_m3 > 0):
-        # Could not ask. A zero here would route a real job to the fast machine
-        # on the strength of a number nothing computed -- refuse instead.
-        raise MeshingError(
-            f"the multi-part estimate got h={h_m:g} m and V={v_m3:g} m3 from "
-            f"the region plan; neither can be used to size a mesh."
-        )
-    return int(float(c) * v_m3 / (h_m ** 3))
+    edges = set()
+    v_m3_total = 0.0
+    per_region = 0.0
+    for info in plan.values():
+        h_r = float(info["edge_m"])
+        v_r = float(info["filled_volume_m3"])
+        if not (h_r > 0) or not (v_r > 0):
+            # Could not ask. A zero here would route a real job to the fast
+            # machine on the strength of a number nothing computed -- refuse.
+            raise MeshingError(
+                f"the multi-part estimate got h={h_r:g} m and V={v_r:g} m3 for "
+                f"region {info['part']!r}; neither can be used to size a mesh."
+            )
+        edges.add(h_r)
+        v_m3_total += v_r
+        per_region += v_r / (h_r ** 3)
+    if len(edges) == 1:
+        # EVERY region at one edge: the one-part expression, bit for bit. Not a
+        # nicety -- this is the number that routes the job, and it must not move
+        # by a rounding step when nothing was graded. The per-region sum is
+        # algebraically the same but rounds differently.
+        return int(float(c) * v_m3_total / (edges.pop() ** 3))
+    return int(float(c) * per_region)
