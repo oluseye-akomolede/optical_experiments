@@ -1147,9 +1147,10 @@ def test_the_uniform_call_is_exactly_the_call_the_mesher_always_made(monkeypatch
 
     # (a) A single material, no parts: the one-part call.
     box = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
-    MESH.tetrahedralize(box, "mm", n_modes=3, n_index=1.0, max_tets=200_000,
-                        min_feature_m=0.35e-3, verbose=False,
-                        materials={"body": 1.0}, parts=None)
+    _pts, one_tets, _reg = MESH.tetrahedralize(
+        box, "mm", n_modes=3, n_index=1.0, max_tets=200_000,
+        min_feature_m=0.35e-3, verbose=False,
+        materials={"body": 1.0}, parts=None)
     assert len(recorded) == 1, f"the one-part mesh tetrahedralized {len(recorded)}x"
     call = recorded[0]
     assert call == {"order": 1, "mindihedral": 20, "minratio": 2.0,
@@ -1160,6 +1161,22 @@ def test_the_uniform_call_is_exactly_the_call_the_mesher_always_made(monkeypatch
     assert call["maxvolume"] > 0, (
         "the one-part call must still pass a POSITIVE maxvolume; without it "
         "and without fixedvolume TetGen meshes unconstrained"
+    )
+    # And the same call must still produce the SAME mesh: the switch set alone
+    # proves the graded path is not reached, not that the output survived it.
+    # Measured on this fixture (a 1 mm box, min_feature_m = 0.35 mm, 3 modes)
+    # with TetGen 0.8.4 through the real wrapper, deterministic for one input
+    # and one switch set. A stray metric=True or a bgmesh of any size moves it.
+    assert int(one_tets.shape[0]) == 1257, (
+        f"the one-part mesh is {int(one_tets.shape[0])} tets, not the 1257 "
+        "measured before this feature -- a single-material mesh changed"
+    )
+    # And no region report: a one-part job has no regions to grade, and the
+    # manifest's `mesh` block is written only from this report, so a
+    # single-material modes.json is the file it was before the feature.
+    assert MESH.LAST_MESH_REPORT is None, (
+        "a one-part mesh must leave no mesh report; otherwise every "
+        "single-material job's modes.json gains a `mesh` block"
     )
 
     # (b) Two parts, ONE shared index: regions, but one edge, so still uniform.
