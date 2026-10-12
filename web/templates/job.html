@@ -109,7 +109,46 @@
     </div>
   {% endif %}
 
-  {# Where this job runs. Shown from the ROUTING DECISION the app made at upload,
+  {# How a MULTI-REGION mesh was graded, from the solver's own record of the mesh
+     it built (modes.json's `mesh` block) -- never re-derived from the request,
+     for the same reason the materials table is not. Rendered only when the mesh
+     was actually GRADED: an equal-index upload has regions but one edge, and a
+     one-part job has no block at all, so both show exactly what they showed
+     before this feature. The caveats are the mesher's own sentences, in the
+     owner's units, and are printed verbatim rather than re-worded here -- a page
+     that paraphrased them could disagree with the mesh that was built while
+     reading perfectly well. #}
+  {% if mesh_report and mesh_report.graded %}
+    <div id="mesh-grading">
+      <p class="muted small">
+        This cavity's mesh is <strong>graded</strong>: each material region is
+        meshed at its own element size, fine where the wavelength is short and
+        coarse where it is not. The finest region, region
+        {{ mesh_report.fine_region }}, is held to the same size a uniform mesh
+        would have given it, so the accuracy of the frequencies is not spent.
+      </p>
+      <table class="materials" id="mesh-regions">
+        <thead><tr><th>Region</th><th>Part</th><th>Refractive index</th>
+          <th>Target element size</th><th>Achieved median</th></tr></thead>
+        <tbody>
+          {% for rid, r in mesh_report.regions|dictsort %}
+            <tr id="mesh-region-{{ rid }}"><td>{{ rid }}</td><td>{{ r.part }}</td>
+              <td>{{ '%g'|format(r.n) }}</td>
+              <td>{{ '%g'|format(r.target_edge_units) }} {{ job.units }}</td>
+              <td>{% if r.achieved_edge_units is not none %}{{ '%g'|format(r.achieved_edge_units) }} {{ job.units }}
+              {%- else %}not measured{% endif %}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if mesh_report.caveats %}
+        <p class="muted small">A few things to know about this mesh:</p>
+        <ul class="muted small" id="mesh-caveats">
+          {% for note in mesh_report.caveats %}<li>{{ note }}</li>{% endfor %}
+        </ul>
+      {% endif %}
+    </div>
+  {% endif %}
+
      not inferred from the status: "queued for the GPU" and "running on the GPU"
      are different things to wait for, and the owner should be able to tell a job
      that is waiting for a machine from one that is using it. #}

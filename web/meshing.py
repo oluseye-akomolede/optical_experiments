@@ -254,12 +254,22 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
     ``parts``/``materials`` are a MULTI-PART upload (a validated
     ``PartSet`` and its name -> n table), and are ``None`` for the one-part
     upload that this function has always handled. With them the answer is the
-    ONE-PART FORMULA at ``h_min``, the finest region edge, on the cavity's total
-    FILLED volume -- because that is the mesh the solver now builds (every
-    region at one edge; see ``mse_common.region_edges``). The count is what
-    ROUTES the job, so the estimate and the mesh must be the same expression:
-    using the wall's edge alone would under-predict a job with a dense core and
-    send it to the GPU to die, which is what this branch exists to prevent.
+    ONE-PART FORMULA SUMMED PER REGION, ``c * sum_r V_r / h_r^3``, with each
+    region at the edge ``mse_common.region_edges`` gives it -- the SAME helper
+    the mesher builds from. The count is what ROUTES the job, so the estimate
+    and the mesh must be the same expression. Where every region lands on one
+    edge (equal indices, or a single dense region) the per-region sum is
+    algebraically the one-part formula and the code takes that expression
+    directly, so the number does not move by a rounding step.
+
+    GRADED MESHES: when the regions' edges differ, the mesh is GRADED -- the
+    fine region at its own edge, the coarse ones coarser -- so pricing every
+    region at the finest edge would OVER-estimate and send a Jetson-sized job
+    to the cluster. The measured agreement is honest but not tight: the sizing
+    field's transition refines the coarse region below its target, so this sum
+    is a LOWER bound (measured 0.39-0.46x the real count on the nested box
+    fixtures against the one-part fit's ~1.0). That is the safe direction for a
+    route decision that is about the GPU's scarce queue.
 
     NOTE ON THE CALLER: ``web/app.py``'s upload route parses the
     ``part_index.<name>`` fields and passes ``parts``/``materials`` in, so this
@@ -285,25 +295,19 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
         surface = COMMON.apply_scale(surface, scale)
         coefficient = EST_TETS_C if c is None else float(c)
         if materials and parts is not None and getattr(parts, "is_multi", False):
-            # MULTI-PART: the ONE-PART formula, on the whole cavity, at h_min
-            # (the finest region edge). The mesh is built uniformly at h_min, so
-            # this is exactly the expression the mesher realises -- and it shares
-            # the one-part calibration constant, so there is no second fit and no
-            # second formula that could drift from the first.
-            #
-            # ``filled_volume_m3`` per region is still what is summed, because
+            # MULTI-PART: the per-region sum, each region at the edge
+            # ``region_edges`` gives it. The edge is the SAME
+            # ``effective_edge_m`` the mesher calls, and the per-region rule
+            # lives in ONE helper both read, so the base the two work from
+            # cannot differ. ``filled_volume_m3`` per region is summed, because
             # the wall's ENCLOSED volume double-counts everything nested in it
             # and the count is what ROUTES the job.
-            #
-            # The edge is the SAME ``effective_edge_m`` the mesher calls, so the
-            # base the two work from cannot differ; the helper resolves h_min
-            # from the shared region plan.
-            edge_units = COMMON.effective_edge_m(
+            edge_m = COMMON.effective_edge_m(
                 surface, n_modes=n_modes, units=units,
                 min_feature_m=min_feature_m, parts=parts, materials=materials,
             )
             return COMMON.estimate_tets_by_region(
-                parts, materials, edge_units, surface, units, coefficient
+                parts, materials, edge_m, surface, units, coefficient
             )
 
         volume_m3 = COMMON.enclosure_volume_m3(surface, units)

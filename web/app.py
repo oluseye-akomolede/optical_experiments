@@ -284,10 +284,19 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
         # The payload routes keep their own 404: for an ``index.json`` or a
         # field file, a missing manifest really is a missing payload.
         achieved_m = None
+        # How a multi-region mesh was graded: each region's target and achieved
+        # edge, its filled volume and the mesher's caveats, written by the
+        # solver beside the achieved median above. Read from the SAME manifest
+        # read, not a second one: the two describe one mesh, and a page that
+        # fetched them separately could show a target from one run beside an
+        # achieved edge from another. ``None`` for a one-part job, whose
+        # manifest has no such block (and for a pc job, which has no manifest).
+        mesh_report = None
         if job.get("status") == DB.DONE and job.get("kind") == DB.CAVITY:
             manifest = _done_manifest(store, jobs_db, job_id)
             if manifest:
                 achieved_m = manifest.get("achieved_median_edge_m")
+                mesh_report = manifest.get("mesh")
         # A pc job's own header fields, read from the row's stored request --
         # the same reason the materials table is rendered from the STORED JSON:
         # a page that re-derived them from the form could show a lattice the
@@ -302,6 +311,7 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
         return render_template("job.html", job=job,
                               effective_size=_effective_size(job),
                               resolution=_resolution_caption(job, achieved_m),
+                              mesh_report=mesh_report,
                               max_edge_overshoot=MAX_EDGE_OVERSHOOT,
                               pc_request=pc_request,
                               coating_rows=coating_rows,
