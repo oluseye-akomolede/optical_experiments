@@ -18,13 +18,24 @@ same number as the one-part expression `V_cavity / h_min^3` when the edges are
 equal. The estimate SHALL use the same per-region edges the mesher builds to, so
 the route decided on cannot be the route for a mesh nobody builds.
 
-For a GRADED mesh the estimate is a LOWER bound on the real element count, not a
-conservative one: the sizing field's transition between the fine and the coarse
-edge refines the coarse region past its target, and the element count is
-superlinear in edge length, so the sum under-counts. Measured at 0.37-0.46x the
-built count on nested-box fixtures, worst for thin walls. The refusal threshold's
-safety margin is therefore REDUCED (not removed) for a multi-material upload, and
-this is recorded rather than hidden behind the coefficient.
+For a GRADED mesh the estimate SHALL price a coarse region at the edge the
+sizing field's transition actually delivers,
+
+    h_eff = h_r * (h_min / h_r) ** TRANSITION_EDGE_EXPONENT
+
+and not at its target edge: the field ramps from the fine edge to the coarse one
+across every boundary between regions, so elements near that boundary are finer
+than the coarse region's own target, and the plain sum UNDER-counts the mesh the
+mesher then builds. Under-counting is the dangerous direction, because the
+estimate is what routes the job. Measured through the product's own path against
+the BUILT element count on five graded fixtures (a thin-walled and a thick-walled
+one among them), the plain sum lands at 0.58-1.14x the real count and the
+corrected one at 1.01-1.87x -- every under-count removed, at the price of the
+same order of over-count. The exponent is measured, and it is exactly 1 when the
+regions' edges are equal, so the uniform number is unchanged. The refusal
+threshold itself is UNCHANGED by this: the correction restores the margin the
+threshold's "up to twice high" allowance assumes, which a 1.7x-under estimate had
+quietly widened to three or four times.
 
 The estimate SHALL return `0`, meaning "do not route on this", when the surface
 is unusable or the formula fails -- not a small number. Source: `web/meshing.py`,
@@ -44,6 +55,13 @@ is unusable or the formula fails -- not a small number. Source: `web/meshing.py`
 - **THEN** the estimate sums the FILLED volumes (a nested core is not
   double-counted), each at its OWN target edge, so a coarse wall does not count
   as if it were meshed at the core's edge
+
+#### Scenario: a graded upload is estimated
+- **WHEN** the regions' edges differ
+- **THEN** every region above the finest edge is priced at `h_eff`, the edge the
+  transition delivers, and the finest region at its own target
+- **AND** the coarse region is never priced as if the whole of it were meshed at
+  the fine edge, which would over-count a thick wall
 
 #### Scenario: every region shares one index
 - **WHEN** a multi-part upload's regions all have the same index

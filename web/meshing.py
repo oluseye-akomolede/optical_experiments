@@ -267,9 +267,14 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
     region at the finest edge would OVER-estimate and send a Jetson-sized job
     to the cluster. The measured agreement is honest but not tight: the sizing
     field's transition refines the coarse region below its target, so this sum
-    is a LOWER bound (measured 0.39-0.46x the real count on the nested box
-    fixtures against the one-part fit's ~1.0). That is the safe direction for a
-    route decision that is about the GPU's scarce queue.
+    prices each coarse region at the edge the sizing field's transition actually
+    delivers rather than at its target (see
+    ``mse_common.TRANSITION_EDGE_EXPONENT``). Without that the per-region sum
+    UNDER-counts the mesh the mesher then builds -- by 1.7x on the fixtures
+    measured so far -- and an under-count routes the job onto a machine it does
+    not fit, which is the unsafe direction for a route decision about the GPU's
+    scarce queue. With it, the estimate lands 1.0-1.9x the built count on the
+    same fixtures.
 
     NOTE ON THE CALLER: ``web/app.py``'s upload route parses the
     ``part_index.<name>`` fields and passes ``parts``/``materials`` in, so this

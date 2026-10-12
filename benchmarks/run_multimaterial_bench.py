@@ -32,20 +32,39 @@ VM. The per-case cost is in the comment on ``CASES`` and the command is in
 
 The script assumes the tree is at ``~/mse-bench/src-<sha>`` and the GPU venv at
 ``~/mse-bench/gpu-venv``. It takes ``--cases`` to select a subset, ``--n-modes``
-and ``--grid`` to match the production job settings, ``--backend``, and
-``--out`` to write the JSON report. It takes no lock itself -- wrap it in
-``flock`` on ``~/mse-bench/.gpu.lock``, the SAME lock the worker takes, so a
-bench run and a real job can never share the GPU:
+and ``--grid`` to match the production job settings, ``--backend``,
+``--per-part-facets`` (the graded diagnosis's fixture), and ``--out`` to write
+the JSON report. It takes no lock itself -- wrap it in ``flock`` on
+``~/mse-bench/.gpu.lock``, the SAME lock the worker takes, so a bench run and a
+real job can never share the GPU:
 
     flock ~/mse-bench/.gpu.lock systemd-run --user --scope -p MemoryMax=5G \
-        env MSE_SOLVER_BACKEND=gpu ~/mse-bench/gpu-venv/bin/python \
+        env MSE_SOLVER_BACKEND=gpu \
+            LD_LIBRARY_PATH="$HOME/cudss-0.7.1/lib:/usr/local/cuda/lib64" \
+            CUDSS_MT_LIB="$HOME/cudss-0.7.1/lib/libcudss_mtlayer_gomp.so.0" \
+            ~/mse-bench/gpu-venv/bin/python \
         ~/mse-bench/src-<sha>/benchmarks/run_multimaterial_bench.py --out /tmp/bench.json
+
+BOTH cuDSS variables are part of the command, not decoration. They are exactly
+what the worker unit sets (``worker/README.md``, ``tests/jetson_gpu_check.sh``):
+``LD_LIBRARY_PATH`` must reach the Jetson aarch64 cuDSS 0.7.1 -- the pip
+``nvidia-cudss-cu12`` wheel is an SBSA build and aborts inside ``cudss.create()``
+-- and ``CUDSS_MT_LIB`` is the MT layer ``mse_backend.py`` passes to
+``DirectSolverOptions``. Without them the run does not reach the solver at all,
+and the residual arithmetic cannot see the difference: it is still a residual
+over the vectors the solver returned. (Hit on 2026-10-12; the docstring used to
+carry the bare ``env MSE_SOLVER_BACKEND=gpu`` line.)
 
 ``systemd-run --scope -p MemoryMax=5G`` is how the bench runs are bounded on the
 Orin (from ``worker/README.md``): ``ulimit -v`` is an address-space limit and
 stops CUDA initialising there, so the cgroup limit is used instead. Each case
 runs in the SAME process, so a case that raises does not take the others down --
 it is caught, recorded with its traceback, and the rest continue.
+
+EXIT CODES (``BENCH_*`` below): 0 every criterion measured and passed, 1 a case
+raised, 2 bad arguments, 3 a criterion FAILED, 4 a criterion could not be
+measured. 255 (ssh) and 128+signo (a signal, e.g. 134 for SIGABRT) are transport
+deaths and mean NO REPORT -- never a pass.
 """
 
 from __future__ import annotations
@@ -70,7 +89,7 @@ if str(_BENCH_DIR) not in sys.path:
     sys.path.insert(0, str(_BENCH_DIR))
 
 import sphere_dielectric as REF  # noqa: E402
-from mse_common import unit_scale  # noqa: E402
+from mse_common import MAX_EDGE_OVERSHOOT, unit_scale  # noqa: E402
 
 #: The geometry. a/b = 1/3 with n = 2 separates the lowest modes (measured gaps
 #: 1.25, 1.37, 1.41), which the analytic module chose so a misidentified root is
@@ -185,7 +204,8 @@ def _facet_subdivisions(radius: float, target_edge: float) -> int:
     )
 
 
-def _parts_obj(specs, target_edge: float) -> bytes:
+def _parts_obj(specs, target_edge: float,
+               edge_by_name: dict | None = None) -> bytes:
     """A ``.obj`` from ``(name, radius)`` pairs, in mm.
 
     Written out through trimesh's OBJ exporter (via an ``o`` line per part, so
@@ -202,13 +222,19 @@ def _parts_obj(specs, target_edge: float) -> bytes:
 
     Every sphere is faceted at ``target_edge`` (see ``_facet_subdivisions``),
     so both parts exercise the ordinary path a real upload takes.
+
+    ``edge_by_name`` overrides the facet edge for a named part. The graded
+    diagnosis uses it to facet the DENSE CORE at its OWN region edge: a core
+    meshed at ``target_edge / n_core`` but BUILT at ``target_edge`` is a
+    polyhedron whose inscribed radius is a percent short of the sphere, and the
+    mode error then measures the fixture's geometry rather than the mesh.
     """
     import trimesh
 
     lines: list[str] = []
     n_verts_written = 0
     for name, r in specs:
-        s = _facet_subdivisions(r, target_edge)
+        s = _facet_subdivisions(r, (edge_by_name or {}).get(name, target_edge))
         mesh = trimesh.creation.icosphere(subdivisions=s, radius=r)
         verts = np.asarray(mesh.vertices, float)
         faces = np.asarray(mesh.faces, np.int64)
@@ -309,7 +335,8 @@ def _effective_radii(parts, n_core, units: str = "mm"):
 
 
 def _run_case(label: str, n_core: float | None, *, n_modes: int, grid: int,
-              work: Path, verbose: bool, backend: str = "gpu") -> dict:
+              work: Path, verbose: bool, backend: str = "gpu",
+              per_part_facets: bool = False) -> dict:
     """Build, mesh, solve and score ONE case over the real production path."""
     import mse_maxwell_solver as SOLVER
 
@@ -457,13 +484,34 @@ def _score(case: dict, key: str = "reference") -> dict:
 
 
 
-def _command_hint() -> str:
+def _command_hint(per_part_facets: bool = False) -> str:
+    """The exact command that reproduces this run, env included.
+
+    Printed into the log so the report carries the command that made it -- the
+    env vars below decide whether the run reaches the solver at all, so a hint
+    without them is not a reproduction.
+    """
     return (
         "flock ~/mse-bench/.gpu.lock systemd-run --user --scope -p MemoryMax=5G \\\n"
-        "    env MSE_SOLVER_BACKEND=gpu ~/mse-bench/gpu-venv/bin/python \\\n"
+        "    env MSE_SOLVER_BACKEND=gpu \\\n"
+        '        LD_LIBRARY_PATH="$HOME/cudss-0.7.1/lib:/usr/local/cuda/lib64" \\\n'
+        '        CUDSS_MT_LIB="$HOME/cudss-0.7.1/lib/libcudss_mtlayer_gomp.so.0" \\\n'
+        "        ~/mse-bench/gpu-venv/bin/python \\\n"
         "    ~/mse-bench/src-<sha>/benchmarks/run_multimaterial_bench.py \\\n"
         "    --out /tmp/mse-bench-<sha>.json"
+        + ("  --per-part-facets" if per_part_facets else "")
     )
+
+
+# Process exit codes. A remote run must not read as success when a criterion
+# FAILED, and a lost connection must not be mistaken for a measured verdict.
+# 2 is argparse's own usage-error code; 255 and 128+signo belong to the
+# transport (ssh, signals) and mean "no report at all".
+BENCH_OK = 0          # every criterion measured and passed
+BENCH_RAISED = 1      # a case raised; the report is incomplete
+BENCH_USAGE = 2       # bad arguments (argparse also uses this)
+BENCH_DEFECT = 3      # a criterion FAILED -- the feature is wrong
+BENCH_INCOMPLETE = 4  # a criterion could not be measured (no baseline/reference)
 
 
 def main(argv: list[str]) -> int:
@@ -478,6 +526,10 @@ def main(argv: list[str]) -> int:
     p.add_argument("--work", default=None, help="work directory (default: a temp dir)")
     p.add_argument("--backend", default="gpu", choices=("cpu", "gpu"),
                    help="solver backend; the tier-1 smoke run uses cpu")
+    p.add_argument("--per-part-facets", action="store_true",
+                   help="facet each part at its OWN region edge (the edge the "
+                        "graded rule meshes it at) instead of the whole-object "
+                        "edge; the fixture the n3 FAIL points at")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
 
@@ -486,13 +538,13 @@ def main(argv: list[str]) -> int:
     if not selected:
         print(f"no cases selected; available: {[c[0] for c in CASES]}",
               file=sys.stderr)
-        return 2
+        return BENCH_USAGE
 
     import tempfile
     work_root = Path(args.work) if args.work else Path(
         tempfile.mkdtemp(prefix="mse-bench-"))
     print(f"[bench] work root: {work_root}")
-    print(f"[bench] command: {_command_hint()}")
+    print(f"[bench] command: {_command_hint(args.per_part_facets)}")
     print()
 
     report = {"cases": []}
@@ -502,7 +554,8 @@ def main(argv: list[str]) -> int:
         try:
             case = _run_case(label, n_core, n_modes=args.n_modes, grid=args.grid,
                              work=work_root / label, verbose=not args.quiet,
-                             backend=args.backend)
+                             backend=args.backend,
+                             per_part_facets=args.per_part_facets)
         except Exception as exc:  # noqa: BLE001 - a case failing is data
             failures += 1
             print(f"[bench] case {label} RAISED: {type(exc).__name__}: {exc}")
@@ -564,6 +617,10 @@ def main(argv: list[str]) -> int:
     # its error is the harness's own faceting floor.
     by_label = {c["label"]: c for c in report["cases"] if "score" in c}
     baseline = by_label.get("empty", {}).get("score", {}).get("worst_rel_error")
+    # Every criterion reads into this list, so the process exit code is decided
+    # by the SAME path that prints the verdict -- a FAIL that printed and still
+    # exited 0 would let a remote run read as success.
+    verdicts: list[str] = []
     print("-" * 60)
     print("[bench] ACCEPTANCE (worst matched multiplet error, vs the empty "
           "sphere's; tets vs a uniform mesh of the same object)")
@@ -574,6 +631,7 @@ def main(argv: list[str]) -> int:
         # the error half had been fine.
         print("[bench]   NO empty-sphere baseline in this run, so the error "
               "criterion is UNMEASURED -- re-run including the 'empty' case")
+        verdicts.append("INCOMPLETE")
     else:
         print(f"[bench]   empty (baseline): worst {baseline*100:.3f}%")
     for c in report["cases"]:
@@ -583,21 +641,59 @@ def main(argv: list[str]) -> int:
             if worst is None:
                 print(f"[bench]   {c['label']}: no scored modes -- error "
                       f"criterion UNMEASURED")
+                verdicts.append("INCOMPLETE")
             elif baseline is None:
                 print(f"[bench]   {c['label']}: worst {worst*100:.3f}% -- "
                       f"NO BASELINE to compare it against")
+                verdicts.append("INCOMPLETE")
             else:
                 err_ok = worst <= 2.0 * baseline
                 print(f"[bench]   {c['label']}: worst {worst*100:.3f}% "
                       f"({worst/baseline:.2f}x the empty sphere) -> "
                       f"{'PASS' if err_ok else 'FAIL'} (<= 2.00x)")
+                verdicts.append("PASS" if err_ok else "DEFECT")
         ratio = c.get("tets_vs_uniform")
         if ratio is not None:
             print(f"[bench]   {c['label']}: {ratio*100:.1f}% of uniform tets -> "
                   f"{'PASS' if ratio < 1.0 else 'FAIL'} (< 100%)")
+            verdicts.append("PASS" if ratio < 1.0 else "DEFECT")
         elif c["label"] != "empty":
             print(f"[bench]   {c['label']}: tets vs uniform UNMEASURED "
                   f"({c.get('uniform_error') or 'the reference was not built'})")
+            verdicts.append("INCOMPLETE")
+        # D: the FINE REGION's OWN achieved edge. The metric above is a median
+        # over the whole mesh, and the wall holds most of the tets -- a dense
+        # core that quietly lost its resolution hides inside an average that is
+        # dominated by the coarse region. The mesh block measures it on the fine
+        # region's own tets (``_mesh_report`` masks ``region_of_tet``), which is
+        # the number the solver itself refuses on, so this criterion holds the
+        # bench to the product's own acceptance rather than to a second opinion.
+        # The empty case has one part and nothing to grade, so its whole-mesh
+        # median IS the fine region's and there is no criterion to add.
+        mesh = c.get("mesh") or {}
+        if c["label"] != "empty":
+            fine_region = (mesh.get("regions") or {}).get(
+                str(mesh.get("fine_region"))) or {}
+            fine_ach = mesh.get("fine_achieved_edge_m")
+            fine_target = mesh.get("target_edge_m")
+            ach_mm = fine_region.get("achieved_edge_units")
+            target_mm = fine_region.get("target_edge_units")
+            if (fine_ach is None or not fine_target
+                    or ach_mm is None or target_mm is None):
+                why = ("no mesh block was written" if not mesh else
+                       f"region {mesh.get('fine_region')} has no tets")
+                print(f"[bench]   {c['label']}: fine-region achieved edge "
+                      f"UNMEASURED ({why})")
+                verdicts.append("INCOMPLETE")
+            else:
+                mult = fine_ach / fine_target
+                fine_ok = mult <= MAX_EDGE_OVERSHOOT
+                print(f"[bench]   {c['label']}: fine region "
+                      f"({fine_region.get('part')}) achieved {ach_mm:.4g} mm vs "
+                      f"its {target_mm:.4g} mm target ({mult:.2f}x, allowance "
+                      f"{MAX_EDGE_OVERSHOOT:.2f}x) -> "
+                      f"{'PASS' if fine_ok else 'FAIL'}")
+                verdicts.append("PASS" if fine_ok else "DEFECT")
     print("=" * 60)
 
     if args.out:
@@ -607,7 +703,22 @@ def main(argv: list[str]) -> int:
     print("=" * 60)
     print(f"[bench] {len(report['cases']) - failures}/{len(selected)} cases ran; "
           f"{failures} raised")
-    return 1 if failures else 0
+    # EXIT CODES, and the ones this process must NOT stand behind: ssh returns
+    # 255 when the connection itself fails and a signal death returns 128+signo
+    # (SIGABRT is 134). Those mean NO REPORT, never "the bench passed" -- read
+    # the code before believing a log with no ACCEPTANCE block in it.
+    if failures:
+        print(f"[bench] EXIT {BENCH_RAISED}: {failures} case(s) raised -- the "
+              f"report is incomplete")
+        return BENCH_RAISED
+    if "DEFECT" in verdicts:
+        print(f"[bench] EXIT {BENCH_DEFECT}: a criterion FAILED")
+        return BENCH_DEFECT
+    if "INCOMPLETE" in verdicts:
+        print(f"[bench] EXIT {BENCH_INCOMPLETE}: a criterion is UNMEASURED")
+        return BENCH_INCOMPLETE
+    print(f"[bench] EXIT {BENCH_OK}: every criterion measured and passed")
+    return BENCH_OK
 
 
 if __name__ == "__main__":

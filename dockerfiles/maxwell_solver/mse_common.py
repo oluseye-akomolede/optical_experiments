@@ -588,6 +588,31 @@ def region_plan(parts, materials, edge_m: float, units: str,
     return out
 
 
+#: How far, in log-edge space, the sizing field's transition moves a COARSE
+#: region below its own target edge. ``estimate_tets_by_region`` prices a coarse
+#: region at ``h_r * (h_min/h_r) ** this``; measured through the product's own
+#: mesh report on five graded fixtures, comparing the estimate with the BUILT
+#: element count (est/built, and the same with the correction):
+#:
+#:     fixture                      ratio r   plain   corrected
+#:     sphere, thin core  (2/0.6 mm)   3.0    0.584    1.012
+#:     sphere, fat core   (5/3 mm)     3.0    1.209    1.392
+#:     box, thick wall    (6/2 mm)     3.0    0.702    1.143
+#:     box, thin wall     (6/4 mm)     3.0    1.101    1.215
+#:     Orin n3 (3.33/10 mm, n=3)       3.0    1.140    1.866
+#:     Orin n2 (3.33/10 mm, n=2)       2.0    1.105    1.685
+#:
+#: The plain sum under-counts by up to 1.7x (the estimate ROUTES the job, so an
+#: under-count sends a job onto a machine it does not fit); 0.25 removes every
+#: under-count on the measured set, at the price of the same order of
+#: over-count. 0.35 was tried and left 2.4x on the largest fixture. The
+#: remaining spread is the shape dependence of ``c`` (a fit made on shells
+#: over-prices a compact dense core), which is not this exponent's to fix.
+#: A larger index ratio gives a larger correction, which is the direction the
+#: physics runs.
+TRANSITION_EDGE_EXPONENT = 0.25
+
+
 def estimate_tets_by_region(parts, materials, edge_m: float,
                             surface, units: str, c: float) -> int:
     """Weyl-free element estimate for a multi-part upload.
@@ -633,6 +658,21 @@ def estimate_tets_by_region(parts, materials, edge_m: float,
 
     ``c`` is the SAME constant the one-part estimate uses -- passed in, never
     re-derived here, so the two paths cannot disagree about it.
+
+    A COARSE REGION IS PRICED AT THE EDGE THE TRANSITION DELIVERS, not at its
+    target. The sizing field ramps from the fine edge to the coarse one across
+    every boundary between regions, and elements near that boundary are finer
+    than the coarse region's own target, so the plain sum UNDER-counts the mesh
+    the mesher then builds -- by 1.9x on the thinnest wall measured, and the
+    estimate is what routes the job. Each region above ``h_min`` is therefore
+    priced at
+
+        h_eff = h_r * (h_min / h_r) ** TRANSITION_EDGE_EXPONENT
+
+    which is ``h_r`` exactly when nothing is graded (the exponent's own limit,
+    preserving the one-edge branch below bit for bit) and moves toward the fine
+    edge as the ratio grows. The exponent is the ONE fitted number here and it
+    is measured, not chosen: see ``TRANSITION_EDGE_EXPONENT``.
     """
     plan = region_plan(parts, materials, edge_m, units)
     if not plan:
@@ -645,7 +685,6 @@ def estimate_tets_by_region(parts, materials, edge_m: float,
         )
     edges = set()
     v_m3_total = 0.0
-    per_region = 0.0
     for info in plan.values():
         h_r = float(info["edge_m"])
         v_r = float(info["filled_volume_m3"])
@@ -658,11 +697,18 @@ def estimate_tets_by_region(parts, materials, edge_m: float,
             )
         edges.add(h_r)
         v_m3_total += v_r
-        per_region += v_r / (h_r ** 3)
     if len(edges) == 1:
         # EVERY region at one edge: the one-part expression, bit for bit. Not a
         # nicety -- this is the number that routes the job, and it must not move
         # by a rounding step when nothing was graded. The per-region sum is
         # algebraically the same but rounds differently.
         return int(float(c) * v_m3_total / (edges.pop() ** 3))
-    return int(float(c) * per_region)
+    h_min = min(edges)
+    delivered = 0.0
+    for info in plan.values():
+        h_r = float(info["edge_m"])
+        v_r = float(info["filled_volume_m3"])
+        if h_r > h_min:
+            h_r *= (h_min / h_r) ** TRANSITION_EDGE_EXPONENT
+        delivered += v_r / (h_r ** 3)
+    return int(float(c) * delivered)

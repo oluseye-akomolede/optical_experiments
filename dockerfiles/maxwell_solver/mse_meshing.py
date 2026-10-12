@@ -357,6 +357,33 @@ LAST_MESH_REPORT: dict | None = None
 #: are pinned equal by ``test_meshing_guard`` all the same.
 TETGEN_MTR_POINTDATA_KEY = "target_size"
 
+#: The most cells a GRADED mesh's sizing background may hold. The background is
+#: a real tetrahedralization built BEFORE the object exists, on the machine that
+#: then solves and while another job may be running on it, so it is given the
+#: same order of budget as the largest mesh this app will build rather than
+#: being allowed to grow with the object-volume/fine-edge ratio. A background
+#: that would exceed it is COARSENED first -- a coarser grid costs mesh quality
+#: in the transition, while refusing costs the answer -- and only a coarsening
+#: that leaves the finest region with no node of its own is refused, with a
+#: message naming that region. See ``_sizing_background``.
+MAX_BACKGROUND_TETS = DEFAULT_MAX_TETS
+
+
+def _background_tet_estimate(vertices: np.ndarray, faces: np.ndarray,
+                             cell_volume: float) -> float:
+    """Cells a background mesh of this PLC will hold, from volume/cell volume.
+
+    The PLC's enclosed volume by the divergence theorem over its own facets --
+    the same surface TetGen is handed, so this is the volume it will fill, not
+    the bounding box. Used to price the background BEFORE building it, which is
+    the only moment at which refusing is free.
+    """
+    a = vertices[faces[:, 0]]
+    b = vertices[faces[:, 1]]
+    c = vertices[faces[:, 2]]
+    enclosed = abs(float(np.einsum("ij,ij->i", np.cross(a, b), c).sum())) / 6.0
+    return enclosed / cell_volume
+
 
 def tetrahedralize(
     surface,
@@ -500,10 +527,16 @@ def tetrahedralize(
     # under its own thickness -- the negative the clamp guards.
     #
     # This block runs BEFORE decimation because the decimation target depends on
-    # it: a graded mesh decimates its surface to the COARSE edge, or the fine
-    # facets left over from the finest region would floor the coarse ones. A
-    # uniform mesh still decimates to ``h_min_units``, which is what it did
-    # before this block moved.
+    # it. The target is ``h_min_units`` -- the FINEST region's edge -- for a
+    # graded mesh and a uniform one alike, and it is deliberately NOT the coarse
+    # edge. The surface facets FIX the shape of every region boundary and the
+    # interior mesh cannot recover it: decimating to the coarse edge left the
+    # Orin's n3 core (a 3.33 mm sphere of index 3 in a 10 mm shell, facets at the
+    # coarse 1.825 mm) a polyhedron whose volume-equivalent radius was 1.14%
+    # short of the ideal, charging the l=1 TE multiplet 0.75% error while the
+    # core's interior mesh sat at 1.09x its own target. The cost of the finer
+    # target is the near-boundary facet count, which the graded mesh pays only
+    # where its own regions already need it.
     region_plan = None
     graded = False
     multi = parts is not None and getattr(parts, "is_multi", False)
@@ -602,7 +635,8 @@ def tetrahedralize(
     # not retry; see below).
     sizing_field = (
         _sizing_background(
-            region_plan, vertices, faces, canonical_offset, canonical_scale, units
+            region_plan, vertices, faces, canonical_offset, canonical_scale,
+            units, verbose,
         )
         if graded else None
     )
@@ -1007,10 +1041,12 @@ def _mesh_report(region_plan, region_of_tet, points_m, tets, units,
             )
     if decimation_note:
         caveats.append(
-            f"the surface was coarsened ({decimation_note}) to the coarsest "
-            f"region edge ({region_plan['coarse_edge_m'] / unit_scale_m:.4g} "
-            f"{units}) so the coarse regions are not floored by the surface's "
-            "fine facets"
+            f"the surface was coarsened ({decimation_note}) to the FINEST "
+            f"region edge ({region_plan['h_min_m'] / unit_scale_m:.4g} {units}), "
+            "the same edge a uniform mesh would have used: the facets fix the "
+            "shape of every region boundary and the interior mesh cannot "
+            "recover it, so a graded surface is never left coarser than a "
+            "uniform one"
         )
 
     fine_region = region_plan["fine_region"]
@@ -1048,12 +1084,12 @@ def _region_plan(parts, materials, edge_m: float, units: str,
         fine_region      the region id the cavity is SOLVED at (argmin of edge_m)
         coarse_region    the region id the mesh is COARSEST in (argmax of edge_m)
         graded           True when the regions do NOT all land on one edge
-        decimate_units   the target for ``decimate_to_edge_length``: the coarse
-                         edge when graded (so the surface does not floor the
-                         coarse regions), else ``h_min_units`` -- which is what
-                         the uniform rule used, so a uniform mesh is unchanged
-        decimate_would_move  True when grading makes the decimation target differ
-                         from ``h_min_units`` (the caveat's trigger)
+        decimate_units   the target for ``decimate_to_edge_length``:
+                         ``h_min_units`` -- the FINEST region's edge, which is
+                         what the uniform rule used, so grading never leaves the
+                         surface (and with it every boundary and interface)
+                         coarser than a uniform mesh would (see the comment at
+                         the assignment for the measurement that settled this)
 
     ``materials`` maps part name -> n and must name every part. A region with no
     material is refused rather than defaulted, because the default would be
@@ -1113,7 +1149,19 @@ def _region_plan(parts, materials, edge_m: float, units: str,
     tol = 1e-9 * max(h_min_m, 1.0)
     graded = (coarse_edge_m - h_min_m) > tol
     coarse_edge_units = coarse_edge_m / unit_scale_m
-    decimate_units = coarse_edge_units if graded else h_min_units
+    # The surface is decimated to the FINEST region's edge, exactly what the
+    # uniform rule did, so a graded mesh is never coarser than a uniform mesh at
+    # any boundary or interface. Decimating to the COARSE edge when graded is
+    # tempting -- the coarse regions are the large-volume ones, and a fine
+    # surface floors the tets that touch it -- and it is a real saving. It buys
+    # that saving with the one geometry grading exists to protect, because a
+    # region's INTERFACE SHAPE is fixed by the facets and the interior mesh
+    # cannot recover it: measured on the Orin (n3: a 3.33 mm core of index 3 in
+    # a 10 mm shell), facets built at the coarse edge left the core a polyhedron
+    # whose volume-equivalent radius was 1.14% short of the ideal (a_eff 3.2953
+    # against 3.3333), charging the l=1 TE multiplet with 0.75% error while the
+    # core's interior mesh was at 1.09x its own target.
+    decimate_units = h_min_units
 
     seeds_units = {}
     for part_index, region_id in enumerate(region_of_part):
@@ -1159,7 +1207,6 @@ def _region_plan(parts, materials, edge_m: float, units: str,
         "coarse_region": int(coarse_region),
         "graded": bool(graded),
         "decimate_units": decimate_units,
-        "decimate_would_move": bool(graded and decimate_units != h_min_units),
         "shared": shared,
     }
 
@@ -1286,7 +1333,7 @@ def _sizing_background_grid(bg_points: np.ndarray, bg_tets: np.ndarray,
 
 def _sizing_background(plan: dict, vertices: np.ndarray, faces: np.ndarray,
                        canonical_offset: np.ndarray, canonical_scale: float,
-                       units: str):
+                       units: str, verbose: bool = False):
     """``(bg_points, bg_tets, bg_sizes)`` for a graded mesh, in the canonical frame.
 
     The sizing field is a background tetrahedralization whose NODES carry target
@@ -1308,6 +1355,13 @@ def _sizing_background(plan: dict, vertices: np.ndarray, faces: np.ndarray,
     the clamp COLLAPSE and REFUTED (identical collapse at 0.22 and at
     0.08/0.05/0.04 canonical), so this is a grading-quality choice, not the
     clamp's mechanism.
+
+    UNLESS that would cost more than ``MAX_BACKGROUND_TETS`` cells, priced from
+    the PLC's own volume before the build: the cells are then coarsened to the
+    cap, and the finest region's target has to survive on at least one node --
+    a background cell wider than the fine region would swallow it and the mesh
+    would come back quietly ungraded, so that outcome REFUSES with the region
+    named instead.
     """
     import tetgen
 
@@ -1327,6 +1381,31 @@ def _sizing_background(plan: dict, vertices: np.ndarray, faces: np.ndarray,
     # are described the same way.
     bg_volume = (bg_edge ** 3) / (6.0 * np.sqrt(2.0))
 
+    # --- price it before building it ------------------------------------
+    #
+    # The background is the one mesh built before the object exists, so a job
+    # that dies here has burnt the owner's time and, on the Orin, RAM the solver
+    # needed. Its cost is the enclosed volume over the cell volume, computable
+    # from the PLC in this function's own hands: cells at the FINEST region's
+    # edge over the WHOLE object, which is the largest single number the graded
+    # path produces. Above the cap the cells are coarsened to fit rather than
+    # refused -- a coarser grid still carries every region's target as long as
+    # each region keeps a node of its own, and that is checked below.
+    wanted_edge = bg_edge
+    estimated_tets = _background_tet_estimate(vertices, faces, bg_volume)
+    if estimated_tets > MAX_BACKGROUND_TETS:
+        bg_edge *= (estimated_tets / float(MAX_BACKGROUND_TETS)) ** (1.0 / 3.0)
+        bg_volume = (bg_edge ** 3) / (6.0 * np.sqrt(2.0))
+        if verbose:
+            print(
+                f"[mse] the sizing background grid would need about "
+                f"{estimated_tets:,.0f} cells, above the "
+                f"{MAX_BACKGROUND_TETS:,} cap; coarsening its cells from "
+                f"{wanted_edge / canonical_scale:.4g} to "
+                f"{bg_edge / canonical_scale:.4g} {units}",
+                flush=True,
+            )
+
     bg = tetgen.TetGen(vertices, faces)
     for region_id, seed_canonical in _region_requests(
         plan, canonical_offset, canonical_scale
@@ -1344,6 +1423,17 @@ def _sizing_background(plan: dict, vertices: np.ndarray, faces: np.ndarray,
             f"internal error: the sizing background mesh got {attrib.shape[0]} "
             f"region attributes for {bg_tets.shape[0]} tetrahedra"
         )
+    if bg_tets.shape[0] > MAX_BACKGROUND_TETS:
+        # The coarsening above could not hold the cap, so its estimate was
+        # wrong. Say which number was wrong rather than carrying on: the next
+        # step would hand this grid to the solver's own memory budget.
+        raise MeshingError(
+            f"the sizing background grid came back with {bg_tets.shape[0]:,} "
+            f"cells, above the {MAX_BACKGROUND_TETS:,} cap it was coarsened to "
+            f"fit (the estimate said {estimated_tets:,.0f}). This object is "
+            "too large and too finely graded to mesh inside one job's memory; "
+            "try fewer modes or a coarser target for the dense region."
+        )
     node_region = np.full(bg_points.shape[0], -1, dtype=np.int64)
     for tet_index in range(bg_tets.shape[0]):
         region_id = int(attrib[tet_index])
@@ -1360,6 +1450,28 @@ def _sizing_background(plan: dict, vertices: np.ndarray, faces: np.ndarray,
         ],
         dtype=float,
     )
+    if sizes.size == 0 or float(sizes.min()) > fine_canonical * (1.0 + 1e-12):
+        # NO node carries the finest region's edge. The field is then unable to
+        # produce that edge ANYWHERE, so the mesh would come back quietly
+        # UNGRADED -- the failure this whole path exists to avoid, and the one
+        # the coarsening above can cause, because a background cell wider than
+        # the fine region SWALLOWS it and the region then owns no node. Refuse,
+        # naming the region and its edge, rather than build a mesh whose fine
+        # region is a lie.
+        fine_rid = int(plan["fine_region"])
+        fine_part = next(
+            (name for name, rid in plan["region_of_part"].items()
+             if int(rid) == fine_rid),
+            f"region {fine_rid}",
+        )
+        raise MeshingError(
+            f"the sizing background grid is too coarse to carry the finest "
+            f"region ({fine_part}, edge "
+            f"{fine_canonical / canonical_scale:.4g} {units}): no cell of it "
+            "lands inside that region, so the mesh's dense region would come "
+            "back no finer than the rest. Try fewer modes, a lower "
+            "refractive index for that region, or a coarser object."
+        )
     return bg_points, bg_tets, sizes
 
 

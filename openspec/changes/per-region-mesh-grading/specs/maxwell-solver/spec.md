@@ -86,6 +86,67 @@ is on the target, not on the background mesh's step.
 - **WHEN** every region's graded edge is under its clamp
 - **THEN** no caveat is written
 
+### Requirement: The sizing background grid SHALL be priced before it is built
+
+A graded mesh's sizing field needs a tetrahedralization of the cavity to carry it,
+and that grid is built BEFORE the object exists, on the machine that then builds
+and solves the mesh while another job may be running. The mesher SHALL therefore
+estimate the grid's element count from the cavity's ENCLOSED volume over its cell
+volume BEFORE building it, SHALL hold it under a stated cap
+(`MAX_BACKGROUND_TETS`), and SHALL COARSEN its cells to fit that cap rather than
+refuse: a coarser transition costs mesh quality in the graded band, refusing costs
+the answer. A coarsening can leave the finest region with no node of its own, and
+the field then cannot produce that region's edge anywhere -- a mesh that comes
+back quietly UNGRADED -- so the mesher SHALL refuse, with a plain message naming
+that region and the edges, rather than build it. The same refusal SHALL follow a
+built grid that exceeded the cap. Source: `dockerfiles/maxwell_solver/mse_meshing.py`.
+
+Measured basis: the grid must be as fine as the fine edge and covered 8.6k-580k
+elements on the fixtures measured -- up to ~19x the final mesh's own element
+count. The estimate is the volume/cell-volume ratio, not the bounding box, so it
+prices exactly the tetrahedralization about to be attempted.
+
+#### Scenario: the priced grid is over the cap
+- **WHEN** the estimated element count exceeds `MAX_BACKGROUND_TETS`
+- **THEN** the grid's cells are coarsened to fit the cap and the mesh is still
+  built graded, every region keeping its own achieved edge
+
+#### Scenario: coarsening would swallow the finest region
+- **WHEN** the grid's coarsened cells leave no node carrying the finest region's
+  edge
+- **THEN** the mesher refuses BEFORE building, naming that region, its edge and
+  what the owner can change
+
+#### Scenario: a grid inside the cap
+- **WHEN** the estimated element count is inside the cap
+- **THEN** the grid is built at its planned step, unchanged, and no cap applies
+
+### Requirement: The multi-material benchmark SHALL carry its verdict in its exit code
+
+The benchmark SHALL exit zero only when every criterion was measured AND passed.
+A criterion that FAILED SHALL end the process with a non-zero DEFECT code and a
+criterion that could not be measured SHALL end it with a distinct non-zero code,
+so that a remote invocation cannot read a FAILED run as success. Its fine-region
+criterion SHALL measure the achieved edge on the FINE REGION's own elements --
+never the whole-mesh median, which a graded mesh's coarse regions dominate -- and
+SHALL compare it with the same overshoot allowance the mesher itself enforces. The
+benchmark's module docstring SHALL carry the invocation that works, including the
+environment the solver backend needs. Source: `benchmarks/run_multimaterial_bench.py`.
+
+#### Scenario: a criterion fails
+- **WHEN** a case's worst error or its element count fails its criterion
+- **THEN** the report prints the failed criterion and the process exits non-zero
+
+#### Scenario: a graded case's fine region is scored
+- **WHEN** a graded case is scored
+- **THEN** its fine region's achieved median edge is taken from that region's own
+  elements and compared with that region's own target
+
+#### Scenario: the mesh block is missing
+- **WHEN** a case has no mesh block, or its fine region holds no elements
+- **THEN** the fine-region criterion is UNMEASURED, which fails the run, and it is
+  never reported as a pass
+
 ## MODIFIED Requirements
 
 ### Requirement: The interior element size follows Weyl's law from enclosed volume

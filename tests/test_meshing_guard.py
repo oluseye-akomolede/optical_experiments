@@ -1379,3 +1379,175 @@ def test_a_single_material_job_never_takes_the_graded_path(monkeypatch):
         f"a single-material job routes through the ungraded call and has no "
         f"graded caveat to state; got {report['caveats']}"
     )
+
+
+def _fine_nested_parts(units="mm"):
+    """Two nested boxes, each faceted to its OWN region edge.
+
+    The graded path can only be exercised with facets fine enough for the
+    fine region's interior: TetGen cannot refine a surface below its facets,
+    so a 12-triangle box would floor the core and the mesh would be refused as
+    too coarse (a different failure, and the one that would hide what these
+    tests are about). The wall is faceted at the wall's edge and the core at
+    the core's, the shape a real upload of a graded object arrives in.
+    """
+    import mse_parts as PARTS
+
+    wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
+    core = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    wall = wall.subdivide_to_size(max_edge=1.2)
+    core = core.subdivide_to_size(max_edge=0.4)
+    obj = trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8")
+    return PARTS.load_parts(obj, units=units)
+
+
+def _record_tetgen(monkeypatch) -> list[dict]:
+    """Every call the mesher makes to TetGen, in order.
+
+    Wrapping the class's method rather than patching a private helper means the
+    count is of TETRAHEDRALIZATIONS, whatever the code between them did. That is
+    the quantity the row's question is about: a retry is a second full
+    tetrahedralization with a global ``maxvolume``, and a global maxvolume
+    OVERRIDES the sizing field, so one that happened would silently drop the
+    grading for that job.
+    """
+    import tetgen as TET
+
+    recorded: list[dict] = []
+    real = TET.TetGen
+
+    class Recorder(real):
+        def tetrahedralize(self, **kwargs):
+            recorded.append(kwargs)
+            return super().tetrahedralize(**kwargs)
+
+    monkeypatch.setattr(TET, "TetGen", Recorder)
+    return recorded
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+def test_a_graded_mesh_over_the_cap_refuses_instead_of_retrying(monkeypatch):
+    """C: the graded path cannot reach the global-``maxvolume`` retry.
+
+    ``maxvolume`` is what the RETRY raises, and a raised ``maxvolume`` overrides
+    the sizing field -- so a graded mesh that retried would come back with every
+    region at ONE edge and nothing in the mesh would say so. Measured here on
+    the calls: a graded over-cap request tetrahedralizes exactly TWICE (one
+    sizing background, one mesh, the second carrying ``bgmesh`` and no positive
+    ``maxvolume``) and raises the graded refusal. It never reaches the retry.
+
+    The control is the SECOND half, and it is what makes the first half mean
+    anything: the same object with one shared index takes the uniform arm, which
+    IS allowed to retry -- so the same instrument must see two or more meshes
+    there. A count of one on the graded side proves nothing unless the
+    instrument can see a retry when one exists.
+    """
+    import mse_parts as PARTS
+
+    parts = _fine_nested_parts()
+    merged = PARTS.merged_surface(parts)
+
+    recorded = _record_tetgen(monkeypatch)
+    with pytest.raises(MESH.MeshingError) as caught:
+        MESH.tetrahedralize(
+            merged, "mm", n_modes=3, n_index=1.0, max_tets=1,
+            min_feature_m=1.2e-3, verbose=False,
+            materials={"wall": 1.0, "core": 3.0}, parts=parts,
+        )
+    graded_calls = list(recorded)
+    message = str(caught.value)
+    assert "graded object would need about" in message, (
+        f"an over-cap graded mesh must raise the GRADED refusal (the fine "
+        f"region's own acceptance is the only thing a graded mesh may fail on); "
+        f"got: {message}"
+    )
+    assert len(graded_calls) == 2, (
+        f"a graded mesh tetrahedralized {len(graded_calls)}x; it must be two "
+        f"(the sizing background and the mesh) and never a third -- a retry "
+        f"would raise a global maxvolume and drop the grading"
+    )
+    assert sum(1 for c in graded_calls if "bgmesh" in c) == 1, (
+        "exactly one of the two calls must be the graded one (it carries the "
+        "sizing field); the other is the background build"
+    )
+    graded_call = next(c for c in graded_calls if "bgmesh" in c)
+    assert graded_call.get("maxvolume", 0.0) in (0.0, None), (
+        f"the graded call must carry NO global maxvolume (got "
+        f"{graded_call.get('maxvolume')}): a global maxvolume overrides the "
+        f"sizing field and silently ungrades the mesh"
+    )
+
+    # THE CONTROL: one shared index -> the uniform arm, which retries.
+    recorded.clear()
+    with pytest.raises(MESH.MeshingError):
+        MESH.tetrahedralize(
+            merged, "mm", n_modes=3, n_index=1.0, max_tets=1,
+            min_feature_m=1.2e-3, verbose=False,
+            materials={"wall": 1.0, "core": 1.0}, parts=parts,
+        )
+    assert len(recorded) >= 2, (
+        f"the uniform over-cap arm retried {len(recorded) - 1} time(s); this "
+        f"control exists to prove the counter can SEE a retry, so it must be "
+        f"at least two meshes -- got {len(recorded)}"
+    )
+    assert len({c.get("maxvolume") for c in recorded}) > 1, (
+        "the uniform retry must actually change the global maxvolume"
+    )
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+def test_a_graded_mesh_under_the_cap_comes_back_graded(monkeypatch):
+    """C, the other half: the mesh that DOES come back is still graded.
+
+    Refusing over the cap is only half the answer -- the row also asks whether
+    the graded path can hand back an ungraded mesh. This reads the per-region
+    achieved edges EACH REGION'S OWN TETS, which is the only place a lost
+    grading is visible: a whole-mesh median is dominated by the wall and would
+    look the same either way.
+    """
+    import mse_parts as PARTS
+
+    parts = _fine_nested_parts()
+    merged = PARTS.merged_surface(parts)
+    points_m, tets, region_of_tet = MESH.tetrahedralize(
+        merged, "mm", n_modes=3, n_index=1.0, max_tets=600_000,
+        min_feature_m=1.2e-3, verbose=False,
+        materials={"wall": 1.0, "core": 3.0}, parts=parts,
+    )
+    report = MESH.LAST_MESH_REPORT
+    assert report is not None and report["graded"] is True
+    regions = report["regions"]
+    assert len(regions) == 2, f"expected two regions, got {sorted(regions)}"
+
+    (fine_id, fine), = [(rid, r) for rid, r in regions.items() if r["n"] == 3.0]
+    (coarse_id, coarse), = [(rid, r) for rid, r in regions.items() if r["n"] == 1.0]
+    # The two regions are asked for measurably different edges (3x by index,
+    # pulled in by the thickness clamp for the wall, so this is an inequality
+    # rather than the ratio of the indices).
+    assert coarse["target_edge_m"] > 2.0 * fine["target_edge_m"], (
+        f"the two regions were asked for "
+        f"{coarse['target_edge_m'] * 1e3:.4g} and "
+        f"{fine['target_edge_m'] * 1e3:.4g} mm: this fixture is not graded"
+    )
+    assert fine["tets"] and coarse["tets"], "a region came back with no tets"
+
+    # Each region's OWN tets: the fine one is at its own (fine) edge, the coarse
+    # one is measurably coarser -- which is what "still graded" means.
+    assert fine["achieved_edge_m"] <= MESH.MAX_EDGE_OVERSHOOT * fine["target_edge_m"], (
+        f"the fine region's own tets are at {fine['achieved_edge_m'] * 1e3:.4f} "
+        f"mm against its {fine['target_edge_m'] * 1e3:.4f} mm target "
+        f"({fine['achieved_edge_m'] / fine['target_edge_m']:.2f}x, allowance "
+        f"{MESH.MAX_EDGE_OVERSHOOT:.2f}x)"
+    )
+    assert coarse["achieved_edge_m"] > fine["achieved_edge_m"] * 1.2, (
+        f"the coarse region ({coarse['achieved_edge_m'] * 1e3:.4f} mm) is not "
+        f"measurably coarser than the fine one "
+        f"({fine['achieved_edge_m'] * 1e3:.4f} mm): the mesh came back UNGRADED "
+        f"even though the report says otherwise"
+    )
+    # And the report's top-level fine measurement is the fine region's own.
+    assert report["fine_achieved_edge_m"] == pytest.approx(
+        fine["achieved_edge_m"], rel=1e-12)

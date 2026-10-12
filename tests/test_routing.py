@@ -1907,21 +1907,29 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
         f"h/h_core cubed is {octave:g}, not 8 -- the fixture no longer has the "
         f"n=2-in-n=1 shape this test is built on"
     )
-    # THE PER-REGION SUM, BEFORE TRUNCATION. `estimate_tets_by_region` returns
-    # `int(c*sum_r V_r/h_r^3)`, so the claim is about the SUM, compared before
-    # the code's own int(). Previously this was the identity
+    # THE GRADED PER-REGION SUM, BEFORE TRUNCATION. `estimate_tets_by_region`
+    # returns `int(c*sum_r V_r/h_eff_r^3)`, so the claim is about the SUM,
+    # compared before the code's own int(). Previously this was the identity
     # ``exact_multi == exact_one_part * 8 * (v_cavity/merged_enclosed)`` -- the
     # multi-part figure was the one-part formula at h_min rescaled by the edge
     # and the volume. Under the graded rule that identity is GONE: the wall is
-    # priced at h, not h_min, so only the core carries the 8x. The replacement
-    # names the graded mechanism instead: the wall at h plus the core at h/2.
-    exact_wall = MESH.EST_TETS_C * plan[0]["filled_volume_m3"] / (plan[0]["edge_m"] ** 3)
+    # priced at its own edge, not h_min, so only the core carries the 8x.
+    # `h_eff` is the region's edge for the finest region and
+    # `h*(h_min/h)**TRANSITION_EDGE_EXPONENT` above it, because the sizing
+    # field's transition leaves the coarse region finer than its target and
+    # pricing the wall at `h` alone UNDER-counts what the mesher builds (measured
+    # 0.58-1.14x the built count on five graded fixtures). This number routes the
+    # job, so the correction is part of what the test is pinning.
+    wall_eff = plan[0]["edge_m"] * (
+        plan[1]["edge_m"] / plan[0]["edge_m"]
+    ) ** COMMON.TRANSITION_EDGE_EXPONENT
+    exact_wall = MESH.EST_TETS_C * plan[0]["filled_volume_m3"] / (wall_eff ** 3)
     exact_core = MESH.EST_TETS_C * plan[1]["filled_volume_m3"] / (plan[1]["edge_m"] ** 3)
     exact_graded = exact_wall + exact_core
     assert estimate == int(exact_graded), (
         f"the estimate ({estimate:,}) is not int({exact_graded:.4f}) = "
-        f"{int(exact_graded):,}, the wall at h plus the core at h/2; the branch is "
-        f"not the per-region sum"
+        f"{int(exact_graded):,}, the wall at its transition edge plus the core at "
+        f"h/2; the branch is not the corrected per-region sum"
     )
     # The core is 8x finer than the wall and tiny, yet it is the wall's term that
     # dominates -- a fixture-shape guard so the "wall stayed coarse" claim above
