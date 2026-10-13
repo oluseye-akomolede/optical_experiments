@@ -10,7 +10,10 @@ effective edge length, with a conservative coefficient, and SHALL:
 - ROUTE the job to the GPU worker when the estimate reaches the GPU threshold;
 - otherwise ROUTE it to the cluster;
 - REFUSE with a plain-English message when the estimate exceeds the refusal
-  threshold (twice the real cap, because the estimate can be up to twice high).
+  threshold (twice the real cap). The 2x is the MARGIN the threshold carries,
+  not a property of the estimate: measured through the product's own path the
+  estimate is a bound on NEITHER side -- it ranges 0.57x to 2.99x the built
+  count, and the measurement is the paragraph below.
 
 For a multi-part upload the estimate SHALL be the sum over the regions of
 `V_r / h_r^3`, each region's FILLED volume at its OWN target edge, which is the
@@ -37,9 +40,9 @@ exactly 1 when the regions' edges are equal, so the uniform number is unchanged,
 and its value is ONE number that cannot also represent the fine region's own
 boundary effects -- the measured table in `mse_common.TRANSITION_EDGE_EXPONENT`
 states that spread as the model's accuracy limit, not a bound. The refusal
-threshold itself is UNCHANGED by this: the correction restores the margin the
-threshold's "up to twice high" allowance assumes, which an under-counting
-estimate had quietly widened.
+threshold itself is UNCHANGED by this: the 2x is the margin the threshold
+carries against that measured spread, and an under-counting estimate had quietly
+widened the margin it was meant to leave.
 
 The estimate SHALL return `0`, meaning "do not route on this", when the surface
 is unusable or the formula fails -- not a small number. Source: `web/meshing.py`,

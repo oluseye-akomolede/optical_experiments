@@ -483,15 +483,8 @@ def _run_case(label: str, n_core: float | None, *, n_modes: int, grid: int,
             want_edge = ((mesh_block.get("regions") or {}).get(str(fine_region))
                          or {}).get("achieved_edge_units")
             got_edge = graded_bands["core"]["edge_mm"]
-            tets_ok = int(gtets.shape[0]) == want_tets
-            edge_ok = (got_edge is not None and want_edge is not None
-                       and abs(got_edge - want_edge) <= 0.02 * want_edge)
-            remesh_matches = bool(tets_ok and edge_ok)
-            if not remesh_matches:
-                graded_remesh_note = (
-                    f"the rebuilt graded mesh is not the one solved: "
-                    f"{gtets.shape[0]:,} tets vs {want_tets:,}, fine edge "
-                    f"{got_edge} vs {want_edge}")
+            remesh_matches, graded_remesh_note = _remesh_verdict(
+                gtets.shape[0], want_tets, got_edge, want_edge)
         except Exception as exc:  # noqa: BLE001 - a failed re-mesh is data
             graded_remesh_note = f"{type(exc).__name__}: {exc}"
 
@@ -632,6 +625,42 @@ def _band_edges_mm(points_m, tets, a_eff_mm: float, *,
                         / 1e-3 if n else None),
         }
     return out
+
+
+#: How far a RE-BUILT graded mesh's fine edge may sit from the mesh report's own
+#: achieved edge and still count as THE SAME MESH. The re-mesh repeats the solved
+#: mesh's bytes and arguments, so this is not tolerance on accuracy -- it is
+#: slack for the run-to-run wiggle TetGen's point insertion and a median's
+#: tie-breaking can carry, and 2% is well under the finest number the report
+#: itself quotes.
+REMESH_EDGE_TOLERANCE = 0.02
+
+
+def _remesh_verdict(got_tets, want_tets, got_edge, want_edge):
+    """Is a re-built graded mesh the one that was solved? ``(bool, note|None)``.
+
+    The graded per-band edges are measured on a SECOND mesh of the same bytes,
+    so they describe the solve only if that mesh IS the solved one: the same
+    element count, and a fine-region edge within ``REMESH_EDGE_TOLERANCE`` of the
+    mesh report's own achieved edge. This is the trigger the report withdraws the
+    bands on (``_run_case`` stores it as ``remesh_matches``) -- a disagreement is
+    a different object, and its bands are NAMED as withdrawn rather than printed
+    as if they described the run. An edge that could not be measured counts as a
+    disagreement too: "could not ask" is not a match.
+
+    Kept as one function so the suite can drive the trigger itself, not only the
+    warning it prints -- the withdrawal a canned case's ``remesh_matches=False``
+    asserts is the PRINT of a decision made here.
+    """
+    tets_ok = int(got_tets) == int(want_tets)
+    edge_ok = (got_edge is not None and want_edge is not None
+               and abs(got_edge - want_edge) <= REMESH_EDGE_TOLERANCE * want_edge)
+    if tets_ok and edge_ok:
+        return True, None
+    return False, (
+        f"the rebuilt graded mesh is not the one solved: "
+        f"{int(got_tets):,} tets vs {int(want_tets):,}, fine edge "
+        f"{got_edge} vs {want_edge}")
 
 
 def _solve_mesh(points_m, tets, eps_by_tet, n_modes, backend,

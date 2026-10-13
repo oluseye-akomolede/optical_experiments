@@ -536,6 +536,41 @@ def test_bands_are_withdrawn_when_the_rebuilt_mesh_is_not_the_one_solved(
             "graded mesh is not the one solved") in text, text
 
 
+def test_a_rebuilt_mesh_that_is_not_the_solved_one_is_rejected_by_the_trigger():
+    """The withdrawal DECISION, not just the warning it prints.
+
+    ``test_bands_are_withdrawn_...`` hands ``_run_case`` a case whose
+    ``remesh_matches`` is already ``False``, so it exercises the warning a canned
+    value asserted. This drives the trigger the report actually withdraws on:
+    a re-mesh is the solved mesh only when it has the solved mesh's tet count AND
+    a fine edge within the tolerance of the report's own achieved edge. Probed on
+    both sides of that tolerance, so neither a widened nor a tightened band could
+    pass, and on the two ways a mesh can differ (count, edge).
+    """
+    # The same mesh: accepted, no note.
+    assert BENCH._remesh_verdict(90_000, 90_000, 0.210, 0.210) == (True, None)
+
+    # A different element count is a different object even with the edge right.
+    count_ok, count_note = BENCH._remesh_verdict(91_000, 90_000, 0.210, 0.210)
+    assert count_ok is False, count_ok
+    assert "91,000 tets vs 90,000" in count_note, count_note
+
+    # 2% of 0.210 mm is 0.0042: 0.2139 (1.86%) is the same mesh, 0.2143 (2.05%)
+    # is not. Both directions of the band, so its value cannot be off.
+    inside, _ = BENCH._remesh_verdict(90_000, 90_000, 0.2139, 0.210)
+    outside, edge_note = BENCH._remesh_verdict(90_000, 90_000, 0.2143, 0.210)
+    assert inside is True, inside
+    assert outside is False, outside
+    assert "fine edge 0.2143 vs 0.21" in edge_note, edge_note
+
+    # An edge that could not be measured is not a match either: "could not ask"
+    # must not read as "unchanged".
+    unmeasured, unmeasured_note = BENCH._remesh_verdict(90_000, 90_000, None,
+                                                        0.210)
+    assert unmeasured is False, unmeasured
+    assert "fine edge None vs 0.21" in unmeasured_note, unmeasured_note
+
+
 def test_an_empty_band_is_reported_as_empty_not_as_zero():
     """A band with no tet is a measurement (nothing was meshed there), and a
     zero edge would read as a perfectly resolved region -- the opposite."""
@@ -628,5 +663,51 @@ def test_eps_by_radius_splits_the_core_at_the_interface():
         _regular_tet_at(0.4e-3, 1.5e-3),   # outside
     ])
     tets = np.array([[0, 1, 2, 3], [4, 5, 6, 7]])
+    eps = BENCH._eps_by_radius(pts, tets, 1.0, 3.0)
+    assert eps.tolist() == [9.0, 1.0], eps
+
+
+def test_a_tet_straddling_the_interface_is_banded_by_its_centroid():
+    """The band rule measures a tet's CENTROID -- and the fixture makes it bite.
+
+    A tet big enough to sit across the interface has vertices on BOTH sides, so
+    "which side" is a choice; the code takes the centroid (``_tet_radius_mm``),
+    the point the eps rule is validated against. Two tets are built so every
+    single-vertex rule answers differently: tet A's centroid is inside the 1.0 mm
+    interface while its FURTHEST vertex is outside and its vertices' MEAN
+    distance is also outside (a norm's mean is at least the centroid's, so this is
+    the only way the two can disagree); tet B's centroid is outside while its
+    NEAREST vertex is inside. The earlier band test's tets (0.2-0.8 mm edges at
+    0.5/1.5/3.0 mm) lie wholly on one side, so they cannot see the choice at all.
+    """
+    import numpy as np
+    import mse_meshing  # noqa: F401 - the real achieved_edge_length is used
+
+    edge = 1.0e-3
+    pts = np.vstack([
+        _regular_tet_at(edge, 0.9e-3),    # centroid 0.9 mm -> inside
+        _regular_tet_at(edge, 1.4e-3),    # centroid 1.4 mm -> first mm outside
+    ])
+    tets = np.array([[0, 1, 2, 3], [4, 5, 6, 7]])
+
+    # The fixture must actually straddle, or it proves nothing: A's vertices span
+    # the interface and their mean distance is on the far side from its centroid.
+    va = np.linalg.norm(pts[:4], axis=1) / 1e-3
+    vb = np.linalg.norm(pts[4:], axis=1) / 1e-3
+    assert va.min() < 1.0 < va.max(), va
+    assert va.mean() > 1.0, va
+    assert vb.min() < 1.0 < vb.max(), vb
+
+    # The radius IS the centroid's -- 0.9 and 1.4, not any of the vertices'.
+    r = BENCH._tet_radius_mm(pts, tets)
+    assert r == pytest.approx([0.9, 1.4], abs=1e-9), r
+
+    # So the bands fall by the centroid: A core, B the shell just outside it.
+    bands = BENCH._band_edges_mm(pts, tets, 1.0, shell_mm=1.0)
+    assert bands["core"]["n_tets"] == 1, bands
+    assert bands["shell"]["n_tets"] == 1, bands
+    assert bands["wall"]["n_tets"] == 1, bands
+
+    # And the uniform mesh's per-tet eps follows the same rule: A core, B vacuum.
     eps = BENCH._eps_by_radius(pts, tets, 1.0, 3.0)
     assert eps.tolist() == [9.0, 1.0], eps

@@ -1402,6 +1402,28 @@ def _fine_nested_parts(units="mm"):
     return PARTS.load_parts(obj, units=units)
 
 
+def _mildly_graded_parts(units="mm"):
+    """``_fine_nested_parts`` graded by less than 2x: the one regime the
+    background floor binds in.
+
+    ``bg_edge = min(0.5 * coarse, fine)``, so the floored coarsening
+    ``min(widened, fine)`` can only bite once the pre-floor widening overshoots
+    the FINE edge -- which needs ``0.5 * coarse < fine``, a grading under 2x. At
+    3x (``_fine_nested_parts``) the fine edge is never the binding term, which is
+    why the floor's mutant survived the suite. Same shape: each box faceted to
+    its own region's edge.
+    """
+    import mse_parts as PARTS
+
+    wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
+    core = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    wall = wall.subdivide_to_size(max_edge=1.2)
+    core = core.subdivide_to_size(max_edge=0.8)
+    obj = trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8")
+    return PARTS.load_parts(obj, units=units)
+
+
 def _record_tetgen(monkeypatch) -> list[dict]:
     """Every call the mesher makes to TetGen, in order.
 
@@ -1733,3 +1755,104 @@ def test_the_graded_estimate_lands_on_the_mesh_the_mesher_builds():
         "the uncorrected sum stays inside the band on every fixture, so this "
         "test cannot tell the correction from its absence: " + "; ".join(lines)
     )
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+def test_the_background_coarsening_is_floored_at_the_fine_regions_edge(monkeypatch):
+    """B: the coarsening floor is load-bearing, on the one plan where it bites.
+
+    Over the cap the sizing background's cells are widened to bring the volume
+    price down -- but never past the FINEST region's own edge: a background cell
+    wider than the region it must resolve leaves that region with no node of its
+    own, and the mesh comes back quietly ungraded. The line is a ``min`` against
+    the fine edge, and the mutant that dropped it left this suite green: no
+    fixture drove the price over the cap while the pre-floor widening overshot
+    the fine edge AND the price at the floored edge stayed legal.
+
+    What is measured is the maxvolume TetGen was HANDED for the background build
+    (``_record_tetgen``), converted back with the same regular-tet volume
+    relation the code uses -- the edge the code CHOSE, not a re-derivation of the
+    formula. The price is supplied here (to the code under test it is a black
+    box, the way TetGen is); the arms make the instrument visible: a price under
+    the cap builds at the WANTED edge, the overshooting price builds at the FINE
+    edge, and the edge the floor refused -- the unfloored widening, 3.3x past --
+    is a value the recorded build must never show.
+    """
+    import mse_common as COMMON
+    import mse_parts as PARTS
+
+    parts = _mildly_graded_parts()
+    merged = PARTS.merged_surface(parts)
+    call = dict(n_modes=3, n_index=1.0, max_tets=600_000,
+                min_feature_m=1.2e-3, verbose=False,
+                materials={"wall": 1.0, "core": 1.5}, parts=parts)
+    CAP = float(MESH.MAX_BACKGROUND_TETS)
+
+    # The plan's own canonical edges, captured from the call the code makes --
+    # not recomputed here, so this arithmetic cannot drift from the code's.
+    seen: dict = {}
+    real_bg = MESH._sizing_background
+
+    def spy(region_plan, vertices, faces, canonical_offset, canonical_scale,
+            units, verbose):
+        edge_c = {int(r): float(h) / COMMON.unit_scale(units) * canonical_scale
+                  for r, h in region_plan["edge_m"].items()}
+        seen["coarse"] = max(edge_c.values())
+        seen["fine"] = min(edge_c.values())
+        return real_bg(region_plan, vertices, faces, canonical_offset,
+                       canonical_scale, units, verbose)
+
+    monkeypatch.setattr(MESH, "_sizing_background", spy)
+
+    def volume(edge):
+        # the code's own regular-tet cell volume
+        return edge ** 3 / (6.0 * np.sqrt(2.0))
+
+    def bg_built(recorded):
+        """The background build -- the only one with no sizing field -- as the
+        cell edge its maxvolume stands for."""
+        return [c for c in recorded if "bgmesh" not in c]
+
+    # ---- arm 1, the control: a price UNDER the cap -> no coarsening -------
+    recorded = _record_tetgen(monkeypatch)
+    monkeypatch.setattr(MESH, "_background_tet_estimate",
+                        lambda v, f, vol: CAP / 10.0)
+    MESH.tetrahedralize(merged, "mm", **call)
+    wanted = min(0.5 * seen["coarse"], seen["fine"])   # the pre-price edge
+    fine = seen["fine"]
+    ctrl = bg_built(recorded)
+    assert len(ctrl) == 1, f"expected one background build, got {len(ctrl)}"
+    assert (float(ctrl[0]["maxvolume"]) * 6.0 * np.sqrt(2.0)) ** (1 / 3) == \
+        pytest.approx(wanted, rel=1e-9), (
+            "with the price under the cap nothing is widened: the control build "
+            "must land on the wanted edge, or the priced arm proves nothing")
+    assert wanted < fine * (1.0 - 1e-9), (
+        "this fixture must be graded under 2x, or the floor never binds: "
+        f"wanted {wanted:.6g} vs fine {fine:.6g} canonical")
+
+    # ---- arm 2, priced: over the cap, with the floored edge legal ---------
+    # E(V) = (cap/2) * (V / V_fine) ** -6 -- an edge dependence steeper than
+    # 1/volume, so the price at the FLOORED edge is legal (the call builds)
+    # while the unfloored widening still overshoots it.
+    recorded.clear()
+    monkeypatch.setattr(
+        MESH, "_background_tet_estimate",
+        lambda v, f, vol: (CAP / 2.0) * (vol / volume(seen["fine"])) ** -6)
+    MESH.tetrahedralize(merged, "mm", **call)
+
+    e_wanted = (CAP / 2.0) * (volume(wanted) / volume(fine)) ** -6
+    unfloored = wanted * (e_wanted / CAP) ** (1.0 / 3.0)
+    priced = bg_built(recorded)
+    assert priced, (
+        "the priced arm must BUILD -- the price at the floored edge is legal; a "
+        "refusal here means the fixture is not the one the floor protects")
+    assert e_wanted > CAP, "the branch must run, or the floor is not exercised"
+    assert unfloored > fine * 1.5, (
+        "the unfloored widening must overshoot the fine edge by a margin the "
+        f"recording can see: unfloored {unfloored:.6g} vs fine {fine:.6g}")
+    built = (float(priced[0]["maxvolume"]) * 6.0 * np.sqrt(2.0)) ** (1 / 3)
+    assert built == pytest.approx(fine, rel=1e-9), (
+        "over the cap the cells were widened PAST the fine region's own edge -- "
+        f"the floor did not hold: built {built:.6g} vs fine {fine:.6g} (the "
+        f"unfloored edge the floor refused would be {unfloored:.6g})")
