@@ -14,14 +14,19 @@ exactly the edge each region was ASKED for, beside the clamp's own inputs.
 
 PART B -- a tiny analogue mesh at the same relative recipe (b = 6 mm, edge
 0.9 mm, n_core = 3, 24,887 tets) whose achieved per-band medians can be
-measured on the VM in seconds. The analogue is what turns "the Orin's shell
-number is 0.504 x h_wall" from a coincidence into a mechanism: the same ratio
-has to fall out at a different scale for the number to be a property of the
-sizing background rather than of the Orin's fixture.
+measured on the VM in seconds. It builds the layer-by-layer profile of the
+transition (section C) and sweeps the band's width (section D).
 
 THE ORIN NUMBERS ARE A RECORD, NOT AN INPUT. `ORIN_11357F4` below is the lead's
 measurement on the Orin; nothing here computes with it. It is quoted so the
 analogue's ratios can be read beside the ratios they are meant to explain.
+
+WARNING ON THE FIRST READING OF THIS FILE. The shell band's median came out at
+0.504 x h_wall on the Orin and 0.504 x h_wall here -- but at DIFFERENT relative
+band widths (0.559 vs 0.667 h_wall), which is not a like-for-like comparison.
+Section D is that control: it sweeps the width, and at the Orin's own relative
+width the analogue reads 0.477, not 0.504. Quote section D, not the bare
+agreement.
 """
 import sys
 from pathlib import Path
@@ -178,6 +183,57 @@ def part_b(b_mm=6.0, edge_mm=0.9, n_core=3.0, shell_mm=0.6):
     print("\n  READ: `shell` is 0-15% h_min and 0% h_wall -- it is almost all")
     print("  ramp, so its median is no region's target, and `wall` (~core) is a")
     print("  mixture of that ramp with a bulk that IS built at h_wall.")
+
+    # Does the lead's named mechanism -- the sizing background's cell at an
+    # interface, `min(coarse/2, fine)` -- produce the shell number? That cell
+    # would be the SMALLER of h_wall/2 and h_min, i.e. h_min here. Measure
+    # where each edge actually lives, by distance from the interface.
+    print("\n  C. the transition, layer by layer (distance from the interface in")
+    print(f"     units of h_wall; a_eff = {a_eff:.4f} mm, h_wall = {edge_mm:.3f} mm)")
+    depth = (radius - a_eff) / edge_mm
+    print(f"     {'depth':>12} {'tets':>6} {'median mm':>10} {'/h_wall':>8} "
+          f"{'/h_min':>7}  {'near h_min':>10} {'near h_wall':>11}")
+    bin_edges = [-0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0, 99.0]
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        sel = (depth > lo) & (depth <= hi)
+        if not sel.any():
+            continue
+        med = float(np.median(size[sel]))
+        nf = np.mean(np.abs(size[sel] - edge_mm / n_core) <= 0.15 * edge_mm / n_core)
+        nw = np.mean(np.abs(size[sel] - edge_mm) <= 0.15 * edge_mm)
+        print(f"     {f'{lo:+.1f}..{hi:+.1f}':>12} {int(sel.sum()):>6} "
+              f"{med:>10.4f} {med / edge_mm:>8.3f} {med / (edge_mm / n_core):>7.3f}  "
+              f"{nf * 100:>9.0f}% {nw * 100:>10.0f}%")
+    print(f"\n  h_wall/2 = {edge_mm / 2:.4f} mm;  the bench helper's shell median "
+          f"= {bands['shell']['edge_mm']:.4f} mm "
+          f"= {bands['shell']['edge_mm'] / (edge_mm / 2):.4f} x h_wall/2")
+    print(f"  min(coarse/2, fine) as the interface cell would be "
+          f"{min(edge_mm / 2, edge_mm / n_core):.4f} mm = h_min here.")
+    print("  So read the table, not the formula: the edge RAMPS from h_min at")
+    print("  the interface to h_wall over ~2 x h_wall, so a band's median is")
+    print("  whatever the ramp reads at the band's centre.")
+
+    # CONTROL, and it matters: the bench's shell band is 1.0 ABSOLUTE mm, which
+    # is 1.0 / h_wall in units of h_wall -- 0.559 for the Orin's n3 fixture but
+    # 1.11 for this analogue. Quoting "0.504 at both scales" therefore compares
+    # two DIFFERENT relative band widths. The same ratio only convicts the
+    # mechanism if it holds at the MATCHED relative width, so sweep the width.
+    orin_b_ratio = ORIN_11357F4["shell"] / 1.7884      # the Orin's, in h_wall
+    print("\n  CONTROL -- the shell median against the band's WIDTH, in h_wall")
+    print("  units. The Orin's band was 1.0 mm = 0.559 h_wall, so the matched")
+    print("  row is the one nearest 0.559; a ratio that only holds at some other")
+    print("  width is not the Orin's mechanism.")
+    print(f"     {'width mm':>9} {'/h_wall':>8} {'median mm':>10} "
+          f"{'/h_wall':>8}  {'Orin 0.504?':>12}")
+    for width in (0.25, edge_mm * orin_b_ratio, 0.6, 1.0):
+        b = B._band_edges_mm(pts, tets, float(a_eff), region_of_tet=region,
+                             fine_region=fine, shell_mm=width)
+        e = b["shell"]["edge_mm"]
+        if e is None:
+            continue
+        tag = "MATCHED" if abs(width - edge_mm * orin_b_ratio) < 1e-9 else ""
+        print(f"     {width:>9.4f} {width / edge_mm:>8.3f} {e:>10.4f} "
+              f"{e / edge_mm:>8.3f}  {e / edge_mm - 0.5044:>+12.3f} {tag}")
 
 
 if __name__ == "__main__":

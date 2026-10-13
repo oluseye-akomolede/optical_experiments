@@ -114,37 +114,52 @@
       this ratio; the `min` term only sets the core to h/3 = 0.5961 and leaves
       the wall at h = 1.7884. 0.9014 is neither of those, and 1.4530 is neither.
 
-      (b) BOTH NUMBERS ARE MEDIANS OF MIXED POPULATIONS, and the mixtures are
-      made by the SIZING BACKGROUND's ramp between the two region edges. Both
-      bands are measured on the wall side, where the field is ramping from
-      h_min to h_wall, so no band's median can equal a region target:
+      (b) BOTH NUMBERS ARE WHATEVER THE SIZING BACKGROUND'S RAMP READS AT THE
+      CENTRE OF A BAND, and every term the row named is refuted or local:
 
-        * shell 0.9014 mm = 0.504 x h_wall. The band is an ABSOLUTE
-          `SHELL_BAND_MM = 1.0` wide, `r` in `(a_eff, a_eff + 1.0]`. On the
-          analogue (b = 6 mm, edge 0.9 mm, n_core = 3, same relative recipe,
-          24,887 tets) the bench's OWN band helper gives shell 0.4536 mm =
-          0.504 x h_wall -- the same ratio to three digits at 2.7x smaller
-          scale, so it is the ramp's shape and not the Orin's fixture. Its tets
-          are 14% within 15% of h_min, 0% within 15% of h_wall, 85% in
-          between: the band IS the ramp, and its median sits inside a
-          0.25-0.70 mm continuum no rule asked for.
+        * `finest-node-wins` is REAL BUT LOCAL, and it is what sets the ramp's
+          lower end, not either reported number. Measured layer by layer in the
+          analogue (section C of the probe; depth = (r - a_eff)/h_wall):
+          within h_wall/5 of the interface 26-52% of tets are within 15% of
+          h_min; by depth 0.4 h_wall, 0%; past 2 h_wall the median is 1.036
+          x h_wall. So the field STEPS to the fine edge only at the interface
+          and then RAMPS to the coarse edge over ~2 x h_wall.
+        * `bg cell = min(coarse/2, fine)` is the background GRID's cell, and at
+          n3 it is min(1.7884/2, 0.5961) = 0.5961 = h_min (the fine edge wins,
+          exactly as the row's `min` says). It is visible in the mesh as the
+          ramp's starting value -- h_min at the interface -- NOT as 0.901.
+        * shell 0.9014 mm and wall 1.4530 mm are samples of that ramp. The
+          shell band is an ABSOLUTE `SHELL_BAND_MM = 1.0`, so its median is a
+          function of the band's WIDTH. Swept on the analogue (section D), in
+          units of h_wall: width 0.278 -> median 0.439; 0.504 -> 0.477; 0.667 ->
+          0.504; 1.111 -> 0.556. The Orin's band was 0.559 h_wall and its
+          number 0.504; at the MATCHED relative width the analogue reads 0.477,
+          a 5% discrepancy. So the analogue reproduces the STRUCTURE (a ramp
+          whose samples move with the band width) and the order of magnitude,
+          and NOT the number exactly. The earlier "same ratio to three digits"
+          compared two different relative widths (0.667 here vs 0.559 there)
+          and is WITHDRAWN; the width sweep is the evidence, and it is stronger
+          than the coincidence was.
         * wall 1.4530 mm = 0.812 x h_wall. `wall` in that helper is `~core` --
-          the WHOLE outer region -- so it mixes the ramp with the interior too.
+          the WHOLE outer region -- so it mixes the ramp with the interior.
           Analogue, same mask: 0.7685 mm = 0.854 x h_wall (Orin 0.812). The
-          wall's own BULK (r > a_eff + 1 mm) is 0.878 mm = 0.975 x h_wall, with
-          53% of its tets within 15% of h_wall. So the background DOES deliver
-          the wall's asked edge where the band is not contaminated by the
-          interface; the 0.81-0.85 figure is the band's placement, not the
-          rule's output.
+          wall's own BULK (r > a_eff + 1 mm) is 0.932 mm = 1.036 x h_wall with
+          61% of its tets within 15% of h_wall. So the background DOES deliver
+          the wall's asked edge in the wall's interior; the 0.81-0.85 figure is
+          the band's mixture, not the rule's output.
 
-      (c) THE OWNER'S QUESTION, answered. The grading RULE is not fitted to one
-      job: `region_plan` reads only the object's own geometry and indices, and
-      (a) shows no per-job constant in play at n3. What IS shaped by the job's
-      size is the BENCH'S BAND METRIC -- `SHELL_BAND_MM = 1.0` absolute mm is
-      10% of this b = 10 mm and would be 50% of a 2 mm upload, so the shell
-      number would move with the upload even if the rule did not. A per-region
-      report, or a band width relative to a_eff, does not have that failure
-      mode. Measuring it across shapes is step 2's matrix, not more arguing.
+      (c) THE OWNER'S QUESTION, answered in two halves -- the rule and the
+      metric are not the same thing, and only one of them is job-shaped. The
+      RULE is not fitted to one job: `region_plan` reads only the object's own
+      geometry and indices, no per-job constant is in play at n3, and (a) shows
+      the clamp never fires. The BENCH'S METRIC is job-shaped: `SHELL_BAND_MM =
+      1.0` absolute mm is 10% of this b = 10 mm upload and 50% of a 2 mm one,
+      and (b)'s sweep shows the number it reports moves by 0.12 h_wall as the
+      width moves from 0.28 to 1.11 h_wall. A per-region report (the mesh
+      report already emits each region's achieved edge), or a band width
+      relative to a_eff or h_wall, does not have that failure mode. No bar
+      computed from these bands should be carried across uploads until that
+      changes; measuring it across shapes is step 2's matrix, not more arguing.
 
       (d) WHAT STEP 1 DOES NOT ESTABLISH, plainly: the accuracy bar itself. The
       bands are DIAGNOSTICS -- the criterion scores the spectrum -- so (b)
@@ -159,3 +174,7 @@
       (ratio 3) it fails. The trade is RATIO-dependent, and a tier-1 probe
       cannot reach the achieved edge of a full-size graded mesh on this VM (no
       heavy compute), so sweeping the ratio is step 2's job by construction.
+
+      Note for step 2's operation: `benchmarks/probe_n3_bands.py` is tier 1
+      (24,887 tets, seconds) and must be run with OMP/MKL/OPENBLAS threads
+      pinned to 1-2 -- unpinned it took 23 BLAS threads.
