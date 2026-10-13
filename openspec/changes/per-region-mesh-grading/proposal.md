@@ -65,9 +65,14 @@ fail (reduction < 75%, core edge off its MEASURED uniform target by > 25%).
    caveat the mesher recorded.
 8. **The acceptance bar is the uniform mesh** (owner's choice, 2026-10-13). The
    Orin at `ebfd570` measured n2 graded worst error 0.341% against the SAME
-   object solved uniformly at 0.559% -- a 2.18x improvement -- and n3 graded
+   object solved uniformly at 0.559% -- a 1.64x improvement -- and n3 graded
    0.749% with its uniform reference UNMEASURED (cuDSS `ALLOC_FAILED` at
-   199,062 tets). The benchmark had been judging the graded mesh against twice
+   199,062 tets). At `11357f4` the same Orin command DID measure n3's uniform
+   reference: n3 graded 0.749% vs uniform 0.662% (1.13x) -- a FAIL under this
+   bar, and the run exited 3 -- while n2 was unchanged (0.341% vs 0.559%,
+   0.61x, PASS). Median edges at n3: graded core 0.664 / shell 0.9014 / wall
+   1.453 mm against uniform core 0.7085 / shell 0.7253 / wall 0.5287 mm. The
+   benchmark had been judging the graded mesh against twice
    the EMPTY SPHERE's error, a bar nobody buys; it now judges it against the
    uniform mesh the owner would have got, and a bar that could not be measured
    fails the run rather than passing it.

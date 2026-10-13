@@ -474,6 +474,77 @@ def test_a_uniform_solve_that_raised_is_unmeasured_not_a_pass(
     assert "EXIT 4" in text, text
 
 
+def test_the_orins_mixed_shape_passes_what_it_measured_and_exits_incomplete(
+        monkeypatch, capsys, tmp_path):
+    """PASS on one case plus UNMEASURED on another is exit 4, never exit 0.
+
+    This is the shape the Orin produced at ``ebfd570``: n2's uniform reference
+    was solved (graded 0.341% vs uniform 0.559% -> PASS), and n3's was not
+    (cuDSS ALLOC_FAILED at 199,062 tets), so the accuracy bar could not be
+    decided there. A run that measured one case and could not measure the other
+    must not leave with the code a fully-passing run gets -- the lead reads the
+    exit code first, and a 0 would file the missing n3 number as a pass.
+    """
+    cases = [
+        _case("empty", None, 0.010, 26_000, None),
+        _case("n2", 2.0, 0.00341, 40_000, 76_000,
+              uniform_score={"worst_rel_error": 0.00559, "n_matched": 10,
+                             "n_clusters": 20, "matched": []}),
+        _case("n3", 3.0, 0.00749, 90_000, 199_062,
+              uniform_solve_error="RuntimeError: CUDSS ALLOC_FAILED (199062 "
+                                  "tets)"),
+    ]
+    rc, text = _run(monkeypatch, cases, capsys, tmp_path,
+                    argv=["--cases", "empty,n2,n3", "--solve-uniform", "--out",
+                          str(tmp_path / "r.json")])
+    assert ("n2: graded worst 0.341% vs uniform worst 0.559% (0.61x) -> "
+            "PASS (<= 1.00x the uniform mesh)") in text, text
+    assert ("n3: graded worst 0.749% -- accuracy UNMEASURED (RuntimeError: "
+            "CUDSS ALLOC_FAILED (199062 tets))") in text, text
+    assert rc == BENCH.BENCH_INCOMPLETE, (
+        "one measured PASS beside one unmeasured bar is not a clean run")
+    assert "EXIT 4" in text, text
+    assert "EXIT 0" not in text, text
+
+
+def test_a_failed_criterion_is_not_hidden_behind_an_unmeasured_one(
+        monkeypatch, capsys, tmp_path):
+    """DEFECT beside UNMEASURED is exit 3: the FAIL outranks the missing number.
+
+    Both verdicts are present, so whichever the exit-code block tests FIRST
+    decides the code. DEFECT must win: a run that measured a regression has
+    something to fix, and returning INCOMPLETE instead would file a known-wrong
+    mesh as a merely unfinished measurement. Swapping the two checks is silent on
+    every single-verdict arm -- each still exits on its own verdict -- which is
+    why this mixed shape needs its own test.
+
+    The FAIL arm carries the Orin's real `11357f4` numbers for n3 (graded 0.749%
+    vs uniform 0.662%, 1.13x) and the UNMEASURED arm the `ebfd570` shape on n2,
+    so the test stands on the two measurements the bench actually produced.
+    """
+    cases = [
+        _case("empty", None, 0.010, 26_000, None),
+        _case("n2", 2.0, 0.012, 40_000, 76_000,
+              uniform_solve_error="RuntimeError: CUDSS ALLOC_FAILED (199062 "
+                                  "tets)"),
+        _case("n3", 3.0, 0.00749, 90_000, 199_062,
+              uniform_score={"worst_rel_error": 0.00662, "n_matched": 10,
+                             "n_clusters": 20, "matched": []}),
+    ]
+    rc, text = _run(monkeypatch, cases, capsys, tmp_path,
+                    argv=["--cases", "empty,n2,n3", "--solve-uniform", "--out",
+                          str(tmp_path / "r.json")])
+    assert ("n3: graded worst 0.749% vs uniform worst 0.662% (1.13x) -> "
+            "FAIL (<= 1.00x the uniform mesh)") in text, text
+    assert ("n2: graded worst 1.200% -- accuracy UNMEASURED (RuntimeError: "
+            "CUDSS ALLOC_FAILED (199062 tets))") in text, text
+    assert rc == BENCH.BENCH_DEFECT, (
+        "a measured FAIL must not be filed as an unmeasured bar")
+    assert rc != BENCH.BENCH_INCOMPLETE, "INCOMPLETE must not outrank DEFECT"
+    assert "EXIT 3" in text, text
+    assert "EXIT 4" not in text, text
+
+
 def test_the_worst_multiplet_is_named_per_case(monkeypatch, capsys, tmp_path):
     """WHICH mode is worst, for graded and uniform, with its index and kb.
 

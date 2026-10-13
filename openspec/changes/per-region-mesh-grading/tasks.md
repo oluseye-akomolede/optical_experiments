@@ -88,8 +88,14 @@
       lead on the row (the lead runs it; this seat does not).
 - [x] 5.3 The accuracy criterion is rebarred to the UNIFORM mesh (owner's
       decision, 2026-10-13), on the Orin measurement at `ebfd570`: n2 graded
-      worst 0.341% vs uniform 0.559% (2.18x), n3 graded 0.749% with its uniform
+      worst 0.341% vs uniform 0.559% (1.64x), n3 graded 0.749% with its uniform
       reference UNMEASURED (cuDSS `ALLOC_FAILED`, 199,062 tets). The old "within
       2x the empty sphere" bar is replaced by "no worse than the uniform mesh",
       and an unmeasured bar fails the run (INCOMPLETE, exit 4) instead of
       passing it. Tests cover the pass, fail, unmeasured-solve and flag-off arms.
+      The later Orin run at `11357f4` solved n3's uniform reference: n3 graded
+      0.749% vs uniform 0.662% (1.13x) -> FAIL (the run exited 3), n2 unchanged
+      (0.341% vs 0.559%, 0.61x, PASS). Median edges at n3: graded core 0.664 /
+      shell 0.9014 / wall 1.453 mm, uniform core 0.7085 / shell 0.7253 / wall
+      0.5287 mm. n3 does not meet the bar on this measurement; the ALLOC_FAILED
+      at `ebfd570` stands as that run's result.
