@@ -1832,13 +1832,15 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
     # sizing field grades, so the coarse region carries a TRANSITION: between
     # the fine region's edge and the coarse one TetGen must step through
     # intermediate sizes, and the tets in that band are finer than the region's
-    # target. The transition is intrinsic to a smooth field and its size scales
-    # with the edge ratio, so the per-region sum is a LOWER BOUND -- measured
-    # 0.37-0.46x on the nested fixtures (this 6/2 box 0.37, a 6/4 box 0.42 with
-    # a finer core, the matrix's shapes 0.39-0.46). The floor below is set under
-    # the worst measured case, and it is still far from 0.15 -- the wrong-formula
-    # floor -- so a collapse to the uniform rule (which would push the ratio
-    # toward 1.0, not 0.4) still fails here.
+    # target. The transition is intrinsic to a smooth field, and the estimate
+    # PRICES for it (``TRANSITION_EDGE_EXPONENT``) rather than calling the plain
+    # per-region sum a bound: measured across eleven plan-and-mesh pairs, the
+    # plain sum lands anywhere from 0.57x to 2.99x of the built count -- so it is
+    # neither a lower nor an upper bound, and a band stated from one fixture
+    # family would be false on another. The band below is the estimator's own
+    # stated accuracy: the coefficient's 3x, whose calibration constant is the
+    # UNIFORM case measured at 2.99x. The floor is still far from 0.15 -- the
+    # wrong-formula floor -- so a collapse to the uniform rule fails here too.
     assert 0.25 <= ratio <= 3.0, (
         f"the estimate ({estimate:,}) and the mesh ({actual:,}) disagree by "
         f"{ratio:.2f}x -- the app would route this job on a number the mesher "
@@ -1847,26 +1849,18 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
 
     # THE DISCRIMINATOR. The multi-part estimate is the ONE-PART FORMULA SUMMED
     # PER REGION, each region at ITS OWN edge -- the same ``region_edges`` the
-    # mesher builds from. This object is a core at n=2 in a wall at n=1, so the
-    # wall's edge is h and the core's is h/2. A branch that priced the whole
-    # cavity at h (the old uniform rule's wall edge) would land on the one-part
-    # count at h; a branch that priced every region at h/2 would be 8x it. The
-    # exact per-region sum names which one ran, and BOTH collapses are named
-    # below so neither can pass as a slack.
+    # mesher builds from -- with a coarse region priced at the edge
+    # ``TRANSITION_EDGE_EXPONENT`` gives its transition. This object is a core at
+    # n=2 in a wall at n=1, so the wall's edge is h and the core's is h/2. A
+    # branch that priced the whole cavity at h (the old uniform rule's wall edge)
+    # would land on the one-part count at h; a branch that priced every region at
+    # h/2 would be 8x it. BOTH collapses are named below so neither can pass as
+    # a slack, and the graded sum itself -- the exact float expression, before
+    # the code's ``int()`` -- is pinned further down.
     one_part_at_h = MESH.estimate_tets(merged, 3, "mm")
     h = COMMON.effective_edge_m(merged, n_modes=3, units="mm")
     plan = COMMON.region_plan(parts, materials, h, "mm")
     v_cavity = sum(info["filled_volume_m3"] for info in plan.values())
-    per_region = sum(
-        info["filled_volume_m3"] / (info["edge_m"] ** 3) for info in plan.values()
-    )
-    expected = int(MESH.EST_TETS_C * per_region)
-    assert estimate == expected, (
-        f"the multi-part estimate ({estimate:,}) is not the per-region sum "
-        f"(c * sum_r V_r / h_r^3 = {expected:,}); the two paths must share the "
-        f"expression and the calibration constant, or the route and the mesh "
-        f"disagree"
-    )
     # Not the OLD rule: the whole cavity priced at the wall's edge.
     assert estimate > one_part_at_h, (
         f"the estimate ({estimate:,}) is not above the one-part count at h "
@@ -1916,10 +1910,12 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
     # priced at its own edge, not h_min, so only the core carries the 8x.
     # `h_eff` is the region's edge for the finest region and
     # `h*(h_min/h)**TRANSITION_EDGE_EXPONENT` above it, because the sizing
-    # field's transition leaves the coarse region finer than its target and
-    # pricing the wall at `h` alone UNDER-counts what the mesher builds (measured
-    # 0.58-1.14x the built count on five graded fixtures). This number routes the
-    # job, so the correction is part of what the test is pinning.
+    # field's transition leaves the coarse region finer than its target, so
+    # pricing the wall at `h` alone UNDER-counts the mesh on the fixtures where
+    # the transition is most of the coarse region (measured 0.57x and 0.74x of
+    # the built count on the two the meshing guard builds;
+    # ``mse_common.TRANSITION_EDGE_EXPONENT`` carries the whole measured table).
+    # This number routes the job, so the correction is part of the pin.
     wall_eff = plan[0]["edge_m"] * (
         plan[1]["edge_m"] / plan[0]["edge_m"]
     ) ** COMMON.TRANSITION_EDGE_EXPONENT

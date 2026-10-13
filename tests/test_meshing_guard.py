@@ -1551,3 +1551,185 @@ def test_a_graded_mesh_under_the_cap_comes_back_graded(monkeypatch):
     # And the report's top-level fine measurement is the fine region's own.
     assert report["fine_achieved_edge_m"] == pytest.approx(
         fine["achieved_edge_m"], rel=1e-12)
+
+
+def _fine_nested_parts_thin_wall(units="mm"):
+    """``_fine_nested_parts`` with the core grown so the WALL is thin.
+
+    The wall is the 1 mm shell between the 6 mm and the 4 mm box: thin enough
+    that the thickness clamp bites, which is the fixture the estimate's
+    correction exists for -- the sizing field's transition refines a thin wall
+    hardest, and the plain sum prices the wall at its own target. Facets follow
+    the same rule as its sibling (each part at its OWN region edge), because
+    TetGen cannot refine a surface below its facets and a coarse one would
+    refuse the mesh for a reason that is not what the test is about.
+    """
+    import mse_parts as PARTS
+
+    wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
+    core = trimesh.creation.box(extents=(4.0, 4.0, 4.0))
+    wall = wall.subdivide_to_size(max_edge=0.8)
+    core = core.subdivide_to_size(max_edge=0.2667)
+    obj = trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8")
+    return PARTS.load_parts(obj, units=units)
+
+
+def test_a_refusal_names_the_part_it_is_about():
+    """The never-silent refusals must NAME the region, and must not crash.
+
+    ``plan["region_of_part"]`` is a LIST in part order (``mse_parts.py``), and an
+    earlier version of both refusal sites read ``.items()`` off it, so the
+    refusal raised ``AttributeError`` instead of the ``MeshingError`` it exists
+    for -- the caller's ``except MeshingError`` never sees it, and the user gets
+    a traceback instead of "try a coarser target for the core". The plan handed
+    in here is the MESHER's own (``_region_plan``), not a hand-built dict, so
+    what this reads is the shape the refusal actually meets.
+    """
+    import mse_parts as PARTS
+
+    parts = _fine_nested_parts()
+    plan = MESH._region_plan(parts, {"wall": 1.0, "core": 3.0}, 1.2e-3, "mm",
+                             verbose=False)
+    assert isinstance(plan["region_of_part"], list), (
+        "the plan's region_of_part is not the list mse_parts builds; the "
+        "refusals' lookup and this test both assume part-order"
+    )
+    fine = plan["fine_region"]
+    coarse = next(rid for rid in plan["edge_m"] if rid != fine)
+    assert MESH._part_of_region(plan, fine) == "core"
+    assert MESH._part_of_region(plan, coarse) == "wall"
+    # A region the plan cannot name falls back to the id -- never to a raise.
+    assert MESH._part_of_region({"shared": {}}, 7) == "region 7"
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+def test_a_background_over_the_cap_refuses_before_building_it(monkeypatch):
+    """A: an object too big for one job is refused BEFORE the build.
+
+    The sizing background is the one mesh built before the object exists, so a
+    job that dies building it has already burnt the owner's time and, on the
+    Orin, RAM the solver needed. The cap is priced from the PLC's own volume
+    before the build; when even the coarsest grid that still carries the fine
+    region would not fit, the call refuses with the region named in plain words.
+    The recorder is the assertion: "refused" and "refused after paying for a
+    build" are the same exception, and only the calls tell them apart.
+
+    The control is the same call with the estimate left alone: it builds and
+    comes back graded, so the guard fired on the price and not on the fixture.
+    """
+    import mse_parts as PARTS
+
+    parts = _fine_nested_parts()
+    merged = PARTS.merged_surface(parts)
+    call = dict(n_modes=3, n_index=1.0, max_tets=600_000,
+                min_feature_m=1.2e-3, verbose=False,
+                materials={"wall": 1.0, "core": 3.0}, parts=parts)
+
+    recorded = _record_tetgen(monkeypatch)
+    monkeypatch.setattr(MESH, "_background_tet_estimate", lambda *a, **k: 1.0e9)
+    with pytest.raises(MESH.MeshingError) as caught:
+        MESH.tetrahedralize(merged, "mm", **call)
+    message = str(caught.value)
+    assert "core" in message and "cap" in message, (
+        f"the over-cap refusal must name the fine region and the limit it "
+        f"broke; got: {message}"
+    )
+    assert recorded == [], (
+        f"the over-cap refusal tetrahedralized {len(recorded)}x; it must refuse "
+        f"on the PRICE, before the build -- refusing after the build has already "
+        f"paid for the background it refuses"
+    )
+
+    # THE CONTROL: the real estimate, the same call -- it builds and it grades.
+    monkeypatch.undo()
+    _pts, tets, _reg = MESH.tetrahedralize(merged, "mm", **call)
+    assert MESH.LAST_MESH_REPORT["graded"] is True
+    assert len(tets) > 0, "the control build came back empty"
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+def test_the_graded_estimate_lands_on_the_mesh_the_mesher_builds():
+    """B: the estimate that ROUTES a graded job, against the mesh that follows.
+
+    The plain per-region sum prices a coarse region at its own target, but the
+    sizing field ramps from the fine edge across every boundary, so the mesher
+    builds more elements than that sum says -- and the sum is what picks the
+    machine. Measured here on a thick wall and a thin one: the corrected
+    estimate must land INSIDE the band on both, and the control below shows the
+    uncorrected form leaving it on the thick wall, so the correction is
+    load-bearing rather than decoration.
+
+    The built count is TetGen's OWN element array from the product call and the
+    estimate is the routing entry (``web.meshing``), so this compares the two
+    things that must agree -- not two copies of one formula. An under-count is
+    the unsafe direction: it routes the job onto a machine it does not fit.
+
+    Measured here (est/built, uncorrected in brackets): thick wall 1.04x
+    (0.57x), thin wall 0.85x (0.74x). BAND is wide enough for TetGen-version
+    variation in the built count and narrow enough to fail a 3x over-correction
+    on either fixture; the thick wall's uncorrected 0.57x is what makes the
+    floor load-bearing. The thin wall is the model's tightest point (0.85x), and
+    it is also where the limit shows: the same index ratio leaves the coarse
+    region a different share of the count in each fixture, and one exponent
+    cannot hold both -- ``TRANSITION_EDGE_EXPONENT`` carries the wider measured
+    table and states that as the model's accuracy limit.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "web"))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]
+                              / "dockerfiles" / "maxwell_solver"))
+    import meshing as WEB
+    import mse_common as COMMON
+
+    BAND = (0.70, 1.35)
+    fixtures = [
+        ("thick wall", _fine_nested_parts(), {"wall": 1.0, "core": 3.0}, 1.2e-3),
+        ("thin wall", _fine_nested_parts_thin_wall(),
+         {"wall": 1.0, "core": 3.0}, 0.8e-3),
+    ]
+    lines, plain_ratios = [], []
+    for label, parts, materials, min_feature_m in fixtures:
+        import mse_parts as PARTS
+
+        merged = PARTS.merged_surface(parts)
+        est = WEB.estimate_tets(merged, 2, "mm", min_feature_m=min_feature_m,
+                                parts=parts, materials=materials)
+        _pts, tets, _reg = MESH.tetrahedralize(
+            merged, "mm", n_modes=2, n_index=1.0, max_tets=600_000,
+            min_feature_m=min_feature_m, verbose=False,
+            materials=materials, parts=parts,
+        )
+        built = int(len(tets))
+        assert built > 0, f"{label}: the mesh came back empty"
+        ratio = est / built
+
+        # THE CONTROL: the SAME plan, priced with no transition correction.
+        h_base = COMMON.effective_edge_m(
+            merged, n_modes=2, units="mm", min_feature_m=min_feature_m,
+            parts=parts, materials=materials)
+        plan = COMMON.region_plan(parts, materials, h_base, "mm")
+        plain = int(WEB.EST_TETS_C * sum(
+            info["filled_volume_m3"] / (info["edge_m"] ** 3)
+            for info in plan.values()))
+        plain_ratios.append(plain / built)
+        lines.append(
+            f"{label}: est {est:,} vs built {built:,} = {ratio:.2f}x "
+            f"(uncorrected {plain:,} = {plain / built:.2f}x)")
+
+        assert BAND[0] <= ratio <= BAND[1], (
+            f"{label}: the routing estimate is {ratio:.2f}x the mesh TetGen "
+            f"builds, outside the stated band {BAND}. " + "; ".join(lines)
+        )
+
+    # The control IS the revert: ``est`` above is the routing entry with the
+    # exponent in place, and ``plain`` is the same plan with ``h_eff = h_r`` --
+    # what the code computes when the exponent is 1, i.e. what it would compute
+    # if the correction were removed. An under-count here is a mutation the
+    # band assertion above catches, so this names the mechanism, not a copy of
+    # the formula.
+    assert min(plain_ratios) < BAND[0], (
+        "the uncorrected sum stays inside the band on every fixture, so this "
+        "test cannot tell the correction from its absence: " + "; ".join(lines)
+    )

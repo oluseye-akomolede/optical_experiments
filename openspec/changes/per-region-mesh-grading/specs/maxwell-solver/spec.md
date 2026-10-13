@@ -97,25 +97,45 @@ volume BEFORE building it, SHALL hold it under a stated cap
 refuse: a coarser transition costs mesh quality in the graded band, refusing costs
 the answer. A coarsening can leave the finest region with no node of its own, and
 the field then cannot produce that region's edge anywhere -- a mesh that comes
-back quietly UNGRADED -- so the mesher SHALL refuse, with a plain message naming
-that region and the edges, rather than build it. The same refusal SHALL follow a
-built grid that exceeded the cap. Source: `dockerfiles/maxwell_solver/mse_meshing.py`.
+back quietly UNGRADED -- so the cells are never widened past the finest region's
+own edge, and only when coarsening has run out there, with the volume term still
+over the cap, does the mesher refuse: BEFORE building, with a plain message
+naming that region, its edge and what the owner can change. Source:
+`dockerfiles/maxwell_solver/mse_meshing.py`.
 
 Measured basis: the grid must be as fine as the fine edge and covered 8.6k-580k
 elements on the fixtures measured -- up to ~19x the final mesh's own element
 count. The estimate is the volume/cell-volume ratio, not the bounding box, so it
-prices exactly the tetrahedralization about to be attempted.
+prices exactly the tetrahedralization about to be attempted. The cap's SIZE comes
+from TetGen's own memory: ~589k cells of this PLC held 107-123 MB resident on the
+VM (182-209 B/cell; 63 B/cell where the cells are far coarser than the facets), so
+the cap is worth ~0.12 GB, a few per cent of a worker's RAM.
+
+A BUILT grid can still exceed the cap, and that SHALL be reported, not refused:
+once the cells are much coarser than the PLC's own facets, the facets set the
+count and the cell edge stops moving it -- measured on the thick-wall fixture as
+37.4k, 16.9k and 19.7k cells at an 8k, 3k and 1k cap, then 16,130 cells at 300, 60
+and 20, with the cells 5.4x, 9.3x and 13.4x wider than the fine region's edge.
+Refusing there would discard a build already paid for. The property grading
+actually rests on -- the finest region keeping a node of its own -- is checked
+separately and still refuses.
 
 #### Scenario: the priced grid is over the cap
 - **WHEN** the estimated element count exceeds `MAX_BACKGROUND_TETS`
-- **THEN** the grid's cells are coarsened to fit the cap and the mesh is still
-  built graded, every region keeping its own achieved edge
+- **THEN** the grid's cells are coarsened to fit the cap, but never past the
+  finest region's own edge, and the mesh is still built graded, every region
+  keeping its own achieved edge
 
-#### Scenario: coarsening would swallow the finest region
-- **WHEN** the grid's coarsened cells leave no node carrying the finest region's
-  edge
+#### Scenario: coarsening has run out at the finest region's edge
+- **WHEN** the volume term is still over the cap with the cells widened to the
+  finest region's own edge
 - **THEN** the mesher refuses BEFORE building, naming that region, its edge and
   what the owner can change
+
+#### Scenario: the built grid exceeds the cap
+- **WHEN** the built grid holds more cells than the cap, because the PLC's own
+  facets set the count
+- **THEN** the mesher reports the count and its reason and builds on
 
 #### Scenario: a grid inside the cap
 - **WHEN** the estimated element count is inside the cap

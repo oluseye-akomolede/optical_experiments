@@ -363,9 +363,18 @@ TETGEN_MTR_POINTDATA_KEY = "target_size"
 #: same order of budget as the largest mesh this app will build rather than
 #: being allowed to grow with the object-volume/fine-edge ratio. A background
 #: that would exceed it is COARSENED first -- a coarser grid costs mesh quality
-#: in the transition, while refusing costs the answer -- and only a coarsening
-#: that leaves the finest region with no node of its own is refused, with a
-#: message naming that region. See ``_sizing_background``.
+#: in the transition, while refusing costs the answer -- and the object is
+#: refused, with a message naming the finest region and its edge, only when the
+#: coarsening has run out at that region's own edge (see ``_sizing_background``).
+#:
+#: WHERE THE NUMBER COMES FROM: it is the app's own mesh cap
+#: (``DEFAULT_MAX_TETS``), and the reason to keep it there is a measurement.
+#: TetGen held ~589,000 cells of this PLC for 107-123 MB of resident memory on
+#: the VM (182-209 B/cell; 63 B/cell in the cheaper case where the cells are far
+#: coarser than the facets, measured by building the same box background at
+#: three cell edges). So this cap is worth about 0.12 GB at the top end -- a
+#: few per cent of a worker's RAM, and of the Orin's -- while a background ten
+#: times larger would be ~1.2 GB and would compete with the solver it is sizing.
 MAX_BACKGROUND_TETS = DEFAULT_MAX_TETS
 
 
@@ -1156,7 +1165,10 @@ def _region_plan(parts, materials, edge_m: float, units: str,
     # surface floors the tets that touch it -- and it is a real saving. It buys
     # that saving with the one geometry grading exists to protect, because a
     # region's INTERFACE SHAPE is fixed by the facets and the interior mesh
-    # cannot recover it: measured on the Orin (n3: a 3.33 mm core of index 3 in
+    # cannot recover it. That holds for a NESTED region too, not only the outer
+    # shell: the merged PLC carries every part's own facets (the thick-wall test
+    # fixture: 768 + 768 = 1,536 faces), so decimating to the coarse edge would
+    # round the core itself. Measured on the Orin (n3: a 3.33 mm core of index 3 in
     # a 10 mm shell), facets built at the coarse edge left the core a polyhedron
     # whose volume-equivalent radius was 1.14% short of the ideal (a_eff 3.2953
     # against 3.3333), charging the l=1 TE multiplet with 0.75% error while the
@@ -1331,6 +1343,22 @@ def _sizing_background_grid(bg_points: np.ndarray, bg_tets: np.ndarray,
     return grid
 
 
+def _part_of_region(plan: dict, rid: int) -> str:
+    """The part name a region id belongs to, for a refusal message.
+
+    ``plan["region_of_part"]`` is a LIST in part order (``mse_parts.py``), and an
+    earlier version of both call sites read ``.items()`` off it: the refusal
+    raised ``AttributeError`` instead of the ``MeshingError`` it was written for,
+    which is the failure this rig calls *a refusal escapes when its type is not
+    caught* -- a guard that cannot run is worse than no guard, because the
+    caller's ``except MeshingError`` never sees it. The name comes from
+    ``plan["shared"]``, which is keyed by region id, and a region missing from
+    it falls back to the id rather than raising.
+    """
+    info = (plan.get("shared") or {}).get(int(rid)) or {}
+    return info.get("part") or f"region {int(rid)}"
+
+
 def _sizing_background(plan: dict, vertices: np.ndarray, faces: np.ndarray,
                        canonical_offset: np.ndarray, canonical_scale: float,
                        units: str, verbose: bool = False):
@@ -1357,11 +1385,14 @@ def _sizing_background(plan: dict, vertices: np.ndarray, faces: np.ndarray,
     clamp's mechanism.
 
     UNLESS that would cost more than ``MAX_BACKGROUND_TETS`` cells, priced from
-    the PLC's own volume before the build: the cells are then coarsened to the
-    cap, and the finest region's target has to survive on at least one node --
-    a background cell wider than the fine region would swallow it and the mesh
-    would come back quietly ungraded, so that outcome REFUSES with the region
-    named instead.
+    the PLC's own volume before the build. The cells are then coarsened to the
+    cap, but never past the finest region's own edge -- a background cell wider
+    than the fine region swallows it and the mesh comes back quietly ungraded,
+    which is the failure this path exists to avoid. If the volume term is still
+    over the cap at that edge, the object cannot be meshed in one job and the
+    call REFUSES here, before the build. The built grid can still exceed the cap
+    (see the report below): its cell edge is not the only thing that decides how
+    many cells it holds.
     """
     import tetgen
 
@@ -1388,14 +1419,39 @@ def _sizing_background(plan: dict, vertices: np.ndarray, faces: np.ndarray,
     # needed. Its cost is the enclosed volume over the cell volume, computable
     # from the PLC in this function's own hands: cells at the FINEST region's
     # edge over the WHOLE object, which is the largest single number the graded
-    # path produces. Above the cap the cells are coarsened to fit rather than
-    # refused -- a coarser grid still carries every region's target as long as
-    # each region keeps a node of its own, and that is checked below.
+    # path produces. Above the cap the cells are coarsened -- a coarser grid
+    # still carries every region's target as long as each region keeps a node of
+    # its own -- and only when coarsening has run out, at the finest region's own
+    # edge, is the object refused, which happens here, before the build.
     wanted_edge = bg_edge
     estimated_tets = _background_tet_estimate(vertices, faces, bg_volume)
+    priced_tets = estimated_tets
     if estimated_tets > MAX_BACKGROUND_TETS:
-        bg_edge *= (estimated_tets / float(MAX_BACKGROUND_TETS)) ** (1.0 / 3.0)
+        # The edge that would bring the volume term to the cap, floored at the
+        # finest region's own edge: widening the cells past that is the swallow
+        # the docstring names, so the grid is not allowed to go there.
+        bg_edge = min(
+            wanted_edge * (estimated_tets / float(MAX_BACKGROUND_TETS)) ** (1.0 / 3.0),
+            fine_canonical,
+        )
         bg_volume = (bg_edge ** 3) / (6.0 * np.sqrt(2.0))
+        priced_tets = _background_tet_estimate(vertices, faces, bg_volume)
+        if priced_tets > MAX_BACKGROUND_TETS:
+            # Coarsening has run out: even at the fine region's own edge the
+            # grid would not fit, so this object is too large for one job. Say
+            # so HERE, before the build, which is the only moment refusing is
+            # free.
+            fine_rid = int(plan["fine_region"])
+            fine_part = _part_of_region(plan, fine_rid)
+            raise MeshingError(
+                f"this object is too large and too finely graded to mesh inside "
+                f"one job's memory: its sizing background grid would need about "
+                f"{priced_tets:,.0f} cells, above the "
+                f"{MAX_BACKGROUND_TETS:,} cap, even with its cells widened to "
+                f"the finest region's own edge "
+                f"({fine_canonical / canonical_scale:.4g} {units}, {fine_part}). "
+                "Try fewer modes or a coarser target for that region."
+            )
         if verbose:
             print(
                 f"[mse] the sizing background grid would need about "
@@ -1423,16 +1479,27 @@ def _sizing_background(plan: dict, vertices: np.ndarray, faces: np.ndarray,
             f"internal error: the sizing background mesh got {attrib.shape[0]} "
             f"region attributes for {bg_tets.shape[0]} tetrahedra"
         )
-    if bg_tets.shape[0] > MAX_BACKGROUND_TETS:
-        # The coarsening above could not hold the cap, so its estimate was
-        # wrong. Say which number was wrong rather than carrying on: the next
-        # step would hand this grid to the solver's own memory budget.
-        raise MeshingError(
-            f"the sizing background grid came back with {bg_tets.shape[0]:,} "
-            f"cells, above the {MAX_BACKGROUND_TETS:,} cap it was coarsened to "
-            f"fit (the estimate said {estimated_tets:,.0f}). This object is "
-            "too large and too finely graded to mesh inside one job's memory; "
-            "try fewer modes or a coarser target for the dense region."
+    if bg_tets.shape[0] > MAX_BACKGROUND_TETS and verbose:
+        # REPORTED, not refused, and the measurement is why. Raising the cell
+        # edge does not bound this count: on the thick-wall test fixture
+        # (``tests/test_meshing_guard.py``'s ``_fine_nested_parts``, n_modes=3,
+        # wall index 1.0 against core 3.0: 1,536 facets, base edge 1.018 mm,
+        # fine edge 0.3394 mm) the built background held 37,406 cells at an
+        # 8,000 cap, 16,949 at 3,000, 19,744 at 1,000, and then 16,130 at 300,
+        # at 60 and at 20 -- the same number three times, with the cells 5.4x,
+        # 9.3x and 13.4x wider than the fine region's edge. Past the point where
+        # the cells are much coarser than the PLC's own facets, the FACETS set
+        # the count and the edge stops mattering. So the cap prices the volume
+        # term, which is the part this code controls; refusing here would throw
+        # away a build already paid for, while the property grading actually
+        # rests on -- the finest region keeping a node of its own -- is checked,
+        # and still refuses, just below.
+        print(
+            f"[mse] note: the sizing background grid came back with "
+            f"{bg_tets.shape[0]:,} cells, above the {MAX_BACKGROUND_TETS:,} cap "
+            f"its cells were priced for (volume term {priced_tets:,.0f}); the "
+            "PLC's own facets set the rest",
+            flush=True,
         )
     node_region = np.full(bg_points.shape[0], -1, dtype=np.int64)
     for tet_index in range(bg_tets.shape[0]):
@@ -1459,11 +1526,7 @@ def _sizing_background(plan: dict, vertices: np.ndarray, faces: np.ndarray,
         # naming the region and its edge, rather than build a mesh whose fine
         # region is a lie.
         fine_rid = int(plan["fine_region"])
-        fine_part = next(
-            (name for name, rid in plan["region_of_part"].items()
-             if int(rid) == fine_rid),
-            f"region {fine_rid}",
-        )
+        fine_part = _part_of_region(plan, fine_rid)
         raise MeshingError(
             f"the sizing background grid is too coarse to carry the finest "
             f"region ({fine_part}, edge "

@@ -265,16 +265,26 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
     GRADED MESHES: when the regions' edges differ, the mesh is GRADED -- the
     fine region at its own edge, the coarse ones coarser -- so pricing every
     region at the finest edge would OVER-estimate and send a Jetson-sized job
-    to the cluster. The measured agreement is honest but not tight: the sizing
-    field's transition refines the coarse region below its target, so this sum
-    prices each coarse region at the edge the sizing field's transition actually
-    delivers rather than at its target (see
-    ``mse_common.TRANSITION_EDGE_EXPONENT``). Without that the per-region sum
-    UNDER-counts the mesh the mesher then builds -- by 1.7x on the fixtures
-    measured so far -- and an under-count routes the job onto a machine it does
-    not fit, which is the unsafe direction for a route decision about the GPU's
-    scarce queue. With it, the estimate lands 1.0-1.9x the built count on the
-    same fixtures.
+    to the cluster. The sum prices each coarse region at the edge the sizing
+    field's transition actually delivers rather than at its target (see
+    ``mse_common.TRANSITION_EDGE_EXPONENT``, which carries the measured table
+    and the constant's justification).
+
+    The plain per-region sum is a bound on NEITHER side, so the correction is a
+    single-parameter compromise and its spread is this estimate's accuracy
+    limit. Measured est/built through this path, plain -> corrected: the
+    thin-wall fixture 0.74 -> 0.85, the thick-wall fixture 0.57 -> 1.04, the
+    coarse-faceted nested boxes 1.17 -> 1.95, 1.19 -> 2.14, 1.29 -> 2.00 and
+    1.97 -> 2.24. Two effects push in opposite directions. The transition makes
+    a coarse region FINER than its target, so on the fixtures where the
+    transition is most of the coarse region the plain sum UNDER-counts -- 1.35x
+    thin, 1.75x thick -- and an under-count is the unsafe direction: the
+    estimate ROUTES the job, so the failure lands after the machine is paid for.
+    On the nested boxes the same correction instead makes an over-count LARGER.
+    The ceiling the tests hold is 3.0 est/built, which is the UNGRADED case's
+    own 2.99 on the nested box -- that is the volume law's error on the shape,
+    not the transition's. The band in the meshing guard's test is that spread,
+    and the refusal threshold is unchanged.
 
     NOTE ON THE CALLER: ``web/app.py``'s upload route parses the
     ``part_index.<name>`` fields and passes ``parts``/``materials`` in, so this

@@ -405,8 +405,8 @@ def _run_case(label: str, n_core: float | None, *, n_modes: int, grid: int,
     # THE UNIFORM REFERENCE -- what this SAME object costs when every region is
     # meshed at the fine region's edge. That is the count grading is claiming to
     # beat, so it is MEASURED (a real mesh of the same bytes, one part, at that
-    # edge) rather than taken from the estimate, which is a fitted lower bound
-    # for a graded mesh and says nothing about the uniform one.
+    # edge) rather than taken from the estimate, which prices the GRADED mesh
+    # (see ``TRANSITION_EDGE_EXPONENT``) and says nothing about the uniform one.
     #
     # Mesh-only: the case's own solve above already established the spectrum, and
     # a second solve would cost minutes of GPU for a number the mesh alone gives.

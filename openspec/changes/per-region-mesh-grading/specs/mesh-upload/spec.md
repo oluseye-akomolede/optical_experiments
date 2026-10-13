@@ -28,14 +28,18 @@ across every boundary between regions, so elements near that boundary are finer
 than the coarse region's own target, and the plain sum UNDER-counts the mesh the
 mesher then builds. Under-counting is the dangerous direction, because the
 estimate is what routes the job. Measured through the product's own path against
-the BUILT element count on five graded fixtures (a thin-walled and a thick-walled
-one among them), the plain sum lands at 0.58-1.14x the real count and the
-corrected one at 1.01-1.87x -- every under-count removed, at the price of the
-same order of over-count. The exponent is measured, and it is exactly 1 when the
-regions' edges are equal, so the uniform number is unchanged. The refusal
+the BUILT element count, the plain sum is not a bound on either side: it lands at
+0.57x and 0.74x the real count on the two fixtures the meshing guard's test
+builds (reproducible by running it), and at 1.2-3.0x on the coarser-faceted
+nested boxes the routing tests build. The corrected estimate lands at 1.04x and
+0.85x on the two guard fixtures: the under-count is removed. The exponent is
+exactly 1 when the regions' edges are equal, so the uniform number is unchanged,
+and its value is ONE number that cannot also represent the fine region's own
+boundary effects -- the measured table in `mse_common.TRANSITION_EDGE_EXPONENT`
+states that spread as the model's accuracy limit, not a bound. The refusal
 threshold itself is UNCHANGED by this: the correction restores the margin the
-threshold's "up to twice high" allowance assumes, which a 1.7x-under estimate had
-quietly widened to three or four times.
+threshold's "up to twice high" allowance assumes, which an under-counting
+estimate had quietly widened.
 
 The estimate SHALL return `0`, meaning "do not route on this", when the surface
 is unusable or the formula fails -- not a small number. Source: `web/meshing.py`,

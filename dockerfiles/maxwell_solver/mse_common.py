@@ -590,27 +590,50 @@ def region_plan(parts, materials, edge_m: float, units: str,
 
 #: How far, in log-edge space, the sizing field's transition moves a COARSE
 #: region below its own target edge. ``estimate_tets_by_region`` prices a coarse
-#: region at ``h_r * (h_min/h_r) ** this``; measured through the product's own
-#: mesh report on five graded fixtures, comparing the estimate with the BUILT
-#: element count (est/built, and the same with the correction):
+#: region at ``h_r * (h_min/h_r) ** this``.
 #:
-#:     fixture                      ratio r   plain   corrected
-#:     sphere, thin core  (2/0.6 mm)   3.0    0.584    1.012
-#:     sphere, fat core   (5/3 mm)     3.0    1.209    1.392
-#:     box, thick wall    (6/2 mm)     3.0    0.702    1.143
-#:     box, thin wall     (6/4 mm)     3.0    1.101    1.215
-#:     Orin n3 (3.33/10 mm, n=3)       3.0    1.140    1.866
-#:     Orin n2 (3.33/10 mm, n=2)       2.0    1.105    1.685
+#: MEASURED through the product's own path -- the routing estimate against
+#: TetGen's element count for the SAME plan (est/built; "plain" is the sum with
+#: no correction) -- on the five graded plans ``tests/test_routing.py``'s
+#: nested-pair matrix builds (the 6/2 box at n_modes 3) and the two
+#: ``tests/test_meshing_guard.py::test_the_graded_estimate_lands_on_the_mesh_the_mesher_builds``
+#: builds, so every row is reproducible by running them:
 #:
-#: The plain sum under-counts by up to 1.7x (the estimate ROUTES the job, so an
-#: under-count sends a job onto a machine it does not fit); 0.25 removes every
-#: under-count on the measured set, at the price of the same order of
-#: over-count. 0.35 was tried and left 2.4x on the largest fixture. The
-#: remaining spread is the shape dependence of ``c`` (a fit made on shells
-#: over-prices a compact dense core), which is not this exponent's to fix.
-#: A larger index ratio gives a larger correction, which is the direction the
-#: physics runs.
-TRANSITION_EDGE_EXPONENT = 0.25
+#:     plan (6/2 box, index ratios)  plain   0.3     0.5
+#:     n=1.0/1.0  (ungraded)         2.99   2.99    2.99
+#:     n=1.0/2.0                     1.17   1.95    2.81
+#:     n=1.0/3.5                     1.19   2.14    3.70
+#:     n=2.0/3.5                     1.29   2.00    2.70
+#:     n=3.0/3.5                     1.97   2.24    2.45
+#:     6/2 wall/core 1.0/3.0         0.57   1.04    1.74
+#:     6/4 wall/core 1.0/3.0         0.74   0.85    1.00
+#:
+#: The plain per-region sum is a bound on NEITHER side, and the mesher's own
+#: per-region report says why: two effects move a graded mesh in opposite
+#: directions.
+#:
+#:   * A coarse region carries a TRANSITION the plain formula does not pay for,
+#:     and its tets come out FINER than its target -- achieved/target 0.71 on
+#:     the n=1.0/3.5 plan, 0.64 on the thick fixture and 0.80 on the pinned
+#:     test's own plan -- so it always holds more than ``c * V / h_r^3``:
+#:     1.27x, 2.26x and 1.06x its plain pricing. This pushes the sum DOWN, and
+#:     it is the expensive direction: the estimate ROUTES the job, so an
+#:     under-count sends it onto a machine it does not fit and the failure
+#:     lands after the machine has been paid for.
+#:   * A FINE region only a few cells across is not described by the volume law
+#:     at all -- its tets are dominated by the boundary it shares with the
+#:     transition. The same 8 mm^3 core delivered an effective coefficient of
+#:     8.0, 17.7 and 5.5 on those three plans, against the 14 fitted on whole
+#:     objects. That pushes the sum UP on two of the three.
+#:
+#: The exponent pays the first effect and cannot pay the second, so it is a
+#: single-parameter compromise and that spread is its accuracy limit. 0.3 is the
+#: largest inflation that keeps EVERY measured plan clear of the estimator's own
+#: ceiling (the tests bound est/built at 3.0, itself the UNGRADED case measured
+#: at 2.99); 0.5 measured 3.70 on the 1.0/3.5 plan and broke that contract. An
+#: earlier revision used the geometric mean of the two edges (0.5) on the two
+#: fixtures alone; the nested-pair matrix is what falsified it.
+TRANSITION_EDGE_EXPONENT = 0.3
 
 
 def estimate_tets_by_region(parts, materials, edge_m: float,
@@ -662,17 +685,19 @@ def estimate_tets_by_region(parts, materials, edge_m: float,
     A COARSE REGION IS PRICED AT THE EDGE THE TRANSITION DELIVERS, not at its
     target. The sizing field ramps from the fine edge to the coarse one across
     every boundary between regions, and elements near that boundary are finer
-    than the coarse region's own target, so the plain sum UNDER-counts the mesh
-    the mesher then builds -- by 1.9x on the thinnest wall measured, and the
-    estimate is what routes the job. Each region above ``h_min`` is therefore
-    priced at
+    than the coarse region's own target, so pricing each region at its own
+    target UNDER-counts the mesh the mesher then builds -- measured, 1.35x on
+    the thin wall fixture and 1.75x on the thick one, and the estimate is what
+    routes the job. Each region above ``h_min`` is therefore priced at
 
         h_eff = h_r * (h_min / h_r) ** TRANSITION_EDGE_EXPONENT
 
     which is ``h_r`` exactly when nothing is graded (the exponent's own limit,
     preserving the one-edge branch below bit for bit) and moves toward the fine
-    edge as the ratio grows. The exponent is the ONE fitted number here and it
-    is measured, not chosen: see ``TRANSITION_EDGE_EXPONENT``.
+    edge as the ratio grows. The correction is ONE number, so it pays the coarse
+    region's transition and cannot also represent the fine region's own boundary
+    effects; ``TRANSITION_EDGE_EXPONENT`` carries the measured table and states
+    that as the model's accuracy limit, rather than claiming a bound.
     """
     plan = region_plan(parts, materials, edge_m, units)
     if not plan:
