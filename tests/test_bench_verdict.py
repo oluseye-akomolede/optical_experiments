@@ -1,11 +1,11 @@
 """The bench's ACCEPTANCE verdict, pinned without meshing or solving anything.
 
-``benchmarks/run_multimaterial_bench.py`` prints the two claims per-region
-grading makes -- the dense core's error stays within twice the empty sphere's,
-and the mesh costs fewer tets than the same object meshed uniformly -- as
-PASS/FAIL lines. Those lines are what the lead reads on the Orin, and a wrong
-verdict there is worse than no verdict: it would either bless a regression or
-fail a good mesh, and neither is visible from the JSON alone.
+``benchmarks/run_multimaterial_bench.py`` prints the claims per-region grading
+makes -- the graded mesh's error is NO WORSE than the uniform mesh's (the
+owner's bar, 2026-10-13), and it costs fewer tets than the same object meshed
+uniformly -- as PASS/FAIL lines. Those lines are what the lead reads on the
+Orin, and a wrong verdict there is worse than no verdict: it would either bless
+a regression or fail a good mesh, and neither is visible from the JSON alone.
 
 So both ends of the report are replaced with canned values: ``_run_case``
 returns a case whose mesher and solver never ran, and ``_score`` returns the
@@ -13,11 +13,14 @@ error already computed. What is left under test is exactly the verdict logic --
 the code that turns those numbers into PASS/FAIL lines and an exit code. No
 TetGen, no matrix, no GPU: this is the tier-1 test of the tier-2 report.
 
-The third case is the one that matters most. With no ``empty`` case in the run,
-the error criterion cannot be decided at all -- and a verdict block that printed
-only the tets half would read as if the error half had been fine. That is the
-rig's signature defect ("could not ask must not look like nothing there"), so it
-is asserted explicitly.
+The arms of the accuracy criterion each get their own test, because each fails
+RUNS: the graded error is no worse than the uniform mesh's (pass), it is worse
+(fail), the uniform mesh could not be solved so the bar is unmeasured (the case
+the Orin hit -- cuDSS ALLOC_FAILED), and ``--solve-uniform`` was not passed so
+the bar is unmeasured too. An unmeasured bar is never a pass: a verdict block
+that printed only the tets half would read as if the error half had been fine.
+That is the rig's signature defect ("could not ask must not look like nothing
+there"), so it is asserted explicitly.
 """
 
 from __future__ import annotations
@@ -136,17 +139,29 @@ def _run(monkeypatch, cases, capsys, tmp_path, argv=None):
 
 
 def test_a_good_graded_run_passes_both_criteria(monkeypatch, capsys, tmp_path):
+    """The PASS arm of the accuracy criterion: graded NO WORSE than uniform."""
     cases = [
         _case("empty", None, 0.010, 26_000, None),
-        _case("n2", 2.0, 0.015, 40_000, 76_000),
-        _case("n3", 3.0, 0.019, 90_000, 258_000),
+        _case("n2", 2.0, 0.015, 40_000, 76_000,
+              uniform_score={"worst_rel_error": 0.017, "n_matched": 10,
+                             "n_clusters": 20, "matched": []}),
+        _case("n3", 3.0, 0.019, 90_000, 258_000,
+              uniform_score={"worst_rel_error": 0.021, "n_matched": 10,
+                             "n_clusters": 20, "matched": []}),
     ]
-    rc, text = _run(monkeypatch, cases, capsys, tmp_path)
+    rc, text = _run(monkeypatch, cases, capsys, tmp_path,
+                    argv=["--cases", "empty,n2,n3", "--solve-uniform", "--out",
+                          str(tmp_path / "r.json")])
     assert rc == BENCH.BENCH_OK
-    assert "empty (baseline): worst 1.000%" in text, text
-    # n3 at 1.90x the baseline: inside the 2x allowance, and 34.9% of uniform.
-    assert "n3: worst 1.900% (1.90x the empty sphere) -> PASS (<= 2.00x)" in text
+    assert ("empty sphere (INFORMATION only, not a criterion): worst 1.000%"
+            in text), text
+    # n3 graded 1.90% is NO WORSE than the uniform mesh's 2.10%, and cheaper.
+    assert ("n3: graded worst 1.900% vs uniform worst 2.100% (0.90x) -> "
+            "PASS (<= 1.00x the uniform mesh)") in text, text
     assert "n3: 34.9% of uniform tets -> PASS (< 100%)" in text
+    # Both empty-sphere ratios are printed, and labelled as not a criterion.
+    assert ("n3: vs the empty sphere: graded 1.90x, uniform 2.10x "
+            "(INFORMATION, not a criterion)") in text, text
     assert "FAIL" not in text, text
     assert "EXIT 0" in text, text
 
@@ -156,58 +171,77 @@ def test_a_bad_graded_run_fails_the_criterion_it_should(monkeypatch, capsys,
     """The verdict must FAIL when a criterion is broken, and name which one.
 
     Two independent ways to fail, both present at once so neither can be
-    satisfied by the other: n3's error is 2.4x the baseline (past the 2x
-    allowance) while its mesh IS cheaper, and n2's error is fine while its mesh
-    is BIGGER than uniform.
+    satisfied by the other: n3 is WORSE than its uniform mesh (0.019 vs 0.015)
+    while its mesh IS cheaper, and n2 beats its uniform mesh while its mesh is
+    BIGGER than uniform.
+
+    n3's error is deliberately INSIDE the old bar (0.019 <= 2x the empty
+    sphere's 0.010), so a run that still judged against that bar would call it a
+    PASS -- which is the difference this criterion exists to make.
     """
     cases = [
         _case("empty", None, 0.010, 26_000, None),
-        _case("n2", 2.0, 0.012, 90_000, 76_000),
-        _case("n3", 3.0, 0.024, 90_000, 258_000),
+        _case("n2", 2.0, 0.012, 90_000, 76_000,
+              uniform_score={"worst_rel_error": 0.018, "n_matched": 10,
+                             "n_clusters": 20, "matched": []}),
+        _case("n3", 3.0, 0.019, 90_000, 258_000,
+              uniform_score={"worst_rel_error": 0.015, "n_matched": 10,
+                             "n_clusters": 20, "matched": []}),
     ]
-    rc, text = _run(monkeypatch, cases, capsys, tmp_path)
+    rc, text = _run(monkeypatch, cases, capsys, tmp_path,
+                    argv=["--cases", "empty,n2,n3", "--solve-uniform", "--out",
+                          str(tmp_path / "r.json")])
     # The exit code carries the verdict: a FAIL that printed and still exited 0
     # would let a remote run read as success.
     assert rc == BENCH.BENCH_DEFECT, "a FAILED criterion must set the exit code"
-    assert "n2: worst 1.200% (1.20x the empty sphere) -> PASS (<= 2.00x)" in text
+    assert ("n2: graded worst 1.200% vs uniform worst 1.800% (0.67x) -> "
+            "PASS (<= 1.00x the uniform mesh)") in text, text
     assert "n2: 118.4% of uniform tets -> FAIL (< 100%)" in text
-    assert "n3: worst 2.400% (2.40x the empty sphere) -> FAIL (<= 2.00x)" in text
+    assert ("n3: graded worst 1.900% vs uniform worst 1.500% (1.27x) -> "
+            "FAIL (<= 1.00x the uniform mesh)") in text, text
     assert "n3: 34.9% of uniform tets -> PASS (< 100%)" in text
     assert "EXIT 3: a criterion FAILED" in text, text
 
 
 def test_no_baseline_says_unmeasured_rather_than_passing(monkeypatch, capsys,
                                                          tmp_path):
-    """Running without the control case must not look like a clean result."""
+    """Running without the harness's own control must not look like a pass.
+
+    The empty sphere is no longer the accuracy BAR, but it is still the
+    benchmark's control that the harness measures the right geometry; without
+    it the run is a missing measurement.
+    """
     cases = [_case("n3", 3.0, 0.019, 90_000, 258_000)]
     rc, text = _run(monkeypatch, cases, capsys, tmp_path,
                     argv=["--cases", "n3", "--out",
                           str(tmp_path / "r.json")])
     assert rc == BENCH.BENCH_INCOMPLETE, "an undecidable criterion is not 0"
-    assert "NO empty-sphere baseline in this run" in text, text
-    assert "UNMEASURED" in text, text
-    assert "n3: worst 1.900% -- NO BASELINE to compare it against" in text
-    # The tets half IS measurable without the baseline, and is still reported.
+    assert "NO 'empty' case in this run" in text, text
+    assert "accuracy UNMEASURED" in text, text
+    # The tets half IS measurable without the control case, and is still reported.
     assert "n3: 34.9% of uniform tets -> PASS (< 100%)" in text
     # And nothing in this run may read as an error pass.
-    assert "<= 2.00x)" not in text, text
+    assert "<= 1.00x the uniform mesh)" not in text, text
 
 
 def test_a_reference_that_could_not_be_built_is_not_a_pass(monkeypatch, capsys,
                                                            tmp_path):
-    """A uniform reference that raised leaves the tets criterion UNMEASURED."""
+    """A uniform reference that raised leaves BOTH criteria UNMEASURED."""
     cases = [
         _case("empty", None, 0.010, 26_000, None),
         _case("n2", 2.0, 0.012, 40_000, None,
               uniform_error="MeshingError: would need 900,000 elements"),
     ]
     rc, text = _run(monkeypatch, cases, capsys, tmp_path,
-                    argv=["--cases", "empty,n2", "--out",
+                    argv=["--cases", "empty,n2", "--solve-uniform", "--out",
                           str(tmp_path / "r.json")])
     assert rc == BENCH.BENCH_INCOMPLETE, "an unbuilt reference is not a pass"
+    assert ("n2: graded worst 1.200% -- accuracy UNMEASURED (MeshingError: "
+            "would need 900,000 elements)") in text, text
     assert "tets vs uniform UNMEASURED" in text, text
     assert "MeshingError" in text
     assert "% of uniform tets -> PASS" not in text, text
+    assert "<= 1.00x the uniform mesh)" not in text, text
     assert "EXIT 4: a criterion is UNMEASURED" in text, text
 
 
@@ -229,7 +263,7 @@ def test_a_case_that_raised_is_recorded_and_does_not_take_the_others_down(
     assert "case n2 RAISED" in text
     assert "2/3 cases ran; 1 raised" in text
     # The surviving cases are still scored, including the one after the failure.
-    assert "n3: worst 1.900%" in text, text
+    assert "n3: graded worst 1.900%" in text, text
 
 
 @pytest.fixture(autouse=True)
@@ -270,11 +304,14 @@ def test_a_fine_region_that_lost_its_edge_fails_even_when_the_averages_pass(
             "caveats": [],
         }
 
-    argv = ["--cases", "empty,n3", "--out", str(tmp_path / "r.json")]
+    argv = ["--cases", "empty,n3", "--solve-uniform", "--out",
+            str(tmp_path / "r.json")]
+    ok_uniform = {"worst_rel_error": 0.021, "n_matched": 1, "n_clusters": 1,
+                  "matched": [_match(2.0, 2, "TE", 5, 2.042, 0.021)]}
     cases = [
         _case("empty", None, 0.010, 26_000, None),
         _case("n3", 3.0, 0.019, 90_000, 258_000,
-              mesh=coarse_core(0.19, 0.21)),
+              mesh=coarse_core(0.19, 0.21), uniform_score=ok_uniform),
     ]
     rc, text = _run(monkeypatch, cases, capsys, tmp_path, argv=argv)
     assert rc == BENCH.BENCH_OK, text
@@ -283,7 +320,7 @@ def test_a_fine_region_that_lost_its_edge_fails_even_when_the_averages_pass(
     # Same case, but the core's own tets came back at 0.40 mm against its
     # 0.19 mm target: 2.1x, past the 1.6x the product itself refuses on.
     cases[1] = _case("n3", 3.0, 0.019, 90_000, 258_000,
-                     mesh=coarse_core(0.19, 0.40))
+                     mesh=coarse_core(0.19, 0.40), uniform_score=ok_uniform)
     rc, text = _run(monkeypatch, cases, capsys, tmp_path, argv=argv)
     assert rc == BENCH.BENCH_DEFECT, (
         "a fine region at 2.11x its own target is a FAILED criterion"
@@ -292,7 +329,8 @@ def test_a_fine_region_that_lost_its_edge_fails_even_when_the_averages_pass(
            "(2.11x, allowance 1.60x) -> FAIL" in text, text
     # And the criteria whose medians DID pass must still read as passes: the
     # verdict has to name the fine region, not smear it over the whole mesh.
-    assert "n3: worst 1.900% (1.90x the empty sphere) -> PASS (<= 2.00x)" in text
+    assert ("n3: graded worst 1.900% vs uniform worst 2.100% (0.90x) -> "
+            "PASS (<= 1.00x the uniform mesh)") in text, text
     assert "n3: 34.9% of uniform tets -> PASS (< 100%)" in text
 
 
@@ -380,61 +418,60 @@ def test_solve_uniform_is_off_by_default_and_solved_only_with_the_flag(
     assert "--solve-uniform" in text, text
 
 
-def test_the_uniform_error_is_evidence_and_does_not_move_the_verdict(
+def test_without_solve_uniform_the_bar_is_unmeasured_not_the_2x_yardstick(
         monkeypatch, capsys, tmp_path):
-    """A uniform mesh that ALSO misses 2x must not turn the graded PASS red.
+    """The flag-off arm: the bar cannot be decided, so the run fails.
 
-    The row's question is "is the yardstick wrong, or did grading lose it", and
-    the graded mesh is judged by the SAME yardstick either way. So the uniform
-    number is printed and NAMED -- "the yardstick is suspect" -- while the exit
-    code stays the graded run's. If the uniform result were folded into the
-    verdicts, this run would exit 3 and the two questions could not be told
-    apart.
+    The graded error used to be judged against the empty sphere's error at 2x.
+    That is no longer the criterion -- the bar is the uniform mesh the owner
+    would have got -- and without ``--solve-uniform`` that mesh was never
+    solved, so the criterion is UNMEASURED. The empty-sphere ratio is still
+    printed, but labelled INFORMATION: a run must not read as though the old 2x
+    yardstick had been met.
     """
     cases = [
         _case("empty", None, 0.010, 26_000, None),
-        _case("n3", 3.0, 0.019, 90_000, 258_000,
-              uniform_score={"worst_rel_error": 0.024, "n_matched": 10,
-                             "n_clusters": 20, "matched": []}),
+        _case("n3", 3.0, 0.019, 90_000, 258_000),
     ]
-    argv = ["--cases", "empty,n3", "--solve-uniform", "--out",
-            str(tmp_path / "r.json")]
-    rc, text = _run(monkeypatch, cases, capsys, tmp_path, argv=argv)
-    assert rc == BENCH.BENCH_OK, text
-    assert ("n3: uniform worst 2.400% (2.40x the empty sphere) -> also over "
-            "2.00x -- the yardstick is suspect; graded 1.90x") in text, text
-    assert "n3: worst 1.900% (1.90x the empty sphere) -> PASS (<= 2.00x)" in text
-
-    # The other arm: a uniform mesh within the yardstick reads as such.
-    cases[1] = _case("n3", 3.0, 0.019, 90_000, 258_000,
-                     uniform_score={"worst_rel_error": 0.015, "n_matched": 10,
-                                    "n_clusters": 20, "matched": []})
-    rc, text = _run(monkeypatch, cases, capsys, tmp_path, argv=argv)
-    assert rc == BENCH.BENCH_OK, text
-    assert "n3: uniform worst 1.500% (1.50x the empty sphere) -> within 2.00x" \
-        in text, text
+    rc, text = _run(monkeypatch, cases, capsys, tmp_path,
+                    argv=["--cases", "empty,n3", "--out",
+                          str(tmp_path / "r.json")])
+    assert rc == BENCH.BENCH_INCOMPLETE, "an undecided bar is not a pass"
+    assert ("n3: graded worst 1.900% -- accuracy UNMEASURED (--solve-uniform "
+            "was not passed") in text, text
+    assert ("n3: vs the empty sphere: graded 1.90x (INFORMATION, not a "
+            "criterion)") in text, text
+    # The old 2x bar is gone: neither side of it may be claimed.
+    assert "<= 2.00x)" not in text, text
+    assert "<= 1.00x the uniform mesh)" not in text, text
+    assert "EXIT 4" in text, text
 
 
-def test_a_uniform_solve_that_raised_is_unmeasured_not_a_number(
+def test_a_uniform_solve_that_raised_is_unmeasured_not_a_pass(
         monkeypatch, capsys, tmp_path):
-    """A reference that could not be SOLVED is a missing measurement.
+    """The unmeasured arm: a reference that could not be SOLVED is not a pass.
 
-    The uniform mesh built fine, so the failure is in the solve -- and the one
-    thing the report must never do is print a uniform error it does not have.
-    The graded verdict is untouched either way.
+    The uniform mesh built fine, so the failure is in the solve -- the case the
+    bench actually hit on the Orin (cuDSS ALLOC_FAILED at n3's 199,062 tets).
+    The one thing the report must never do is print a uniform error it does not
+    have, or let the missing number read as "graded is no worse".
     """
     cases = [
         _case("empty", None, 0.010, 26_000, None),
         _case("n3", 3.0, 0.019, 90_000, 258_000,
-              uniform_solve_error="RuntimeError: the GPU venv forgot cupy"),
+              uniform_solve_error="RuntimeError: CUDSS ALLOC_FAILED (199062 "
+                                  "tets)"),
     ]
     rc, text = _run(monkeypatch, cases, capsys, tmp_path,
                     argv=["--cases", "empty,n3", "--solve-uniform", "--out",
                           str(tmp_path / "r.json")])
-    assert rc == BENCH.BENCH_OK, text
-    assert ("n3: uniform mesh UNMEASURED (RuntimeError: the GPU venv forgot "
-            "cupy)") in text, text
+    assert rc == BENCH.BENCH_INCOMPLETE, "an unsolved reference is not a pass"
+    assert ("n3: graded worst 1.900% -- accuracy UNMEASURED (RuntimeError: "
+            "CUDSS ALLOC_FAILED (199062 tets))") in text, text
     assert "uniform worst" not in text, text
+    assert "PASS (<= 1.00x the uniform mesh)" not in text, text
+    assert "FAIL (<= 1.00x the uniform mesh)" not in text, text
+    assert "EXIT 4" in text, text
 
 
 def test_the_worst_multiplet_is_named_per_case(monkeypatch, capsys, tmp_path):
@@ -453,10 +490,10 @@ def test_the_worst_multiplet_is_named_per_case(monkeypatch, capsys, tmp_path):
             _match(2.0, 2, "TE", 5, 2.019, 0.019),
         ]}
     uniform = {
-        "worst_rel_error": 0.018, "n_matched": 2, "n_clusters": 4,
+        "worst_rel_error": 0.024, "n_matched": 2, "n_clusters": 4,
         "matched": [
             _match(2.0, 2, "TE", 5, 2.006, 0.006),
-            _match(1.0, 1, "TE", 3, 1.018, 0.018),
+            _match(1.0, 1, "TE", 3, 1.024, 0.024),
         ]}
     n3 = _case("n3", 3.0, 0.019, 90_000, 258_000, uniform_score=uniform)
     n3["score"] = graded
@@ -470,7 +507,7 @@ def test_the_worst_multiplet_is_named_per_case(monkeypatch, capsys, tmp_path):
             "computed 2.0190, err 1.900%") in text, text
     # uniform's worst is a DIFFERENT mode (the 1.0 kb one) -- index 1
     assert ("n3: worst multiplet uniform: #1 ref kb 1.0000 (l=1 TE x3), "
-            "computed 1.0180, err 1.800%") in text, text
+            "computed 1.0240, err 2.400%") in text, text
 
 
 def test_worst_multiplet_index_is_by_reference_frequency_not_input_order():
@@ -502,10 +539,14 @@ def test_the_bands_print_the_shell_not_only_the_core(monkeypatch, capsys,
     """
     cases = [
         _case("empty", None, 0.010, 26_000, None),
-        _case("n3", 3.0, 0.019, 90_000, 258_000),
+        _case("n3", 3.0, 0.019, 90_000, 258_000,
+              uniform_score={"worst_rel_error": 0.021, "n_matched": 1,
+                             "n_clusters": 1,
+                             "matched": [_match(2.0, 2, "TE", 5, 2.042, 0.021)]}),
     ]
     rc, text = _run(monkeypatch, cases, capsys, tmp_path,
-                    argv=["--cases", "empty,n3", "--out", str(tmp_path / "r.json")])
+                    argv=["--cases", "empty,n3", "--solve-uniform", "--out",
+                          str(tmp_path / "r.json")])
     assert rc == BENCH.BENCH_OK, text
     assert ("n3: bands graded (median edge): core 0.21 mm/4,500 tets, "
             "shell 0.4 mm/300 tets, wall 0.62 mm/85,500 tets") in text, text
@@ -527,10 +568,14 @@ def test_bands_are_withdrawn_when_the_rebuilt_mesh_is_not_the_one_solved(
     """
     cases = [
         _case("empty", None, 0.010, 26_000, None),
-        _case("n3", 3.0, 0.019, 90_000, 258_000, remesh_matches=False),
+        _case("n3", 3.0, 0.019, 90_000, 258_000, remesh_matches=False,
+              uniform_score={"worst_rel_error": 0.021, "n_matched": 1,
+                             "n_clusters": 1,
+                             "matched": [_match(2.0, 2, "TE", 5, 2.042, 0.021)]}),
     ]
     rc, text = _run(monkeypatch, cases, capsys, tmp_path,
-                    argv=["--cases", "empty,n3", "--out", str(tmp_path / "r.json")])
+                    argv=["--cases", "empty,n3", "--solve-uniform", "--out",
+                          str(tmp_path / "r.json")])
     assert rc == BENCH.BENCH_OK, text
     assert ("n3: WARNING graded bands are about a different mesh -- the rebuilt "
             "graded mesh is not the one solved") in text, text

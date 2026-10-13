@@ -146,7 +146,11 @@ separately and still refuses.
 The benchmark SHALL exit zero only when every criterion was measured AND passed.
 A criterion that FAILED SHALL end the process with a non-zero DEFECT code and a
 criterion that could not be measured SHALL end it with a distinct non-zero code,
-so that a remote invocation cannot read a FAILED run as success. Its fine-region
+so that a remote invocation cannot read a FAILED run as success. Its accuracy
+criterion SHALL be that the graded mesh's worst matched-mode error is NO WORSE
+than the UNIFORM mesh's for the same object -- the mesh the owner would have got
+before grading existed -- and SHALL be UNMEASURED, never passed, when that uniform
+mesh was not solved. Its fine-region
 criterion SHALL measure the achieved edge on the FINE REGION's own elements --
 never the whole-mesh median, which a graded mesh's coarse regions dominate -- and
 SHALL compare it with the same overshoot allowance the mesher itself enforces. The
@@ -167,16 +171,21 @@ environment the solver backend needs. Source: `benchmarks/run_multimaterial_benc
 - **THEN** the fine-region criterion is UNMEASURED, which fails the run, and it is
   never reported as a pass
 
-#### Scenario: the uniform reference is solved for comparison
+#### Scenario: the uniform reference is the accuracy bar
 - **WHEN** the benchmark is run with `--solve-uniform`
 - **THEN** it ALSO solves the uniform reference mesh it already builds -- under the
-  SAME per-element permittivity rule the graded mesh is solved under -- and prints
-  that mesh's worst mode beside the graded one, per case, WITH the worst multiplet
-  named (index in reference-frequency order, analytic frequency, error)
-- **AND** this comparison SHALL NOT decide the exit code: the uniform result is
-  evidence for whether the 2x yardstick or the grading is at fault, so it is
-  printed and never appended to the criteria
-- **AND** with the flag off (the default) the uniform mesh is built but not solved
+  SAME per-element permittivity rule the graded mesh is solved under -- and judges
+  each graded case's worst matched-mode error against that mesh's: the criterion
+  PASSES when the graded error is no worse, FAILS when it is worse, and prints the
+  pair and their ratio, WITH the worst multiplet named for each (index in
+  reference-frequency order, analytic frequency, error)
+- **AND** when the uniform mesh was not solved -- the flag is off (the default),
+  the reference could not be built, or the solve raised (the Orin's cuDSS
+  ALLOC_FAILED at n3's 199,062 tets) -- the criterion is UNMEASURED, which fails
+  the run with the non-zero INCOMPLETE code, never a pass
+- **AND** the empty-sphere case's own error SHALL be printed as an INFORMATION
+  line that no criterion reads, so the old 2x-against-the-empty-sphere bar is not
+  reintroduced as a criterion
 
 #### Scenario: the achieved edge is reported per region
 - **WHEN** a case's mesh is measured

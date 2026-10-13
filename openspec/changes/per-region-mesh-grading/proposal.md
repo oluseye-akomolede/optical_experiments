@@ -63,6 +63,14 @@ fail (reduction < 75%, core edge off its MEASURED uniform target by > 25%).
    gains `graded`, the per-region targets/achieved edges/volumes, and the
    caveats; the job page shows a graded job's per-region resolution and any
    caveat the mesher recorded.
+8. **The acceptance bar is the uniform mesh** (owner's choice, 2026-10-13). The
+   Orin at `ebfd570` measured n2 graded worst error 0.341% against the SAME
+   object solved uniformly at 0.559% -- a 2.18x improvement -- and n3 graded
+   0.749% with its uniform reference UNMEASURED (cuDSS `ALLOC_FAILED` at
+   199,062 tets). The benchmark had been judging the graded mesh against twice
+   the EMPTY SPHERE's error, a bar nobody buys; it now judges it against the
+   uniform mesh the owner would have got, and a bar that could not be measured
+   fails the run rather than passing it.
 
 ## Impact
 

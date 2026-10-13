@@ -34,10 +34,11 @@ The script assumes the tree is at ``~/mse-bench/src-<sha>`` and the GPU venv at
 ``~/mse-bench/gpu-venv``. It takes ``--cases`` to select a subset, ``--n-modes``
 and ``--grid`` to match the production job settings, ``--backend``,
 ``--per-part-facets`` (the graded diagnosis's fixture), ``--solve-uniform`` (OFF
-by default: also SOLVE the uniform reference mesh and print its own worst-mode
-error beside the graded one -- evidence for whether the 2x yardstick or the
-grading is at fault; it does not decide the exit code, and it is a second full
-solve, so n3's mesh must stay under the cap), and ``--out`` to write the JSON
+by default: also SOLVE the uniform reference mesh -- the mesh the owner would
+have got before grading -- and make its worst-mode error the accuracy BAR the
+graded mesh is judged against, ``graded <= uniform``, per case; it is a second
+full solve, so n3's mesh must stay under the cap, and WITHOUT it the accuracy
+criterion is UNMEASURED, which fails the run), and ``--out`` to write the JSON
 report. It takes no lock itself -- wrap it in ``flock`` on
 ``~/mse-bench/.gpu.lock``, the SAME lock the worker takes, so a bench run and a
 real job can never share the GPU:
@@ -942,12 +943,19 @@ def main(argv: list[str]) -> int:
         print()
 
     # THE ACCEPTANCE CRITERIA, stated as pass/fail rather than left for the
-    # reader to compute. Two claims are being made for grading: the frequencies
-    # do not get worse (the dense core's error stays within twice the empty
-    # sphere's) and the mesh does get cheaper (fewer tets than the same object
-    # meshed uniformly at the fine edge). The empty case is the baseline for the
-    # first because it is the same object with no grading decision to make --
-    # its error is the harness's own faceting floor.
+    # reader to compute. Three claims are made for grading: the frequencies are
+    # NO WORSE than the uniform mesh -- the mesh the owner would have got before
+    # grading existed (the owner's bar, 2026-10-13) -- the mesh does get cheaper
+    # (fewer tets than the same object meshed uniformly at the fine edge), and
+    # the fine region kept its own resolution.
+    #
+    # The accuracy bar REPLACED "within twice the empty sphere's error". The
+    # empty case is the same object with no grading decision to make, so its
+    # error is the harness's own faceting floor -- not a number the owner ever
+    # had to accept, and a bar nobody buys. The bar that matters is the mesh the
+    # owner WOULD have got, so it is measured: the same object solved on the
+    # uniform reference mesh (``--solve-uniform``). The empty sphere's error is
+    # still printed, but as INFORMATION only -- no criterion reads it.
     by_label = {c["label"]: c for c in report["cases"] if "score" in c}
     baseline = by_label.get("empty", {}).get("score", {}).get("worst_rel_error")
     # Every criterion reads into this list, so the process exit code is decided
@@ -955,36 +963,63 @@ def main(argv: list[str]) -> int:
     # exited 0 would let a remote run read as success.
     verdicts: list[str] = []
     print("-" * 60)
-    print("[bench] ACCEPTANCE (worst matched multiplet error, vs the empty "
-          "sphere's; tets vs a uniform mesh of the same object)")
+    print("[bench] ACCEPTANCE (worst matched multiplet error: graded vs the "
+          "uniform mesh of the same object; tets vs that uniform mesh)")
     if baseline is None:
-        # An absent baseline is a MISSING MEASUREMENT, not a pass and not a
-        # silent skip: the error criterion cannot be decided without the control
-        # case, and a report that printed only the tets half would read as if
-        # the error half had been fine.
-        print("[bench]   NO empty-sphere baseline in this run, so the error "
-              "criterion is UNMEASURED -- re-run including the 'empty' case")
+        # The empty-sphere case is the benchmark's OWN control -- it must
+        # reproduce the bare PEC sphere, which pins that the harness is
+        # measuring the right geometry. Absent, the run is a MISSING
+        # MEASUREMENT: it still cannot exit 0, whether or not the accuracy
+        # criterion found its uniform bar.
+        print("[bench]   NO 'empty' case in this run -- the empty sphere is the "
+              "harness's own control, so the run is UNMEASURED; re-run "
+              "including the 'empty' case")
         verdicts.append("INCOMPLETE")
     else:
-        print(f"[bench]   empty (baseline): worst {baseline*100:.3f}%")
+        print(f"[bench]   empty sphere (INFORMATION only, not a criterion): "
+              f"worst {baseline*100:.3f}%")
     for c in report["cases"]:
         score = c.get("score") or {}
         worst = score.get("worst_rel_error")
+        uw = (c.get("uniform_score") or {}).get("worst_rel_error")
         if c["label"] != "empty":
+            # (1) THE ACCURACY CRITERION: the graded mesh's worst matched-mode
+            #     error must be NO WORSE than the uniform mesh's -- both solved
+            #     on the product's own pipeline. An absent uniform number is a
+            #     MISSING MEASUREMENT, never a pass: without it the bar cannot be
+            #     decided, and a report that skipped the criterion would read as
+            #     if grading had met it.
             if worst is None:
-                print(f"[bench]   {c['label']}: no scored modes -- error "
+                print(f"[bench]   {c['label']}: no scored modes -- accuracy "
                       f"criterion UNMEASURED")
                 verdicts.append("INCOMPLETE")
-            elif baseline is None:
-                print(f"[bench]   {c['label']}: worst {worst*100:.3f}% -- "
-                      f"NO BASELINE to compare it against")
+            elif uw is None:
+                why = (c.get("uniform_solve_error") or c.get("uniform_error")
+                       or ("--solve-uniform was not passed, so the uniform "
+                           "mesh was not solved"
+                           if not args.solve_uniform else
+                           "the uniform reference was not built"))
+                print(f"[bench]   {c['label']}: graded worst {worst*100:.3f}% "
+                      f"-- accuracy UNMEASURED ({why}); the bar is 'no worse "
+                      f"than today's uniform mesh', so the run fails")
                 verdicts.append("INCOMPLETE")
             else:
-                err_ok = worst <= 2.0 * baseline
-                print(f"[bench]   {c['label']}: worst {worst*100:.3f}% "
-                      f"({worst/baseline:.2f}x the empty sphere) -> "
-                      f"{'PASS' if err_ok else 'FAIL'} (<= 2.00x)")
+                err_ok = worst <= uw
+                print(f"[bench]   {c['label']}: graded worst {worst*100:.3f}% "
+                      f"vs uniform worst {uw*100:.3f}% ({worst/uw:.2f}x) -> "
+                      f"{'PASS' if err_ok else 'FAIL'} "
+                      f"(<= 1.00x the uniform mesh)")
                 verdicts.append("PASS" if err_ok else "DEFECT")
+            # INFORMATION, not a criterion: how the two meshes sit against the
+            # harness's own faceting floor -- the number the OLD bar used, kept
+            # so a reader can still see it, but no verdict reads it.
+            if baseline is not None and (worst is not None or uw is not None):
+                bits = ([f"graded {worst/baseline:.2f}x"] if worst is not None
+                        else [])
+                if uw is not None:
+                    bits.append(f"uniform {uw/baseline:.2f}x")
+                print(f"[bench]   {c['label']}: vs the empty sphere: "
+                      f"{', '.join(bits)} (INFORMATION, not a criterion)")
         ratio = c.get("tets_vs_uniform")
         if ratio is not None:
             print(f"[bench]   {c['label']}: {ratio*100:.1f}% of uniform tets -> "
@@ -994,29 +1029,6 @@ def main(argv: list[str]) -> int:
             print(f"[bench]   {c['label']}: tets vs uniform UNMEASURED "
                   f"({c.get('uniform_error') or 'the reference was not built'})")
             verdicts.append("INCOMPLETE")
-        # --solve-uniform: the UNIFORM mesh's OWN error, beside the graded one.
-        # Not a criterion of its own -- the verdict stays the graded-vs-empty
-        # one -- but the evidence the correction asked for: if the UNIFORM mesh
-        # ALSO misses the 2x yardstick the graded one is judged against, the
-        # yardstick is what is wrong; if it does not, grading lost it.
-        if args.solve_uniform and c["label"] != "empty":
-            uw = (c.get("uniform_score") or {}).get("worst_rel_error")
-            if uw is None:
-                why = (c.get("uniform_solve_error") or c.get("uniform_error")
-                       or "the uniform reference was not solved")
-                print(f"[bench]   {c['label']}: uniform mesh UNMEASURED ({why})")
-            elif baseline is None:
-                print(f"[bench]   {c['label']}: uniform worst {uw*100:.3f}% "
-                      f"-- NO BASELINE to compare it against")
-            else:
-                u_ratio = uw / baseline
-                verdict = ("also over 2.00x -- the yardstick is suspect"
-                           if u_ratio > 2.0 else "within 2.00x")
-                graded_bit = (f"; graded {worst / baseline:.2f}x"
-                              if worst is not None else "")
-                print(f"[bench]   {c['label']}: uniform worst {uw*100:.3f}% "
-                      f"({u_ratio:.2f}x the empty sphere) -> {verdict}"
-                      f"{graded_bit}")
         # D: the FINE REGION's OWN achieved edge. The metric above is a median
         # over the whole mesh, and the wall holds most of the tets -- a dense
         # core that quietly lost its resolution hides inside an average that is

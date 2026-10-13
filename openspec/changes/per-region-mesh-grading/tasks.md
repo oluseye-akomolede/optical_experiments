@@ -86,3 +86,10 @@
       loading without error and grading nothing).
 - [x] 5.2 The Jetson command for the concentric-sphere benchmark goes to the
       lead on the row (the lead runs it; this seat does not).
+- [x] 5.3 The accuracy criterion is rebarred to the UNIFORM mesh (owner's
+      decision, 2026-10-13), on the Orin measurement at `ebfd570`: n2 graded
+      worst 0.341% vs uniform 0.559% (2.18x), n3 graded 0.749% with its uniform
+      reference UNMEASURED (cuDSS `ALLOC_FAILED`, 199,062 tets). The old "within
+      2x the empty sphere" bar is replaced by "no worse than the uniform mesh",
+      and an unmeasured bar fails the run (INCOMPLETE, exit 4) instead of
+      passing it. Tests cover the pass, fail, unmeasured-solve and flag-off arms.
