@@ -99,3 +99,63 @@
       shell 0.9014 / wall 1.453 mm, uniform core 0.7085 / shell 0.7253 / wall
       0.5287 mm. n3 does not meet the bar on this measurement; the ALLOC_FAILED
       at `ebfd570` stands as that run's result.
+- [x] 5.4 STEP 1 of row `600283f7` (owner's 10-13 13:00Z direction: "the meshing
+      needs to work generally for any mesh supplied"): the cause of the n3 shell
+      0.901 / wall 1.453 medians, from the plan dict's own numbers plus a tier-1
+      analogue mesh. `benchmarks/probe_n3_bands.py` reproduces every number
+      below (tier 1, no solver, no Orin); the quoted Orin numbers are the lead's
+      `11357f4` measurement, a record and not an input to anything.
+
+      (a) NEITHER REGION IS CLAMPED, and the `min(h, h * n_wall / n_r)` term
+      produces NEITHER reported number. `region_plan` on the real fixture
+      (b = 10 mm, a/b = 1/3, n_core = 3): wall asked 1.7884 = unclamped 1.7884,
+      thickness 5.7693, `clamped` False; core asked 0.5961 = unclamped 0.5961,
+      thickness 2.1882, `clamped` False. The clamp is refuted as the cause at
+      this ratio; the `min` term only sets the core to h/3 = 0.5961 and leaves
+      the wall at h = 1.7884. 0.9014 is neither of those, and 1.4530 is neither.
+
+      (b) BOTH NUMBERS ARE MEDIANS OF MIXED POPULATIONS, and the mixtures are
+      made by the SIZING BACKGROUND's ramp between the two region edges. Both
+      bands are measured on the wall side, where the field is ramping from
+      h_min to h_wall, so no band's median can equal a region target:
+
+        * shell 0.9014 mm = 0.504 x h_wall. The band is an ABSOLUTE
+          `SHELL_BAND_MM = 1.0` wide, `r` in `(a_eff, a_eff + 1.0]`. On the
+          analogue (b = 6 mm, edge 0.9 mm, n_core = 3, same relative recipe,
+          24,887 tets) the bench's OWN band helper gives shell 0.4536 mm =
+          0.504 x h_wall -- the same ratio to three digits at 2.7x smaller
+          scale, so it is the ramp's shape and not the Orin's fixture. Its tets
+          are 14% within 15% of h_min, 0% within 15% of h_wall, 85% in
+          between: the band IS the ramp, and its median sits inside a
+          0.25-0.70 mm continuum no rule asked for.
+        * wall 1.4530 mm = 0.812 x h_wall. `wall` in that helper is `~core` --
+          the WHOLE outer region -- so it mixes the ramp with the interior too.
+          Analogue, same mask: 0.7685 mm = 0.854 x h_wall (Orin 0.812). The
+          wall's own BULK (r > a_eff + 1 mm) is 0.878 mm = 0.975 x h_wall, with
+          53% of its tets within 15% of h_wall. So the background DOES deliver
+          the wall's asked edge where the band is not contaminated by the
+          interface; the 0.81-0.85 figure is the band's placement, not the
+          rule's output.
+
+      (c) THE OWNER'S QUESTION, answered. The grading RULE is not fitted to one
+      job: `region_plan` reads only the object's own geometry and indices, and
+      (a) shows no per-job constant in play at n3. What IS shaped by the job's
+      size is the BENCH'S BAND METRIC -- `SHELL_BAND_MM = 1.0` absolute mm is
+      10% of this b = 10 mm and would be 50% of a 2 mm upload, so the shell
+      number would move with the upload even if the rule did not. A per-region
+      report, or a band width relative to a_eff, does not have that failure
+      mode. Measuring it across shapes is step 2's matrix, not more arguing.
+
+      (d) WHAT STEP 1 DOES NOT ESTABLISH, plainly: the accuracy bar itself. The
+      bands are DIAGNOSTICS -- the criterion scores the spectrum -- so (b)
+      explains the two medians the lead read, not the 0.749% / 0.662% FAIL.
+      What the bands do show is the trade the grading makes: the uniform
+      reference puts h_min = 0.5961 mm everywhere, so its outer region is 2.75x
+      finer than the graded mesh's wall band (0.5287 vs 1.4530) for ~7.6x the
+      elements (`estimate_tets`: 274,415 uniform vs 36,237 graded; the Orin
+      built 199,062 for the uniform -- the estimator runs ~1.4x high, so its
+      counts are upper bounds and the matrix's `--list` should be read as one).
+      At n2 (h_wall/h_min = 2) that trade passes (0.341% vs 0.559%); at n3
+      (ratio 3) it fails. The trade is RATIO-dependent, and a tier-1 probe
+      cannot reach the achieved edge of a full-size graded mesh on this VM (no
+      heavy compute), so sweeping the ratio is step 2's job by construction.
