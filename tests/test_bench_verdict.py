@@ -44,16 +44,34 @@ def _region(part, n, target_mm, achieved_mm, tets):
 
 
 def _case(label, n_core, worst, n_tets, uniform, uniform_error=None,
-          mesh=None):
+          mesh=None, bands=None, remesh_matches=True, eps_agreement=0.999,
+          uniform_score=None, uniform_solve_error=None):
     """One canned case: enough of the shape ``main`` reads, none of the work.
 
     The ``mesh`` block is the product's own ``LAST_MESH_REPORT`` as the real
     ``_run_case`` copies it into the case, because the acceptance criteria read
     it: leaving it out would make the fine-region criterion UNMEASURED for every
     case and the fixture would then be testing a shape the bench never sees.
+
+    ``bands`` is the per-band achieved edge the report prints (core / shell /
+    wall, graded and uniform). The default SHELL is deliberately COARSER than
+    the core -- that is the transition the ``--solve-uniform`` run exists to
+    test -- so a check that the shell is printed cannot pass on a fixture where
+    the two bands happen to be equal.
     """
+    fine_tets = int(n_tets * 0.05)
+
+    def _band(core_mm, shell_mm, wall_mm):
+        return {
+            "core": {"n_tets": fine_tets, "edge_mm": core_mm},
+            "shell": {"n_tets": 300, "edge_mm": shell_mm},
+            "wall": {"n_tets": n_tets - fine_tets, "edge_mm": wall_mm},
+        }
+
+    if bands is None and n_core is not None:
+        bands = {"graded": _band(0.21, 0.40, 0.62),
+                 "uniform": _band(0.19, 0.19, 0.19)}
     if mesh is None:
-        fine_tets = int(n_tets * 0.05)
         mesh = {
             "graded": label != "empty",
             "fine_region": 1,
@@ -66,17 +84,41 @@ def _case(label, n_core, worst, n_tets, uniform, uniform_error=None,
             },
             "caveats": [],
         }
+    graded = n_core is not None
     return {
         "label": label, "n_core": n_core, "n_tets": n_tets,
         "uniform_n_tets": uniform, "uniform_error": uniform_error,
+        "uniform_solve_error": uniform_solve_error,
         "tets_vs_uniform": (n_tets / uniform) if uniform else None,
         "fine_edge_units": 0.19, "elapsed_s": 1.0,
         "solver_backend": "cpu", "kb_computed": [], "reference": [],
         "reference_ideal": [], "a_over_b": 0.33, "a_over_b_ideal": 0.33,
         "a_eff_mm": 3.3, "b_eff_mm": 10.0, "n_modes_requested": 10,
-        "mesh": mesh,
+        "mesh": mesh, "bands": bands,
+        "graded_remesh_note": (None if remesh_matches else
+                               "the rebuilt graded mesh is not the one solved"),
+        "remesh_matches": remesh_matches if graded else None,
+        "eps_attribution_agreement": eps_agreement if graded else None,
+        "uniform_score": uniform_score,
         "score": {"worst_rel_error": worst, "n_matched": 10, "n_clusters": 20,
                   "matched": []},
+    }
+
+
+def _match(reference_kb, l, family, multiplicity, centre, rel_error,
+           count=None, count_matches=True, truncated_at_request=False):
+    """One matched multiplet, with EVERY key the printer reads.
+
+    ``main`` prints a matched entry with ``count``, ``count_matches`` and
+    ``truncated_at_request`` as well as the scored fields; a fixture that omits
+    them raises inside the printer and reads as a harness failure. Supply them.
+    """
+    return {
+        "reference_kb": reference_kb, "l": l, "family": family,
+        "reference_multiplicity": multiplicity, "centre": centre,
+        "rel_error": rel_error, "count": count if count is not None else multiplicity,
+        "count_matches": count_matches,
+        "truncated_at_request": truncated_at_request,
     }
 
 
@@ -279,3 +321,312 @@ def test_an_unmeasurable_fine_region_is_unmeasured_not_a_pass(
     assert "n3: fine-region achieved edge UNMEASURED (region 1 has no tets)" \
         in text, text
     assert "fine region (core) achieved" not in text, text
+
+
+# --------------------------------------------------------------------------
+# --solve-uniform, the per-multiplet labelling and the shell band.
+#
+# These are the three things the row asked to be able to SEE: WHICH mode the
+# worst error belongs to, what the coarse shell just outside the interface came
+# back at, and -- with the flag -- whether the uniform mesh misses the same
+# yardstick the graded one is judged against. None of them is a new criterion;
+# they are evidence, and the tests below hold them to that too (a uniform
+# result must NOT move the exit code).
+# --------------------------------------------------------------------------
+
+
+def test_solve_uniform_is_off_by_default_and_solved_only_with_the_flag(
+        monkeypatch, capsys, tmp_path):
+    """The uniform SOLVE is opt-in -- it is minutes of GPU on the largest mesh.
+
+    Asserted on the ARGUMENT ``_run_case`` receives, not on the printed text:
+    "not solved" is a message the report can print whether or not a solve was
+    attempted, and a default that quietly turned the solve on would still print
+    a number. The call record is the only thing the wording cannot fake.
+    """
+    cases = [
+        _case("empty", None, 0.010, 26_000, None),
+        _case("n2", 2.0, 0.015, 40_000, 76_000),
+        _case("n3", 3.0, 0.019, 90_000, 258_000),
+    ]
+    by_label = {c["label"]: c for c in cases}
+    seen: dict[str, bool] = {}
+
+    def spy(label, n_core, **kw):
+        seen[label] = kw.get("solve_uniform")
+        c = dict(by_label[label])
+        if kw.get("solve_uniform") and c["n_core"] is not None:
+            c["uniform_score"] = {
+                "worst_rel_error": 0.024, "n_matched": 1, "n_clusters": 20,
+                "matched": [_match(2.0, 2, "TE", 5, 2.048, 0.024)]}
+        return c
+
+    monkeypatch.setattr(BENCH, "_run_case", spy)
+    monkeypatch.setattr(BENCH, "_score",
+                        lambda case, key="reference": case["score"])
+    argv = ["--cases", "empty,n2,n3", "--out", str(tmp_path / "r.json")]
+
+    BENCH.main(argv)
+    text = capsys.readouterr().out
+    assert seen == {"empty": False, "n2": False, "n3": False}, seen
+    assert "not solved (--solve-uniform off)" in text, text
+    assert "uniform worst" not in text, text
+
+    BENCH.main(argv + ["--solve-uniform"])
+    text = capsys.readouterr().out
+    assert seen == {"empty": True, "n2": True, "n3": True}, seen
+    assert "not solved (--solve-uniform off)" not in text, text
+    # the reproduction hint has to name the flag, or the log cannot be replayed
+    assert "--solve-uniform" in text, text
+
+
+def test_the_uniform_error_is_evidence_and_does_not_move_the_verdict(
+        monkeypatch, capsys, tmp_path):
+    """A uniform mesh that ALSO misses 2x must not turn the graded PASS red.
+
+    The row's question is "is the yardstick wrong, or did grading lose it", and
+    the graded mesh is judged by the SAME yardstick either way. So the uniform
+    number is printed and NAMED -- "the yardstick is suspect" -- while the exit
+    code stays the graded run's. If the uniform result were folded into the
+    verdicts, this run would exit 3 and the two questions could not be told
+    apart.
+    """
+    cases = [
+        _case("empty", None, 0.010, 26_000, None),
+        _case("n3", 3.0, 0.019, 90_000, 258_000,
+              uniform_score={"worst_rel_error": 0.024, "n_matched": 10,
+                             "n_clusters": 20, "matched": []}),
+    ]
+    argv = ["--cases", "empty,n3", "--solve-uniform", "--out",
+            str(tmp_path / "r.json")]
+    rc, text = _run(monkeypatch, cases, capsys, tmp_path, argv=argv)
+    assert rc == BENCH.BENCH_OK, text
+    assert ("n3: uniform worst 2.400% (2.40x the empty sphere) -> also over "
+            "2.00x -- the yardstick is suspect; graded 1.90x") in text, text
+    assert "n3: worst 1.900% (1.90x the empty sphere) -> PASS (<= 2.00x)" in text
+
+    # The other arm: a uniform mesh within the yardstick reads as such.
+    cases[1] = _case("n3", 3.0, 0.019, 90_000, 258_000,
+                     uniform_score={"worst_rel_error": 0.015, "n_matched": 10,
+                                    "n_clusters": 20, "matched": []})
+    rc, text = _run(monkeypatch, cases, capsys, tmp_path, argv=argv)
+    assert rc == BENCH.BENCH_OK, text
+    assert "n3: uniform worst 1.500% (1.50x the empty sphere) -> within 2.00x" \
+        in text, text
+
+
+def test_a_uniform_solve_that_raised_is_unmeasured_not_a_number(
+        monkeypatch, capsys, tmp_path):
+    """A reference that could not be SOLVED is a missing measurement.
+
+    The uniform mesh built fine, so the failure is in the solve -- and the one
+    thing the report must never do is print a uniform error it does not have.
+    The graded verdict is untouched either way.
+    """
+    cases = [
+        _case("empty", None, 0.010, 26_000, None),
+        _case("n3", 3.0, 0.019, 90_000, 258_000,
+              uniform_solve_error="RuntimeError: the GPU venv forgot cupy"),
+    ]
+    rc, text = _run(monkeypatch, cases, capsys, tmp_path,
+                    argv=["--cases", "empty,n3", "--solve-uniform", "--out",
+                          str(tmp_path / "r.json")])
+    assert rc == BENCH.BENCH_OK, text
+    assert ("n3: uniform mesh UNMEASURED (RuntimeError: the GPU venv forgot "
+            "cupy)") in text, text
+    assert "uniform worst" not in text, text
+
+
+def test_the_worst_multiplet_is_named_per_case(monkeypatch, capsys, tmp_path):
+    """WHICH mode is worst, for graded and uniform, with its index and kb.
+
+    A bare "worst 2.5%" does not say whether the bad mode is the one the mesh
+    under-resolved or one the scorer misidentified -- and those want opposite
+    responses. The index is 1-based in reference-frequency order, so the same
+    mode has the same name on every run.
+    """
+    graded = {
+        "worst_rel_error": 0.019, "n_matched": 3, "n_clusters": 4,
+        "matched": [
+            _match(1.0, 1, "TE", 3, 1.010, 0.010),
+            _match(1.5, 1, "TM", 3, 1.500, 0.005),
+            _match(2.0, 2, "TE", 5, 2.019, 0.019),
+        ]}
+    uniform = {
+        "worst_rel_error": 0.018, "n_matched": 2, "n_clusters": 4,
+        "matched": [
+            _match(2.0, 2, "TE", 5, 2.006, 0.006),
+            _match(1.0, 1, "TE", 3, 1.018, 0.018),
+        ]}
+    n3 = _case("n3", 3.0, 0.019, 90_000, 258_000, uniform_score=uniform)
+    n3["score"] = graded
+    cases = [_case("empty", None, 0.010, 26_000, None), n3]
+    rc, text = _run(monkeypatch, cases, capsys, tmp_path,
+                    argv=["--cases", "empty,n3", "--solve-uniform", "--out",
+                          str(tmp_path / "r.json")])
+    assert rc == BENCH.BENCH_OK, text
+    # graded's worst is the 2.0 kb mode, third in reference-frequency order
+    assert ("n3: worst multiplet graded: #3 ref kb 2.0000 (l=2 TE x5), "
+            "computed 2.0190, err 1.900%") in text, text
+    # uniform's worst is a DIFFERENT mode (the 1.0 kb one) -- index 1
+    assert ("n3: worst multiplet uniform: #1 ref kb 1.0000 (l=1 TE x3), "
+            "computed 1.0180, err 1.800%") in text, text
+
+
+def test_worst_multiplet_index_is_by_reference_frequency_not_input_order():
+    """The index must name the mode, not its slot in a list whose order is the
+    scorer's business: reversing the input must not rename it."""
+    a = {"reference_kb": 1.0, "l": 1, "family": "TE",
+         "reference_multiplicity": 3, "centre": 1.01, "rel_error": 0.010}
+    b = {"reference_kb": 2.0, "l": 2, "family": "TE",
+         "reference_multiplicity": 5, "centre": 2.05, "rel_error": 0.025}
+    c = {"reference_kb": 1.5, "l": 1, "family": "TM",
+         "reference_multiplicity": 3, "centre": 1.5, "rel_error": 0.005}
+    fwd = BENCH._worst_multiplet({"matched": [a, b, c]})
+    rev = BENCH._worst_multiplet({"matched": [c, b, a]})
+    assert fwd == rev, (fwd, rev)
+    assert fwd["index"] == 3 and fwd["reference_kb"] == 2.0
+    assert fwd["rel_error"] == 0.025
+    assert BENCH._worst_multiplet({"matched": []}) is None
+    assert BENCH._worst_multiplet(None) is None
+
+
+def test_the_bands_print_the_shell_not_only_the_core(monkeypatch, capsys,
+                                                    tmp_path):
+    """The shell must appear as its OWN band, and be the SHELL's number.
+
+    A per-region median cannot see the first millimetre outside the interface
+    (the wall beside it is coarse), so the check is that the printed shell edge
+    is the shell's -- the fixture's shell is 0.40 mm against a 0.21 mm core, so
+    a report that printed the core twice would read 0.21 and fail here.
+    """
+    cases = [
+        _case("empty", None, 0.010, 26_000, None),
+        _case("n3", 3.0, 0.019, 90_000, 258_000),
+    ]
+    rc, text = _run(monkeypatch, cases, capsys, tmp_path,
+                    argv=["--cases", "empty,n3", "--out", str(tmp_path / "r.json")])
+    assert rc == BENCH.BENCH_OK, text
+    assert ("n3: bands graded (median edge): core 0.21 mm/4,500 tets, "
+            "shell 0.4 mm/300 tets, wall 0.62 mm/85,500 tets") in text, text
+    assert ("n3: bands uniform (median edge): core 0.19 mm/4,500 tets, "
+            "shell 0.19 mm/300 tets, wall 0.19 mm/85,500 tets") in text, text
+    assert ("n3: eps-by-radius agrees with the product's region_of_tet on "
+            "99.90% of tets") in text, text
+    assert "empty: bands: n/a (one region, no interface)" in text, text
+
+
+def test_bands_are_withdrawn_when_the_rebuilt_mesh_is_not_the_one_solved(
+        monkeypatch, capsys, tmp_path):
+    """A re-mesh that disagrees with the product's own mesh block is named.
+
+    The bands come from a SECOND mesh of the same bytes, so they are only about
+    the solve if that mesh is the one the solver used. When the rebuilt mesh
+    differs the report says so rather than printing bands as if they described
+    the run.
+    """
+    cases = [
+        _case("empty", None, 0.010, 26_000, None),
+        _case("n3", 3.0, 0.019, 90_000, 258_000, remesh_matches=False),
+    ]
+    rc, text = _run(monkeypatch, cases, capsys, tmp_path,
+                    argv=["--cases", "empty,n3", "--out", str(tmp_path / "r.json")])
+    assert rc == BENCH.BENCH_OK, text
+    assert ("n3: WARNING graded bands are about a different mesh -- the rebuilt "
+            "graded mesh is not the one solved") in text, text
+
+
+def test_an_empty_band_is_reported_as_empty_not_as_zero():
+    """A band with no tet is a measurement (nothing was meshed there), and a
+    zero edge would read as a perfectly resolved region -- the opposite."""
+    bands = {
+        "core": {"n_tets": 10, "edge_mm": 0.21},
+        "shell": {"n_tets": 0, "edge_mm": None},
+        "wall": {"n_tets": 5, "edge_mm": 0.62},
+    }
+    s = BENCH._fmt_bands(bands)
+    assert "shell --/0 tets" in s, s
+    assert "0.0 mm" not in s, s
+    assert BENCH._fmt_bands(None) == "not measured"
+    assert BENCH._fmt_worst(None) == "none matched"
+
+
+def _regular_tet_at(edge_m: float, radius_m: float) -> np.ndarray:
+    """Four vertices of a REGULAR tet (all six edges equal), centroid on +x.
+
+    A regular tet's median edge IS its edge, so a mesh built from these has an
+    arithmetic answer and a wrong band boundary shows up as a wrong number.
+    """
+    import numpy as np
+
+    l = edge_m
+    v = np.array([
+        [0.0, 0.0, 0.0],
+        [l, 0.0, 0.0],
+        [l / 2, l * 3 ** 0.5 / 2, 0.0],
+        [l / 2, l * 3 ** 0.5 / 6, l * (2.0 / 3.0) ** 0.5],
+    ])
+    return v + (np.array([radius_m, 0.0, 0.0]) - v.mean(axis=0))
+
+
+def test_band_edges_measure_the_shell_by_distance_not_by_region():
+    """The band split is measured from the interface, on real tets.
+
+    The formatter tests above do not run this code at all, so this is the check
+    that the bands are the tets the words say. Three regular tets sit at 0.5,
+    1.5 and 3.0 mm from the origin against an interface at 1.0 mm, so the bands
+    are arithmetic and the shell is the one in between -- a version that took
+    the shell to be the whole wall would read n=2 and swallow it.
+    """
+    import numpy as np
+    import mse_meshing  # noqa: F401 - the real achieved_edge_length is used
+
+    pts = np.vstack([
+        _regular_tet_at(0.2e-3, 0.5e-3),   # inside the interface -> core
+        _regular_tet_at(0.4e-3, 1.5e-3),   # first mm outside -> shell
+        _regular_tet_at(0.8e-3, 3.0e-3),   # far outside -> wall, beyond the shell
+    ])
+    tets = np.array([[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]])
+
+    b = BENCH._band_edges_mm(pts, tets, 1.0, shell_mm=1.0)
+    assert b["core"]["n_tets"] == 1, b
+    assert b["shell"]["n_tets"] == 1, b
+    # The wall is everything OUTSIDE the core, so it CONTAINS the shell: the
+    # two tets outside the interface, edged 0.4 and 0.8, median 0.6. A wall read
+    # as "beyond the shell" would be one tet at 0.8 -- a finer number for the
+    # coarser half of the object, which is the mistake this pins down.
+    assert b["wall"]["n_tets"] == 2, b
+    assert b["core"]["edge_mm"] == pytest.approx(0.2, rel=1e-6), b
+    assert b["shell"]["edge_mm"] == pytest.approx(0.4, rel=1e-6), b
+    assert b["wall"]["edge_mm"] == pytest.approx(0.6, rel=1e-6), b
+
+    # A region label decides the CORE when the mesh carries one (the graded
+    # mesh does); the shell stays geometric either way, because no label can
+    # say "within 1 mm of the interface".
+    labelled = BENCH._band_edges_mm(pts, tets, 1.0, region_of_tet=[1, 1, 0],
+                                    fine_region=1, shell_mm=1.0)
+    assert labelled["core"]["n_tets"] == 2, labelled
+    assert labelled["shell"]["n_tets"] == 1, labelled
+
+    # A shell with no tet in it is an empty measurement, not an error.
+    empty = BENCH._band_edges_mm(pts, tets, 10.0, shell_mm=1.0)
+    assert empty["shell"]["n_tets"] == 0, empty
+    assert empty["shell"]["edge_mm"] is None, empty
+
+
+def test_eps_by_radius_splits_the_core_at_the_interface():
+    """The uniform mesh has no region labels, so its eps comes from the radius.
+
+    One tet inside the interface and one outside: the core must take n^2 and the
+    rest vacuum, or the uniform spectrum would be solved on the wrong object and
+    the whole comparison would be meaningless.
+    """
+    import numpy as np
+
+    pts = np.vstack([
+        _regular_tet_at(0.2e-3, 0.5e-3),   # inside
+        _regular_tet_at(0.4e-3, 1.5e-3),   # outside
+    ])
+    tets = np.array([[0, 1, 2, 3], [4, 5, 6, 7]])
+    eps = BENCH._eps_by_radius(pts, tets, 1.0, 3.0)
+    assert eps.tolist() == [9.0, 1.0], eps

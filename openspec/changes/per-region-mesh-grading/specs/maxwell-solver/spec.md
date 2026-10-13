@@ -167,6 +167,26 @@ environment the solver backend needs. Source: `benchmarks/run_multimaterial_benc
 - **THEN** the fine-region criterion is UNMEASURED, which fails the run, and it is
   never reported as a pass
 
+#### Scenario: the uniform reference is solved for comparison
+- **WHEN** the benchmark is run with `--solve-uniform`
+- **THEN** it ALSO solves the uniform reference mesh it already builds -- under the
+  SAME per-element permittivity rule the graded mesh is solved under -- and prints
+  that mesh's worst mode beside the graded one, per case, WITH the worst multiplet
+  named (index in reference-frequency order, analytic frequency, error)
+- **AND** this comparison SHALL NOT decide the exit code: the uniform result is
+  evidence for whether the 2x yardstick or the grading is at fault, so it is
+  printed and never appended to the criteria
+- **AND** with the flag off (the default) the uniform mesh is built but not solved
+
+#### Scenario: the achieved edge is reported per region
+- **WHEN** a case's mesh is measured
+- **THEN** the median achieved edge is printed for the core, the SHELL (the first
+  millimetre of the wall just outside the interface, measured by centroid distance
+  because no region label expresses "within 1 mm of the interface") and the wall,
+  for the graded and the uniform mesh alike
+- **AND** a band holding no element is reported as an empty measurement, never as a
+  zero edge
+
 ## MODIFIED Requirements
 
 ### Requirement: The interior element size follows Weyl's law from enclosed volume

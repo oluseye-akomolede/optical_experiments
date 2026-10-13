@@ -33,8 +33,12 @@ VM. The per-case cost is in the comment on ``CASES`` and the command is in
 The script assumes the tree is at ``~/mse-bench/src-<sha>`` and the GPU venv at
 ``~/mse-bench/gpu-venv``. It takes ``--cases`` to select a subset, ``--n-modes``
 and ``--grid`` to match the production job settings, ``--backend``,
-``--per-part-facets`` (the graded diagnosis's fixture), and ``--out`` to write
-the JSON report. It takes no lock itself -- wrap it in ``flock`` on
+``--per-part-facets`` (the graded diagnosis's fixture), ``--solve-uniform`` (OFF
+by default: also SOLVE the uniform reference mesh and print its own worst-mode
+error beside the graded one -- evidence for whether the 2x yardstick or the
+grading is at fault; it does not decide the exit code, and it is a second full
+solve, so n3's mesh must stay under the cap), and ``--out`` to write the JSON
+report. It takes no lock itself -- wrap it in ``flock`` on
 ``~/mse-bench/.gpu.lock``, the SAME lock the worker takes, so a bench run and a
 real job can never share the GPU:
 
@@ -336,7 +340,8 @@ def _effective_radii(parts, n_core, units: str = "mm"):
 
 def _run_case(label: str, n_core: float | None, *, n_modes: int, grid: int,
               work: Path, verbose: bool, backend: str = "gpu",
-              per_part_facets: bool = False) -> dict:
+              per_part_facets: bool = False,
+              solve_uniform: bool = False) -> dict:
     """Build, mesh, solve and score ONE case over the real production path."""
     import mse_maxwell_solver as SOLVER
 
@@ -415,29 +420,98 @@ def _run_case(label: str, n_core: float | None, *, n_modes: int, grid: int,
     # with ``None``.
     mesh_block = modes_json.get("mesh")
     fine_units = (target_units / float(n_core)) if n_core else None
-    uniform_n_tets = None
-    uniform_error = None
+    ref_pairs = [(k, l, f, m) for k, l, f, m in ref]
+    uniform_n_tets = uniform_error = None
+    uniform_bands = uniform_score = uniform_solve_error = None
+    graded_bands = graded_remesh_note = None
+    remesh_matches = eps_agreement = None
     if n_core is not None:
+        merged = SOLVER.PARTS.merged_surface(parts)
+
+        # THE UNIFORM REFERENCE, in two halves that fail independently.
+        # (i) the MESH -- what this SAME object costs when every region is
+        #     meshed at the fine region's edge. MEASURED (a real mesh of the
+        #     same bytes, one part, at that edge), not taken from the estimate,
+        #     which prices the GRADED mesh and says nothing about the uniform
+        #     one. Its per-band edges come from the same helper the graded bands
+        #     do, so the two are one measurement.
+        # (ii) the SOLVE -- only with ``--solve-uniform``. It is a second full
+        #     solve on a mesh many times larger than the graded one, which is why
+        #     it is off by default; when on, it is the evidence the row asked
+        #     for: does the UNIFORM mesh ALSO miss the yardstick the graded mesh
+        #     is judged against?
         try:
-            merged_uniform = SOLVER.PARTS.merged_surface(parts)
-            _up, utets, _ur = MESH.tetrahedralize(
-                merged_uniform, "mm", n_modes=n_modes, n_index=1.0,
+            up, utets, _ur = MESH.tetrahedralize(
+                merged, "mm", n_modes=n_modes, n_index=1.0,
                 max_tets=600_000, min_feature_m=fine_units * 1e-3,
                 verbose=False, materials=None, parts=None)
             uniform_n_tets = int(utets.shape[0])
+            uniform_bands = _band_edges_mm(up, utets, float(a_eff))
+            if solve_uniform:
+                eps_u = _eps_by_radius(up, utets, float(a_eff), float(n_core))
+                kb_u = _solve_mesh(up, utets, eps_u, n_modes, backend)
+                uniform_score = REF.score_multiplets(
+                    kb_u, ref_pairs, n_requested=n_modes)
         except Exception as exc:  # noqa: BLE001 - a failed REFERENCE is data
-            uniform_error = f"{type(exc).__name__}: {exc}"
+            if uniform_n_tets is None:
+                uniform_error = f"{type(exc).__name__}: {exc}"
+            else:
+                uniform_solve_error = f"{type(exc).__name__}: {exc}"
+
+        # THE GRADED MESH, RE-MESHED so its per-band edges can be measured. The
+        # product's mesh report medians each REGION, and the wall's median is
+        # dominated by the coarse interior far from the interface -- the shell
+        # the transition hypothesis is about does not move it. Re-meshing the
+        # same bytes with the same arguments is deterministic, and the result is
+        # CHECKED against the product's own mesh block before its numbers are
+        # trusted: if the rebuilt mesh is not the mesh the solver used, the
+        # bands are about a different object and are reported as such.
+        try:
+            gpoints, gtets, gregion = MESH.tetrahedralize(
+                merged, "mm", n_modes=n_modes, n_index=1.0, max_tets=600_000,
+                min_feature_m=None, verbose=False,
+                materials=materials, parts=parts)
+            fine_region = int(mesh_block["fine_region"]) if mesh_block else None
+            graded_bands = _band_edges_mm(
+                gpoints, gtets, float(a_eff),
+                region_of_tet=gregion, fine_region=fine_region)
+            if fine_region is not None:
+                inside = _tet_radius_mm(gpoints, gtets) <= a_eff
+                truth = np.asarray(gregion) == fine_region
+                eps_agreement = float(np.mean(inside == truth))
+            want_tets = int(summary["n_tets"])
+            want_edge = ((mesh_block.get("regions") or {}).get(str(fine_region))
+                         or {}).get("achieved_edge_units")
+            got_edge = graded_bands["core"]["edge_mm"]
+            tets_ok = int(gtets.shape[0]) == want_tets
+            edge_ok = (got_edge is not None and want_edge is not None
+                       and abs(got_edge - want_edge) <= 0.02 * want_edge)
+            remesh_matches = bool(tets_ok and edge_ok)
+            if not remesh_matches:
+                graded_remesh_note = (
+                    f"the rebuilt graded mesh is not the one solved: "
+                    f"{gtets.shape[0]:,} tets vs {want_tets:,}, fine edge "
+                    f"{got_edge} vs {want_edge}")
+        except Exception as exc:  # noqa: BLE001 - a failed re-mesh is data
+            graded_remesh_note = f"{type(exc).__name__}: {exc}"
+
     return {
         "label": label,
         "n_core": n_core,
         "n_tets": summary["n_tets"],
         "uniform_n_tets": uniform_n_tets,
         "uniform_error": uniform_error,
+        "uniform_solve_error": uniform_solve_error,
         "tets_vs_uniform": (
             uniform_n_tets and summary["n_tets"] / uniform_n_tets
         ),
         "fine_edge_units": fine_units,
         "mesh": mesh_block,
+        "bands": {"graded": graded_bands, "uniform": uniform_bands},
+        "graded_remesh_note": graded_remesh_note,
+        "remesh_matches": remesh_matches,
+        "eps_attribution_agreement": eps_agreement,
+        "uniform_score": uniform_score,
         "elapsed_s": elapsed,
         "kb_computed": kb.tolist(),
         "reference": [{"kb": k, "l": l, "family": f, "multiplicity": m}
@@ -483,8 +557,187 @@ def _score(case: dict, key: str = "reference") -> dict:
                                 n_requested=case.get("n_modes_requested"))
 
 
+#: The SHELL the transition hypothesis is about: the first millimetre of the
+#: coarse region just OUTSIDE the interface. A per-region median cannot see it --
+#: the wall's own median is dominated by the coarse interior far from the
+#: interface, so the band is measured on its OWN tets, geometrically, as a
+#: distance from the core SURFACE rather than from any region label.
+SHELL_BAND_MM = 1.0
 
-def _command_hint(per_part_facets: bool = False) -> str:
+
+def _tet_radius_mm(points_m: np.ndarray, tets: np.ndarray) -> np.ndarray:
+    """Distance from the origin to each tet's centroid, in mm.
+
+    The geometry is concentric about the origin (``_parts_obj`` builds spheres
+    there), so the radius IS the distance to the interface. The centroid, not a
+    vertex: a tet straddling the core surface has vertices on both sides, and
+    the centroid is the least-biased single point to attribute it by -- the same
+    choice the ``eps`` rule below is validated against.
+    """
+    return np.linalg.norm(points_m[tets].mean(axis=1), axis=1) / 1e-3
+
+
+def _eps_by_radius(points_m, tets, a_eff_mm: float, n_core: float) -> np.ndarray:
+    """Per-tet relative permittivity for a ONE-REGION mesh, by centroid radius.
+
+    The uniform reference mesh is built with ``materials=None`` (one region), so
+    the product reports no ``region_of_tet`` for it and has nothing to hand the
+    solve as a per-element eps. The core/eps split therefore comes from the
+    geometry: a tet whose centroid is inside ``a_eff`` is core (``n_core**2``),
+    the rest is vacuum (1.0). This is the SAME rule the product's own region
+    attribution agrees with on the graded mesh -- which carries the label -- and
+    the agreement rate is measured and printed, so a wrong rule shows up as a
+    number and not as a plausible-looking spectrum.
+    """
+    inside = _tet_radius_mm(points_m, tets) <= a_eff_mm
+    return np.where(inside, float(n_core) ** 2, 1.0)
+
+
+def _band_edges_mm(points_m, tets, a_eff_mm: float, *,
+                   region_of_tet=None, fine_region=None,
+                   shell_mm: float = SHELL_BAND_MM) -> dict:
+    """Median achieved edge (mm) for the core, the shell and the wall.
+
+    Three masks, each measured on its OWN tets with the product's
+    ``achieved_edge_length`` -- the SAME median the mesh report and criterion D
+    use, so these numbers and the numbers the job carries are one measurement:
+
+    ``core``   the dense region. From the product's ``region_of_tet`` when the
+               mesh carries it (the graded mesh), else from the centroid-radius
+               test (the uniform one-region mesh, see ``_eps_by_radius``).
+    ``wall``   everything outside the core.
+    ``shell``  the first ``shell_mm`` of the wall just outside the interface --
+               the transition band. Always geometric: it is a distance from the
+               interface, which no region label expresses.
+
+    An empty band is reported as ``None``/0 tets, never raised: a shell with no
+    tet in it is a measurement (the mesher put nothing in the band), and
+    ``achieved_edge_length`` raises on an empty mask, so the guard is here.
+    """
+    import mse_meshing as MESH
+
+    radius = _tet_radius_mm(points_m, tets)
+    if region_of_tet is not None and fine_region is not None:
+        core = np.asarray(region_of_tet) == int(fine_region)
+    else:
+        core = radius <= a_eff_mm
+    shell = (radius > a_eff_mm) & (radius <= a_eff_mm + shell_mm)
+
+    out = {}
+    for name, mask in (("core", core), ("shell", shell), ("wall", ~core)):
+        n = int(np.count_nonzero(mask))
+        out[name] = {
+            "n_tets": n,
+            "edge_mm": (float(MESH.achieved_edge_length(points_m, tets, mask=mask))
+                        / 1e-3 if n else None),
+        }
+    return out
+
+
+def _solve_mesh(points_m, tets, eps_by_tet, n_modes, backend,
+                n_index: float = 1.0) -> np.ndarray:
+    """Solve the eigenproblem on a caller-supplied mesh; return the mode ``kb``.
+
+    The product has no seam for this. ``solve()`` builds its OWN mesh inside
+    ``tetrahedralize`` and takes no ``plan``/``mesh`` argument, so a caller that
+    must score a DIFFERENT mesh (the uniform reference) has no production entry
+    point to hand it a mesh through. What it does have is the product's pipeline
+    one stage later: the same five calls ``solve()`` makes, in the same order and
+    with the same arguments the route passes --
+
+        build_edges -> assemble_global(eps_by_tet) -> boundary_edges
+        -> pec_eliminate -> solve_modes -> to_physical
+
+    -- so the uniform spectrum is produced by the solver under test and not by a
+    second implementation of it. ``eps_by_tet`` is the one argument the caller
+    supplies, because the uniform mesh carries no regions (``_eps_by_radius``).
+
+    ``kb = 2 pi f b / c`` is computed exactly as ``_run_case`` computes it for the
+    graded spectrum, in the same ``b`` = ``B_MM``. Deliberately NOT a fallback:
+    a failure here is data (a reference that could not be solved), and the caller
+    records it rather than substituting the graded number.
+    """
+    import mse_fem as F
+    import mse_eigen as EIG
+
+    edges, tet_edges, _signs = F.build_edges(tets)
+    n_edges = int(edges.shape[0])
+    A, B = F.assemble_global(points_m, tets, tet_edges, n_edges,
+                             eps_by_tet=eps_by_tet)
+    constrained = F.boundary_edges(tets, edges)
+    A_free, B_free, free_edges = F.pec_eliminate(A, B, constrained, n_edges)
+    eigenvalues, _eigenvectors, _sigma = EIG.solve_modes(
+        A_free, B_free, n_modes, points_m,
+        edges=edges, tets=tets, tet_edges=tet_edges,
+        free_edges=free_edges, constrained=constrained, verbose=False,
+        backend=backend,
+    )
+    _k, _k0, freq_hz, _wl = EIG.to_physical(eigenvalues, n_index)
+    return 2.0 * np.pi * np.asarray(freq_hz, float) * (B_MM * 1e-3) / 299_792_458.0
+
+
+def _worst_multiplet(score: dict | None) -> dict | None:
+    """The matched multiplet with the largest relative error, NAMED.
+
+    ``worst_rel_error`` says how bad the worst mode is but not WHICH mode it is,
+    and which one it is decides how to read the number: a mode whose field the
+    mesh resolves badly is a resolution finding, while a root the scorer
+    misidentified is a harness artefact, and the two want opposite responses. So
+    the multiplet is reported with its INDEX (1-based, in reference-frequency
+    order -- the order ``spectrum`` returns), the analytic frequency it was
+    matched to (``kb``) and the error.
+
+    ``None`` when nothing matched: an empty run is not a clean one, and the
+    caller prints it as such rather than as a low error.
+    """
+    matched = (score or {}).get("matched") or []
+    if not matched:
+        return None
+    ranked = sorted(matched, key=lambda m: m["reference_kb"])
+    pos = max(range(len(ranked)), key=lambda i: ranked[i]["rel_error"])
+    worst = ranked[pos]
+    return {
+        "index": pos + 1,
+        "reference_kb": float(worst["reference_kb"]),
+        "l": int(worst["l"]),
+        "family": worst["family"],
+        "reference_multiplicity": int(worst["reference_multiplicity"]),
+        "centre": float(worst["centre"]),
+        "rel_error": float(worst["rel_error"]),
+    }
+
+
+def _fmt_bands(bands: dict | None) -> str:
+    """One line: the achieved median edge of each band, in mm.
+
+    ``not measured`` for a missing band, so an absent measurement is never read
+    as a zero edge (a zero would look like a perfectly resolved region).
+    """
+    if not bands:
+        return "not measured"
+    bits = []
+    for name in ("core", "shell", "wall"):
+        b = bands.get(name) or {}
+        edge = b.get("edge_mm")
+        if edge is None:
+            bits.append(f"{name} --/{b.get('n_tets', 0):,} tets")
+        else:
+            bits.append(f"{name} {edge:.4g} mm/{b.get('n_tets', 0):,} tets")
+    return ", ".join(bits)
+
+
+def _fmt_worst(worst: dict | None) -> str:
+    """One line naming the worst multiplet, or that there was none to name."""
+    if not worst:
+        return "none matched"
+    return (f"#{worst['index']} ref kb {worst['reference_kb']:.4f} "
+            f"(l={worst['l']} {worst['family']} "
+            f"x{worst['reference_multiplicity']}), computed "
+            f"{worst['centre']:.4f}, err {worst['rel_error'] * 100:.3f}%")
+
+
+def _command_hint(per_part_facets: bool = False,
+                  solve_uniform: bool = False) -> str:
     """The exact command that reproduces this run, env included.
 
     Printed into the log so the report carries the command that made it -- the
@@ -500,6 +753,7 @@ def _command_hint(per_part_facets: bool = False) -> str:
         "    ~/mse-bench/src-<sha>/benchmarks/run_multimaterial_bench.py \\\n"
         "    --out /tmp/mse-bench-<sha>.json"
         + ("  --per-part-facets" if per_part_facets else "")
+        + ("  --solve-uniform" if solve_uniform else "")
     )
 
 
@@ -530,6 +784,12 @@ def main(argv: list[str]) -> int:
                    help="facet each part at its OWN region edge (the edge the "
                         "graded rule meshes it at) instead of the whole-object "
                         "edge; the fixture the n3 FAIL points at")
+    p.add_argument("--solve-uniform", action="store_true",
+                   help="ALSO solve the uniform reference mesh (every region at "
+                        "the fine edge) and print its worst-mode error beside "
+                        "the graded one -- the evidence for whether the 2x "
+                        "yardstick or the grading is at fault. Off by default: "
+                        "it is a second full solve on a much larger mesh.")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
 
@@ -544,7 +804,7 @@ def main(argv: list[str]) -> int:
     work_root = Path(args.work) if args.work else Path(
         tempfile.mkdtemp(prefix="mse-bench-"))
     print(f"[bench] work root: {work_root}")
-    print(f"[bench] command: {_command_hint(args.per_part_facets)}")
+    print(f"[bench] command: {_command_hint(args.per_part_facets, args.solve_uniform)}")
     print()
 
     report = {"cases": []}
@@ -555,7 +815,8 @@ def main(argv: list[str]) -> int:
             case = _run_case(label, n_core, n_modes=args.n_modes, grid=args.grid,
                              work=work_root / label, verbose=not args.quiet,
                              backend=args.backend,
-                             per_part_facets=args.per_part_facets)
+                             per_part_facets=args.per_part_facets,
+                             solve_uniform=args.solve_uniform)
         except Exception as exc:  # noqa: BLE001 - a case failing is data
             failures += 1
             print(f"[bench] case {label} RAISED: {type(exc).__name__}: {exc}")
@@ -606,6 +867,49 @@ def main(argv: list[str]) -> int:
         if score.get("count_mismatches"):
             print(f"[bench] {label}: *** {len(score['count_mismatches'])} "
                   f"multiplet(s) short of modes below the cutoff ***")
+        # WHICH multiplet is worst, and the per-band achieved edge -- the two
+        # things a bare worst-error number cannot show. Printed for the graded
+        # mesh always, and for the uniform one when it was solved.
+        print(f"[bench] {label}: worst multiplet graded: "
+              f"{_fmt_worst(_worst_multiplet(score))}")
+        uw = _worst_multiplet(case.get("uniform_score"))
+        if n_core is None:
+            print(f"[bench] {label}: worst multiplet uniform: n/a (no core)")
+        elif case.get("uniform_solve_error"):
+            print(f"[bench] {label}: worst multiplet uniform: UNMEASURED "
+                  f"({case['uniform_solve_error']})")
+        elif not case.get("uniform_n_tets"):
+            print(f"[bench] {label}: worst multiplet uniform: UNMEASURED "
+                  f"({case.get('uniform_error') or 'no reference mesh'})")
+        elif case.get("uniform_score") is None:
+            print(f"[bench] {label}: worst multiplet uniform: not solved "
+                  f"(--solve-uniform off)")
+        elif uw is None:
+            # The solve RAN and nothing matched a reference: saying "not
+            # solved" here would read as "the flag was off" and hide an
+            # unmatched reference, so the two are kept apart.
+            print(f"[bench] {label}: worst multiplet uniform: solved, but no "
+                  f"multiplet matched a reference")
+        else:
+            print(f"[bench] {label}: worst multiplet uniform: {_fmt_worst(uw)}")
+        bands = case.get("bands") or {}
+        if n_core is None:
+            print(f"[bench] {label}: bands: n/a (one region, no interface)")
+        else:
+            print(f"[bench] {label}: bands graded (median edge): "
+                  f"{_fmt_bands(bands.get('graded'))}")
+            print(f"[bench] {label}: bands uniform (median edge): "
+                  f"{_fmt_bands(bands.get('uniform'))}")
+            if case.get("remesh_matches") is False:
+                print(f"[bench] {label}: WARNING graded bands are about a "
+                      f"different mesh -- {case.get('graded_remesh_note')}")
+            elif case.get("remesh_matches") is None:
+                print(f"[bench] {label}: graded bands UNMEASURED "
+                      f"({case.get('graded_remesh_note') or 'the re-mesh was not built'})")
+            if case.get("eps_attribution_agreement") is not None:
+                print(f"[bench] {label}: eps-by-radius agrees with the product's "
+                      f"region_of_tet on "
+                      f"{case['eps_attribution_agreement'] * 100:.2f}% of tets")
         print()
 
     # THE ACCEPTANCE CRITERIA, stated as pass/fail rather than left for the
@@ -661,6 +965,29 @@ def main(argv: list[str]) -> int:
             print(f"[bench]   {c['label']}: tets vs uniform UNMEASURED "
                   f"({c.get('uniform_error') or 'the reference was not built'})")
             verdicts.append("INCOMPLETE")
+        # --solve-uniform: the UNIFORM mesh's OWN error, beside the graded one.
+        # Not a criterion of its own -- the verdict stays the graded-vs-empty
+        # one -- but the evidence the correction asked for: if the UNIFORM mesh
+        # ALSO misses the 2x yardstick the graded one is judged against, the
+        # yardstick is what is wrong; if it does not, grading lost it.
+        if args.solve_uniform and c["label"] != "empty":
+            uw = (c.get("uniform_score") or {}).get("worst_rel_error")
+            if uw is None:
+                why = (c.get("uniform_solve_error") or c.get("uniform_error")
+                       or "the uniform reference was not solved")
+                print(f"[bench]   {c['label']}: uniform mesh UNMEASURED ({why})")
+            elif baseline is None:
+                print(f"[bench]   {c['label']}: uniform worst {uw*100:.3f}% "
+                      f"-- NO BASELINE to compare it against")
+            else:
+                u_ratio = uw / baseline
+                verdict = ("also over 2.00x -- the yardstick is suspect"
+                           if u_ratio > 2.0 else "within 2.00x")
+                graded_bit = (f"; graded {worst / baseline:.2f}x"
+                              if worst is not None else "")
+                print(f"[bench]   {c['label']}: uniform worst {uw*100:.3f}% "
+                      f"({u_ratio:.2f}x the empty sphere) -> {verdict}"
+                      f"{graded_bit}")
         # D: the FINE REGION's OWN achieved edge. The metric above is a median
         # over the whole mesh, and the wall holds most of the tets -- a dense
         # core that quietly lost its resolution hides inside an average that is
