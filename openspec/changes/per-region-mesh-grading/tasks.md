@@ -1040,3 +1040,158 @@ Item A is implemented and tier-1 green; item B is implemented, tier-1 green, and
 **unmeasured on real meshes**. Both are bench-only. One commit reports in the
 step-2e message to the lead. Step 3 (the product rule change) remains **NO GO**
 and nothing here reopens it.
+
+### 5.11 The reference's error is shared, and BOTH sides get a band (step 2f)
+
+The lead's rotation runs at `8a77aa1` (`jetson:~/mse-bench/matrix-8a77aa1`, six
+orientations per case) settled 5.10's question: **mesh noise is small**.
+ramp-outward band **0.033%** against a **0.500%** gap (15x), c1.5-thick
+**0.017%** against **0.712%** (41x), c2-thick **0.078%** against **0.255%**
+(3.3x), three-region **0.034%** against **0.053%** (1.5x, outside the band). So
+noise no longer decides these cases; **the reference's own error does**. Three
+bench-only items below, in reply to the lead's 2026-10-14 10:45Z message. Step 3
+stays **NO GO**.
+
+#### 1. The reference bound is SHARED between the two sides
+
+5.10-A's bound shifts the uniform side alone. But graded and uniform are both
+scored **against the same reference**, so a reference error `d` moves both
+*signed* errors by the same `d`:
+
+- `e_u` → `e_u + d`, `e_g` → `e_g + d`, and the verdict compares `|e_u + d|`
+  against `|e_g + d|`.
+
+The bound that can overturn the verdict therefore is not `uniform ± c` but, per
+multiplet, the **worst case over `d ∈ [-c, +c]`** of
+`|e_uniform + d| − |e_graded + d|`. Implemented as
+`shared_reference_bounds(rows, convergence, richardson=1.0)` — one entry per
+scaling (raw and Richardson), built from the **paired** rows of
+`per_mode_table` (a row with only one side's signed error is not a comparison,
+and the count travels with the bound as `n_paired`/`n_rows`), with
+`ends[0]` = `d = -shift` and `ends[1]` = `d = +shift`. A row with nothing paired
+has `margin = None` and is **not** a bound.
+`shared_verdict_supported(row)` reads the two ends together: `PASS` when both
+end margins are positive (uniform the worse side at each end), `FAIL` when both
+are negative, `NEITHER` when they disagree, `None` when an end has no margin.
+
+**The property that makes this the right shape.** When `e_u` and `e_g` have the
+same sign, `d` **cancels** in the margin, both ends are identical, and the
+shared margin equals the raw gap. The shared bound only bites **across a zero
+crossing** — which is exactly where the one-sided rule was wrong and where
+c2-thick's sign-changing multiplet lives. It is strictly weaker than the
+one-sided bound (never overturns a verdict the one-sided bound keeps) and never
+stronger in the helpful direction.
+
+**It is printed beside the verdict, not wired into it.** The rule that decides
+PASS/FAIL/NO VERDICT (`criterion`) is **unchanged**, including its
+worst-multiplet aggregation. The printer prints the shared bound and, when the
+shared reading disagrees with the verdict above it, says so: `(the verdict above
+is …, from the one-sided rule)`. Folding the shared bound into `criterion` would
+change what a verdict *is* — a decision for the lead and the owner, not a bench
+edit, and it is deliberately **not** made here.
+
+Four tier-1 tests, on the numbers the lead's message supplies (three-region
+u = 0.274%, g = 0.221%, c = 0.089%): the one-sided rule flips on this case while
+the shared rule **holds**; a case with a signed error across zero where **both**
+flip (`NEITHER` at the two ends, the one-sided lower bound clamped at 0); the
+paired-row count; and the no-paired-row case, which must not read as a bound.
+
+#### 2. `--rotations` now covers BOTH sides
+
+The uniform band says how much of the uniform NUMBER is noise; a verdict
+compares two numbers, so the graded side needs its own band before a thin gap
+can be read — and it is the direct answer to the sign-change worry: if
+c2-thick's graded 0.341% sat near a zero crossing by luck, its rotations scatter
+widely, while a real error barely moves. `_graded_rotations` rebuilds the graded
+mesh (the product's own `solve`) at each orientation, scoring it against the
+same reference; each rotation gets **its own store directory**
+(`graded-rot<i>`) so the band never overwrites the run's primary graded artifact.
+The identity member on each side **reuses the run's own number** (no second
+solve), so `--rotations N` costs `N` uniform + `N` graded builds+solves, `N + 1`
+members per side.
+
+JSON: `graded_rotations`, `graded_rotation_band`, `graded_rotation_note` (same
+`UNMEASURED` discipline as the uniform side: any failed member ⇒ `None`, never a
+survivors-only spread). The printer prints each side's band and reads the gap
+`uniform − graded` against the **larger of the two measured bands** — a gap
+smaller than *either* number's own spread has not been shown to exist.
+
+#### 3. A ladder rise within the case's own band is not a rise
+
+`reliability(..., tolerance=...)` takes the case's own **measured** rotation band
+(`uniform_rotation_band`) as the tolerance. A consecutive rise of the uniform
+ladder **≤ that band** has not been shown to be a rise: two meshes of the SAME
+resolution already differ by that much. The tolerance is the case's own measured
+number, never a constant chosen here; `tolerance=None` (no band measured, e.g.
+`--rotations` not given) keeps the old strict reading, so a case with no band
+**stays UNRELIABLE** — "small enough that it might be noise" is not the same as
+"measured to be noise". The message names the band it used and names the excused
+rises explicitly (`; a smaller rise 0.100%->0.115% is within that band and is not
+counted`), so the comparison is checkable.
+
+**c1.5-thick is BORDERLINE and stays UNRELIABLE — stated plainly, no silent
+loosening.** The lead's numbers: ladder rises 0.271 → 0.292% (k 1.25 → 1.5), a
+rise of **0.021%**, against a measured band of **0.017%**. `0.021% > 0.017%`, so
+under the literal rule this case is still UNRELIABLE. The rule was not bent to
+pass it — the band is the case's own measured number and the rise is genuinely
+bigger than it. (This is the item where a fixed constant would have been
+tempting; it is exactly why the rule takes the measured band instead.)
+
+#### The Orin commands (tier 2, the lead's)
+
+Six cases: the four with a usable reference (`ramp-outward`, `three-region`,
+`c1.5-thick`, `c2-thick`) and the two the lead named for the reference check
+(`centred-core`, `offset-sphere`, each with `--fine-reference 1.75`, whose
+reference needed tightening — see 5.8). Same shape as the rotation runs at
+`8a77aa1`, into a fresh directory:
+
+```
+cd ~/mse-bench
+mkdir -p matrix-2f
+(ulimit -v 5000000; nice -n 10 timeout 30m python run_grading_matrix.py \
+   --case ramp-outward --baseline product --rotations 5 --backend gpu \
+   --json matrix-2f/ramp-outward.json) > matrix-2f/ramp-outward.log 2>&1
+```
+
+and identically for `three-region`, `c1.5-thick`, `c2-thick`, plus:
+
+```
+(ulimit -v 5000000; nice -n 10 timeout 30m python run_grading_matrix.py \
+   --case centred-core --baseline product --rotations 5 --fine-reference 1.75 \
+   --backend gpu --json matrix-2f/centred-core.json) > matrix-2f/centred-core.log 2>&1
+
+(ulimit -v 5000000; nice -n 10 timeout 30m python run_grading_matrix.py \
+   --case offset-sphere --baseline product --rotations 5 --fine-reference 1.75 \
+   --backend gpu --json matrix-2f/offset-sphere.json) > matrix-2f/offset-sphere.log 2>&1
+```
+
+**Cost, and the 30-minute cap.** `--rotations 5` is now **10 builds and 10
+solves** per case (5 uniform + 5 graded, one identity each side reused): the
+graded half is the expensive one, so a case that already sat near the timeout
+may now exceed it. If it does, cut to `--rotations 3` first (still 4 members per
+side, enough for a spread) rather than dropping a case; a case with no band at
+all goes back to the strict `None` reading, which is the outcome 5.11-3 exists to
+avoid.
+
+**Predictions, and their falsifiers.** (i) The shared bound should *hold* on
+three-region where the one-sided bound flips — because both sides' signed errors
+there are on the same side of zero, the shift cancels and the margin is the raw
+0.053% gap; **falsifier:** the shared reading flips on a case whose two signed
+errors share a sign, which would mean the `d`-cancellation is not implemented
+right. (ii) c2-thick's graded band should be **larger** than its uniform band
+(0.078%) — its graded number is the one with a sign-changing multiplet, and that
+is where orientation luck would show; **falsifier:** graded band ≤ uniform band
+on c2-thick would say the "sign change" is not a zero-crossing artifact.
+(iii) c1.5-thick's rise (0.021%) should stay above its band (0.017%) — it should
+report UNRELIABLE with the band named; **falsifier:** a measured band ≥ 0.021%
+excuses the rise and the case becomes decidable.
+
+#### Where this stopped
+
+All three items are implemented and tier-1 green (bench only; the product rule,
+the mesher and `criterion` are untouched). **Nothing here is measured on real
+meshes from this seat** — meshing and solves are tier 2 and the lead's, so every
+number cited above is either the lead's own message or a tier-1 fixture, and the
+predictions are predictions. No `--rotations` run was made here. One commit
+reports in the step-2f message to the lead with the local sha. Step 3 (the
+product rule change) remains **NO GO**.

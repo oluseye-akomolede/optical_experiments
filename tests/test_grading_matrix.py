@@ -1323,7 +1323,8 @@ def test_the_band_prints_as_a_percent_and_none_prints_as_unmeasured(
     printed = capsys.readouterr().out
     assert "mesh-to-mesh band: 5.000%" in printed, printed
     # gap = uniform 0.020 - graded 0.010 = 0.010, which is INSIDE the band
-    assert "0.20x the band (within mesh noise)" in printed, printed
+    assert "0.20x the larger measured band (5.000%) (within mesh noise)" in printed, \
+        printed
 
 
 def test_rotations_out_of_range_is_refused_not_silently_sliced(
@@ -1333,6 +1334,213 @@ def test_rotations_out_of_range_is_refused_not_silently_sliced(
     monkeypatch.setattr(GM, "run_case", lambda *a, **k: None)
     assert GM.main(["--case", "box-sphere", "--rotations", "99"]) == GM.MATRIX_USAGE
     assert f"1..{len(GM.ROTATIONS)}" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# step 2f item 1: the reference bound is SHARED by the two sides
+# --------------------------------------------------------------------------
+
+
+def _signed_rows(*pairs):
+    """A ``per_mode_table``-shaped table from (graded, uniform) signed errors."""
+    return [{"reference_kb": 10.0 + i, "l": 0, "family": "f",
+             "graded_signed_rel": g, "uniform_signed_rel": u}
+            for i, (g, u) in enumerate(pairs)]
+
+
+def test_the_shared_shift_holds_where_the_one_sided_bound_flips():
+    """Item 1, the lead's three-region numbers (2026-10-14).
+
+    uniform 0.274%, graded 0.221%, the reference's own convergence 0.089%. The
+    one-sided rule credits the whole convergence to the uniform side alone
+    (0.274 - 0.089 = 0.185, below graded 0.221) and flips the PASS. The shared
+    shift moves BOTH sides by the same d, so the gap is preserved: the PASS
+    holds at both ends.
+    """
+    u, g, c = 0.00274, 0.00221, 0.00089
+    fb = GM.favourable_bound(u, g, c)
+    assert GM.adversarial_bounds(fb, "PASS")[0]["flips"] is True      # one-sided
+    row = GM.shared_reference_bounds(_signed_rows((g, u)), c)[0]
+    assert GM.shared_verdict_supported(row) == "PASS"
+    # both signed errors are positive, so the shift cancels exactly and the two
+    # ends agree to the digit -- which is the common case, not a lucky one
+    assert row["ends"][0]["margin"] == pytest.approx(row["ends"][1]["margin"])
+    assert row["ends"][0]["margin"] == pytest.approx(u - g)
+
+
+def test_both_readings_flip_when_a_signed_error_sits_across_zero():
+    """The one-sided bound clamps at 0 and flips; the shared ends disagree.
+
+    A uniform error of 0.05% and a graded one of 0.02% with a reference
+    convergence of 0.10%: the two ends of the shared shift straddle a zero
+    crossing, so they disagree and NEITHER verdict is supported. This is the
+    one case where the shift does NOT cancel, and it is exactly the
+    zero-crossing worry item 2 measures.
+    """
+    u, g, c = 0.0005, 0.0002, 0.0010
+    fb = GM.favourable_bound(u, g, c)
+    one = GM.adversarial_bounds(fb, "PASS")[0]
+    assert one["flips"] is True and one["clamped"] is True
+    row = GM.shared_reference_bounds(_signed_rows((g, u)), c)[0]
+    assert GM.shared_verdict_supported(row) == "NEITHER"
+    assert (row["ends"][0]["margin"] > 0.0) != (row["ends"][1]["margin"] > 0.0)
+
+
+def test_a_shared_bound_counts_the_rows_it_actually_paired():
+    """A table where uniform matched only one of the two multiplets.
+
+    The margin is a per-multiplet statement, so only paired rows may enter it --
+    comparing one side's maximum over two multiplets against the other's over
+    one is a different measurement. The count travels with the bound.
+    """
+    rows = [{"reference_kb": 10.0, "l": 0, "family": "f",
+             "graded_signed_rel": 0.01, "uniform_signed_rel": None},
+            {"reference_kb": 11.0, "l": 0, "family": "f",
+             "graded_signed_rel": 0.02, "uniform_signed_rel": 0.03}]
+    row = GM.shared_reference_bounds(rows, 0.001)[0]
+    assert row["n_rows"] == 2 and row["n_paired"] == 1
+    assert row["ends"][0]["margin"] is not None
+
+
+def test_a_shared_bound_with_no_paired_row_is_not_a_bound():
+    rows = [{"reference_kb": 10.0, "l": 0, "family": "f",
+             "graded_signed_rel": 0.01, "uniform_signed_rel": None},
+            {"reference_kb": 11.0, "l": 0, "family": "f",
+             "graded_signed_rel": None, "uniform_signed_rel": 0.03}]
+    row = GM.shared_reference_bounds(rows, 0.001)[0]
+    assert [e["margin"] for e in row["ends"]] == [None, None]
+    assert GM.shared_verdict_supported(row) is None
+    assert row["weakest"] is None
+
+
+# --------------------------------------------------------------------------
+# step 2f item 2: the GRADED side gets its own rotation band
+# --------------------------------------------------------------------------
+
+
+def test_graded_rotations_build_a_band_from_rotated_uploads(monkeypatch):
+    """``_graded_rotations`` rebuilds the graded mesh per orientation.
+
+    The graded path carries its own region attributes (the mesher reads them
+    off the object), so the rotation only has to reach the upload -- and the
+    band is the spread of the graded score across those orientations.
+    """
+    import numpy as np
+    seen = {"work": []}
+
+    def fake_graded(case, obj, work, *, grid, backend, verbose):
+        text = obj if isinstance(obj, bytes) else Path(obj).read_bytes()
+        seen["work"].append(Path(work))
+        # key the answer on the rotated BYTES, so a band that ignored them
+        # would read 0; the frequency is not the graded side's own
+        n = 1.0 + 0.01 * len(seen["work"])
+        assert b"v " in text, "the rotated upload must still be an OBJ"
+        return ({"n_tets": 100}, {"mesh": {"regions": {}}},
+                np.array([n]), 0.0)
+
+    monkeypatch.setattr(GM, "_graded", fake_graded)
+    # ``_kb``'s constant is not this test's subject: pin it to identity so the
+    # band arithmetic is the arithmetic of the numbers handed in, not of a
+    # conversion factor.
+    monkeypatch.setattr(GM, "_kb", lambda freqs, scale: np.asarray(freqs, float))
+    monkeypatch.setattr(GM.REF, "score_multiplets",
+                        lambda kb, ref, n_requested: {
+                            "worst_rel_error": float(np.asarray(kb)[0])
+                            / 100.0, "n_matched": 3})
+    out = GM._graded_rotations(
+        {"label": "x"}, b"o wall\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 1 1\n",
+        Path("/tmp/mse-rot-test"), reference=None, scale_mm=5.0, n_modes=5,
+        n=3, identity_error=0.0100, grid=10, backend="cpu", verbose=False)
+    assert len(out["graded_rotations"]) == 4          # identity + 3 rotations
+    assert out["graded_rotations"][0]["degrees"] == 0.0
+    assert [r["degrees"] for r in out["graded_rotations"][1:]] == \
+        [d for d, _a in GM.ROTATIONS[:3]]
+    # the identity member reuses the run's own graded number (no second solve),
+    # so only the three rotations were built
+    assert len(seen["work"]) == 3
+    assert all("graded-rot" in str(w) for w in seen["work"])
+    # errors 0.0100 (identity), 0.0101, 0.0102, 0.0103 -> spread 0.0003
+    assert out["graded_rotation_band"] == pytest.approx(0.0003)
+
+
+def test_the_gap_is_read_against_the_wider_of_the_two_measured_bands(
+        monkeypatch, capsys):
+    """Both sides' bands, and the gap against the larger one.
+
+    A verdict compares two numbers; a gap smaller than EITHER number's own
+    spread has not been shown to exist, so the tolerance is the larger measured
+    band -- the case's own number, never a constant chosen here. Here the graded
+    band is the wider one, so it is the graded band that decides the reading.
+    """
+    # A run whose payload carries only the band fields exercises the print
+    # without a build; ``modes_errors`` is absent, so the one-sided bound is the
+    # fallback for the bound line.
+    base = {"verdict": "NO VERDICT", "detail": "graded and uniform inside one another",
+            "meta": {}, "case": {
+                "uniform_score": {"worst_rel_error": 0.00814},
+                "graded_score": {"worst_rel_error": 0.00559},
+                "uniform_rotations": [{"degrees": 0.0, "identity": True,
+                                       "worst_rel_error": 0.00814}],
+                "uniform_rotation_band": 0.00078,
+                "uniform_rotation_note": "spread of 2 members",
+                "graded_rotations": [{"degrees": 0.0, "identity": True,
+                                      "worst_rel_error": 0.00559}],
+                "graded_rotation_band": 0.00200,
+                "graded_rotation_note": "spread of 2 members"}}
+    monkeypatch.setattr(GM, "run_case", lambda *a, **k: copy.deepcopy(base))
+    assert GM.main(["--case", "box-sphere", "--rotations", "1", "--quiet"]) \
+        == GM.MATRIX_NO_VERDICT
+    printed = capsys.readouterr().out
+    assert "graded side at rigid rotations" in printed
+    assert "graded mesh-to-mesh band: 0.200%" in printed
+    # 0.255% of gap / 0.200% (the wider, GRADED band) = 1.275x -> printed 1.27x
+    assert "1.27x the larger measured band (0.200%)" in printed
+    # 0.00255 of gap > 0.00200 of band: the gap is bigger than the noise, so
+    # this line must not call it noise
+    assert "outside mesh noise" in printed
+
+
+# --------------------------------------------------------------------------
+# step 2f item 3: the error ladder's tolerance is the case's OWN band
+# --------------------------------------------------------------------------
+
+
+def test_a_rise_within_the_measured_band_is_not_a_rise():
+    """Item 3. A ladder rise no larger than the case's own measured band.
+
+    Comparing two meshes of the SAME resolution moves the number by this much
+    already, so a rise the same size has not been shown to be a rise -- and the
+    tolerance is that case's own measured number, not a constant.
+    """
+    errors = [{"k": 1.0, "worst_rel_error": 0.00271},
+              {"k": 1.25, "worst_rel_error": 0.00271},
+              {"k": 1.5, "worst_rel_error": 0.00292}]
+    assert GM.reliability(errors, 6, [], tolerance=0.00021) is None
+    # the SAME ladder with no measured band is still UNRELIABLE: "small enough
+    # that it might be noise" is not the same as "measured to be noise"
+    assert "does not fall" in GM.reliability(errors, 6, [])
+
+
+def test_a_rise_larger_than_the_band_still_falls_into_unreliable():
+    errors = [{"k": 1.0, "worst_rel_error": 0.00271},
+              {"k": 1.25, "worst_rel_error": 0.00271},
+              {"k": 1.5, "worst_rel_error": 0.00292}]
+    msg = GM.reliability(errors, 6, [], tolerance=0.00010)
+    assert "does not fall" in msg
+    assert "rising by more than the case's own measured mesh-to-mesh band" in msg
+    assert "0.010%" in msg          # the tolerance it used is printed
+
+
+def test_the_excused_rise_is_named_so_the_reading_is_checkable():
+    errors = [{"k": 1.0, "worst_rel_error": 0.00100},
+              {"k": 1.25, "worst_rel_error": 0.00115},     # +0.015%, within
+              {"k": 1.5, "worst_rel_error": 0.00160}]      # +0.045%, above
+    msg = GM.reliability(errors, 6, [], tolerance=0.00020)
+    # the rise that IS counted is 0.115%->0.160%; the one excused is
+    # 0.100%->0.115%, and it is named so the reader can check the comparison
+    assert "does not fall" in msg
+    assert "a smaller rise 0.100%->0.115% is within that band and is not counted" \
+        in msg
 
 
 if __name__ == "__main__":  # pragma: no cover
