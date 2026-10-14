@@ -790,3 +790,116 @@
 
       Bench only. No product rule, estimate or threshold is touched. Step 3
       remains NO GO.
+
+### 5.9 A per-case scatter band from the case's own uniform ladder (step 2d, notes only)
+
+No code, no runs. Everything below is read from the JSONs the runs already
+wrote (`jetson:~/mse-bench/matrix-*/`; the lead copied 1935511, 34ff8ca and
+f6f0efd to `/tmp/mse-orin/`, and 4883a55 / 6b97968 were read read-only on the
+Jetson).
+
+**Why a band at all.** The comparison this bench exists to make -- graded mesh
+vs today's uniform mesh at the product's own `h_min` -- is a ~0.1% effect. The
+uniform side's own error moves by a comparable amount when only its resolution
+changes. A difference smaller than that movement is not resolvable by this
+instrument, whatever the verdict code prints. The band says how small is too
+small, per case, without a constant fitted to these cases.
+
+**The proposal.** From the case's JSON take `case.uniform_level_errors`, the
+uniform side's error `e_u(k)` at each rung actually run.
+
+1. **Drop the rung that is the reference.** When
+   `reference_kind == "uniform-refined"` the finest uniform rung *is* the
+   reference, so its error is 0 **by construction** -- it is a tautology, not a
+   measurement. Including it injects a jump equal to the whole ladder range.
+   Measured on `34ff8ca/centred-core-fine`: the retained (non-reference) rungs
+   jump by at most 0.049%, but the last step into the reference rung is 0.139%
+   -- 2.8x wider, wide enough to swallow a real 0.113% gap and call it scatter.
+   When `reference_kind == "analytic"` no rung is the reference, so keep them
+   all.
+2. **band(case) = max over adjacent retained rungs of `|e_u(k_{i+1}) - e_u(k_i)|`.**
+   Properties: dimensionless; from the case's own numbers only; no constant
+   fitted to these cases; computed from the **uniform side alone**, so the
+   yardstick does not depend on the grading rule under test; conservative (the
+   largest single step, not an average).
+3. Rejected alternatives: `(max - min)/2` of the ladder -- also constant-free,
+   but it grows with the ladder's spread, i.e. it forgives the most erratic
+   ladder the most (0.047% on c4-thin against 0.093% for the max-step rule);
+   half the finest step only -- measures residual movement and under-reads.
+4. **Reading.** On the raw basis, `d = graded_worst - uniform_worst`:
+   clearly worse if `d > band`, clearly better if `d < -band`, within scatter
+   otherwise. If the ladder is absent, the case is **`band unmeasured`** --
+   *not* "within scatter". (An unmeasured band must not read as agreement.)
+5. **Then require the two bases to agree.** The bench's own criterion does not
+   use the raw uniform error: it compares `graded_worst` with the uniform error
+   Richardson-extrapolated to the graded mesh's *achieved* edge. The two bases
+   can disagree in direction, so a case is called clearly better/worse only
+   when the raw step and the extrapolated bound agree; otherwise "within
+   scatter / direction unresolved".
+
+**What the band covers, and what it does not.** It measures how much the
+uniform side moves when only *resolution* changes. It does not cover
+style-driven differences at equal resolution, and it is blind to a reference
+that is itself wrong (c4-thin's analytic reference, section 5.8 item 2).
+
+**A. The five artifacts that carry a ladder** (all were run with `--ladder`):
+
+| case | revision | ref kind | graded | uniform k=1 | ladder `e_u(k)` | band | `d` | reading |
+|---|---|---|---|---|---|---|---|---|
+| centred-core | 34ff8ca | uniform-refined | 0.161% | 0.047% | 1.0 0.047 / 1.25 0.096 / 1.5 0.139 / *(1.75 = ref)* | 0.049% | +0.113% | raw 2.3x band -> worse; extrapolated 0.148% -> +0.013% -> within. **unresolved** |
+| offset-sphere | 34ff8ca | uniform-refined | 0.097% | 0.055% | 1.0 0.055 / 1.25 0.110 / 1.5 0.091 / *(1.75 = ref)* | 0.054% | +0.042% | raw within; extrapolated 0.169% -> graded 0.57x -> better. **unresolved** |
+| c4-thin | 34ff8ca | analytic | 0.063% | 0.004% | 0.8 0.034 / 1.0 0.004 / 1.25 0.098 | 0.093% | +0.059% | within; UNRELIABLE regardless (analytic reference unusable) |
+| centred-core | f6f0efd | uniform-refined | 0.130% | 0.092% | 1.0 0.092 / 1.25 0.043 / *(1.5 = ref)* | 0.049% | +0.038% | within (0.79x band), and the extrapolated basis agrees |
+| c4-thin | f6f0efd | analytic | 0.063% | 0.004% | 0.8 0.034 / 1.0 0.004 / 1.25 0.098 / 1.5 0.191 | 0.093% | +0.059% | within; UNRELIABLE regardless |
+
+The `34ff8ca` rows are the point of step 2c: with the reference tightened to
+1.75, **centred-core and offset-sphere both stop being resolvable effects** --
+the raw gap and the extrapolated gap disagree on direction, so neither can be
+called. The lead's own numbers say the same (0.161 vs 0.148 = 1.09x; 0.097 vs
+0.169 = 0.57x). The `f6f0efd` centred-core row shows the band *confirming* the
+existing NO VERDICT (0.038% gap under a 0.049% band).
+
+**B. The fifteen artifacts with no ladder** -- read from the JSONs only, so
+`band unmeasured`; raw `d` is shown because it is free, but no scatter reading
+is possible:
+
+| case | revision | verdict | graded | uniform | `d` |
+|---|---|---|---|---|---|
+| box-sphere | 4883a55 | UNMEASURED | -- | 0.882% | -- |
+| c1.5-thick | 4883a55 | PASS | 0.379% | 1.113% | -0.734% |
+| c2-thick | 4883a55 | PASS | 0.341% | 0.559% | -0.218% |
+| c2-thin | 4883a55 | PASS | 0.191% | 0.194% | -0.003% |
+| box-sphere | 6b97968 | UNMEASURED | -- | 1.442% | -- |
+| c3-thick | 6b97968 | FAIL | 0.749% | 0.662% | +0.087% |
+| c4-thick | 6b97968 | UNMEASURED | 1.465% | -- | -- |
+| c4-thin | 6b97968 | PASS | 0.063% | 0.094% | -0.031% |
+| offset-sphere | 6b97968 | FAIL | 0.092% | 0.028% | +0.064% |
+| three-region | 6b97968 | FAIL | 0.231% | 0.106% | +0.125% |
+| c2-thin | 1935511 | FAIL | 0.191% | 0.191% | +0.000% |
+| c4-thin | 1935511 | FAIL | 0.063% | 0.004% | +0.059% |
+| offset-sphere | 1935511 | FAIL | 0.098% | 0.043% | +0.055% |
+| ramp-outward | 1935511 | PASS | 0.279% | 0.779% | -0.500% |
+| three-region | 1935511 | PASS | 0.221% | 0.274% | -0.053% |
+
+Two things this table says that the per-run messages did not:
+
+- **The revision must be in the row.** `c4-thin` reads PASS at `6b97968`, FAIL
+  at `1935511`, UNRELIABLE at `f6f0efd`. The same case name is three different
+  claims, so a bare case name carries no verdict.
+- **`c2-thin @ 1935511` has `d = 0` to 13 significant digits** -- graded and
+  uniform are the same mesh at that `h_min`, so its 0.000% is not a
+  measurement of grading (the explicit SAME MESH verdict only arrived in
+  `f6f0efd`).
+
+**Cost, and how to band the rest.** The band is free: it is already in the
+JSON, and `f6f0efd` added `uniform_self_ladder` for the same rungs. The only
+requirement is that the run used `--ladder`; **5 of these 20 artifacts do**.
+To band a case in table B, re-run it with `--ladder` (same command shape as
+5.8 item 4, e.g.
+`run_grading_matrix.py --case <name> --baseline product --ladder --backend gpu
+--json <name>.json`). No new run is proposed here -- that is the lead's call.
+
+If the two superseded revisions should be in the canonical set, copy
+`jetson:~/mse-bench/matrix-4883a55/*.json` and
+`jetson:~/mse-bench/matrix-6b97968/*.json`; the other three are already on the
+VM.
