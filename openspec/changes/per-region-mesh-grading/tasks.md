@@ -903,3 +903,140 @@ If the two superseded revisions should be in the canonical set, copy
 `jetson:~/mse-bench/matrix-4883a55/*.json` and
 `jetson:~/mse-bench/matrix-6b97968/*.json`; the other three are already on the
 VM.
+
+### 5.10 Two bench defects the 9118aec ladders exposed (step 2e)
+
+The lead's 2026-10-14 ladder runs (`9118aec`, JSONs in
+`~/mse-bench-results/ladders-9118aec/`) left one clear pass, no clear fail, and
+an instrument that could not decide the rest. Both items below are **bench
+only**: the graded rule, the mesher and the product are untouched, and Step 3
+stays NO GO.
+
+#### A. The Richardson line read its flag on the wrong side of the verdict
+
+`favourable_bound` (item 5, 5.8) shifts the uniform side the one way that
+**helps grading**: it ADDS the reference's own convergence. On a PASS case that
+shift can only widen grading's margin, so `still_fail` is false *by
+construction*, and the printer read it as `-- FLIPS: not decidable from these
+runs`. Both cases in the ladder log printed that line -- for opposite reasons.
+The bound that can overturn a verdict is the one most favourable to that
+verdict's **loser**, and the loser changes with the verdict:
+
+- **PASS** loses if the uniform side was *better* than measured, so the
+  overturning bound is `uniform - c`, and the PASS flips when graded is **above**
+  it. This is the lead's own reading for ramp-outward: *"graded wins even if you
+  SUBTRACT the reference's convergence from uniform (0.779 - 0.096 = 0.683;
+  Richardson 0.779 - 0.218 = 0.561)"*.
+- **FAIL** loses if the uniform side was *worse* than measured -- the direction a
+  same-family reference biases it -- so the bound is `uniform + c`, and the FAIL
+  flips when graded is **at or under** it.
+
+So the two verdicts sit on **opposite sides** of the measured uniform number,
+which is why one printed bound cannot serve both. Implemented as
+`adversarial_bounds(bound, verdict)` (one entry per scaling, `[]` for any
+verdict with nothing to overturn: UNRELIABLE, NO VERDICT, SAME MESH, UNMEASURED),
+printed for both the raw and the Richardson scaling. A lower bound that goes
+below zero -- the reference's convergence swallowing the whole uniform number --
+is clamped at 0 with `clamped: true`, and the printer says the flip is a limit of
+the instrument, not a measurement. The dead `if fb.get("uniform") is None` branch
+(the function already returns `None` when an operand is missing) went with it.
+
+Four tests, one per side, plus the regression's own positive control:
+
+| case | verdict | uniform | graded | `c` | bound | reading |
+|---|---|---|---|---|---|---|
+| ramp-outward | PASS | 0.779% | 0.279% | 0.096% | 0.683% raw / 0.561% Richardson | PASS **holds**; old line printed "FLIPS: not decidable" |
+| three-region | PASS | 0.274% | 0.221% | 0.089% | 0.185% raw | PASS **flips** -- matches the lead's "0.274-0.089 = 0.185 < 0.221" |
+| three-region, graded forced to 0.500% | FAIL | 0.274% | 0.500% | 0.089% | 0.363% raw | FAIL **holds** (graded far above the de-flattered uniform) |
+| three-region, graded forced to 0.290% | FAIL | 0.274% | 0.290% | 0.089% | 0.363% raw | FAIL **flips** to PASS |
+
+#### B. The 5.9 band rule reads convergence as scatter
+
+5.9's band is the largest adjacent jump of the uniform ladder. On
+**ramp-outward** the ladder falls monotonically (0.81, 0.78, 0.10, 0 at
+k = 0.8, 1, 1.25, 1.5), so its one big step -- 0.78 -> 0.10 = **0.68%**, the
+reference rung dropped exactly as 5.9 requires -- *is* its convergence. The real
+gap is `uniform - graded` = 0.779 - 0.279 = **0.50%**, so 5.9's rule would print
+"within scatter" on the one case in the ladder set the instrument can actually
+decide. More refinement makes the convergence step larger, so the rule punishes
+the cleanest cases hardest. A monotone drop is convergence, not noise.
+
+**The measure proposed instead (the lead's suggestion, implemented).** Rebuild
+the uniform mesh at ONE resolution for a few rigid rotations of the **same
+upload** and take the spread of the worst error across them. A rotation changes
+nothing physical, so whatever moves is mesh-to-mesh noise; no constant is fitted
+to these cases; the uniform side alone is used, so the yardstick does not depend
+on the grading rule under test.
+
+- **`--rotations N`** (N in 1..5; `ROTATIONS` is a fixed table of five
+  `(degrees, axis)` and the flag is refused outside that range rather than
+  silently sliced). Each orientation is a full uniform build+solve at the case's
+  own `h_min` and `k = 1.0` -- **the cheap half of the case**.
+- The **identity build is a member** and is *not* rebuilt: it is the uniform
+  number the verdict itself used, so the band is measured against the gap being
+  judged. `N` rotations therefore report `N + 1` members.
+- The rotation is applied to the upload's **OBJ `v` lines about the object's own
+  centroid**, and the same rigid rotation is handed to the eps assignment
+  (`_eps_by_layers(..., rot=, about=)`) so the LAYERS rotate with the object --
+  the layers say where the material is *on the object*. Rotating the mesh and
+  reading it against the unrotated layer frame would assign the outermost
+  material to most of the object and still run without error, so the frame
+  direction is pinned by a tier-1 test on an off-centre-core box (a rotated
+  centroid must read its core material; the same point unrotated must read the
+  outer box; the forward direction must fail).
+- **`band = max - min`** of the measured errors, and it is **`None`** -- printed
+  `UNMEASURED`, never 0 -- as soon as any member failed or matched nothing: a
+  spread over the survivors would shrink toward "clean mesh" exactly when the
+  run knew least. The note names which orientation failed and how many of how
+  many measured.
+- JSON: `uniform_rotations` (`[{degrees, axis, worst_rel_error, n_tets}]`),
+  `uniform_rotation_band`, `uniform_rotation_note`; the printer states the band
+  in percent and the gap `uniform - graded` as a multiple of it, marked within /
+  outside mesh noise.
+
+**Prediction (to be tested on the Orin, tier 2 -- the lead runs it).** For
+ramp-outward the band should come out **well under the 0.50% gap** (a rotation
+of the same geometry at the same target edge should move the worst error by a
+few hundredths of a percent, since grading's advantage is geometric, not
+orientation-dependent), so the one clear pass survives. **Falsifier:** a band at
+or above 0.50% demotes ramp-outward, and the ladder set would then hold no
+decidable case at all. For **c1.5-thick and c2-thick** -- whose ladders do not
+fall (1.01/1.09/0.27/0.29 and 0.17/0.60/0.53/0.44) and so read UNRELIABLE -- the
+rotation band is the instrument that can say whether that movement is noise or
+convergence, which is the question those two cases leave open.
+
+**What it does not cover.** Orientation noise at the uniform rung only; not the
+graded side's own noise, and not the reference's error (that is the A line
+above). A case whose reference is itself suspect (c4-thick: uniform matched 0 of
+64 reference multiplets) is not rescued by a small band -- the band would be
+measured against a reference that cannot rank the modes.
+
+**Honest scope.** No `--rotations` run has been made from this seat: meshing and
+solves are tier 2 and the lead's. The code is tier-1 tested with the heavy calls
+faked (four new tests: the band arithmetic and its unmeasured case, the frame
+direction, the rotated-bytes fidelity, and the wiring through `run_case` to the
+JSON and the print), so **the band's real magnitude is unmeasured here** and the
+prediction above is a prediction, not a result.
+
+**The Orin commands (tier 2, the lead's).** Same shape as the ladder runs, with
+`--rotations` in place of `--ladder`:
+
+```
+cd ~/mse-bench
+(ulimit -v 5000000; nice -n 10 timeout 30m python run_grading_matrix.py \
+   --case ramp-outward --baseline product --rotations 5 --backend gpu \
+   --json matrix-9118aec/ramp-outward-rot.json) > ramp-outward-rot.log 2>&1
+```
+
+and the same for `three-region`, `c1.5-thick` and `c2-thick` (the four cases
+with a usable reference in the ladder set). `--rotations 5` is the maximum and
+costs five uniform builds and their solves on top of the case. Add
+`--ladder --fine-reference 1.75` to a case only if its own reference needs
+tightening.
+
+#### Where this stopped
+
+Item A is implemented and tier-1 green; item B is implemented, tier-1 green, and
+**unmeasured on real meshes**. Both are bench-only. One commit reports in the
+step-2e message to the lead. Step 3 (the product rule change) remains **NO GO**
+and nothing here reopens it.

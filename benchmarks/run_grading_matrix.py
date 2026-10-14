@@ -491,10 +491,23 @@ def _contains(layer, p) -> bool:
             and abs(p[2] - cz) <= hz)
 
 
-def _eps_by_layers(points_m, tets, layers) -> np.ndarray:
-    """``eps_r`` per tet: the innermost layer containing its centroid."""
+def _eps_by_layers(points_m, tets, layers, rot=None, about=None) -> np.ndarray:
+    """``eps_r`` per tet: the innermost layer containing its centroid.
+
+    ``rot``/``about`` map a ROTATED build back into the layers' own frame
+    first. The layers describe where the material is ON the object, so a rigid
+    rotation of the upload rotates them with it; testing a rotated centroid
+    against the unrotated ``_contains`` would assign the outermost material to
+    most of the object. Identity by default, so the unrotated callers are
+    unchanged.
+    """
     cent = np.asarray(points_m, float)[np.asarray(tets, np.int64)].mean(axis=1)
     cent = cent * 1e3                                    # mm, like ``layers``
+    if rot is not None:
+        # Row vectors: ``v @ R`` is ``R.T @ v`` for a column vector, i.e. the
+        # INVERSE of the rotation ``_rotate_obj`` applied to the upload.
+        cent = (cent - np.asarray(about, float)) @ np.asarray(rot, float) \
+            + np.asarray(about, float)
     eps = np.ones(cent.shape[0], float)
     for layer in layers:                    # outermost first: inner ones win
         eps[np.array([_contains(layer, p) for p in cent])] = layer["n"] ** 2
@@ -580,7 +593,7 @@ def _graded(case, obj, work, *, grid, backend, verbose):
 
 
 def _uniform(materials, obj, case, h_min_mm, *, k: float, layers, backend,
-             np_verbose=False):
+             np_verbose=False, rot=None, about=None):
     """One uniform mesh+solve at ``h_min/k``, the same bytes.
 
     Mirrors ``run_multimaterial_bench._run_case``'s reference half: the mesh is
@@ -588,6 +601,11 @@ def _uniform(materials, obj, case, h_min_mm, *, k: float, layers, backend,
     one-part mesh (``materials=None``), and the spectrum comes from
     ``_solve_mesh`` -- the product's own five solver calls -- with eps supplied
     per tet by geometry, because a uniform mesh carries no regions.
+
+    ``rot``/``about`` are the rigid rotation already applied to ``obj`` (see
+    ``_rotate_obj``); they are passed straight to ``_eps_by_layers`` so the
+    material assignment follows the rotation instead of reading the rotated
+    build against the layers' unrotated frame.
     """
     import mse_meshing as MESH
     import mse_maxwell_solver as SOLVER
@@ -598,9 +616,144 @@ def _uniform(materials, obj, case, h_min_mm, *, k: float, layers, backend,
         merged, "mm", n_modes=case["n_modes"], n_index=1.0, max_tets=600_000,
         min_feature_m=(h_min_mm / k) * 1e-3, verbose=np_verbose,
         materials=None, parts=None)
-    eps = _eps_by_layers(points, tets, layers)
+    eps = _eps_by_layers(points, tets, layers, rot=rot, about=about)
     kb = BENCH._solve_mesh(points, tets, eps, case["n_modes"], backend)
     return points, tets, kb
+
+
+# ------------------------------------------------- the mesh-to-mesh band (2e)
+# Item 2 of the lead's 2026-10-14 ladder message: the 2d band rule (largest
+# adjacent jump of the uniform ladder, reference rung dropped) reads a monotone
+# fall as scatter, so ramp-outward's 0.78 -> 0.10 step would be a 0.68% band
+# that swallows its real 0.50% gap -- convergence reported as noise. A monotone
+# drop is convergence. The band here instead rebuilds the uniform mesh at ONE
+# resolution for a few rigid rotations of the SAME upload: a rotation changes
+# nothing physical, so whatever moves the error is mesh-to-mesh noise, and no
+# constant is fitted to these cases.
+
+#: Rigid rotations for the band measure: ``(degrees, axis)``, deterministic and
+#: recorded in the JSON so two runs of one revision are comparable. The angles
+#: avoid the symmetry rotations of the fixtures (a cube repeats at 90 deg about
+#: a face normal, 120 about a body diagonal; a sphere's FACET pattern is what
+#: the mesher sees, and that does not repeat), and each run uses a different
+#: tilted axis so the five orientations are not one family.
+ROTATIONS = ((23.0, (1.0, 0.7, 0.3)), (47.0, (0.4, 1.0, 0.65)),
+             (71.0, (0.9, 0.35, 1.0)), (101.0, (1.0, 0.85, 0.2)),
+             (131.0, (0.55, 0.25, 1.0)))
+
+
+def _rotation_matrix(degrees: float, axis) -> np.ndarray:
+    """Rodrigues rotation, 3x3, from an angle in degrees and any axis."""
+    a = np.asarray(axis, float)
+    a = a / np.linalg.norm(a)
+    t = np.radians(float(degrees))
+    x, y, z = a
+    k = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], float)
+    return np.eye(3) + np.sin(t) * k + (1.0 - np.cos(t)) * (k @ k)
+
+
+def _obj_centroid(obj) -> np.ndarray:
+    """The mean of an OBJ's ``v`` lines, in the file's own units (mm here).
+
+    Used as the rotation pivot: about the centroid a rigid rotation leaves the
+    object where it was, so the build sees a different ORIENTATION and not a
+    different position -- and the base edge stays the case's own ``h_min``.
+    """
+    verts = [ln.split()[1:4] for ln in obj.decode("utf-8").splitlines()
+             if ln.startswith("v ")]
+    return np.asarray(verts, float).mean(axis=0)
+
+
+def _rotate_obj(obj, matrix, about):
+    """``obj`` bytes with every ``v`` line rotated by ``matrix`` about ``about``.
+
+    Only the coordinates change: the ``o``/``f`` structure, the vertex order and
+    any extra per-vertex columns are written back untouched, so the rotated
+    upload passes the same ``load_parts`` validation as the original and the
+    rotation is the ONLY difference between the two builds.
+    """
+    out = []
+    for line in obj.decode("utf-8").splitlines():
+        if line.startswith("v "):
+            cols = line.split()
+            p = np.asarray(cols[1:4], float)
+            q = matrix @ (p - about) + about
+            out.append(" ".join(["v", *(f"{c:.9g}" for c in q), *cols[4:]]))
+        else:
+            out.append(line)
+    return ("\n".join(out) + "\n").encode("utf-8")
+
+
+def rotation_band(members) -> tuple[float | None, str]:
+    """``(band, note)`` from the uniform side's spread across rigid rotations.
+
+    ``members`` is one dict per rotation AND the identity build, each carrying
+    ``degrees``, ``worst_rel_error`` and either ``n_tets`` or ``error``. The
+    band is ``max - min`` of the errors that were measured.
+
+    It is ``None`` whenever ANY member failed or matched nothing, and the note
+    says which: a spread over the survivors would shrink toward zero as the
+    instrument declined to answer, and would read as "clean mesh" exactly when
+    the run knew least. The identity member is required for the same reason --
+    it is the uniform number the verdict itself used, so dropping it would
+    measure the rotations against a gap that is not the one being judged.
+    """
+    bad = [m for m in members
+           if m.get("error") or m.get("worst_rel_error") is None]
+    if len(members) < 2:
+        return None, "no rotation spread: fewer than two members measured"
+    if bad:
+        reasons = "; ".join(
+            (f"{m['degrees']:g} deg: {m['error']}" if m.get("error") else
+             f"{m['degrees']:g} deg: matched 0 modes") for m in bad)
+        return None, ("band unmeasured -- " + reasons
+                      + f" ({len(members) - len(bad)} of {len(members)} "
+                        "rotations measured, which is not a spread)")
+    lo_m = min(members, key=lambda m: float(m["worst_rel_error"]))
+    hi_m = max(members, key=lambda m: float(m["worst_rel_error"]))
+    lo, hi = float(lo_m["worst_rel_error"]), float(hi_m["worst_rel_error"])
+    return (hi - lo,
+            f"max-min across {len(members)} rigid orientations of the same "
+            f"upload ({lo * 100:.3f}% at {lo_m['degrees']:g} deg, "
+            f"{hi * 100:.3f}% at {hi_m['degrees']:g} deg)")
+
+
+def _uniform_rotations(case, obj, reference, h_min, layers, backend, n_modes,
+                       n: int, identity_error) -> dict:
+    """The uniform rung rebuilt at ``n`` rigid rotations, scored against the
+    SAME reference, and the band they give (see ``rotation_band``).
+
+    Builds at the uniform side's own resolution (``k=1.0``) and its own
+    ``h_min``: the question is how much of the uniform NUMBER is noise, so
+    neither the resolution nor the base edge may move between members. The
+    identity build is already in the run's ``uniform`` score, so it is reused
+    rather than rebuilt -- one fewer solve, and it is by construction the number
+    the verdict used.
+    """
+    about = _obj_centroid(obj)
+    # The identity member is the uniform score the verdict already used, so it
+    # is reused rather than rebuilt: no second solve, no second place for the
+    # same number (its tets count is ``out["uniform"]["1.0"]``).
+    members = [{"degrees": 0.0, "axis": None, "identity": True,
+                "worst_rel_error": identity_error}]
+    for degrees, axis in ROTATIONS[:n]:
+        row = {"degrees": float(degrees), "axis": list(axis)}
+        try:
+            rot = _rotation_matrix(degrees, axis)
+            rotated = _rotate_obj(obj, rot, about)
+            _p, tets, kb = _uniform(case["materials"], rotated, case, h_min,
+                                    k=1.0, layers=layers, backend=backend,
+                                    rot=rot, about=about)
+            score = REF.score_multiplets(kb, reference, n_requested=n_modes)
+            row["n_tets"] = int(tets.shape[0])
+            row["worst_rel_error"] = score.get("worst_rel_error")
+            row["n_matched"] = score.get("n_matched")
+        except Exception as exc:  # noqa: BLE001 - a failed rotation is data
+            row["error"] = f"{type(exc).__name__}: {exc}"
+        members.append(row)
+    band, note = rotation_band(members)
+    return {"uniform_rotation_band": band, "uniform_rotation_note": note,
+            "uniform_rotations": members}
 
 
 def _uniform_regions(case, obj, h_min_mm, verbose=False):
@@ -1055,6 +1208,11 @@ def favourable_bound(uniform_worst, graded_worst, reference_convergence,
     ``richardson = 1 / (r**p - 1)``. For this bench's 1.25 -> 1.5 pair at p = 2
     it is 2.27. It is an ASSUMPTION -- one order, one constant -- so the raw and
     the scaled bounds are both reported rather than one being chosen here.
+
+    This is the reading most favourable TO GRADING and so can only confirm a
+    PASS; the bound that could overturn the verdict actually reached is
+    ``adversarial_bounds``, which is what the runner prints. The dict here is
+    the operand carrier for both.
     """
     if uniform_worst is None or graded_worst is None or reference_convergence is None:
         return None
@@ -1070,6 +1228,62 @@ def favourable_bound(uniform_worst, graded_worst, reference_convergence,
     return p
 
 
+def adversarial_bounds(bound: dict, verdict: str) -> list[dict]:
+    """The bounds that could OVERTURN ``verdict``, one entry per scaling.
+
+    ``favourable_bound`` shifts the uniform side the one way that helps grading
+    (it ADDS the reference's convergence), so on a PASS case its ``still_fail``
+    flag is false by construction and the print read "FLIPS: not decidable
+    from these runs" on a verdict that had never been in doubt. Both cases in
+    the 2026-10-14 ladder logs printed that line, for opposite reasons. The
+    bound that can overturn a verdict is the one that is most favourable to
+    that verdict's LOSER, and the loser changes with the verdict:
+
+      * a PASS loses if the uniform side was better than measured, so the
+        overturning bound is ``uniform - c``, and the PASS flips when graded is
+        ABOVE it -- grading no longer clearly wins;
+      * a FAIL loses if the uniform side was worse than measured (the direction
+        the same-family reference biases it), so the overturning bound is
+        ``uniform + c``, and the FAIL flips when graded is at or under it --
+        grading is no longer clearly worse.
+
+    The two verdicts therefore sit on opposite sides of the measured uniform
+    number, which is why one bound cannot be printed for both.
+
+    ``verdict`` is the verdict actually reached, so the caller prints the bound
+    that applies to the case in hand. Returns ``[]`` for any other verdict:
+    there is nothing to overturn, and the verdict line already carries why. A
+    lower bound below zero is not an error but a region the reference's own
+    convergence cannot resolve; it is clamped at zero and ``clamped`` says so,
+    so a flip against it is never reported as a measurement.
+    """
+    if not bound or verdict not in ("PASS", "FAIL"):
+        return []
+    graded = bound["graded_worst"]
+    # PASS: the uniform side is the loser, so the bound that can overturn the
+    # verdict is the uniform number at its BEST -- the reference's own
+    # convergence taken off it and handed to the uniform mesh. This is the
+    # lead's own reading for ramp-outward: "graded wins even if you SUBTRACT
+    # the reference's convergence from uniform (0.779 - 0.096 = 0.683)".
+    # FAIL: the graded side is the loser and only the uniform number moves, so
+    # the overturning reading is uniform at its WORST -- the convergence added
+    # to it, which is the de-flattered uniform error.
+    sign = -1.0 if verdict == "PASS" else +1.0
+    rows = []
+    for tag, factor in (("raw", 1.0), ("Richardson", bound["richardson"])):
+        shift = factor * bound["reference_convergence"]
+        raw = bound["uniform_worst"] + sign * shift
+        b = max(0.0, raw)
+        rows.append({
+            "label": tag, "verdict": verdict,
+            "other": "FAIL" if verdict == "PASS" else "PASS",
+            "bound": b, "raw": raw, "clamped": raw < 0.0,
+            "graded": graded, "shift": shift,
+            "flips": bool(graded > b) if verdict == "PASS" else bool(graded <= b),
+        })
+    return rows
+
+
 #: Richardson scale for the bench's own refinement pair, from the order of the
 #: eigenproblem's discretisation (p = 2 for linear tets with a consistent mass),
 #: applied only to a reference's coarse-vs-finest convergence. See
@@ -1079,7 +1293,8 @@ RICHARDSON_SCALE = richardson_scale(REFINE_FACTORS)
 
 def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
              baseline: str = "product", ladder=False,
-             fine_reference: float | None = None) -> dict:
+             fine_reference: float | None = None,
+             rotations: int = 0) -> dict:
     """Build, mesh and solve ONE matrix case, and judge it.
 
     ``baseline`` picks the resolution of the UNIFORM side: ``"product"`` builds
@@ -1097,6 +1312,11 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
     ``refine_factors``), which tightens the reference's own convergence for a
     uniform-refined case -- the knob for a gap that sits under the reference's
     error. It costs one extra build and its solve, and the price grows ~K^3.
+
+    ``rotations`` rebuilds the uniform rung at that many rigid rotations of the
+    same upload and reports the spread (see ``rotation_band``). It costs one
+    uniform build and its solve per rotation -- the cheap half of the case, and
+    the only half a rotation can move without also moving the graded number.
     """
     import mse_maxwell_solver as SOLVER
 
@@ -1252,6 +1472,18 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
     out["uniform_score"] = {k: uniform[k] for k in
                             ("n_matched", "n_clusters", "n_returned",
                              "worst_rel_error", "matched") if k in uniform}
+
+    # Item 2, step 2e: how much of the uniform NUMBER is mesh-to-mesh noise.
+    # From the SAME upload, rotated; the reference and the base edge are held
+    # fixed, so the only thing that moves between members is the mesh.
+    if rotations:
+        try:
+            out.update(_uniform_rotations(
+                case, obj, reference, h_min, layers, backend, n_modes,
+                rotations, uniform.get("worst_rel_error")))
+        except Exception as exc:  # noqa: BLE001 - a failed band is data
+            out["uniform_rotation_band"] = None
+            out["uniform_rotation_note"] = f"band unmeasured -- {type(exc).__name__}: {exc}"
 
     # The uniform side's PER-REGION build, beside the graded side's. The bench's
     # uniform mesh is one part with no regions (see ``_uniform``), so on its own
@@ -1676,6 +1908,13 @@ def main(argv=None) -> int:
     p.add_argument("--bands", action="store_true",
                    help="also report the per-band achieved edges (concentric "
                         "cases; costs one extra mesh build)")
+    p.add_argument("--rotations", type=int, default=0, metavar="N",
+                   help="rebuild the uniform rung at N rigid rotations of the "
+                        "same upload (max %d) and report the spread as the "
+                        "case's mesh-to-mesh band; the identity build counts as "
+                        "a member and is not rebuilt. Costs one uniform build "
+                        "and solve per rotation -- the cheap half of the case"
+                        % len(ROTATIONS))
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
 
@@ -1702,6 +1941,13 @@ def main(argv=None) -> int:
     if args.case not in labels:
         print(f"unknown case {args.case!r}; known: {labels}", file=sys.stderr)
         return MATRIX_USAGE
+    if args.rotations and not 1 <= args.rotations <= len(ROTATIONS):
+        # A silent slice would run fewer orientations than asked and report the
+        # spread as if it were the requested one.
+        print(f"--rotations must be 1..{len(ROTATIONS)} "
+              f"({len(ROTATIONS)} fixed orientations are defined); got "
+              f"{args.rotations}", file=sys.stderr)
+        return MATRIX_USAGE
     case = next(c for c in MATRIX if c["label"] == args.case)
     work = (Path(args.work) if args.work
             else Path(tempfile.mkdtemp(prefix=f"mse-matrix-{args.case}-")))
@@ -1711,7 +1957,8 @@ def main(argv=None) -> int:
         result = run_case(case, grid=args.grid, backend=args.backend, work=work,
                           verbose=not args.quiet, bands=args.bands,
                           baseline=args.baseline, ladder=args.ladder,
-                          fine_reference=args.fine_reference)
+                          fine_reference=args.fine_reference,
+                          rotations=args.rotations)
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
         print(f"[matrix] case RAISED: {type(exc).__name__}: {exc}")
@@ -1817,27 +2064,71 @@ def main(argv=None) -> int:
         print("[matrix] reference's own convergence (coarse vs finest): "
               f"{result['meta']['reference_convergence'] * 100:.3f}%")
     if fb:
-        print("[matrix] uniform side's most favourable reading: "
-              f"{fb['uniform_worst'] * 100:.3f}% + the reference's whole "
-              f"convergence {fb['reference_convergence'] * 100:.3f}% = "
-              f"{fb['uniform'] * 100:.3f}%, against graded "
-              f"{fb['graded_worst'] * 100:.3f}%"
-              + (" -- STILL FAIL" if fb["still_fail"] else " -- the verdict "
-                 "does depend on the reference's quality"))
-        # The coarse-vs-finest difference UNDERSTATES the finest level's own
-        # error by 1 - r**-p, so the line above is a floor on the correction,
-        # not the correction. Both are printed; only the run's author chooses.
+        # The bound that can OVERTURN this case's verdict, not the one that can
+        # only confirm it. ``favourable_uniform_bound`` shifts the uniform side
+        # the way that HELPS grading, so on a PASS its still-failing flag is
+        # false by construction and the old line read "FLIPS: not decidable
+        # from these runs" on a verdict that had never moved -- and both cases
+        # in the 2026-10-14 ladder logs printed it, for opposite reasons.
         _rf = out.get("refine_factors") or list(REFINE_FACTORS)
-        print(f"[matrix]   scaled by Richardson (p = 2, ratio "
-              f"{_rf[-1] / _rf[0]:g} -> x{fb['richardson']:.2f}): "
-              f"{fb['richardson_uniform'] * 100:.3f}%, against graded "
-              f"{fb['graded_worst'] * 100:.3f}% = "
-              f"{fb['richardson_ratio']:.2f}x"
-              + (" -- STILL FAIL" if fb["richardson_still_fail"]
-                 else " -- FLIPS: not decidable from these runs"))
+        adv = adversarial_bounds(fb, result["verdict"])
+        for row in adv:
+            _scale = ("" if row["label"] == "raw" else
+                      f", scaled by Richardson (p = 2, ratio "
+                      f"{_rf[-1] / _rf[0]:g} -> x{fb['richardson']:.2f})")
+            # A bound below zero is not a number the run can measure against:
+            # the reference's own convergence cannot resolve the region, so the
+            # flip is reported as a limit of the instrument, not a measurement.
+            _clamp = (" (the bound is negative before clamping to 0: the "
+                      "reference's own convergence cannot resolve it)"
+                      if row["clamped"] else "")
+            print(f"[matrix] the bound that could overturn the {row['verdict']}"
+                  f"{_scale}: uniform {fb['uniform_worst'] * 100:.3f}% "
+                  f"{'-' if row['verdict'] == 'PASS' else '+'} "
+                  f"{row['shift'] * 100:.3f}% = {row['bound'] * 100:.3f}%, "
+                  f"against graded {row['graded'] * 100:.3f}%"
+                  + (f" -- the {row['verdict']} FLIPS to {row['other']}"
+                     if row["flips"] else
+                     f" -- the {row['verdict']} HOLDS")
+                  + _clamp)
+        if not adv:
+            # No PASS or FAIL to overturn. Both readings of the uniform side
+            # are still printed, because they are what the verdict line just
+            # declined to decide between.
+            _lo = max(0.0, fb['uniform_worst'] - fb['reference_convergence'])
+            _hi = fb['uniform_worst'] + fb['reference_convergence']
+            print(f"[matrix] no verdict to overturn: uniform is "
+                  f"{fb['uniform_worst'] * 100:.3f}% and the reference's own "
+                  f"convergence {fb['reference_convergence'] * 100:.3f}%, so "
+                  f"uniform lies between {_lo * 100:.3f}% and "
+                  f"{_hi * 100:.3f}% -- graded {fb['graded_worst'] * 100:.3f}% "
+                  f"is inside that and this run cannot separate them")
     if out.get("bands"):
         print("[matrix] bands: " + "  ".join(
             f"{k} {v['edge_mm']:.4f} mm" for k, v in out["bands"].items()))
+    # Item 2, step 2e: the mesh-to-mesh band, and the gap read against it. The
+    # gap is the number the verdict is made of (uniform - graded), so the band
+    # is only useful beside it -- and "unmeasured" is printed as unmeasured, not
+    # as a small spread.
+    if out.get("uniform_rotations"):
+        _band = out.get("uniform_rotation_band")
+        rows = out["uniform_rotations"]
+        print("[matrix] uniform side at rigid rotations: " + ", ".join(
+            f"{r['degrees']:g}deg "
+            + (f"{r['worst_rel_error'] * 100:.3f}%" if r.get("worst_rel_error")
+               is not None else (r.get("error") or "matched 0"))
+            for r in rows))
+        print(f"[matrix] mesh-to-mesh band: "
+              + (f"{_band * 100:.3f}%" if _band is not None else "UNMEASURED")
+              + f" -- {out.get('uniform_rotation_note', '')}")
+        _gw, _uw = out.get("graded_score", {}).get("worst_rel_error"), \
+            out.get("uniform_score", {}).get("worst_rel_error")
+        if _band is not None and _gw is not None and _uw is not None:
+            _d = _uw - _gw
+            print(f"[matrix]   gap uniform - graded {_d * 100:+.3f}% is "
+                  f"{abs(_d) / _band:.2f}x the band"
+                  + (" (within mesh noise)"
+                     if abs(_d) <= _band else " (outside mesh noise)"))
     return {"PASS": MATRIX_OK, "FAIL": MATRIX_FAIL,
             "UNMEASURED": MATRIX_INCOMPLETE, "SAME MESH": MATRIX_SAME_MESH,
             "UNRELIABLE": MATRIX_UNRELIABLE,

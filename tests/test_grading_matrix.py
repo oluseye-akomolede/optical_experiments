@@ -13,6 +13,7 @@ folded back into ``PASS``.
 """
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 
@@ -339,7 +340,7 @@ GRADED_FREQ_HZ = 1.0
 
 
 def _fake_run_case(monkeypatch, baseline: str = "product", ladder: bool = False,
-                   fine_reference=None):
+                   fine_reference=None, rotations: int = 0):
     """``run_case`` with every heavy call faked out. Returns ``(result, seen)``.
 
     ``seen`` records the floor the uniform side was built at, which is the
@@ -360,7 +361,9 @@ def _fake_run_case(monkeypatch, baseline: str = "product", ladder: bool = False,
     graded_kb = float(GM._kb(np.array([GRADED_FREQ_HZ]), 5.0)[0])
 
     def fake_build(case, n_modes):
-        return {"obj": b"o wall\no core\n", "parts": None,
+        return {"obj": (b"o wall\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\n"
+                        b"f 1 2 3\nf 1 2 4\nf 1 3 4\nf 2 3 4\n"),
+                "parts": None,
                 "plan": {"0": {"edge_m": 1e-3, "unclamped_m": 1e-3}},
                 "h_min_mm": 0.3368, "probe_h_min_mm": 0.7511,
                 "layers": [], "scale_mm": 5.0}
@@ -371,8 +374,16 @@ def _fake_run_case(monkeypatch, baseline: str = "product", ladder: bool = False,
                 np.array([GRADED_FREQ_HZ]), 0.5)
 
     def fake_uniform(materials, obj, case, h_min_mm, *, k, layers, backend,
-                     np_verbose=False):
+                     np_verbose=False, rot=None, about=None):
         seen.setdefault("uniform_floors", []).append((k, h_min_mm))
+        if rot is not None:
+            # A rotated build carries no rung: it rebuilds the k=1.0 uniform
+            # mesh and must be handed its pivot. Each orientation gets its OWN
+            # spectrum, so a band that ignored the rotations would read 0.
+            seen.setdefault("rot_pivots", []).append(tuple(np.asarray(about, float)))
+            seen["rot_n"] = seen.get("rot_n", 0) + 1
+            return (np.zeros((7, 3), float), np.zeros((7, 4), int),
+                    np.array([3.0 + seen["rot_n"]]))
         # A NODE CLOUD, not None. The runner now checks the points a level's
         # build returned before a reference is allowed to come from it, so a
         # fake that returned None would model a producer the runner refuses --
@@ -391,6 +402,10 @@ def _fake_run_case(monkeypatch, baseline: str = "product", ladder: bool = False,
             return {"worst_rel_error": None, "n_clusters": 3, "n_matched": 0,
                     "n_returned": 1, "spurious": [{"nearest_rel": 0.4}],
                     "unmatched_reference": ["a", "b", "c"]}
+        if float(kb[0]) >= 3.0:               # a rotation member of the band
+            return {"worst_rel_error": 0.02 + 0.002 * (float(kb[0]) - 3.0),
+                    "n_clusters": 3, "n_matched": 3, "n_returned": 3,
+                    "spurious": [], "unmatched_reference": []}
         return {"worst_rel_error": 0.02, "n_clusters": 3, "n_matched": 3,
                 "n_returned": 3, "spurious": [], "unmatched_reference": []}
 
@@ -406,7 +421,7 @@ def _fake_run_case(monkeypatch, baseline: str = "product", ladder: bool = False,
     case = next(c for c in GM.MATRIX if c["label"] == "box-sphere")
     result = GM.run_case(case, grid=10, backend="cpu", work=Path("/tmp"),
                          verbose=False, baseline=baseline, ladder=ladder,
-                         fine_reference=fine_reference)
+                         fine_reference=fine_reference, rotations=rotations)
     return result, seen
 
 
@@ -1031,7 +1046,11 @@ def test_the_reference_convergence_line_does_not_duplicate_the_favourable_one(
     GM.main(["--case", "box-sphere", "--grid", "10", "--backend", "cpu",
              "--quiet"])
     out = capsys.readouterr().out
-    assert "most favourable reading" in out, out
+    # Step 2e replaced the favourable line with the bound against the verdict
+    # actually reached; with a NO VERDICT that is the undecided line. Either way
+    # it carries the convergence inside its arithmetic, so the standalone line
+    # stays suppressed -- which is what this test is about.
+    assert "no verdict to overturn" in out, out
     assert label not in out, out
 
     # The positive control: with no graded worst error the favourable line is
@@ -1054,6 +1073,266 @@ def test_list_says_it_ignores_a_fine_reference(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "1.75 is a case-run rung" in out, out
     assert "NOT in this table" in out, out
+
+
+# --------------------------------------------------------------------------
+# step 2e, item 1: the bound that could OVERTURN the verdict actually reached
+# --------------------------------------------------------------------------
+
+#: The lead's own 2026-10-14 ladder numbers, as fractions. Uniform and graded
+#: are the two sides' worst errors; ``C`` is the reference's own convergence
+#: between its two levels.
+RAMPOUT_UNIFORM, RAMPOUT_GRADED, RAMPOUT_C = 0.00779, 0.00279, 0.00096
+THREEREG_UNIFORM, THREEREG_GRADED, THREEREG_C = 0.00274, 0.00221, 0.00089
+
+
+def test_a_pass_that_holds_is_read_against_uniform_minus_the_convergence():
+    """ramp-outward, the lead's worked example: "graded wins even if you
+    SUBTRACT the reference's convergence from uniform (0.779 - 0.096 = 0.683;
+    Richardson 0.779 - 0.218 = 0.561)". The uniform side is a PASS's loser, so
+    the reading that could overturn it is the uniform number at its BEST."""
+    b = GM.favourable_bound(RAMPOUT_UNIFORM, RAMPOUT_GRADED, RAMPOUT_C,
+                            richardson=GM.RICHARDSON_SCALE)
+    rows = {r["label"]: r for r in GM.adversarial_bounds(b, "PASS")}
+    raw, rich = rows["raw"], rows["Richardson"]
+    assert abs(raw["bound"] - 0.00683) < 1e-9, raw
+    assert abs(rich["bound"] - 0.00561) < 2e-5, rich
+    assert raw["flips"] is False and rich["flips"] is False, rows
+    # The regression's own positive control: the OLD line read its ``still_fail``
+    # flag, which is false by construction on a PASS -- so it printed "FLIPS:
+    # not decidable from these runs" for a verdict that never moved.
+    assert b["still_fail"] is False, b
+    assert b["richardson_still_fail"] is False, b
+
+
+def test_a_pass_that_flips_is_one_the_old_line_could_not_report():
+    """three-region: uniform 0.274%, graded 0.221% reads PASS, but the uniform
+    side credited with the reference's 0.089% convergence falls to 0.185%,
+    BELOW graded -- so the PASS does not survive and the run must say so, in the
+    opposite direction from the ramp-outward case above. Both printed "FLIPS:
+    not decidable" before this change."""
+    b = GM.favourable_bound(THREEREG_UNIFORM, THREEREG_GRADED, THREEREG_C,
+                            richardson=GM.RICHARDSON_SCALE)
+    rows = {r["label"]: r for r in GM.adversarial_bounds(b, "PASS")}
+    assert abs(rows["raw"]["bound"] - 0.00185) < 1e-9, rows["raw"]
+    assert rows["raw"]["flips"] is True, rows["raw"]
+    assert rows["raw"]["other"] == "FAIL", rows["raw"]
+    # the scaled reading is harsher still, and agrees in direction
+    assert rows["Richardson"]["bound"] < rows["raw"]["bound"], rows
+    assert rows["Richardson"]["flips"] is True, rows["Richardson"]
+
+
+def test_a_fail_reads_against_uniform_plus_the_convergence():
+    """A FAIL's loser is the graded side, and only the uniform number can move,
+    so the overturning reading is uniform at its WORST -- the de-flattered
+    number, which is the direction a same-family reference biases. A solid FAIL
+    (graded far above even that) keeps its verdict; a marginal one does not."""
+    holds = GM.favourable_bound(THREEREG_UNIFORM, 0.00500, THREEREG_C,
+                                richardson=GM.RICHARDSON_SCALE)
+    flip = GM.favourable_bound(THREEREG_UNIFORM, 0.00290, THREEREG_C,
+                               richardson=GM.RICHARDSON_SCALE)
+    for b, want_flip, verdict in ((holds, False, "FAIL"), (flip, True, "FAIL")):
+        rows = {r["label"]: r for r in GM.adversarial_bounds(b, verdict)}
+        assert abs(rows["raw"]["bound"] - (THREEREG_UNIFORM + THREEREG_C)) < 1e-9
+        assert rows["raw"]["flips"] is want_flip, (b["graded_worst"], rows)
+        assert rows["raw"]["other"] == "PASS"
+        # the scaled reading moves the bound the same way it moves a PASS's:
+        # further out, away from the measured uniform number
+        assert rows["Richardson"]["bound"] > rows["raw"]["bound"]
+
+
+def test_the_overturning_bound_is_verdict_specific_and_undefined_off_pass_fail():
+    """One bound cannot serve both verdicts -- they sit on opposite sides of the
+    measured uniform number, which is exactly why the old single line was wrong
+    for one of them. A verdict with nothing to overturn gets no bound (and the
+    printer says so instead of inventing one)."""
+    b = GM.favourable_bound(RAMPOUT_UNIFORM, RAMPOUT_GRADED, RAMPOUT_C)
+    pass_b = GM.adversarial_bounds(b, "PASS")[0]["bound"]
+    fail_b = GM.adversarial_bounds(b, "FAIL")[0]["bound"]
+    assert pass_b < RAMPOUT_UNIFORM < fail_b, (pass_b, fail_b)
+    for verdict in ("UNRELIABLE", "NO VERDICT", "SAME MESH", "UNMEASURED"):
+        assert GM.adversarial_bounds(b, verdict) == [], verdict
+    assert GM.adversarial_bounds(None, "PASS") == []
+    # A lower bound below zero is the reference's convergence swallowing the
+    # whole uniform number: clamped at 0, and flagged so the flip is not read
+    # as a measurement.
+    tiny = GM.favourable_bound(0.00050, 0.00020, 0.00300)
+    row = GM.adversarial_bounds(tiny, "PASS")[0]
+    assert row["bound"] == 0.0 and row["raw"] < 0.0 and row["clamped"] is True, row
+
+
+@pytest.mark.parametrize("verdict,uniform,graded,c,sign,word", [
+    ("PASS", RAMPOUT_UNIFORM, RAMPOUT_GRADED, RAMPOUT_C, "-", "HOLDS"),
+    ("PASS", THREEREG_UNIFORM, THREEREG_GRADED, THREEREG_C, "-", "FLIPS"),
+    ("FAIL", THREEREG_UNIFORM, 0.00500, THREEREG_C, "+", "HOLDS"),
+    ("FAIL", THREEREG_UNIFORM, 0.00290, THREEREG_C, "+", "FLIPS"),
+])
+def test_the_printer_names_the_verdict_the_sign_and_the_outcome(
+        monkeypatch, capsys, verdict, uniform, graded, c, sign, word):
+    """Each of the four sides through the REAL printer. The defect lived in the
+    printed line, so a test of the arithmetic alone would not have caught it:
+    the old print emitted one string -- "FLIPS: not decidable from these runs"
+    -- for all four of these cases. The line must name the verdict it is trying
+    to overturn, SUBTRACT for a PASS and ADD for a FAIL, and read HOLDS or FLIPS
+    from the numbers."""
+    rows = {r["label"]: r for r in GM.adversarial_bounds(
+        GM.favourable_bound(uniform, graded, c,
+                            richardson=GM.RICHARDSON_SCALE), verdict)}
+    bound = rows["raw"]["bound"]
+    base = {"verdict": verdict, "detail": "synthetic case for the printer",
+            "meta": {},
+            "case": {"favourable_uniform_bound": GM.favourable_bound(
+                         uniform, graded, c, richardson=GM.RICHARDSON_SCALE),
+                     "graded_score": {"worst_rel_error": graded},
+                     "uniform_score": {"worst_rel_error": uniform}}}
+    monkeypatch.setattr(GM, "run_case", lambda *a, **k: copy.deepcopy(base))
+    code = GM.main(["--case", "box-sphere", "--grid", "10", "--backend", "cpu",
+                    "--quiet"])
+    out = capsys.readouterr().out
+    assert f"could overturn the {verdict}" in out, out
+    assert f"the {verdict} {word}" in out, out
+    assert f"uniform {uniform * 100:.3f}% {sign} " in out, out
+    assert f"= {bound * 100:.3f}%, against graded {graded * 100:.3f}%" in out, out
+    assert code == {"PASS": GM.MATRIX_OK, "FAIL": GM.MATRIX_FAIL}[verdict]
+
+
+# --------------------------------------------------------------------------
+# step 2e, item 2: a mesh-to-mesh band that is noise, not convergence
+# --------------------------------------------------------------------------
+
+def test_a_rotated_build_reads_its_material_in_the_objects_own_frame():
+    """A rigid rotation of the upload rotates the LAYERS with it, because the
+    layers say where the material is ON the object. Rotating the mesh but
+    testing it against the unrotated layer frame still runs and still returns
+    numbers -- so the frame is pinned here on geometry that CAN tell the two
+    apart: an outer box with an OFF-CENTRE core, and one tet whose centroid is
+    the core's centre in the ROTATED frame."""
+    import numpy as np
+    layers = [{"n": 1.5, "kind": "box", "centre": (0.0, 0.0, 0.0),
+               "half": (2.0, 2.0, 2.0)},
+              {"n": 3.0, "kind": "box", "centre": (1.0, 0.0, 0.0),
+               "half": (0.5, 0.5, 0.5)}]
+    rot = GM._rotation_matrix(90.0, (0.0, 0.0, 1.0))
+    about = np.zeros(3)
+    p_rot = rot @ np.array([1.0, 0.0, 0.0]) + about       # the core's centre
+    assert np.allclose(p_rot, [0.0, 1.0, 0.0]), p_rot
+    points = np.asarray([p_rot * 1e-3])                   # metres, one node
+    tets = np.asarray([[0, 0, 0, 0]])
+    assert GM._eps_by_layers(points, tets, layers, rot=rot, about=about)[0] == 9.0
+    # the positive control: the same point read with NO rotation lands in the
+    # outer box, so the assertion above is not "everything is the core"
+    assert GM._eps_by_layers(points, tets, layers)[0] == 2.25
+    # the direction is the whole point: the rotated centroid mapped back through
+    # ``@ rot`` recovers the object frame (1, 0, 0), the core -- while the
+    # FORWARD rotation sends it to (-1, 0, 0), outside the core, so a transposed
+    # frame is caught here instead of silently reading the outer box
+    assert np.allclose(np.array([0.0, 1.0, 0.0]) @ rot, [1.0, 0.0, 0.0])
+    assert np.allclose(rot @ np.array([0.0, 1.0, 0.0]), [-1.0, 0.0, 0.0])
+
+
+def test_the_rotation_band_is_the_spread_and_a_failure_unmeasures_it():
+    """The band is max - min of the measured errors, and it is None -- not the
+    spread of the survivors -- as soon as one orientation could not be measured:
+    a spread over the rest would shrink toward "clean mesh" exactly when the run
+    knew least. The identity build is one of the members, because it is the
+    uniform number the verdict itself used."""
+    ok = [{"degrees": 0.0, "worst_rel_error": 0.020},
+          {"degrees": 23.0, "worst_rel_error": 0.025},
+          {"degrees": 47.0, "worst_rel_error": 0.018}]
+    band, note = GM.rotation_band(ok)
+    assert abs(band - 0.007) < 1e-12, band
+    # the note names the extremes by their OWN degree: 1.800% is the low (47
+    # deg) and 2.500% the high (23 deg) -- not the first member
+    assert "47 deg" in note and "23 deg" in note, note
+    assert "1.800%" in note and "2.500%" in note, note
+    # one rotation matched nothing: the band is unmeasured, and the note names
+    # WHICH orientation failed
+    bad = ok + [{"degrees": 71.0, "worst_rel_error": None, "n_matched": 0}]
+    band, note = GM.rotation_band(bad)
+    assert band is None and "band unmeasured" in note, note
+    assert "71 deg" in note and "3 of 4" in note, note
+    # a rotation that RAISED is the same honest answer, with the reason
+    raised = ok + [{"degrees": 101.0, "error": "RuntimeError: boom"}]
+    band, note = GM.rotation_band(raised)
+    assert band is None and "RuntimeError: boom" in note, note
+    # fewer than two members is not a spread
+    assert GM.rotation_band([{"degrees": 0.0, "worst_rel_error": 0.02}])[0] is None
+
+
+def test_the_rotated_upload_differs_only_in_the_vertex_coordinates():
+    """``_rotate_obj`` must move the vertices and NOTHING else -- same object,
+    same faces, same vertex order, extra per-vertex columns kept -- because the
+    rotated bytes go back through the product's own ``load_parts``."""
+    import numpy as np
+    obj = (b"o wall\nv 1 0 0\nv 0 2 0.5 7\nvt 0 0\nf 1 2 1\no core\nv 3 3 3\nf 1 1 1\n")
+    about = np.zeros(3)
+    rot = GM._rotation_matrix(90.0, (0.0, 0.0, 1.0))
+    out = GM._rotate_obj(obj, rot, about)
+    lines = out.decode("utf-8").splitlines()
+    assert lines[0] == "o wall" and "vt 0 0" in lines and "o core" in lines
+    assert lines[-1] == "f 1 1 1" and "f 1 2 1" in lines
+    v2 = [ln for ln in lines if ln.startswith("v ")][1]
+    assert v2.split()[4:] == ["7"], v2          # the extra column survived
+    assert np.allclose([float(x) for x in v2.split()[1:4]], [-2.0, 0.0, 0.5]), v2
+    assert np.allclose(GM._obj_centroid(obj), [4.0 / 3.0, 5.0 / 3.0, 3.5 / 3.0])
+
+
+def test_run_case_reports_the_band_and_the_print_shows_it(monkeypatch, capsys):
+    """The wiring: ``rotations`` reaches ``run_case``, each orientation is
+    scored against the SAME reference, the band is the spread of those scores,
+    and it lands in the JSON. The rotation spectra differ by construction, so a
+    band that ignored the orientations would read 0 here."""
+    result, seen = _fake_run_case(monkeypatch, rotations=3)
+    out = result["case"]
+    assert len(out["uniform_rotations"]) == 4, out["uniform_rotations"]
+    assert abs(out["uniform_rotation_band"] - 0.006) < 1e-12, out["uniform_rotation_band"]
+    assert "4 rigid orientations" in out["uniform_rotation_note"], out["uniform_rotation_note"]
+    assert out["uniform_rotations"][0]["identity"] is True
+    assert [r["degrees"] for r in out["uniform_rotations"][1:]] == \
+        [r[0] for r in GM.ROTATIONS[:3]]
+    # every orientation used the SAME pivot: a rotation about different points
+    # would MOVE the object as well as turn it, and the band would then be
+    # measuring a translation
+    assert len({p for p in seen["rot_pivots"]}) == 1, seen["rot_pivots"]
+    assert seen["rot_n"] == 3, seen
+
+
+def test_the_band_prints_as_a_percent_and_none_prints_as_unmeasured(
+        monkeypatch, capsys):
+    """The printer reads the JSON, so it must state the band in percent and, at
+    a band of ``None``, say UNMEASURED -- a 0 here would read as "clean mesh",
+    which is the one thing an unmeasured band must not look like."""
+    base = {"verdict": "UNMEASURED", "detail": "graded matched nothing",
+            "meta": {}, "case": {
+                "uniform_rotations": [{"degrees": 0.0, "worst_rel_error": 0.020},
+                                      {"degrees": 23.0, "error": "RuntimeError: boom"}],
+                "uniform_rotation_band": None,
+                "uniform_rotation_note": "band unmeasured -- 23 deg: RuntimeError: boom",
+                "graded_score": {"worst_rel_error": 0.010},
+                "uniform_score": {"worst_rel_error": 0.020}}}
+    monkeypatch.setattr(GM, "run_case", lambda *a, **k: copy.deepcopy(base))
+    assert GM.main(["--case", "box-sphere", "--rotations", "1",
+                    "--quiet"]) == GM.MATRIX_INCOMPLETE
+    printed = capsys.readouterr().out
+    assert "mesh-to-mesh band: UNMEASURED" in printed, printed
+    assert "2.00x the band" not in printed, printed     # no gap ratio off None
+    base["case"].update({"uniform_rotation_band": 0.05,
+                         "uniform_rotation_note": "max-min across 2 orientations"})
+    assert GM.main(["--case", "box-sphere", "--rotations", "1",
+                    "--quiet"]) == GM.MATRIX_INCOMPLETE
+    printed = capsys.readouterr().out
+    assert "mesh-to-mesh band: 5.000%" in printed, printed
+    # gap = uniform 0.020 - graded 0.010 = 0.010, which is INSIDE the band
+    assert "0.20x the band (within mesh noise)" in printed, printed
+
+
+def test_rotations_out_of_range_is_refused_not_silently_sliced(
+        monkeypatch, capsys):
+    """``ROTATIONS[:n]`` would quietly run fewer orientations than asked and
+    report the spread as the requested one."""
+    monkeypatch.setattr(GM, "run_case", lambda *a, **k: None)
+    assert GM.main(["--case", "box-sphere", "--rotations", "99"]) == GM.MATRIX_USAGE
+    assert f"1..{len(GM.ROTATIONS)}" in capsys.readouterr().err
 
 
 if __name__ == "__main__":  # pragma: no cover
