@@ -65,7 +65,7 @@ def test_the_thin_cases_trip_the_clamp_and_the_thick_ones_do_not():
     never fires would leave the axis uncovered while reading as covered."""
     def clamp_bites(label):
         case = next(c for c in GM.MATRIX if c["label"] == label)
-        _o, _p, plan, _h, _l, _s = GM._build(case, case["n_modes"])
+        plan = GM._build(case, case["n_modes"])["plan"]
         return [rid for rid, v in plan.items()
                 if v["edge_m"] < v["unclamped_m"] - 1e-12]
 
@@ -132,8 +132,10 @@ def test_over_ceiling_cases_are_reported(monkeypatch, capsys):
     """A case too big for tier 2 must be visible in the list rather than met as
     an OOM mid-run."""
     def fake(case):
-        # the real ``predicted_counts`` shape
-        return {"h_min_mm": 0.5961,
+        # the real ``predicted_counts`` shape (see its ``return``): the two
+        # floors, the probe's own count, and the ratio between the floors
+        return {"h_min_mm": 0.5961, "probe_h_min_mm": 0.5961,
+                "probe_uniform_tets": 250_000, "baseline_ratio": 1.0,
                 "counts": {"graded": 1_000, "uniform": 250_000},
                 "over_ceiling": ["uniform"]}
 
@@ -163,9 +165,18 @@ def test_a_failed_estimate_is_incomplete_not_a_zero(monkeypatch, capsys):
 #: asks for this list "plainly", so it is a checked artifact rather than a line
 #: in a report: a sizing change or an estimator change that moves a case across
 #: the mark has to update this map.
+#:
+#: Corrected on 2026-10-14, and the change is the point of the correction: the
+#: uniform side is now sized at the floor the PRODUCT's own plan asks for, not
+#: at a fixed icosphere probe's. `c3-thin`'s uniform mesh drops under the mark
+#: (274,415 -> 154,673 predicted) while its graded side stays on it, and
+#: `box-sphere`'s two reference levels -- 250,439 and 432,759 -- come over it,
+#: which is a case whose reference cannot be built on tier 2 at all.
 EXPECTED_OVER_MARK = {
     "c3-thick": ["uniform"],             # the row's own 199,062-element mesh
-    "c3-thin": ["graded", "uniform"],    # the clamp, not the mode count, sizes it
+    "c3-thin": ["graded"],               # the clamp, not the mode count, sizes it
+    "box-sphere": ["ref1.25", "ref1.5"],  # both reference levels, on the box's
+                                          # own (much finer) floor
 }
 
 
@@ -173,8 +184,12 @@ def test_every_case_is_sized_for_tier_2_or_listed_as_unmeasurable():
     """The row's 'each case sized to fit tier 2', locked. Also the estimator
     seam: every predicted count here comes from the product's own
     ``estimate_tets`` with the constant ``web.config`` routes on, so a broken
-    import shows up as a failed estimate for all ten cases, not as a green
-    suite over a dead estimator. This is the slow test in this file."""
+    import shows up as a failed estimate for every case, not as a green suite
+    over a dead estimator. This is the slow test in this file.
+
+    The map below is the LIST's flag, not a prediction that the Orin will OOM:
+    the estimator reads 1.2-3.3x high on the meshes we have built, so a case
+    flagged here can still solve, and the Orin's own run decides."""
     over = {}
     for case in GM.MATRIX:
         pred = GM.predicted_counts(case)
@@ -185,6 +200,399 @@ def test_every_case_is_sized_for_tier_2_or_listed_as_unmeasurable():
     assert over == EXPECTED_OVER_MARK, (
         "the set of cases the Orin cannot solve moved; either the sizing "
         f"changed or the estimator did: {over} != {EXPECTED_OVER_MARK}")
+
+
+# --------------------------------------------------------------------------
+# a missing side says which side it is (the Orin's box-sphere row)
+# --------------------------------------------------------------------------
+
+def test_a_missing_side_names_the_side_and_what_it_produced():
+    """The Orin's box-sphere row came back ``graded_worst=None`` over a solve
+    that SUCCEEDED, and the message said only "one of the two worst errors is
+    missing". Which side, and what did it produce, is the whole diagnosis."""
+    score = {"worst_rel_error": None, "n_clusters": 4, "n_matched": 0,
+             "n_returned": 2,
+             "spurious": [{"nearest_rel": 0.0512}, {"nearest_rel": 0.19}],
+             "unmatched_reference": ["a", "b", "c"]}
+    reason = GM.missing_side_reason("the GRADED mesh", score, ["r"] * 5)
+    assert reason is not None
+    assert "the GRADED mesh" in reason
+    assert "0 of its 4 clusters" in reason
+    assert "3 of 5 reference multiplets unmatched" in reason
+    assert "5.12%" in reason, reason        # the NEAREST cluster, not the worst
+    # the tolerance in the message is the SCORER's, read from its signature --
+    # pin both, so a change to either shows up here rather than in a report
+    assert GM.SCORE_TOL == 0.02, GM.SCORE_TOL
+    assert f"{GM.SCORE_TOL * 100:.2f}%" in reason, reason
+    assert "19.00%" not in reason, reason
+
+
+def test_a_measured_side_carries_no_reason():
+    """The other arm: a side that produced a number must not be described as
+    missing, or the detail would name the wrong side on a good run."""
+    assert GM.missing_side_reason("x", {"worst_rel_error": 0.01}, ["r"]) is None
+
+
+def test_a_missing_side_with_no_cluster_at_all_still_says_so():
+    """A side that produced nothing at all must say that, rather than print a
+    distance it does not have."""
+    reason = GM.missing_side_reason(
+        "the UNIFORM mesh",
+        {"worst_rel_error": None, "n_clusters": 0, "n_matched": 0,
+         "spurious": [], "unmatched_reference": ["a"]}, ["r"])
+    assert "the UNIFORM mesh" in reason
+    assert "no cluster came within" in reason, reason
+    assert "distance" not in reason, reason
+
+
+# --------------------------------------------------------------------------
+# item 5: how much the reference's own quality can flatter the uniform side
+# --------------------------------------------------------------------------
+
+def test_the_uniform_sides_favourable_bound_is_arithmetic_not_opinion():
+    """Item 5, with the Orin's own two uniform-refined FAILs. Both sides are
+    scored against a finer mesh of the uniform side's own family, so the
+    comparison leans that way; the reference's convergence is the only bound on
+    by how much. Adding ALL of it to the uniform side is the best case for the
+    uniform mesh, and the verdict that survives that reading is the one worth
+    acting on."""
+    # three-region: uniform 0.106%, graded 0.231%, reference converges 0.046%
+    b = GM.favourable_bound(0.00106, 0.00231, 0.00046)
+    assert abs(b["uniform"] - 0.00152) < 1e-12, b
+    assert abs(b["ratio"] - 1.5197) < 1e-3, b
+    assert b["still_fail"] is True, b
+    # offset-sphere: uniform 0.028%, graded 0.091%, reference converges 0.005%
+    b2 = GM.favourable_bound(0.00028, 0.00091, 0.00005)
+    assert abs(b2["uniform"] - 0.00033) < 1e-12, b2
+    assert abs(b2["ratio"] - 2.7576) < 1e-3, b2
+    assert b2["still_fail"] is True, b2
+
+
+def test_the_raw_bound_is_a_floor_on_the_correction_not_a_ceiling():
+    """The coarse-vs-finest difference is NOT the reference's own error: it is
+    ``1 - r**-p`` of it, so the correction that a same-family reference gives
+    away is a multiple of that difference, and the raw bound above is the
+    smallest defensible version of it. Three-region survives the scaled one --
+    by 1.10x, which is the margin that has to travel with the verdict."""
+    r = GM.RICHARDSON_SCALE
+    # derived from the bench's own refinement pair, not typed in: 1/(1.44-1)
+    assert abs(r - 1.0 / ((GM.REFINE_FACTORS[-1] / GM.REFINE_FACTORS[0]) ** 2 - 1.0)) < 1e-12
+    assert abs(r - 2.2727) < 1e-3, r
+    b = GM.favourable_bound(0.00106, 0.00231, 0.00046, richardson=r)
+    assert abs(b["richardson_uniform"] - (0.00106 + r * 0.00046)) < 1e-12, b
+    assert abs(b["richardson_ratio"] - 1.0975) < 1e-3, b
+    assert b["richardson_still_fail"] is True, b
+    # offset-sphere's 3.27x stands up to the same scaling: 0.091% against
+    # 0.028% + 2.27 * 0.005% = 0.039%, still 2.3x.
+    b2 = GM.favourable_bound(0.00028, 0.00091, 0.00005, richardson=r)
+    assert abs(b2["richardson_ratio"] - 2.3116) < 1e-3, b2
+    assert b2["richardson_still_fail"] is True, b2
+    # And the honest limit, as arithmetic: the correction would have to top
+    # (0.231 - 0.106) / 0.046 = 2.72x the difference it measures -- 1.20x the
+    # O(h^2) estimate -- for three-region's FAIL to become a tie.
+    assert GM.favourable_bound(0.00106, 0.00231, 0.00046,
+                               richardson=2.7)["richardson_still_fail"] is True
+    flip = GM.favourable_bound(0.00106, 0.00231, 0.00046, richardson=2.8)
+    assert flip["richardson_still_fail"] is False, flip
+    assert flip["still_fail"] is True, flip  # the raw reading is unaffected
+    # offset-sphere's threshold is (0.091 - 0.028) / 0.005 = 12.6x, far
+    # outside the same assumption.
+    assert GM.favourable_bound(0.00028, 0.00091, 0.00005,
+                               richardson=12.0)["richardson_still_fail"] is True
+    assert GM.favourable_bound(0.00028, 0.00091, 0.00005,
+                               richardson=13.0)["richardson_still_fail"] is False
+
+
+def test_a_bound_that_settles_nothing_says_so():
+    """The honest half: when the convergence is large enough to swallow the
+    difference, the bound decides nothing and must not print the reassuring
+    line. box-sphere is this shape in the real run -- a 1.007% convergence
+    against a uniform side whose whole score is 1.442% (70% of it), so the
+    convergence is 2.3x the difference it is supposed to explain, and the pair
+    is checked here on those proportions rather than on a verdict nobody
+    measured. (Its graded side has no number at all, so the real run gets no
+    bound there: see the test below.)"""
+    # box-sphere's proportions: uniform 1.44%, graded 1.88%, convergence 1.01%
+    assert GM.favourable_bound(0.0144, 0.0188, 0.0101)["still_fail"] is False
+    assert GM.favourable_bound(0.0144, 0.0188, 0.0101)["ratio"] < 1.0
+    # the same pair with a convergence small enough to be a bound at all
+    assert GM.favourable_bound(0.0144, 0.0188, 0.0020)["still_fail"] is True
+
+
+def test_a_bound_needs_all_three_operands():
+    """A bound missing a term would print as a measurement. An analytic
+    reference has no convergence to give away, and a side with no number has no
+    bound either."""
+    assert GM.favourable_bound(None, 0.01, 0.001) is None
+    assert GM.favourable_bound(0.01, None, 0.001) is None
+    assert GM.favourable_bound(0.01, 0.02, None) is None
+
+
+# --------------------------------------------------------------------------
+# the corrected baseline: the uniform side is sized by THIS case's plan
+# --------------------------------------------------------------------------
+
+#: The graded side's one frequency, in Hz. It only has to differ from the
+#: uniform side's, because the fake's two answers are selected by the value the
+#: runner's own ``_kb`` makes of it.
+GRADED_FREQ_HZ = 1.0
+
+
+def _fake_run_case(monkeypatch, baseline: str = "product"):
+    """``run_case`` with every heavy call faked out. Returns ``(result, seen)``.
+
+    ``seen`` records the floor the uniform side was built at, which is the
+    thing the baseline choice moves. ``_build`` reports the two floors the real
+    one measures for ``box-sphere`` (1.0105 mm of base edge on the box's own
+    surface against 2.2533 mm on the fixed icosphere probe), so the arithmetic
+    a test sees is the arithmetic the Orin saw, without meshing anything.
+
+    The two sides are told apart by their SPECTRUM, run through the runner's own
+    ``_kb``: a score fake that branches on a hand-picked number is how this test
+    first returned PASS while asserting UNMEASURED -- the graded frequency
+    landed in the uniform branch, and a faked side that is never asked for a
+    number cannot be the side under test.
+    """
+    import numpy as np
+
+    seen: dict = {}
+    graded_kb = float(GM._kb(np.array([GRADED_FREQ_HZ]), 5.0)[0])
+
+    def fake_build(case, n_modes):
+        return {"obj": b"o wall\no core\n", "parts": None,
+                "plan": {"0": {"edge_m": 1e-3, "unclamped_m": 1e-3}},
+                "h_min_mm": 0.3368, "probe_h_min_mm": 0.7511,
+                "layers": [], "scale_mm": 5.0}
+
+    def fake_graded(case, obj, work, *, grid, backend, verbose):
+        return ({"n_tets": 1000},
+                {"mesh": {"regions": {"0": {"target_edge_units": 1.0}}}},
+                np.array([GRADED_FREQ_HZ]), 0.5)
+
+    def fake_uniform(materials, obj, case, h_min_mm, *, k, layers, backend,
+                     np_verbose=False):
+        seen.setdefault("uniform_floors", []).append((k, h_min_mm))
+        return None, np.zeros((7, 4), int), np.array([2.0])
+
+    def fake_uniform_regions(case, obj, h_min_mm, verbose=False):
+        seen["region_aware_floor"] = h_min_mm
+        return (np.zeros((5, 4), int), np.zeros(5, int),
+                {"regions": {"0": {"target_edge_units": h_min_mm,
+                                   "achieved_edge_units": 0.9}}})
+
+    def fake_score(kb, reference, n_requested):
+        seen.setdefault("scored", []).append(float(kb[0]))
+        if float(kb[0]) == graded_kb:         # the graded spectrum
+            return {"worst_rel_error": None, "n_clusters": 3, "n_matched": 0,
+                    "n_returned": 1, "spurious": [{"nearest_rel": 0.4}],
+                    "unmatched_reference": ["a", "b", "c"]}
+        return {"worst_rel_error": 0.02, "n_clusters": 3, "n_matched": 3,
+                "n_returned": 3, "spurious": [], "unmatched_reference": []}
+
+    monkeypatch.setattr(GM, "_build", fake_build)
+    monkeypatch.setattr(GM, "_graded", fake_graded)
+    monkeypatch.setattr(GM, "_uniform", fake_uniform)
+    monkeypatch.setattr(GM, "_uniform_regions", fake_uniform_regions)
+    monkeypatch.setattr(GM, "_clusters_pairs", lambda kb: [(1.0, 0, "f", 1)])
+    monkeypatch.setattr(GM.REF, "score_multiplets", fake_score)
+    case = next(c for c in GM.MATRIX if c["label"] == "box-sphere")
+    result = GM.run_case(case, grid=10, backend="cpu", work=Path("/tmp"),
+                         verbose=False, baseline=baseline)
+    return result, seen
+
+
+def test_the_uniform_side_is_sized_by_the_products_own_floor(monkeypatch):
+    """Item 3 of the Orin diagnosis: the bench's uniform mesh must be the mesh
+    the product builds today. Before 2026-10-14 the bench sized it from a fixed
+    icosphere probe; for the box-shaped case the two floors are 2.23x apart, so
+    every verdict on that case was against a mesh the product never builds."""
+    result, seen = _fake_run_case(monkeypatch)
+    out = result["case"]
+    assert out["baseline"] == "product"
+    assert out["h_min_mm"] == 0.3368, out
+    assert out["h_min_mm_product"] == 0.3368 and out["h_min_mm_probe"] == 0.7511
+    floors = {h for _k, h in seen["uniform_floors"]}
+    assert floors == {0.3368}, f"the uniform side was not built at h_min: {floors}"
+    assert seen["region_aware_floor"] == 0.3368
+    # a missing side now reaches the criterion as a REASON, not as a gap
+    assert result["verdict"] == "UNMEASURED"
+    assert "the GRADED mesh" in result["detail"], result["detail"]
+    assert out["graded_score"]["n_returned"] == 1
+    assert out["uniform_regions"]["regions"]["0"]["achieved_edge_units"] == 0.9
+
+
+def test_the_probe_baseline_is_still_selectable_and_both_floors_are_reported(
+        monkeypatch):
+    """The pre-2026-10-14 numbers were measured against the probe floor. They
+    stay reproducible -- and the run says which floor it used either way, so a
+    number cannot be read against the wrong baseline again."""
+    result, seen = _fake_run_case(monkeypatch, baseline="probe")
+    out = result["case"]
+    assert out["baseline"] == "probe"
+    assert out["h_min_mm"] == 0.7511
+    assert {h for _k, h in seen["uniform_floors"]} == {0.7511}
+    # ... and the product's floor is still reported, so the two can be compared
+    assert out["h_min_mm_product"] == 0.3368
+
+
+# --------------------------------------------------------------------------
+# the uniform side's per-region build (item 2)
+# --------------------------------------------------------------------------
+
+def test_the_region_aware_uniform_build_pins_every_region_and_lifts_the_pin(
+        monkeypatch):
+    """Two claims in one: every region was pinned to the SAME floor (or the
+    per-region table would not describe a uniform mesh), and the product's own
+    rule is back afterwards (or the graded side of the same case would have
+    been meshed by the bench)."""
+    import numpy as np
+    import mse_common as C
+    import mse_meshing as MESH
+
+    real_edges = C.region_edges
+    captured: dict = {}
+
+    def fake_tetrahedralize(merged, units, **kw):
+        edges = C.region_edges(0.5e-3, 1.0, kw["materials"], kw["parts"], "mm")
+        captured["edges"] = edges
+        captured["still_the_real_one"] = C.region_edges is real_edges
+        MESH.LAST_MESH_REPORT = {"regions": {"0": {"target_edge_units": 0.3368}}}
+        return None, np.zeros((3, 4), int), np.zeros(3, int)
+
+    case = next(c for c in GM.MATRIX if c["label"] == "c1.5-thick")
+    built = GM._build(case, case["n_modes"])
+    monkeypatch.setattr(MESH, "tetrahedralize", fake_tetrahedralize)
+    tets, regions, report = GM._uniform_regions(case, built["obj"], 0.3368)
+
+    assert C.region_edges is real_edges, "the product's rule was left patched"
+    assert captured["still_the_real_one"] is False, "the pin never went in"
+    assert captured["edges"], "the real region_edges returned no region"
+    for rid, info in captured["edges"].items():
+        assert info["edge"] == 0.3368 * 1e-3, (rid, info)
+        assert info["unclamped"] == 0.3368 * 1e-3, (rid, info)
+    assert len(captured["edges"]) == len(case["materials"]), (
+        "fewer regions were pinned than the case has: "
+        f"{sorted(captured['edges'])}")
+    assert report == {"regions": {"0": {"target_edge_units": 0.3368}}}
+    assert tets.shape[0] == 3 and regions.shape[0] == 3
+
+
+# --------------------------------------------------------------------------
+# item 4's two new case types
+# --------------------------------------------------------------------------
+
+def test_a_core_lighter_than_its_shell_plans_uniformly():
+    """A dense shell around a lighter core: no region is denser than the wall,
+    so the rule's raw edges are h*2/2 = h and h*2/1 = h. The case exists to say
+    whether the rule does anything at all there; the plan is the answer, and it
+    is measurable without meshing."""
+    case = next(c for c in GM.MATRIX if c["label"] == "shell-dense")
+    plan = GM._build(case, case["n_modes"])["plan"]
+    edges = [v["edge_m"] for v in plan.values()]
+    assert len(edges) >= 2, plan
+    assert max(edges) - min(edges) <= 1e-12 + 1e-6 * min(edges), plan
+
+
+def test_a_wall_with_index_above_one_is_divided_by_its_own_index():
+    """The other new type: n_wall = 2.0, which every earlier case left at 1.0.
+    The rule is ``raw_r = min(h, h * n_wall / n_r)``, so the wall keeps h and
+    the core -- the only region denser than the wall -- gets 2h/3. The middle
+    region asks h*2/1.5, ABOVE h, so it lands on the outer ``min(h, .)``: the
+    rule never coarsens a region past the wall, and this case is the only one
+    whose ramp would go there. Measured on the corrected baseline: 2.4313 mm
+    for the wall and the middle region, 1.6209 mm for the core.
+    """
+    case = next(c for c in GM.MATRIX if c["label"] == "ramp-outward")
+    plan = GM._build(case, case["n_modes"])["plan"]
+    edges = sorted(v["edge_m"] for v in plan.values())
+    assert len(edges) == 3, plan
+    assert abs(edges[0] - (2.0 / 3.0) * edges[1]) < 1e-9 * edges[1], edges
+    assert edges[1] == edges[2], (
+        f"the middle region should have been capped at the wall's edge: {edges}")
+    # the cap, not the material ratio, is what keeps the wall from coarsening:
+    # the largest raw ask in the plan IS the wall's own edge, nothing is past it
+    h = max(v["unclamped_m"] for v in plan.values())
+    assert h == edges[2], (edges, h)
+    assert any(v["edge_m"] == h and v["unclamped_m"] == h
+               for v in plan.values()), plan
+
+
+def test_the_shell_dense_case_predicts_an_equal_pair():
+    """The estimator's two paths (the graded one and the min_feature_m one)
+    must agree when the plan is uniform, or a 'uniform' case would be scored
+    against a differently-sized uniform mesh. This is the case built to have an
+    exactly uniform plan."""
+    case = next(c for c in GM.MATRIX if c["label"] == "shell-dense")
+    pred = GM.predicted_counts(case)
+    assert pred["counts"]["graded"] == pred["counts"]["uniform"], pred["counts"]
+
+
+# --------------------------------------------------------------------------
+# the list says when a number was measured against the other baseline
+# --------------------------------------------------------------------------
+
+def test_the_list_gives_the_base_edge_ratio_and_not_the_count_ratio(
+        monkeypatch, capsys):
+    """The floors are lengths and the counts are volumes, so the count ratio is
+    the length ratio CUBED. An earlier version of this line printed the count
+    ratio as if it were the length: box-sphere read 'the old probe floor
+    0.7511mm is 0.09x the product's 0.3368mm' when the floor is 2.23x the
+    product's and the MESH is 0.09x the elements."""
+    def fake(case):
+        return {"h_min_mm": 0.3368, "probe_h_min_mm": 0.7511,
+                "probe_uniform_tets": 11_564, "baseline_ratio": 0.0901,
+                "counts": {"graded": 18_466, "uniform": 128_225},
+                "over_ceiling": []}
+
+    monkeypatch.setattr(GM, "predicted_counts", fake)
+    GM.list_cases(GM.MATRIX[:1])
+    out = capsys.readouterr().out
+    assert "2.23x the product's 0.3368mm" in out, out
+    assert "11,564 tets on the old baseline and 128,225" in out, out
+    assert "0.09x" not in out, out
+    # the count runs once per row and once in the summary, so one case with a
+    # deviating floor says "1 of 1" rather than leaving the reader to count
+    # warning lines.
+    assert "1 of 1 cases" in out, out
+
+
+def test_the_list_says_nothing_when_the_two_floors_agree(monkeypatch, capsys):
+    """The warning is a claim about a DIFFERENCE; with the floors equal it must
+    be silent, or it would colour every row."""
+    def fake(case):
+        return {"h_min_mm": 0.5, "probe_h_min_mm": 0.501,
+                "probe_uniform_tets": 1000, "baseline_ratio": 1.0,
+                "counts": {"graded": 900, "uniform": 1000},
+                "over_ceiling": []}
+
+    monkeypatch.setattr(GM, "predicted_counts", fake)
+    GM.list_cases(GM.MATRIX[:1])
+    out = capsys.readouterr().out
+    assert "base edge" not in out, out
+    assert "cases:" not in out, out
+
+
+def test_the_case_print_block_survives_a_result_with_gaps(monkeypatch, capsys):
+    """``main --case`` is the only place the per-region lines are printed, and
+    for a while nothing reached it: a real run needs a solve, which is tier 2
+    and not this suite's to start.
+
+    So it is fed ``run_case``'s own output shape with the heavy calls faked --
+    and deliberately a HOLEY one, because every gap is a branch: the graded side
+    has no ``achieved_edge_units``, so the block must print the missing number
+    rather than a zero, and the fake's graded side is the missing one, so the
+    UNMEASURED detail has to survive the trip to stdout too.
+    """
+    _fake_run_case(monkeypatch)
+    rc = GM.main(["--case", "box-sphere", "--grid", "10", "--backend", "cpu",
+                  "--quiet"])
+    out = capsys.readouterr().out
+    assert "RAISED" not in out, out
+    assert rc == GM.MATRIX_INCOMPLETE, out
+    assert "graded 1,000 tets; uniform" in out, out
+    assert "baseline product: h_min 0.3368 mm (product 0.3368, probe 0.7511)" in out, out
+    assert "graded region 0: asked 1.0 units, built None" in out, out
+    assert "uniform region 0: asked 0.3368 units, built 0.9" in out, out
 
 
 if __name__ == "__main__":  # pragma: no cover

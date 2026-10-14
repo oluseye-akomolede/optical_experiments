@@ -238,6 +238,9 @@
       tier-2 mark is 200,000 elements. production refuses an upload above
       1,200,000 and sends one above 15,000 to the GPU.
       ```
+       ^^^ 5.6 CORRECTS THE `h_min` AND `uniform` COLUMNS ABOVE. They were
+       measured against the probe baseline; the values, and three prose claims
+       in this entry, are superseded -- see 5.6 (2026-10-14).
 
       WHICH CASES THE ORIN CANNOT SOLVE UNIFORM, plainly: c3-thick's uniform
       reference predicts 274,415 (the row's own case: built 199,062, OOMed once,
@@ -251,3 +254,238 @@
       UNMEASURED, never a pass. Everything else predicts at or under 195,139 and
       every reference level at or under 137,207. STEP 3 -- the product rule --
       waits for the lead's go: no product rule is changed by this entry.
+
+- [x] 5.6 STEP 2's diagnosis: the six items the lead returned with 5.5, one
+      commit, tier 1 only, no product rule changed (row `600283f7`, 2026-10-14).
+
+      THE ORIN RUN, as the lead reported it: three-region FAIL 0.231% graded vs
+      0.106% uniform (2.17x), 7,319 vs 14,074 tets; offset-sphere FAIL 0.091% vs
+      0.028% (3.27x), 7,238 vs 19,997; c3-thick FAIL 0.749% vs 0.662% (1.13x),
+      16,252 vs 199,062; c4-thin PASS 0.063% vs 0.094% (0.67x), 61,244 vs
+      105,369, wall clamped 3.234 -> 0.994 mm; c4-thick UNMEASURED (graded
+      solved at 1.465%; the uniform side died on the GPU at 121,518 tets,
+      ALLOC_FAILED / NvMap error 12); box-sphere UNMEASURED (graded SOLVED, 5
+      modes, 7,350 tets, yet `graded_worst` None; uniform 1.442% at 4,868 tets;
+      reference convergence 1.007%).
+
+      ITEM 1 -- box-sphere's missing side. Two different faults, one of them the
+      baseline. (a) The report said only that one of the two worst errors was
+      missing. `score_multiplets` returns `worst_rel_error=None` exactly when
+      nothing matched within its 2% tolerance, so a successful solve can produce
+      it -- and the number now says which: `missing_side_reason` names the side,
+      how many of its clusters matched (`n_matched` of `n_clusters`), which
+      reference multiplets went unmatched, and the nearest cluster's distance
+      against that 2% tolerance. Three tier-1 tests pin it, including the arm
+      that must stay silent when a side DID produce a number. (b) "grading
+      builds MORE tets than uniform" was an artifact of item 3's baseline: on
+      the box's own surface the graded build is 7,350 tets (region 0 asks
+      1.0105 mm and builds 0.7769 in 4,454 tets; the core asks 0.3368 and
+      builds 0.3704 in 2,896 -- the count is dominated by the region that is
+      NOT refined), against 105,321 built for the region-aware uniform at the
+      same floor: 14x FEWER, not more. It only looked bigger against the
+      probe-floor uniform's 4,868. Also checked and excluded as a cause: the
+      region tags and the geometry's own eps agree on 100% of tets in every
+      region-aware build except the box's graded (96.05%, 290 tets) and its
+      uniform (99.66%, 358) -- a box/sphere interface layer, not a materials
+      artifact. And the local tier-1 build reproduces the Orin's graded count
+      for box-sphere exactly (7,350; also three-region 7,319, offset-sphere
+      7,238), so the plan and the achieved mesh ARE the objects the Orin solved.
+
+      ITEM 2 -- the uniform side's per-region edges are now emitted next to the
+      graded ones: `_uniform_regions` pins `mse_common.region_edges` to the
+      chosen floor, runs the PRODUCT's own `tetrahedralize` call, records
+      `LAST_MESH_REPORT` and the tet count, and restores the real rule in a
+      `finally` (a test proves both the pin and the lift). It is what showed
+      that "asked" and "built" differ in both directions: in graded builds the
+      unrefined region comes out FINER than asked (0.769 box-sphere, 0.727
+      three-region, 0.735 offset-sphere -- the transition exponent, consistent
+      with the 0.71/0.64/0.80 measured in step 1), while in a uniform build a
+      region can come out 2.16x COARSER (ramp-outward's middle region). So
+      "grading over-refines its coarse region" holds for graded plans, and is
+      not a property of a region.
+
+      ITEM 3 -- is the bench's uniform side the mesh the product builds today?
+      NO, and every pre-2026-10-14 verdict was scored against another mesh. The
+      bench sized the uniform side from a FIXED icosphere probe's floor while
+      the graded plan came from the PRODUCT's own base edge for the case's
+      surface, so the two sides of one comparison sat on different floors. The
+      graded side is what the product builds and is unchanged; the uniform side
+      moves. Measured floor pairs (product's own base edge / old probe floor,
+      mm): c1.5-thick 1.2169/1.1923, c2-thick 0.9127/0.8942, c3-thick
+      0.6084/0.5961, c4-thick 0.6809/0.6679, c2-thin 1.0825/0.8942, c3-thin
+      0.7217/0.5961, c4-thin 0.8085/0.6679, three-region 1.2157/1.1266,
+      box-sphere 0.3368/0.7511, offset-sphere 1.1416/1.1266, shell-dense
+      2.2972/2.2533, ramp-outward 1.6209/1.5022. The product's base edge can
+      only equal or exceed the probe's -- `effective_edge_m` caps a case at the
+      probe's edge and never shrinks below it (the docstring is right; the
+      comment claiming "the SMALLEST h/n_region" is stale) -- so the corrected
+      baseline is COARSER for the thick and thin concentric families and for
+      three-region/ramp, and MUCH FINER for box-sphere, whose surface edge is
+      3x its core's. `run_case(..., baseline=)` now defaults to the product's
+      floor, keeps the old one as `--baseline probe`, and reports BOTH floors on
+      every run, so no run can be read against the wrong one again. The
+      correction's direction per FAIL is stated with item 5.
+
+      ITEM 4 -- the two missing case types, both sized for the Orin. `shell-dense`
+      (dense shell, lighter core, 5 modes): the only case where the rule's outer
+      `min(h, .)` decides the plan -- the core's raw ask is 2h and is capped to
+      h -- so the plan it produces IS uniform, and this case cannot show the
+      rule doing anything. Measured: both regions ask 2.2972 mm and the two
+      meshes come out identical at 2,753 tets each. `ramp-outward` (n_wall =
+      2.0, where every other case has 1.0, 5 modes): the only case that
+      exercises the wall term in the denominator. Measured (tier 1, meshing
+      only, re-run on the corrected baseline): the wall and the middle region
+      both ask 2.4313 mm -- the middle one CAPPED, its material ratio having
+      asked for more -- the core asks 1.6209 (2h/3), and the graded mesh is
+      6,746 tets against 7,350 for the region-aware uniform at the same floor:
+      an 8% saving, which is what a mild ramp buys. The ledger is NOT one-sided
+      and that matters for item 6: the wall accounts for the saving (5,494 tets
+      against 6,710) while the middle region GAINS 612 (1,172 against 560),
+      because in the uniform build that region came out 3.5000 mm against an
+      asked 1.6209 (2.16x COARSE -- item 2's other direction) where the graded
+      build reached 1.9155. Both cases' estimator readings sit ~1.8-1.9x above
+      the built mesh (shell-dense 4,952 estimated for 2,753 built; ramp-outward
+      7,167/13,652 for 6,746/7,350), and the notes in `run_grading_matrix.py`
+      now carry both instruments so neither reads as the other.
+
+      ITEM 5 -- does the uniform-refined reference favour the uniform side, and
+      by how much? Yes, and the bound the lead named is a FLOOR on that
+      favouring rather than a ceiling. Both FAILs, at the Orin's own numbers,
+      with the uniform side given the reference's WHOLE convergence:
+      three-region's converges 0.046%, so 0.152% (0.106 + 0.046) against the
+      graded 0.231% -- 1.52x, still FAIL; offset-sphere's converges 0.005%, so
+      0.033% against 0.091% -- 2.76x, still FAIL. Read the other way the gaps
+      widen (0.060% -> 3.85x, 0.023% -> 3.96x). box-sphere gets no verdict from
+      that pair at all: its reference convergence (1.007%) is 70% of the
+      uniform side's whole score (1.442%), so nothing in the difference is
+      readable -- and on the corrected baseline neither its uniform mesh nor
+      its reference fits tier 2.
+
+      THE SCALE, and why the raw bound is the weakest form of the correction.
+      The quantity measured as "the reference's convergence" is the
+      coarse-vs-finest DIFFERENCE, and for a method of order p refined by
+      r = K_f/K_c that difference is (1 - r**-p) of the finest level's own
+      error: the finer level's error is a MULTIPLE of it. At this bench's
+      1.25 -> 1.5 pair and p = 2 (linear tets, consistent mass) the multiple is
+      1/(1.44 - 1) = 2.27, so the correction is ~2.27x the difference and the
+      1.52x above is the floor of the uniform side's case. At that scale
+      three-region is 0.106 + 2.27 * 0.046 = 0.2105% against 0.231% -- FAIL by
+      1.10x, i.e. real but THIN -- and offset-sphere 0.039% against 0.091%,
+      FAIL by 2.31x. Three-region's verdict would flip to a tie if the
+      reference's own error were more than 2.72x the difference it reports
+      (0.231 - 0.106 = 0.125 / 0.046 = 2.72), which is the honest limit of what
+      these two runs can decide; offset-sphere's does not flip short of 12.6x
+      ((0.091 - 0.028) / 0.005).
+      `favourable_bound` computes both readings, the run prints both, and three
+      tier-1 tests pin them, including the arm that makes the flip happen.
+      Weaker than the bound and still worth saying: both sides are scored
+      against the same reference at the same mode count, the graded mesh's fine
+      region is at the same floor the reference was built on, and the finer
+      reference level is what the convergence was computed from.
+
+      ITEM 3's OTHER HALF, per FAIL, since these are the same two numbers: the
+      Orin's uniform floors were the probe's, and the corrected (product) floor
+      is COARSER by 7.9% in edge for three-region (1.2157 against 1.1266) and
+      1.3% for offset-sphere (1.1416 against 1.1266) -- a coarser uniform mesh
+      can only score WORSE, which raises the bound and narrows the FAIL. So
+      both corrections (the scale above, the baseline here) push the same way,
+      and three-region survives them at ~1.1x while offset-sphere survives at
+      2.3x. box-sphere's uniform moves the other way entirely (2.23x FINER in
+      edge, 128,225 tets against 11,564), and it has no verdict to correct.
+
+      ITEM 6 -- the candidate and its predictions. The candidate is the rule
+      such that only the coarse side moves: keep the densest region at h_min and
+      bring the next region's edge toward it instead of leaving it at h. Every
+      other shape of change (a transition exponent, a per-region clamp) leaves
+      the coarse side at h, and the measured FAILs live exactly there: the
+      unrefined region holds 4,454 of box-sphere's 7,350 tets (61%) at contrast
+      3, 5,704 of three-region's 7,319 (78%) at contrast 2, and 7,058 of
+      offset-sphere's 7,238 (98%) at contrast 2, and it is the region whose edge
+      decides the error. PREDICTIONS, one per FAIL: three-region FAILs again
+      (the coarse edge would have to come down by roughly 1.4x -- sqrt(2) for a
+      second-order method, not the estimator's reading of the same number --
+      before that region's error can halve, and it is 78% of the mesh);
+      offset-sphere FAILs
+      again (same lever, twice the deficit, essentially the whole mesh in the
+      coarse region); box-sphere NO PREDICTION -- its reference cannot be built
+      on tier 2 and its own convergence is 70% of the uniform's error. What the
+      candidate must keep, and cannot be argued from prose: c4-thin's PASS
+      (0.063% vs 0.094%, a clamp case whose clamped wall is what makes the
+      graded side finer). The decider is the matrix rerun on the corrected
+      baseline; this paragraph is a prediction with a falsifier, not a result.
+
+      WHAT 5.5 GOT WRONG, in one place, since its own numbers stay as the record
+      of that run: (a) the `h_min` and `uniform` columns and its sizing sentence
+      ("650,465, 3.3x", "1,097,656 / 2,601,856") were computed against the probe
+      floor; the corrected values are in the `--list` output below and the same
+      three claims at the corrected floors are 611,826 (3.1x), 445,159 and
+      873,764. (b) "c3-thin carries the SAME uniform mesh" as c3-thick is FALSE:
+      the thin wall's clamp raises the case's own base edge (0.7217 against
+      0.6084), so the two uniform meshes differ -- 154,673 estimated for
+      c3-thin against 258,114 for c3-thick, and c3-thin's graded 220,160 and
+      uniform 154,673 are no longer on the same side of the mark as each other.
+      (c) "the estimator's ~1.4x-high reading" is now measured across six
+      compare points: 1.22x (box-sphere uniform 128,225 estimated against
+      105,321 built), 1.30x (c3-thick uniform 258,114 vs 199,062), 1.80x
+      (shell-dense 4,952 vs 2,753), 1.86x (ramp-outward's uniform path 13,652
+      vs 7,350), 2.0x (c2-thin's uniform path 45,829 against 22,947 built) and
+      3.3x (c2-thin's graded path 75,262 against the SAME 22,947, because
+      c2-thin's graded plan is its uniform plan -- the estimator's two paths
+      differ by 1.64x on one and the same mesh). It is NOT reliably high:
+      ramp-outward's graded path reads 7,167 against 6,746 built, 1.06x. So
+      `--list` counts flag a case for the Orin and are not verdicts, in either
+      direction, and the built mesh is the authority. This is the same seam
+      that made c2-thin's uniform look 1.55x the product's mesh before item 3:
+      two instruments, one compared against the other's number.
+
+      THE LIST, corrected baseline (tier 1, `.venv-mse/bin/python`, exit 0).
+      BOTH floors are printed side by side -- that is item 3's question, and a
+      floor printed in a count's place is the defect this row is about -- with
+      the length ratio between them; element counts come from the product's own
+      estimator. Any case whose two floors differ by more than 5% in LENGTH
+      gets a `!` line naming both counts, and one summary line counts them; the
+      count ratio is never printed as a length (it is that ratio cubed, which
+      is how an earlier version of this line read box-sphere as "0.09x" when
+      its floor is 2.23x the product's):
+
+      ```text
+               case    ref  reg modes h_min(prod) h_min(probe)    graded   uniform len-rat  axes
+         c1.5-thick analytic    2    10      1.2169       1.1923    14,958    32,264    0.98  concentric, thick, n=1.5
+           c2-thick analytic    2    10      0.9127       0.8942    20,676    76,478    0.98  concentric, thick, n=2.0
+           c3-thick analytic    2    10      0.6084       0.5961    35,314   258,114    0.98  concentric, thick, n=3.0
+                      ! over the tier-2 mark 200,000: ['uniform'] -- expect UNMEASURED, not a pass
+           c4-thick analytic    2     3      0.6809       0.6679    16,215   184,163    0.98  concentric, thick, n=4.0
+            c2-thin analytic    2    10      1.0825       0.8942    75,262    45,829    0.83  concentric, thin, n=2.0
+                      ! base edge 0.8942mm is 0.83x the product's 1.0825mm here, so this case's uniform side is 81,308 tets on the old baseline and 45,829 on the corrected one
+            c3-thin analytic    2    10      0.7217       0.5961   220,160   154,673    0.83  concentric, thin, n=3.0
+                      ! over the tier-2 mark 200,000: ['graded'] -- expect UNMEASURED, not a pass
+                      ! base edge 0.5961mm is 0.83x the product's 0.7217mm here, so this case's uniform side is 274,415 tets on the old baseline and 154,673 on the corrected one
+            c4-thin analytic    2     3      0.8085       0.6679   161,389   109,990    0.83  concentric, thin, n=4.0
+                      ! base edge 0.6679mm is 0.83x the product's 0.8085mm here, so this case's uniform side is 195,139 tets on the old baseline and 109,990 on the corrected one
+       three-region uniform-refined    3     5      1.2157       1.1266    11,974    32,361    0.93  concentric, thick, n=2.0  refs [63205, 109218]
+                      ! base edge 1.1266mm is 0.93x the product's 1.2157mm here, so this case's uniform side is 40,654 tets on the old baseline and 32,361 on the corrected one
+         box-sphere uniform-refined    2     5      0.3368       0.7511    18,466   128,225    2.23  box, thick, n=3.0  refs [250439, 432759]
+                      ! over the tier-2 mark 200,000: ['ref1.25', 'ref1.5'] -- expect UNMEASURED, not a pass
+                      ! base edge 0.7511mm is 2.23x the product's 0.3368mm here, so this case's uniform side is 11,564 tets on the old baseline and 128,225 on the corrected one
+      offset-sphere uniform-refined    2     5      1.1416       1.1266     9,659    39,081    0.99  offset, thick, n=2.0  refs [76330, 131898]
+        shell-dense uniform-refined    2     5      2.2972       2.2533     4,952     4,952    0.98  concentric, thick, n=2.0  refs [9672, 16713]
+       ramp-outward uniform-refined    3     5      1.6209       1.5022     7,167    13,652    0.93  concentric, thick, n=2.0  refs [26664, 46076]
+                      ! base edge 1.5022mm is 0.93x the product's 1.6209mm here, so this case's uniform side is 17,150 tets on the old baseline and 13,652 on the corrected one
+
+      6 of 12 cases: the old probe's base edge differs from the product's by more than 5% (0.83x to 2.23x). Verdicts measured before 2026-10-14 are against that other baseline.
+
+      axes covered: contrast=[1.5, 2.0, 3.0, 4.0]; shell=['thick', 'thin']; regions=[2, 3]; shape=['box', 'concentric', 'offset']; reference=['analytic', 'uniform-refined']
+      tier-2 mark is 200,000 elements. production refuses an upload above 1,200,000 and sends one above 15,000 to the GPU
+      ```
+
+      ONE PRECISE BLOCKER, for the lead: on the corrected baseline box-sphere's
+      REFERENCE cannot be built at tier 2 -- its finer level needs 250,439 and
+      432,759 elements against the 200,000 mark, though its uniform mesh
+      (128,225) and its graded mesh (18,466) both fit. c3-thick's uniform
+      (258,114) and c3-thin's graded (220,160) are also over the mark. So the
+      matrix as specified needs either a larger tier-2 budget for those three
+      meshes, or box-sphere sized down (a thinner box, or a smaller refine
+      factor for its reference), or explicit UNMEASUREDs -- the lead's call, not
+      this seat's. Note also that these counts are the estimator's, which reads
+      1.2-3.3x high on the meshes we have built, so the Orin may well solve some
+      of them; what is certain is that no verdict for one is a pass.
