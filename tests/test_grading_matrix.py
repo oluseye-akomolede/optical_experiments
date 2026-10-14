@@ -338,7 +338,8 @@ def test_a_bound_needs_all_three_operands():
 GRADED_FREQ_HZ = 1.0
 
 
-def _fake_run_case(monkeypatch, baseline: str = "product", ladder: bool = False):
+def _fake_run_case(monkeypatch, baseline: str = "product", ladder: bool = False,
+                   fine_reference=None):
     """``run_case`` with every heavy call faked out. Returns ``(result, seen)``.
 
     ``seen`` records the floor the uniform side was built at, which is the
@@ -404,7 +405,8 @@ def _fake_run_case(monkeypatch, baseline: str = "product", ladder: bool = False)
     monkeypatch.setattr(GM.REF, "score_multiplets", fake_score)
     case = next(c for c in GM.MATRIX if c["label"] == "box-sphere")
     result = GM.run_case(case, grid=10, backend="cpu", work=Path("/tmp"),
-                         verbose=False, baseline=baseline, ladder=ladder)
+                         verbose=False, baseline=baseline, ladder=ladder,
+                         fine_reference=fine_reference)
     return result, seen
 
 
@@ -894,6 +896,164 @@ def test_the_estimator_table_reports_both_paths_against_built(monkeypatch, capsy
     assert "61,244" in out and "57,872" in out, out
     assert "no built counts here" in out           # the cases without a file
     assert "over the tier-2 mark 200,000 on built graded" in out, out
+
+
+# --------------------------------------------------------------------------
+# step 2c: the finer reference rung, the self-ladder, and one line per number
+# --------------------------------------------------------------------------
+
+def test_a_finer_reference_rung_is_finer_and_the_richardson_scale_follows_it():
+    """Item 1's arithmetic: the rungs and the correction come from ONE tuple."""
+    assert GM.refine_factors() == GM.REFINE_FACTORS
+    assert GM.refine_factors(2.0) == (1.25, 1.5, 2.0)
+    # Not finer is not a finer rung -- the option must not silently REPLACE the
+    # finest rung with a coarser one, which would loosen the reference.
+    with pytest.raises(ValueError, match="must be >"):
+        GM.refine_factors(1.5)
+    with pytest.raises(ValueError, match="must be >"):
+        GM.refine_factors(1.0)
+    # The default pair's documented constant still derives from the default.
+    assert GM.RICHARDSON_SCALE == pytest.approx(2.27, abs=0.01)
+    # A wider coarse:fine ratio means a SMALLER correction: the finer reference
+    # is closer to converged, so its own error is a smaller share of the
+    # measured convergence. Read from the tuple, never a constant.
+    assert GM.richardson_scale((1.25, 1.5, 2.0)) == pytest.approx(
+        1.0 / (1.6 ** 2 - 1.0), abs=1e-9)
+
+
+def test_the_fine_reference_flag_adds_exactly_one_finer_rung(monkeypatch):
+    """Item 1: the knob is opt-in and adds ONE rung through the real run_case."""
+    _result, seen = _fake_run_case(monkeypatch)
+    assert sorted(k for k, _h in seen["uniform_floors"]) == [1.0, 1.25, 1.5]
+    result, seen = _fake_run_case(monkeypatch, fine_reference=1.75)
+    ks = sorted(k for k, _h in seen["uniform_floors"])
+    assert ks == [1.0, 1.25, 1.5, 1.75], ks
+    # The run records the tuple it actually used, so the Richardson scale the
+    # report quotes can never come from a different ladder.
+    assert result["case"]["refine_factors"] == [1.25, 1.5, 1.75]
+
+
+def test_the_self_ladder_scores_every_rung_against_the_finest(monkeypatch):
+    """Item 2, step 2c: the ladder with the reference taken out.
+
+    Every rung but the finest is scored against the FINEST rung's own spectrum,
+    so a non-falling error can be split into "the mesh is moving" vs "the
+    reference is moving". The finest rung would score against itself, so it is
+    left out rather than listed as a meaningless 0.0.
+    """
+    import numpy as np
+
+    seen = {}
+
+    def pairs(kb):
+        seen["reference_from"] = float(np.asarray(kb)[0])
+        return [(1.0, 0, "f", 2)]
+
+    def score(kb, reference, n_requested):
+        return {"worst_rel_error": 0.005 * float(np.asarray(kb)[0]),
+                "n_matched": 2}
+
+    monkeypatch.setattr(GM, "_clusters_pairs", pairs)
+    monkeypatch.setattr(GM.REF, "score_multiplets", score)
+    levels = {1.0: np.array([1.0]), 1.25: np.array([2.0]), 1.5: np.array([4.0])}
+    ladder = GM.self_ladder(levels, 2)
+    assert [r["k"] for r in ladder] == [1.0, 1.25]
+    assert all(r["against"] == 1.5 for r in ladder)
+    assert seen["reference_from"] == 4.0          # built from the FINEST rung
+    assert [r["self_rel_error"] for r in ladder] == [0.005, 0.01]
+    # One rung is not a ladder, and says so by returning nothing rather than a
+    # single row that would read as a converged mesh.
+    assert GM.self_ladder({1.0: np.array([1.0])}, 2) == []
+
+
+def test_the_self_ladder_note_attributes_the_non_falling_error():
+    """The two readings of a non-falling ladder, and which way each points."""
+    settled = [{"k": 1.25, "against": 1.5, "self_rel_error": 0.0004,
+                "n_matched": 5}]
+    # The two rungs agree with each other (0.040%) far better than with the
+    # reference (0.430%): the mesh has converged, so the REFERENCE is what moved.
+    note = GM._self_ladder_note(settled, 0.0043)
+    assert "REFERENCE is what moved" in note, note
+    # The rungs disagree by as much as the reference step: the mesh itself is
+    # still moving and no reference at these levels can decide it.
+    moving = [{"k": 1.25, "against": 1.5, "self_rel_error": 0.006,
+               "n_matched": 5}]
+    note = GM._self_ladder_note(moving, 0.0043)
+    assert "mesh itself is still moving" in note, note
+    # No self-ladder (a single level) or an unmatched step => no clause, rather
+    # than a clause built on a missing number.
+    assert GM._self_ladder_note([], 0.0043) is None
+    assert GM._self_ladder_note(settled, None) is None
+    assert GM._self_ladder_note(
+        [{"k": 1.25, "against": 1.5, "self_rel_error": None}], 0.0043) is None
+
+
+def test_reliability_marks_an_analytic_reference_unusable():
+    """Item 2, step 2c: a closed-form reference has no finer level to converge
+    into, so a non-falling ladder condemns the CASE, not merely the verdict."""
+    up = [{"k": 1.0, "worst_rel_error": 0.01, "n_matched": 1},
+          {"k": 1.25, "worst_rel_error": 0.02, "n_matched": 1}]
+    analytic = GM.reliability(up, 2, [], reference_kind="analytic")
+    assert "does not fall" in analytic and "ANALYTIC" in analytic, analytic
+    # Same diagnosis for a meshed reference, WITHOUT the unusable clause: it can
+    # be refined, so the case is unjudged, not condemned.
+    meshed = GM.reliability(up, 2, [], reference_kind="uniform-refined")
+    assert "does not fall" in meshed and "ANALYTIC" not in meshed, meshed
+    # The clause attaches only to the non-falling branch: a ladder that does not
+    # rise is judged, not marked unusable.
+    flat = [{"k": 1.0, "worst_rel_error": 0.02, "n_matched": 1},
+            {"k": 1.25, "worst_rel_error": 0.02, "n_matched": 1}]
+    assert GM.reliability(flat, 2, [], reference_kind="analytic") is None
+
+
+def test_the_reference_convergence_line_does_not_duplicate_the_favourable_one(
+        monkeypatch, capsys):
+    """Item 3 of step 2c: one number, one line.
+
+    The favourable line states the reference's convergence inside its own
+    arithmetic, so a standalone line beside it printed the same percentage
+    twice -- which reads as two measurements. It is kept only for the case the
+    favourable line cannot be built (a missing worst error), where it is the
+    only carrier.
+    """
+    import numpy as np
+
+    label = "reference's own convergence (coarse vs finest)"
+
+    def scored(kb, reference, n_requested):
+        graded = float(np.asarray(kb)[0]) < 1.0
+        return {"worst_rel_error": 0.001 if graded else 0.02, "n_clusters": 3,
+                "n_matched": 3, "n_returned": 3, "spurious": [],
+                "unmatched_reference": []}
+
+    _fake_run_case(monkeypatch)
+    monkeypatch.setattr(GM.REF, "score_multiplets", scored)
+    GM.main(["--case", "box-sphere", "--grid", "10", "--backend", "cpu",
+             "--quiet"])
+    out = capsys.readouterr().out
+    assert "most favourable reading" in out, out
+    assert label not in out, out
+
+    # The positive control: with no graded worst error the favourable line is
+    # not built, and the standalone line must be its ONLY carrier -- once.
+    _fake_run_case(monkeypatch)                    # the default fake: graded None
+    GM.main(["--case", "box-sphere", "--grid", "10", "--backend", "cpu",
+             "--quiet"])
+    control = capsys.readouterr().out
+    assert "most favourable reading" not in control, control
+    assert control.count(label) == 1, control
+
+
+def test_list_says_it_ignores_a_fine_reference(monkeypatch, capsys):
+    """--list sizes the DEFAULT ladder, so the flag must not be absorbed in
+    silence -- a reader could size the requested rung off the wrong row."""
+    monkeypatch.setattr(GM, "list_cases", lambda cases: GM.MATRIX_OK)
+    assert GM.main(["--list"]) == GM.MATRIX_OK
+    assert "note:" not in capsys.readouterr().out      # control: silent unused
+    assert GM.main(["--list", "--fine-reference", "1.75"]) == GM.MATRIX_OK
+    out = capsys.readouterr().out
+    assert "1.75 is a case-run rung" in out, out
+    assert "NOT in this table" in out, out
 
 
 if __name__ == "__main__":  # pragma: no cover

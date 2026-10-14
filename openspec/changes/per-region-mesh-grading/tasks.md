@@ -643,3 +643,150 @@
 
       Bench only. No product rule, estimate or threshold is touched. Step 3
       remains NO GO.
+
+- [x] 5.8 STEP 2c: the four items the lead returned with 5.7 -- bench only, one
+      commit, tier 1, no product rule changed, step 3 still NO GO (row
+      `600283f7`, 2026-10-14). Two files, `benchmarks/run_grading_matrix.py` and
+      `tests/test_grading_matrix.py`. 54 tests green (`PYTEST_EXIT=0`, 141.75s),
+      `openspec validate` clean. `--list` still exits 0 (`LIST_EXIT=0`,
+      measured with the flag), and now SAYS so when handed `--fine-reference`:
+      its refs column comes from `REFINE_FACTORS`, so a silently absorbed flag
+      would let a reader size the requested rung off the wrong row, and an
+      ESTIMATED count for it would be worse than none (the bench's cube law
+      misses k=2.0 by 1.43x, see ITEM 1). The tier-1 run caught
+      one real defect of my own before the commit: `self_ladder` called
+      `REF._clusters_pairs`, but `_clusters_pairs` is a module-level function of
+      the runner (`sphere_dielectric`, which has no such attribute, is
+      `score_multiplets`' module). Every `run_case` with two or more rungs raised
+      `AttributeError`; 11 tests were red, 8 of them pre-existing. One-line fix
+      (`_clusters_pairs(levels[finest])`, the same call the reference builder
+      makes), all 54 green. Nothing was committed while red.
+
+      ITEM 1 -- a finer reference rung, as an OPTION not a default.
+      `--fine-reference K` adds ONE rung at `h_min/K`, finer than the default
+      finest (1.5), to `REFINE_FACTORS`; it is opt-in because it is a real
+      build, and `refine_factors` REFUSES `K <= 1.5` (a "finer" rung that is not
+      finer would silently REPLACE the finest rung with a coarser one and
+      loosen the reference). For a uniform-refined case the reference IS the
+      finest rung's build, so a finer rung tightens the reference's own
+      convergence -- the knob for the undecidable gaps (centred-core's 0.038%
+      under 0.043%; offset-sphere 3.27x). `richardson_scale(factors)` derives
+      `1/(r**2 - 1)` from the run's own tuple, so the correction can never come
+      from a different ladder (default pair 2.27; with 2.0, 0.64).
+
+      The measured price, tier 1, meshing only (a scratch probe in /tmp
+      (`probe_item12.py`); rerun it before quoting -- these are measurements,
+      not a spec):
+
+      ```text
+        k     centred-core   offset-sphere   c4-thin
+        1.0        20,323          20,266      57,872
+        1.25       39,448          48,568     189,127
+        1.5        81,091         103,623     215,551
+        1.75      130,447         142,555     355,400   <- the affordable k
+        2.0       232,242   !     278,569   !  595,791
+                  ^ over the 200,000 tier-2 mark for BOTH sphere cases
+      ```
+
+      So k=2.0 does NOT fit this matrix (232,242 and 278,569 built against the
+      200,000 mark) and c4-thin fits neither at any level at or above 1.5; k=1.75
+      is the affordable tightening (130,447 / 142,555, both under). The bench's
+      own cube-law estimate (`uniform_count * k**3`, the estimator's rule) would
+      have said 162,584 for centred-core at k=2.0 -- 1.43x UNDER the 232,242
+      actually built, another face of item 5 and a reminder to spend the build,
+      not the estimate, when the price is what is being asked.
+
+      ITEM 2 -- why the uniform error rises with refinement, and marking the
+      analytic reference unusable there. TWO claims, one falsified first:
+
+      * FALSIFIED: "the mesh is a frozen polyhedron and the reference describes a
+        different volume/radius". An icosphere R=4.0 at te=1.0 mm has faceted
+        volume 0.991394x the ideal sphere (0.86% low), AND the surface refines:
+        distinct near-surface radii grow 18 -> 59 -> 2662 as the edge halves
+        1.0 -> 0.5 -> 0.25 mm (`probe_item2.py`). The mesh is not fixed; it
+        refines. So the faceting story is not what moves the error.
+      * THE MEASURED CAUSE: a THIN region is pinned by its own thinness and the
+        achieved edge does not track the requested one. c4-thin's wall
+        (thickness 0.9943 mm) achieves an edge far coarser than asked at every
+        level (target 0.5390 -> achieved 0.6974 at k=1.5; 0.4043 -> 0.4838 at
+        k=2.0), while the core (5.9768 mm) refines -- and the core's own
+        achieved edge is NOT monotone in k (0.4636 at 1.25, then 0.5032 at
+        1.5). The "ladder" is therefore not one family: each rung is a
+        differently-refined mesh, and eigenvalues wander at the 0.1% level,
+        which is the scale of the errors being compared (0.034%, 0.004%,
+        0.098%, 0.191%). A non-falling ladder here is a statement about the
+        FIXTURE, not about grading.
+
+      Fix, exactly as asked: `reliability(..., reference_kind="analytic")` now
+      appends, to the case it already refuses as UNRELIABLE (exit 6), why it can
+      never be improved: "the reference is ANALYTIC, a closed-form spectrum with
+      no finer level of its own to converge into, so it cannot be tightened --
+      this case is unusable as a grading fixture until it has a meshed
+      reference". A meshed reference gets the same non-falling diagnosis WITHOUT
+      that clause (it can be refined, so the case is unjudged, not condemned).
+      Note `--fine-reference` cannot rescue an analytic case: it adds a MESH
+      rung, and an analytic reference is computed, not built, so the reference
+      does not change.
+
+      INSTRUMENT for the next Orin run: `self_ladder(levels, n_modes)` scores
+      every uniform rung against the FINEST rung's OWN spectrum (the reference
+      taken out), costing no extra solve, because for a FIXED reference the
+      change in the error against it between two rungs equals the change between
+      those rungs' own spectra. `_self_ladder_note` reads it against the
+      reference step and attributes the non-falling ladder either way ("the mesh
+      has converged and the REFERENCE is what moved" vs "the mesh itself is
+      still moving and no reference at these levels can decide it"). It prints
+      as `[matrix] uniform SELF-ladder ...` and travels in the JSON.
+      PREDICTION (c4-thin): the 1.25 -> 1.5 self-gap is about 0.093% (the
+      difference of the two reference-side errors 0.098% and 0.191%, same sign),
+      i.e. at least the 0.093% reference step, so the note reads "the mesh
+      itself is still moving" and the analytic reference is not merely mistuned
+      but unable to decide this case. FALSIFIER: if the printed SELF-ladder
+      shows that gap far BELOW 0.093%, the mesh has converged and the
+      reference-geometry story survives after all.
+
+      ITEM 3 -- the duplicate print. WHAT I FOUND: on this code the
+      favourable/Richardson pair prints ONCE per case -- `grep -c "most
+      favourable"` is 1 in `centred-core.log` and 0 in every other log under
+      `~/mse-bench/matrix-f6f0efd`, so I could not reproduce "prints twice" from
+      the artifacts. WHAT WAS duplicated and is now fixed: (a) the reference's
+      convergence percentage printed on a standalone line AND again inside the
+      favourable line's arithmetic; (b) on UNRELIABLE the reliability sentence
+      appeared both at the end of the verdict detail and on a separate
+      `verdict reliability` line. Both are now single-carrier: the standalone
+      convergence line prints only when the favourable line cannot be built (a
+      missing worst error leaves the bound with an operand missing), and the
+      reliability line only when the verdict is NOT UNRELIABLE (whose detail
+      already ends with it). Test, with its own control: the favourable case
+      prints the standalone label zero times; the same run with no graded error
+      prints it exactly once. If the pair still appears twice on the lead's
+      terminal, that is not in the code or the artifacts I can read -- paste it.
+
+      ITEM 4 -- the exact Orin commands (tier 2; I ran none of these -- whole-case
+      solves are the lead's). The flags are what matters; adapt the path/venv:
+
+      ```text
+      # 1. centred-core with the closest AFFORDABLE reference. k=1.75 built
+      #    130,447 (under 200,000); k=2.0 is 232,242 and must NOT be used.
+      run_grading_matrix.py --case centred-core --baseline product --fine-reference 1.75 --backend gpu --json centred-core-fine.json
+
+      # 2. offset-sphere, same tightening (142,555 built at k=1.75):
+      run_grading_matrix.py --case offset-sphere --baseline product --fine-reference 1.75 --backend gpu --json offset-sphere-fine.json
+
+      # 3. c4-thin: the --ladder run, unchanged. Item 2 needs no new rung -- the
+      #    SELF-ladder is computed from rungs already built; this reproduces the
+      #    UNRELIABLE and now records WHY, in the JSON and the log.
+      run_grading_matrix.py --case c4-thin --baseline product --ladder --backend gpu --json c4-thin-ladder2.json
+      ```
+
+      What the new JSON carries: `refine_factors` (the tuple that ran, so the
+      Richardson scale can be checked against it), `uniform_self_ladder`
+      (per-rung `self_rel_error` against the finest), and, for a finer-reference
+      run, a reference built from the newest finest rung. Expectation for command
+      1: the reference's convergence at 1.25 vs 1.75 is tighter than 0.043%, and
+      if it drops below the 0.038% gap the case becomes decidable; the SELF-ladder
+      is the check that the tightening is honest, since it shows whether the
+      finest two rungs are still moving.
+
+      Bench only. No product rule, estimate or threshold is touched. Step 3
+      remains NO GO.

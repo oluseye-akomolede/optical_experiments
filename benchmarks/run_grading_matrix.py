@@ -141,6 +141,51 @@ TIER2_MAX_TETS = 200_000
 #: between the two levels is what has to carry its trust.
 REFINE_FACTORS = (1.25, 1.5)
 
+#: ``--fine-reference K`` (item 1, step 2c): one extra rung FINER than the
+#: default finest, and the reference itself for a uniform-refined case. Two
+#: uniform-refined cases (centred-core, offset-sphere) were undecidable because
+#: the gap being judged (0.038%) sat under the reference's own convergence at
+#: 1.25 vs 1.5 (0.043%); a reference one rung finer shrinks that convergence.
+#: K is required rather than defaulted, because the cost is real and per-case:
+#: the rung is BUILT, not estimated, and no single value fits every case. The
+#: measured price of the two obvious choices (tier 1, ``probe_item1.py``,
+#: meshing only -- rerun it before quoting: it is a measurement, not a spec):
+#:
+#:     k     centred-core   offset-sphere   c4-thin
+#:     1.75     130,447         142,555      355,400
+#:     2.0      232,242         278,569      595,791   <- k=2.0 is OVER the
+#:                                                       200,000 tier-2 mark
+#:                                                       for both sphere cases
+#:
+#: So k=1.75 is the affordable tightening for those two; k=2.0 fits neither, and
+#: c4-thin fits neither at any of these levels. ``refine_factors``/
+#: ``richardson_scale`` keep the run's rungs and the Richardson ratio derived
+#: from the SAME tuple, so the correction always matches the ladder that ran.
+
+
+def refine_factors(fine=None):
+    """The ladder this run uses: the default rungs, plus a finer one if asked.
+
+    ``fine`` is the k of one extra rung FINER than the default finest. It is the
+    reference itself for a uniform-refined case, so a finer one is a tighter
+    reference -- and it also changes the coarse:fine ratio the Richardson
+    correction is derived from, which is why the scale is computed from the
+    returned tuple and never from a constant.
+    """
+    if fine is None:
+        return tuple(REFINE_FACTORS)
+    if float(fine) <= REFINE_FACTORS[-1]:
+        raise ValueError(
+            f"a finer reference rung must be > {REFINE_FACTORS[-1]} (the "
+            f"current finest), got {fine}")
+    return tuple(REFINE_FACTORS) + (float(fine),)
+
+
+def richardson_scale(factors):
+    """``1 / (r**p - 1)`` for the run's own coarse:fine ratio at p = 2."""
+    return 1.0 / ((factors[-1] / factors[0]) ** 2 - 1.0)
+
+
 #: The coarse rung, built only under ``--ladder`` (item 2). Below 1.0 on purpose:
 #: the refinement levels are all finer than the comparison mesh, so on their own
 #: they can only ever show the error FALLING towards the reference -- a case
@@ -812,6 +857,35 @@ def level_errors(levels, reference, n_modes):
     return out
 
 
+def self_ladder(levels, n_modes):
+    """Each uniform rung scored against the FINEST rung's own spectrum.
+
+    The ladder with the reference taken out of it (item 2, step 2c). A
+    non-falling error ladder has two causes with opposite verdicts: the mesh is
+    not converging, or the mesh IS converging and the reference is what moves.
+    Scoring every rung against the finest rung's spectra separates them and
+    costs no solve, because ``levels`` already holds them.
+
+    The comparison is legitimate, not a proxy: for a FIXED reference the change
+    in the error against it between two rungs equals the change between those
+    two rungs' own spectra, both taken through ``score_multiplets`` as the same
+    ``worst_rel_error``. When the two differ, the reference is the one moving.
+    """
+    if len(levels) < 2:
+        return []
+    finest = max(levels)
+    reference = _clusters_pairs(levels[finest])
+    out = []
+    for k in sorted(levels):
+        if k == finest:
+            continue
+        score = REF.score_multiplets(levels[k], reference, n_requested=n_modes)
+        out.append({"k": k, "against": finest,
+                    "self_rel_error": score.get("worst_rel_error"),
+                    "n_matched": score.get("n_matched")})
+    return out
+
+
 def reference_multiplets_in_reach(reference, n_modes):
     """Distinct reference multiplets the ASKED-FOR modes can reach.
 
@@ -832,7 +906,31 @@ def reference_multiplets_in_reach(reference, n_modes):
     return max(len(distinct), 1)
 
 
-def reliability(errors, n_multiplets, rows):
+def _self_ladder_note(selflad, ref_step):
+    """One clause naming what the mesh did on its own, or ``None``.
+
+    ``selflad`` is :func:`self_ladder`; ``ref_step`` is how much the error
+    against the reference moved over the same finest step (a magnitude). Both
+    are ``worst_rel_error`` from the same scorer, so they are directly
+    comparable and no factor is picked: when the mesh's own step is smaller,
+    the reference is what moved.
+    """
+    entries = [e for e in (selflad or []) if e.get("self_rel_error") is not None]
+    if not entries or ref_step is None:
+        return None
+    e = entries[-1]                      # the finest step the ladder has
+    own = e["self_rel_error"]
+    if own < ref_step:
+        return (f"whereas the same two rungs differ from each other by only "
+                f"{own * 100:.3f}% (k = {e['k']:g} -> {e['against']:g}), so the "
+                "mesh has converged and the REFERENCE is what moved")
+    return (f"and the same two rungs differ from each other by {own * 100:.3f}% "
+            f"(k = {e['k']:g} -> {e['against']:g}) against "
+            f"{ref_step * 100:.3f}% against the reference, so the mesh itself is "
+            "still moving and no reference at these levels can decide it")
+
+
+def reliability(errors, n_multiplets, rows, selflad=None, reference_kind=None):
     """``None`` if this case can carry a verdict, else the reason it cannot.
 
     Two failure modes, both of which make a PASS or a FAIL read as information
@@ -845,6 +943,11 @@ def reliability(errors, n_multiplets, rows):
     * the case has a single reference multiplet, so one signed number decides
       everything and a crossing has nowhere else to show itself (c4-thin: three
       modes are one triplet, and one triplet is one number).
+
+    ``reference_kind`` marks the further consequence for an ``analytic``
+    reference: a closed-form spectrum has no finer level of its own to converge
+    into, so when the ladder does not fall there is no knob left to tighten
+    it -- the case is unusable as a grading fixture, not merely unjudged.
     """
     worsts = [e["worst_rel_error"] for e in errors
               if e.get("worst_rel_error") is not None]
@@ -854,9 +957,16 @@ def reliability(errors, n_multiplets, rows):
     ladder = ", ".join(f"{w * 100:.3f}%" for w in worsts)
     ks = ", ".join(f"{e['k']:g}" for e in errors)
     if len(worsts) >= 2 and any(b > a for a, b in zip(worsts, worsts[1:])):
+        ref_step = abs(worsts[-1] - worsts[-2])
+        note = _self_ladder_note(selflad, ref_step)
+        analytic = ("; the reference is ANALYTIC, a closed-form spectrum with no "
+                    "finer level of its own to converge into, so it cannot be "
+                    "tightened -- this case is unusable as a grading fixture "
+                    "until it has a meshed reference"
+                    if reference_kind == "analytic" else "")
         return ("the uniform side's error does not fall as its mesh is refined "
                 f"({ladder} at k = {ks}), so it is not tracking "
-                "discretisation")
+                "discretisation" + (f"; {note}" if note else "") + analytic)
     if n_multiplets <= 1:
         return (f"the reference has {n_multiplets} multiplet, so one signed "
                 "number decides the verdict and a zero crossing has nowhere "
@@ -964,11 +1074,12 @@ def favourable_bound(uniform_worst, graded_worst, reference_convergence,
 #: eigenproblem's discretisation (p = 2 for linear tets with a consistent mass),
 #: applied only to a reference's coarse-vs-finest convergence. See
 #: ``favourable_bound``.
-RICHARDSON_SCALE = 1.0 / ((REFINE_FACTORS[-1] / REFINE_FACTORS[0]) ** 2 - 1.0)
+RICHARDSON_SCALE = richardson_scale(REFINE_FACTORS)
 
 
 def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
-             baseline: str = "product", ladder=False) -> dict:
+             baseline: str = "product", ladder=False,
+             fine_reference: float | None = None) -> dict:
     """Build, mesh and solve ONE matrix case, and judge it.
 
     ``baseline`` picks the resolution of the UNIFORM side: ``"product"`` builds
@@ -981,6 +1092,11 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
     ``ladder`` adds the coarse rung (see ``COARSE_RUNG``) so the uniform side's
     error can be seen from both sides of the reference; without it a crossing is
     invisible. It costs one extra build and its solve.
+
+    ``fine_reference`` adds one rung FINER than the default finest (see
+    ``refine_factors``), which tightens the reference's own convergence for a
+    uniform-refined case -- the knob for a gap that sits under the reference's
+    error. It costs one extra build and its solve, and the price grows ~K^3.
     """
     import mse_maxwell_solver as SOLVER
 
@@ -1031,7 +1147,13 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
     # k = 1.0 and k = 1.25 below the reference, a case has ONE informative rung.
     # The coarse rung adds the second, at k < 1 (a coarser mesh: the target edge
     # is h_min / k), and it costs one extra build and no solve of the reference.
-    rungs = {1.0} | set(REFINE_FACTORS) | ({COARSE_RUNG} if ladder else set())
+    # The run's own ladder (item 1): the default rungs, plus one finer rung if
+    # asked. Everything downstream -- the reference, the convergence estimate
+    # and the Richardson ratio the favourable bound is scaled by -- is derived
+    # from THIS tuple, so the correction always matches the ladder that ran.
+    factors = refine_factors(fine_reference)
+    out["refine_factors"] = list(factors)
+    rungs = {1.0} | set(factors) | ({COARSE_RUNG} if ladder else set())
     for k in rungs:
         try:
             _p, tets_u, kb_u = _uniform(case["materials"], obj, case, h_min,
@@ -1076,13 +1198,13 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
         reference = [(float(k), int(l), f, int(m)) for k, l, f, m in spectrum]
         out["a_over_b_eff"] = ab_eff
     else:
-        finest = REFINE_FACTORS[-1]
+        finest = factors[-1]
         if finest not in levels:
             return {"label": case["label"], "verdict": "UNMEASURED",
                     "detail": f"the reference could not be built: {uniform_error}",
                     "case": out, "meta": meta}
         reference = _clusters_pairs(levels[finest])
-        coarser = REFINE_FACTORS[0]
+        coarser = factors[0]
         if coarser in levels:
             conv = REF.score_multiplets(levels[coarser], reference,
                                         n_requested=n_modes)
@@ -1103,7 +1225,7 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
             "modes_asked": n_modes}
     if case["reference"] != "analytic":
         gate["reference_mesh_ok"] = (out["uniform"]
-                                     .get(str(REFINE_FACTORS[-1])) or {}) \
+                                     .get(str(factors[-1])) or {}) \
             .get("mesh_ok")
         if gate["reference_mesh_ok"] is False:
             gate["incomplete"] = ("the build the reference came from is not a "
@@ -1182,6 +1304,12 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
     # costs no solve -- every level was built for the reference.
     errors = level_errors(levels, reference, n_modes)
     out["uniform_level_errors"] = errors
+    # The same ladder with the reference taken out (item 2, step 2c). An
+    # analytic reference cannot be tightened by refining it, so a non-falling
+    # error ladder has to be attributed: either the mesh is not converging, or
+    # the mesh IS converging and the reference describes a different object.
+    # This separates the two from the spectra already in hand.
+    out["uniform_self_ladder"] = self_ladder(levels, n_modes)
 
     # The tolerance, from the solver's own measured residual on each side: two
     # meshes whose scores differ by less than the solver's noise have not been
@@ -1240,7 +1368,9 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
     # provisional reading and NOT reported as PASS: the case is UNRELIABLE.
     n_targets = reference_multiplets_in_reach(reference, n_modes)
     out["reference_multiplets_in_reach"] = n_targets
-    unreliable = reliability(errors, n_targets, rows)
+    unreliable = reliability(errors, n_targets, rows,
+                             selflad=out["uniform_self_ladder"],
+                             reference_kind=case["reference"])
     out["reliability"] = unreliable
     if unreliable and verdict in ("PASS", "FAIL"):
         out["provisional_verdict"] = verdict
@@ -1252,7 +1382,7 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
     bound = favourable_bound(uniform.get("worst_rel_error"),
                              graded.get("worst_rel_error"),
                              meta.get("reference_convergence"),
-                             richardson=RICHARDSON_SCALE)
+                             richardson=richardson_scale(factors))
     if bound is not None:
         out["favourable_uniform_bound"] = bound
     return {"label": case["label"], "verdict": verdict, "detail": detail,
@@ -1526,6 +1656,17 @@ def main(argv=None) -> int:
                         "case, so the uniform side's error can be seen from both "
                         "sides of the reference and a zero crossing is "
                         "measurable rather than argued (item 2)")
+    p.add_argument("--fine-reference", type=float, default=None,
+                   metavar="K", help=("add ONE reference rung at h_min/K, finer "
+                                      "than the default finest (a tighter "
+                                      "reference for a uniform-refined case; "
+                                      "must be > 1.5). The rung is BUILT, and "
+                                      "cost scales ~K^3: on the two sphere cases "
+                                      "k=1.75 is ~130k/143k tets but k=2.0 is "
+                                      "~232k/279k, over the 200k tier-2 mark, "
+                                      "so 1.75 is the affordable tightening. "
+                                      "Applies to a case RUN; --list sizes the "
+                                      "default ladder and says so"))
     p.add_argument("--baseline", default="product", choices=("product", "probe"),
                    help="resolution of the uniform side: 'product' = the "
                         "finest edge the product's own plan asks for (the rule "
@@ -1539,6 +1680,17 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     if args.list:
+        if args.fine_reference is not None:
+            # --list sizes the DEFAULT ladder only, and says so rather than
+            # absorbing the flag: its refs column comes from REFINE_FACTORS, so a
+            # silently ignored --fine-reference would let a reader size the
+            # requested rung off the wrong row -- and an ESTIMATED count for it
+            # would be worse than none (the estimator misses by up to 1.4x, 5.8).
+            print(f"note: --list sizes the default ladder "
+                  f"({', '.join(f'{k:g}' for k in REFINE_FACTORS)}); "
+                  f"--fine-reference {args.fine_reference:g} is a case-run rung "
+                  f"and is NOT in this table -- its BUILT count comes from the "
+                  f"run, not the estimate")
         return list_cases(MATRIX)
     if args.estimator:
         return estimator_table(MATRIX, results_dir=args.results)
@@ -1558,7 +1710,8 @@ def main(argv=None) -> int:
     try:
         result = run_case(case, grid=args.grid, backend=args.backend, work=work,
                           verbose=not args.quiet, bands=args.bands,
-                          baseline=args.baseline, ladder=args.ladder)
+                          baseline=args.baseline, ladder=args.ladder,
+                          fine_reference=args.fine_reference)
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
         print(f"[matrix] case RAISED: {type(exc).__name__}: {exc}")
@@ -1627,6 +1780,17 @@ def main(argv=None) -> int:
                              if e.get('worst_rel_error') is not None
                              else f"unmatched({e.get('n_matched')})")
                           for e in ladder))
+    # Item 2, step 2c: the same ladder with the reference removed, so a
+    # non-falling error can be attributed to the mesh or to the reference.
+    selflad = out.get("uniform_self_ladder") or []
+    if selflad:
+        print("[matrix] uniform SELF-ladder (worst error against the finest "
+              "rung's own spectrum): "
+              + ", ".join(f"k={e['k']:g}->{e['against']:g} "
+                          + (f"{_num(e['self_rel_error'])}"
+                             if e.get('self_rel_error') is not None
+                             else f"unmatched({e.get('n_matched')})")
+                          for e in selflad))
     if out.get("tolerance") is not None and out.get("n_tets_graded"):
         if out.get("tolerance"):
             print(f"[matrix] tolerance from the solver's measured residual: "
@@ -1636,12 +1800,22 @@ def main(argv=None) -> int:
         else:
             print(f"[matrix] tolerance: none available -- "
                   f"{out.get('tolerance_unavailable')}")
-    if out.get("reliability"):
+    # The reason a verdict cannot be trusted prints ONCE. On UNRELIABLE it is
+    # already the tail of the verdict line above (the verdict string carries it
+    # to the JSON too, where a lone "reliability" field would be a second place
+    # to look); on NO VERDICT, where the verdict line has a different reason,
+    # this line is its only carrier.
+    if out.get("reliability") and result.get("verdict") != "UNRELIABLE":
         print(f"[matrix] verdict reliability: {out['reliability']}")
-    if result.get("meta", {}).get("reference_convergence") is not None:
+    fb = out.get("favourable_uniform_bound")
+    # A duplicated number reads as two measurements. The favourable line below
+    # states this same convergence inside its arithmetic, so the standalone
+    # line is only printed when there is no such line to state it (a missing
+    # worst error leaves the bound with an operand missing).
+    if (fb is None
+            and result.get("meta", {}).get("reference_convergence") is not None):
         print("[matrix] reference's own convergence (coarse vs finest): "
               f"{result['meta']['reference_convergence'] * 100:.3f}%")
-    fb = out.get("favourable_uniform_bound")
     if fb:
         print("[matrix] uniform side's most favourable reading: "
               f"{fb['uniform_worst'] * 100:.3f}% + the reference's whole "
@@ -1653,8 +1827,9 @@ def main(argv=None) -> int:
         # The coarse-vs-finest difference UNDERSTATES the finest level's own
         # error by 1 - r**-p, so the line above is a floor on the correction,
         # not the correction. Both are printed; only the run's author chooses.
+        _rf = out.get("refine_factors") or list(REFINE_FACTORS)
         print(f"[matrix]   scaled by Richardson (p = 2, ratio "
-              f"{REFINE_FACTORS[-1] / REFINE_FACTORS[0]:g} -> x{fb['richardson']:.2f}): "
+              f"{_rf[-1] / _rf[0]:g} -> x{fb['richardson']:.2f}): "
               f"{fb['richardson_uniform'] * 100:.3f}%, against graded "
               f"{fb['graded_worst'] * 100:.3f}% = "
               f"{fb['richardson_ratio']:.2f}x"
