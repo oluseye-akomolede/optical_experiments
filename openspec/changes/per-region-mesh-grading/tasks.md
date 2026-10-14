@@ -1148,14 +1148,23 @@ reference needed tightening — see 5.8). Same shape as the rotation runs at
 ```
 cd ~/mse-bench
 mkdir -p matrix-2f
+
 (ulimit -v 5000000; nice -n 10 timeout 30m python run_grading_matrix.py \
    --case ramp-outward --baseline product --rotations 5 --backend gpu \
    --json matrix-2f/ramp-outward.json) > matrix-2f/ramp-outward.log 2>&1
-```
 
-and identically for `three-region`, `c1.5-thick`, `c2-thick`, plus:
+(ulimit -v 5000000; nice -n 10 timeout 30m python run_grading_matrix.py \
+   --case three-region --baseline product --rotations 5 --backend gpu \
+   --json matrix-2f/three-region.json) > matrix-2f/three-region.log 2>&1
 
-```
+(ulimit -v 5000000; nice -n 10 timeout 30m python run_grading_matrix.py \
+   --case c1.5-thick --baseline product --rotations 5 --backend gpu \
+   --json matrix-2f/c1.5-thick.json) > matrix-2f/c1.5-thick.log 2>&1
+
+(ulimit -v 5000000; nice -n 10 timeout 30m python run_grading_matrix.py \
+   --case c2-thick --baseline product --rotations 5 --backend gpu \
+   --json matrix-2f/c2-thick.json) > matrix-2f/c2-thick.log 2>&1
+
 (ulimit -v 5000000; nice -n 10 timeout 30m python run_grading_matrix.py \
    --case centred-core --baseline product --rotations 5 --fine-reference 1.75 \
    --backend gpu --json matrix-2f/centred-core.json) > matrix-2f/centred-core.log 2>&1
@@ -1164,6 +1173,13 @@ and identically for `three-region`, `c1.5-thick`, `c2-thick`, plus:
    --case offset-sphere --baseline product --rotations 5 --fine-reference 1.75 \
    --backend gpu --json matrix-2f/offset-sphere.json) > matrix-2f/offset-sphere.log 2>&1
 ```
+
+Six cases, one at a time (tier 2 is one solve at a time). The first four are the
+`--rotations`-only runs; the last two add `--fine-reference 1.75` because their
+reference is the finest uniform rung and needed tightening (5.8). Every label
+above is a real `CASES` label — `grep -oE '"(ramp-outward|three-region|c1\.5-thick|c2-thick|centred-core|offset-sphere)"' benchmarks/run_grading_matrix.py`
+returns each exactly once — so a `--case` typo fails loudly rather than silently
+running nothing.
 
 **Cost, and the 30-minute cap.** `--rotations 5` is now **10 builds and 10
 solves** per case (5 uniform + 5 graded, one identity each side reused): the
