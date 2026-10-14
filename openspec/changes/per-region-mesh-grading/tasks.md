@@ -489,3 +489,157 @@
       this seat's. Note also that these counts are the estimator's, which reads
       1.2-3.3x high on the meshes we have built, so the Orin may well solve some
       of them; what is certain is that no verdict for one is a pass.
+
+- [x] 5.7 STEP 2b: the five items the lead returned with 5.6 -- bench only, one
+      commit, tier 1, no product rule changed, step 3 still NO GO (row
+      `600283f7`, 2026-10-14). Two files, `benchmarks/run_grading_matrix.py`
+      and `tests/test_grading_matrix.py`. 47 tests green (`PYTEST_EXIT=0`),
+      `openspec validate` clean, `--list` and `--estimator` both exit 0. One
+      new case, `centred-core` (offset-sphere's A/B control): the lead's
+      12-value `h_min` verification of `1935511` is untouched, no existing case
+      builder changed (13 cases now).
+
+      ITEM 1 -- a tie is not a verdict. `plan_is_uniform(plan)` is True when
+      two or more regions share one `edge_m` (one region alone is not "uniform
+      and graded"). When the graded and uniform builds are the same plan the
+      verdict is `SAME MESH` -- grading did nothing, and a PASS there would
+      report a rule that did nothing as a rule that held -- with exit code 5.
+      The real c2-thin pair is the fixture: 22,947 tets and the same plan on
+      both sides, worst errors 0.0019135674962923 against 0.0019135674962911,
+      i.e. the same mesh with the difference in the last float. Otherwise the
+      comparison is `graded <= uniform + tol`, where `tol` is the SUM of both
+      sides' measured solver residuals (`mse_eigen.LAST_WORST_RESIDUAL`, the
+      same global the solver records as `solver_worst_residual`); a missing
+      residual on either side does NOT become a zero -- the runner records
+      `tolerance_unavailable` ("the CPU factorisation records none") and says
+      the comparison is strict, because a strict comparison presented as a
+      justified one is worse than no tolerance. Guard-removed control: with
+      `same_plan=False` the same c2-thin pair returns FAIL under the strict
+      `<=`, so the test reddens on the guard, not on the fixture.
+
+      ITEM 2 -- signed errors, both sides, in the JSON and the log. Every
+      matched mode now carries (mode, l, family, reference GHz, graded %,
+      uniform %) with the SIGN kept -- `(centre - reference_kb) / reference_kb`
+      -- plus `zero_crossings` (modes whose signed error changes sign between
+      the two meshes) and `uniform_level_errors` (each already-built uniform
+      rung's worst error, no extra solve). A verdict is flagged `UNRELIABLE`
+      (exit 6, `provisional_verdict` kept) when the uniform ladder does not
+      fall monotonically, or the case reaches only one multiplet, or a
+      crossing is present. **I cannot answer the c4-thin 0.004%
+      zero-crossing question from the Orin artifacts**: they carry
+      per-multiplet MAGNITUDES only (the raw pairs were filtered out of the
+      JSON before this change), and the sign of a 0.004% error is exactly what
+      round-off decides. The command that answers it is below. `--ladder` adds
+      ONE rung coarser than the comparison (`h_min / 0.8`) because the finest
+      rung of a uniform-refined case IS the reference -- its error is 0 by
+      construction, which is the blind spot the old Orin JSONs show as
+      `uniform_level_correction_from=1.25`: a crossing can be seen from below
+      only.
+
+      ITEM 3 -- over-mark on BUILT counts, the 200,000 mark kept, the bases not
+      coarsened. `sides_over_mark` is computed from `n_tets_graded` and the
+      uniform `1.0` build, never from `--list`'s estimate, so c4-thin (estimate
+      161,389, built 61,244) is MEASURED, not refused; c3-thick's uniform is
+      199,062 built against the 258,114 estimated, i.e. under the mark on the
+      count that judges it. Cases the BUILD puts over stay UNMEASURED.
+      box-sphere stays NO VERDICT -- its reference converges only to 1.007% --
+      and that is now its own exit code (7), not an UNMEASURED.
+
+      ITEM 4 -- offset-sphere diagnosis, no rule change. Measured at tier 1
+      (meshing only, no solves; `item4_regions.py`, `item4_ab.py`):
+
+      ```text
+        offset-sphere   7,238 tets | wall asked 2.2831 built 1.6771,   7,058 tets (97.5%)
+                                  | core asked 1.1416 built 1.4195,     180 tets (2.5%), bbox centre z=+4.0 mm
+                      uniform  20,266 | core 161 @ 1.5375 mm | near wall 2,349 @ 1.4694 mm
+        centred-core    8,026 tets | wall asked 2.2831 built 1.6465,   7,835 tets (97.6%)
+                                  | core asked 1.1416 built 1.4019,     191 tets (2.4%), centre (0,0,0)
+                      uniform  20,323 | core 166 @ 1.4945 mm | near wall 2,462 @ 1.4477 mm
+      ```
+
+      So the offset case is NOT under-resolved relative to its centred control
+      anywhere measurable: its core carries 180 tets at 1.4650 mm against the
+      control's 191 at 1.4381 mm, and its near-wall band 1,701 at 1.6415 mm
+      against 1,724 at 1.6411 mm -- the graded side is if anything very
+      slightly finer in both. The tuned count ratios match too (graded/uniform
+      total 0.36x vs 0.39x, core 1.12x vs 1.15x, near wall 0.72x vs 0.70x). The
+      natural story -- "an off-centre core gets pushed coarse" -- is FALSIFIED:
+      there is no coarse core to blame, and the two graded meshes are
+      near-identical in structure. (The estimator is offset-blind as well:
+      both cases read 9,659 / 39,081 -- the offset never enters the estimate.)
+      PREDICTION: the 2.27x is not a local resolution deficit. FALSIFIER: solve
+      `centred-core` on Orin at the corrected baseline. If it PASSES while
+      offset-sphere FAILs, density is ruled out and the deficit is specific to
+      the offset partition -- whose only remaining geometric difference is its
+      thinner wall (min wall 3.5 mm against 7.5 mm), i.e. where the region
+      boundary sits, not how fine the core is. If `centred-core` FAILS at a
+      similar ratio, the cause is shared and is not the offset at all.
+
+      ITEM 5 -- the estimator, a PRODUCT finding, reported and not changed. One
+      row per case: the live routing path (`materials=`) and the bench's
+      uniform path (`min_feature_m=`) against BUILT counts from this bench's
+      own `--json` (`--estimator --results /tmp/mse-orin`, exit 0):
+
+      ```text
+      live routing (read from config): route to GPU at or above 15,000; refuse an upload above 1,200,000 (= 2x the real cap 600,000); tier-2 mark 200,000 (built counts judge that, not estimates)
+               case est(materials=) est(min_feature_m=)  built graded  built uniform built/est  source
+         c1.5-thick          14,958              32,264     not built      not built      ----  no built counts here
+           c2-thick          20,676              76,478     not built      not built      ----  no built counts here
+           c3-thick          35,314             258,114     not built      not built      ----  no built counts here
+           c4-thick          16,215             184,163     not built      not built      ----  no built counts here
+            c2-thin          75,262              45,829        22,947         22,947     0.30x  c2-thin.json
+                      ! the min_feature_m= estimate is 2.00x the BUILT uniform count (45,829 vs 22,947); the bench builds its uniform side by this path
+                      ! the materials= estimate is 3.28x the BUILT count (75,262 vs 22,947) -- above the 2x the refuse threshold (web/config.py:248) is documented to allow
+            c3-thin         220,160             154,673     not built      not built      ----  no built counts here
+            c4-thin         161,389             109,990        61,244         57,872     0.38x  c4-thin.json
+                      ! the min_feature_m= estimate is 1.90x the BUILT uniform count (109,990 vs 57,872); the bench builds its uniform side by this path
+                      ! the materials= estimate is 2.64x the BUILT count (161,389 vs 61,244) -- above the 2x the refuse threshold (web/config.py:248) is documented to allow
+       three-region          11,974              32,361         7,319         11,688     0.61x  three-region.json
+                      ! the min_feature_m= estimate is 2.77x the BUILT uniform count (32,361 vs 11,688); the bench builds its uniform side by this path
+                      ! the min_feature_m= estimate is 2.77x the BUILT count (32,361 vs 11,688) -- above the 2x the refuse threshold (web/config.py:248) is documented to allow
+         box-sphere          18,466             128,225     not built      not built      ----  no built counts here
+      offset-sphere           9,659              39,081         7,238         20,266     0.75x  offset-sphere.json
+                      ! the min_feature_m= estimate is 1.93x the BUILT uniform count (39,081 vs 20,266); the bench builds its uniform side by this path
+       centred-core           9,659              39,081     not built      not built      ----  no built counts here
+        shell-dense           4,952               4,952     not built      not built      ----  no built counts here
+       ramp-outward           7,167              13,652         6,746          7,350     0.94x  ramp-outward.json
+                      ! the min_feature_m= estimate is 1.86x the BUILT uniform count (13,652 vs 7,350); the bench builds its uniform side by this path
+      ```
+
+      Reading: the live `materials=` estimate is HIGH on every case we have
+      built (built/est 0.30x to 0.94x), so the site errs on the conservative
+      side -- it sends to the GPU and refuses uploads more readily than the
+      built mesh warrants, not less. But the overshoot is larger than the
+      margin the refuse threshold is documented to tolerate (2x,
+      `web/config.py:248`, i.e. refuse at 1,200,000 against a real cap of
+      600,000): c2-thin 3.28x and c4-thin 2.64x are over that margin, so an
+      upload just under the refuse line can be refused at well under 600,000
+      built. The bench's own `min_feature_m=` path is worse (1.86x to 2.77x),
+      and it is the path this matrix builds its uniform side by -- which is why
+      `--list`'s counts are 1.2-3.3x high and are not verdicts in either
+      direction. Not changed here; the numbers are the finding.
+
+      THE COMMANDS FOR THE LEAD (tier 2, Orin; I ran none of these -- whole-case
+      solves are the lead's). Adapt the path/venv to your Jetson invocation;
+      the flags are what matters:
+
+      ```text
+      # 1. c4-thin: signed per-mode errors on BOTH sides + one coarser rung,
+      #    which is what answers the 0.004% zero-crossing question (item 2).
+      run_grading_matrix.py --case c4-thin --baseline product --ladder --backend gpu --json c4-thin-ladder.json
+
+      # 2. the offset-sphere A/B control (item 4's falsifier): if this passes
+      #    where offset-sphere failed, local density is ruled out.
+      run_grading_matrix.py --case centred-core --baseline product --backend gpu --json centred-core.json
+
+      # 3. optional, for item 2's ladder on the passing thin case:
+      run_grading_matrix.py --case c2-thin --baseline product --ladder --backend gpu --json c2-thin-ladder.json
+      ```
+
+      Exit codes the runner now returns: 0 PASS, 1 INCOMPLETE/FAIL, 5 SAME
+      MESH, 6 UNRELIABLE, 7 NO VERDICT. The `--ladder` rung is COARSER than the
+      comparison (fewer elements than the base uniform mesh), so it should
+      build where c4-thin's level-1.5 finer rung failed on Orin.
+
+      Bench only. No product rule, estimate or threshold is touched. Step 3
+      remains NO GO.

@@ -112,6 +112,13 @@ MATRIX_OK = 0
 MATRIX_USAGE = 2
 MATRIX_FAIL = 3
 MATRIX_INCOMPLETE = 4
+# Not a verdict. They are separate codes from PASS and FAIL on purpose: a
+# script that treated "no verdict" as "not a failure" (or as "fine") is the
+# defect this bench exists to catch, so neither may share its exit status with
+# anything that reads as an answer.
+MATRIX_SAME_MESH = 5
+MATRIX_UNRELIABLE = 6
+MATRIX_NO_VERDICT = 7
 
 #: The tier-2 budget: one solve at a time on the Orin, under the 5 GB limit and
 #: 30 minutes. The element mark is empirical -- the n3 uniform reference at
@@ -133,6 +140,16 @@ TIER2_MAX_TETS = 200_000
 #: reference is 1.5x finer than the mesh it judges, and the convergence check
 #: between the two levels is what has to carry its trust.
 REFINE_FACTORS = (1.25, 1.5)
+
+#: The coarse rung, built only under ``--ladder`` (item 2). Below 1.0 on purpose:
+#: the refinement levels are all finer than the comparison mesh, so on their own
+#: they can only ever show the error FALLING towards the reference -- a case
+#: whose error passes through zero on the way is invisible from above it. One
+#: mesh coarser than the comparison (edge ``h_min / 0.8``, 0.51x the elements)
+#: puts a rung on the other side, which is what makes a zero crossing
+#: measurable rather than argued. It is off by default because it is one more
+#: solve per case and the matrix's budget is the lead's.
+COARSE_RUNG = 0.8
 
 
 # ---------------------------------------------------------------- the fixtures
@@ -333,6 +350,30 @@ MATRIX = [
                "its levels predict 257,615 and 445,159 elements (2.2x the "
                "mark), and at contrast 3 and three modes still 267,094 at the "
                "1.5 level, over the mark. At contrast 2 the whole pair fits."),
+    # offset-sphere's CONTROL, identical in every argument but the offset. The
+    # lead's item 4 asks why an off-centre core loses 2.27x where a centred one
+    # passes, and the only way to answer with a number rather than a story is to
+    # hold everything else fixed: same builder, same radii, same materials, same
+    # n_modes, same reference kind. If the offset is the cause, this case passes
+    # and the core's built edge lands on (or near) its asked edge; if it also
+    # fails, the cause is the CONTRAST and the offset is a coincidence.
+    _case("centred-core",
+          lambda te: _offset(B_MM, 2.5, 0.0, {"wall": 1.0, "core": 2.0}, te),
+          {"wall": 1.0, "core": 2.0}, "uniform-refined",
+          {"contrast": 2.0, "shell": "thick", "regions": 2,
+           "shape": "concentric"},
+          n_modes=5,
+          note="offset-sphere with the core moved to the centre: same 10 mm "
+               "cavity, same 2.5 mm core, same contrast 2, same five modes, the "
+               "same `_offset` builder with offset 0. It is the control for the "
+               "off-centre FAIL (graded 0.098% against uniform 0.043% on the "
+               "Orin at 1935511), and its job is to be an A/B, not a product "
+               "case. PREDICTION: it PASSES, and its core's built edge lands "
+               "within a few percent of its asked 1.1416 mm, because a centred "
+               "core is surrounded by the fine background field on all sides "
+               "while the off-centre one is pushed by a coarse outer region "
+               "from one side. FALSIFIER: if this case FAILS the same way, the "
+               "offset is not the cause and the contrast is."),
     _case("shell-dense",
           lambda te: _concentric({"wall": B_MM, "core": A_THICK},
                                  {"wall": 2.0, "core": 1.0}, te),
@@ -573,6 +614,60 @@ def _clusters_pairs(kb):
             for c, n in REF.cluster_modes(np.asarray(kb, float), 0.02)]
 
 
+def _full_spectrum(reference, n_modes):
+    """The part of a reference spectrum the run can actually score against.
+
+    An ANALYTIC reference is the whole spectrum; the run asks for ``n_modes``
+    modes, so only the multiplets covering the lowest ``n_modes`` are reachable
+    and the rest are noise for "did the reference build" purposes. A
+    uniform-refined reference is built for exactly those clusters, so it is
+    already the part in question.
+    """
+    covered, out = 0, []
+    for entry in sorted(reference, key=lambda r: float(r[0])):
+        if covered >= n_modes:
+            break
+        out.append(entry)
+        covered += int(entry[3])
+    return out or list(reference)
+
+
+def _looks_like_a_mesh(value) -> bool:
+    """True when ``value`` is an ``(n, 3)`` array of finite float coordinates.
+
+    The failure this exists for is not an exception: a build that returns a
+    partial or degenerate array on a refused refinement is still truthy and
+    still array-shaped, and the only thing detectable from the outside is that
+    its shape is not a node cloud. Counting elements comes after, so a truthy
+    empty array cannot pass for a mesh either.
+    """
+    try:
+        arr = np.asarray(value)
+    except Exception:  # noqa: BLE001
+        return False
+    if arr.ndim != 2 or arr.shape[1] != 3 or arr.shape[0] == 0:
+        return False
+    return bool(np.isfinite(arr.astype(float)).all())
+
+
+def _last_residual():
+    """The solver's measured worst refined residual, or ``None``.
+
+    Read from ``mse_eigen``'s module state -- the same global the solver copies
+    into ``modes.json`` as ``solver_worst_residual`` -- because a uniform level's
+    solve goes through ``_solve_mesh``'s five calls rather than ``solve()`` and
+    so writes no ``modes.json`` of its own. It is ``None`` on a backend that
+    does not refine (the CPU factorisation records no ``worst_residual``), and
+    ``None`` must stay ``None``: a tolerance defaulted to a number here would be
+    a picked number, which is the one thing the tolerance may not be.
+    """
+    try:
+        import mse_eigen as EIG
+        return EIG.LAST_WORST_RESIDUAL
+    except Exception:  # noqa: BLE001 - a missing reader is a missing number
+        return None
+
+
 def _num(x):
     """A number for a report line, or ``None`` printed as ``None``.
 
@@ -614,21 +709,219 @@ def missing_side_reason(tag, score, reference):
             f"multiplets unmatched); {tail}")
 
 
-def criterion(graded_worst, uniform_worst, unmeasured_reason):
-    """The owner's bar as one pure function of the two numbers.
+def plan_is_uniform(plan) -> bool:
+    """True when every region's TARGET edge came out the same.
 
-    Returns ``(verdict, detail)``, verdict in PASS / FAIL / UNMEASURED. An
-    unmeasured bar never returns PASS: a mesh whose reference could not be
-    solved is not a mesh that beat it.
+    That is the plan-level statement of "grading did nothing": the rule asks for
+    a different edge per region, and if the clamping floor and the region
+    thicknesses have flattened them to one value, the graded build and the
+    uniform build are the same mesh by construction. c2-thin is the real
+    instance -- both regions asked 1.0825 mm, so both sides came out 22,947
+    elements.
+
+    A single-region plan is not uniform-and-graded: it has no contrast to
+    flatten, so it cannot be evidence about grading either way and is not
+    reported as SAME MESH.
+    """
+    edges = [v.get("edge_m") for v in (plan or {}).values()
+             if isinstance(v, dict) and isinstance(v.get("edge_m"), float)]
+    return len(edges) >= 2 and max(edges) == min(edges)
+
+
+def signed_pairs(score):
+    """One row per MATCHED multiplet, with the error's SIGN kept.
+
+    ``score_multiplets`` reports ``rel_error = |computed - reference| /
+    reference``: a magnitude, so two runs whose errors sit on opposite sides of
+    the reference are indistinguishable from two runs on the same side. That is
+    the same trap as reading ``|E|`` where ``E`` was meant (it rectifies, and
+    the sign is exactly what a zero crossing lives in), and it is why this
+    recomputes the sign from the pair the scorer already kept -- ``centre`` and
+    ``reference_kb`` -- rather than from the magnitude it returned.
+
+    ``reference_kb`` of 0 would divide by zero; a mode with no reference energy
+    has no relative error to report, so it comes back ``None`` and the report
+    prints that rather than inf.
+    """
+    rows = []
+    for m in (score.get("matched") or []):
+        ref = m.get("reference_kb")
+        centre = m.get("centre")
+        rows.append({
+            "l": m.get("l"), "family": m.get("family"),
+            "reference_kb": ref, "centre_kb": centre,
+            "count": m.get("count"),
+            "reference_multiplicity": m.get("reference_multiplicity"),
+            "signed_rel": (None if not ref or centre is None
+                           else (centre - ref) / ref),
+        })
+    return sorted(rows, key=lambda r: (r["reference_kb"] or 0.0))
+
+
+def per_mode_table(graded, uniform):
+    """Both sides' SIGNED per-multiplet errors, joined on the reference.
+
+    Keyed by the reference multiplet, because that is the object both sides are
+    measured against; a multiplet one side did not match is printed as a missing
+    entry, not dropped, so a table built from a partial match cannot read as a
+    complete one.
+    """
+    by_ref = {}
+    for tag, score in (("graded", graded), ("uniform", uniform)):
+        for row in signed_pairs(score):
+            key = ("ref", round(row["reference_kb"], 9)
+                   if row["reference_kb"] is not None else None,
+                   row["l"], row["family"])
+            by_ref.setdefault(key, {"l": row["l"], "family": row["family"],
+                                    "reference_kb": row["reference_kb"]})
+            by_ref[key][f"{tag}_signed_rel"] = row["signed_rel"]
+    return [by_ref[k] for k in sorted(by_ref, key=lambda k: (k[1] or 0.0))]
+
+
+def zero_crossings(rows):
+    """Multiplets whose signed error changes SIGN somewhere in this table.
+
+    A crossing is the one case where magnitude comparison is not merely noisy
+    but wrong: on either side of the crossing the magnitude can be made as small
+    as the crossing is well reached, so a mesh that is COARSER than another can
+    score a smaller magnitude. Reported rather than silently averaged away.
+    """
+    out = []
+    for row in rows:
+        a, b = row.get("graded_signed_rel"), row.get("uniform_signed_rel")
+        if a is None or b is None:
+            continue
+        if a == 0.0 or b == 0.0 or (a > 0) != (b > 0):
+            out.append(row)
+    return out
+
+
+def level_errors(levels, reference, n_modes):
+    """Each refinement level's error against the reference, finest last.
+
+    ``levels`` is the map ``run_case`` already builds -- ``{k: kb}`` -- so the
+    monotonicity check costs no extra solve. A level that failed to build is
+    absent from ``levels`` and therefore absent here; the caller must not read a
+    short list as a monotone one.
+    """
+    out = []
+    for k in sorted(levels):
+        score = REF.score_multiplets(levels[k], reference, n_requested=n_modes)
+        out.append({"k": k, "worst_rel_error": score.get("worst_rel_error"),
+                    "n_matched": score.get("n_matched")})
+    return out
+
+
+def reference_multiplets_in_reach(reference, n_modes):
+    """Distinct reference multiplets the ASKED-FOR modes can reach.
+
+    Not the length of the reference list: an analytic reference carries the whole
+    spectrum (c4-thin's has tens of multiplets), while the run asks for three
+    modes and therefore only ever sees the lowest ones. The count that matters
+    for a verdict is how many independent targets the comparison actually has,
+    so the spectrum is walked from the lowest multiplet up until the multiplicities
+    cover ``n_modes``. c4-thin: three modes, one triplet -- one target, and one
+    signed number deciding the verdict.
+    """
+    covered, distinct = 0, set()
+    for kb, _l, _fam, m in sorted(reference, key=lambda r: float(r[0])):
+        if covered >= n_modes:
+            break
+        distinct.add(round(float(kb), 9))
+        covered += int(m)
+    return max(len(distinct), 1)
+
+
+def reliability(errors, n_multiplets, rows):
+    """``None`` if this case can carry a verdict, else the reason it cannot.
+
+    Two failure modes, both of which make a PASS or a FAIL read as information
+    that is not there:
+
+    * the uniform side's error does not fall as its mesh is refined (a
+      non-monotone ladder means the errors are dominated by something other
+      than discretisation -- a zero crossing, a spurious cluster, a sign flip
+      between levels -- and the comparison is against a curve, not a level);
+    * the case has a single reference multiplet, so one signed number decides
+      everything and a crossing has nowhere else to show itself (c4-thin: three
+      modes are one triplet, and one triplet is one number).
+    """
+    worsts = [e["worst_rel_error"] for e in errors
+              if e.get("worst_rel_error") is not None]
+    if len(worsts) < len(errors):
+        return ("a refinement level of the uniform side did not match the "
+                "reference, so its ladder is incomplete")
+    ladder = ", ".join(f"{w * 100:.3f}%" for w in worsts)
+    ks = ", ".join(f"{e['k']:g}" for e in errors)
+    if len(worsts) >= 2 and any(b > a for a, b in zip(worsts, worsts[1:])):
+        return ("the uniform side's error does not fall as its mesh is refined "
+                f"({ladder} at k = {ks}), so it is not tracking "
+                "discretisation")
+    if n_multiplets <= 1:
+        return (f"the reference has {n_multiplets} multiplet, so one signed "
+                "number decides the verdict and a zero crossing has nowhere "
+                "else to appear")
+    if zero_crossings(rows):
+        return (f"{len(zero_crossings(rows))} multiplet(s) change sign between "
+                "the two meshes, so their magnitudes cannot be compared")
+    return None
+
+
+def criterion(graded_worst, uniform_worst, unmeasured_reason, *,
+              same_plan=False, tol=0.0, sides_over_mark=(),
+              reference_convergence=None):
+    """The owner's bar as one pure function of the two numbers and their limits.
+
+    Returns ``(verdict, detail)``. A verdict is one of:
+
+    ``UNMEASURED``
+        something the bar needs is missing or could not be built -- and it never
+        returns PASS: a mesh whose reference could not be solved is not a mesh
+        that beat it. A side over the tier-2 mark on its BUILT count is here
+        too, because a mesh that cannot be built on the tier cannot be judged on
+        it (the lead's item 3: judge on built counts, keep the mark).
+    ``SAME MESH``
+        the graded and uniform builds are the same mesh: the plan was uniform,
+        so grading did nothing and the case says nothing about grading. Calling
+        that a PASS would report a rule that did nothing as a rule that held.
+    ``NO VERDICT``
+        the gap being judged is smaller than the reference's own convergence.
+        The comparison then measures the reference, not the two meshes: with a
+        reference error of ``c`` and a gap below it, both sides' numbers move by
+        ``c`` and the sign of the difference is not determined (box-sphere: the
+        gap is 0.023% against the reference's 1.007%).
+    ``PASS`` / ``FAIL``
+        otherwise, and PASS needs ``graded <= uniform + tol`` where ``tol`` is
+        the solver's own measured residual: two meshes whose scores differ by
+        less than the solver's noise have not been shown to differ.
     """
     if unmeasured_reason:
         return "UNMEASURED", unmeasured_reason
+    if same_plan:
+        return "SAME MESH", ("the graded plan is uniform, so the graded and "
+                             "uniform builds are the same mesh: grading did "
+                             "nothing in this case, and it cannot pass or fail")
     if graded_worst is None or uniform_worst is None:
         return "UNMEASURED", "one of the two worst errors is missing"
+    if sides_over_mark:
+        return "UNMEASURED", ("over the tier-2 mark on BUILT counts: "
+                              + ", ".join(sorted(sides_over_mark))
+                              + f" -- the mark is {TIER2_MAX_TETS:,} elements")
+    gap = abs(graded_worst - uniform_worst)
+    if reference_convergence is not None and gap < reference_convergence:
+        return "NO VERDICT", (
+            f"the gap {gap * 100:.3f}% is smaller than the reference's own "
+            f"convergence {reference_convergence * 100:.3f}%, so this "
+            f"comparison is measuring the reference: graded "
+            f"{graded_worst * 100:.3f}% vs uniform "
+            f"{uniform_worst * 100:.3f}%")
     ratio = (graded_worst / uniform_worst) if uniform_worst else float("inf")
-    verdict = "PASS" if graded_worst <= uniform_worst else "FAIL"
+    within_tol = bool(tol) and gap <= tol
+    verdict = "PASS" if graded_worst <= uniform_worst + tol else "FAIL"
     return verdict, (f"graded {graded_worst * 100:.3f}% vs uniform "
-                     f"{uniform_worst * 100:.3f}% ({ratio:.2f}x the uniform mesh)")
+                     f"{uniform_worst * 100:.3f}% ({ratio:.2f}x the uniform mesh)"
+                     + (f"; within the solver's measured residual {tol:.2e} "
+                        "-- NOT measurably worse" if within_tol else ""))
 
 
 def favourable_bound(uniform_worst, graded_worst, reference_convergence,
@@ -675,7 +968,7 @@ RICHARDSON_SCALE = 1.0 / ((REFINE_FACTORS[-1] / REFINE_FACTORS[0]) ** 2 - 1.0)
 
 
 def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
-             baseline: str = "product") -> dict:
+             baseline: str = "product", ladder=False) -> dict:
     """Build, mesh and solve ONE matrix case, and judge it.
 
     ``baseline`` picks the resolution of the UNIFORM side: ``"product"`` builds
@@ -684,6 +977,10 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
     the older probe-derived floor so the numbers already measured on the Orin
     can still be reproduced. Both floors and both counts are reported either
     way -- the point of the pair is that they differ.
+
+    ``ladder`` adds the coarse rung (see ``COARSE_RUNG``) so the uniform side's
+    error can be seen from both sides of the reference; without it a crossing is
+    invisible. It costs one extra build and its solve.
     """
     import mse_maxwell_solver as SOLVER
 
@@ -715,7 +1012,8 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
         kb_graded = _kb(freqs, scale_mm)
         out["n_tets_graded"] = int(summary["n_tets"])
         out["elapsed_s_graded"] = round(elapsed, 1)
-        out["graded_regions"] = ((modes.get("mesh") or {}).get("regions") or {})
+        mesh_report = modes.get("mesh") or {}
+        out["graded_regions"] = (mesh_report.get("regions") or {})
     except Exception as exc:  # noqa: BLE001 - a failed graded solve is data
         out["graded_error"] = f"{type(exc).__name__}: {exc}"
         return {"label": case["label"], "verdict": "UNMEASURED",
@@ -726,12 +1024,41 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
     levels: dict[float, np.ndarray] = {}
     uniform_error = None
     out["uniform"] = {}
-    for k in ({1.0} | set(REFINE_FACTORS)):
+    # LADDER (item 2). The refinement ladder has a structural blind spot: for a
+    # uniform-refined case the reference IS the uniform mesh at the finest rung,
+    # so that rung's own error is 0 by construction -- a rung that cannot fail.
+    # Two rungs are therefore the minimum that can show a crossing, and with only
+    # k = 1.0 and k = 1.25 below the reference, a case has ONE informative rung.
+    # The coarse rung adds the second, at k < 1 (a coarser mesh: the target edge
+    # is h_min / k), and it costs one extra build and no solve of the reference.
+    rungs = {1.0} | set(REFINE_FACTORS) | ({COARSE_RUNG} if ladder else set())
+    for k in rungs:
         try:
             _p, tets_u, kb_u = _uniform(case["materials"], obj, case, h_min,
                                         k=k, layers=layers, backend=backend)
+            # The mesh this level actually produced. For a uniform-refined case
+            # the reference IS this build, so it is checked HERE, while the
+            # coordinates are in hand: a partially built or degenerate cloud is
+            # visible in the array and nowhere else, and the check costs one
+            # pass over the coordinates. Only the RESULT travels in the JSON --
+            # the node cloud itself would be megabytes per level for nothing.
+            mesh_ok = _looks_like_a_mesh(_p)
+            if not mesh_ok:
+                raise RuntimeError(
+                    f"the k={k} build returned something that is not a finite "
+                    f"(n, 3) node cloud ({type(_p).__name__}), so a reference "
+                    f"built from it would be partial or degenerate")
+            n_nodes = int(np.asarray(_p).shape[0])
             levels[k] = kb_u
-            out["uniform"][str(k)] = {"n_tets": int(tets_u.shape[0])}
+            # The solver's own measured residual for THIS level, read from the
+            # module state the pipeline itself reads (mse_eigen sets it at the
+            # end of every solve). Captured per level, because the next level's
+            # solve overwrites it.
+            out["uniform"][str(k)] = {
+                "n_tets": int(tets_u.shape[0]),
+                "n_nodes": n_nodes,
+                "mesh_ok": mesh_ok,
+                "worst_residual": _last_residual()}
         except Exception as exc:  # noqa: BLE001 - a failed reference is data
             uniform_error = f"at h_min/{k}: {type(exc).__name__}: {exc}"
             out["uniform"][str(k)] = {"error": f"{type(exc).__name__}: {exc}"}
@@ -761,14 +1088,48 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
                                         n_requested=n_modes)
             meta["reference_convergence"] = conv.get("worst_rel_error")
 
+    # THE REFERENCE GATE. A reference that does not cover the asked-for modes is
+    # not a weaker reference, it is a different question: the scorer matches
+    # what it can and reports the rest as unmatched, so the verdict would read
+    # "graded beat uniform against one target" while the case was set up for
+    # five. Counting the covered modes catches that for both kinds of reference
+    # (a half-built uniform mesh and a truncated spectrum look the same to the
+    # scorer), and for the built kind the mesh itself is checked as well -- a
+    # partial build that still yields enough clusters would otherwise pass.
+    reachable = _full_spectrum(reference, n_modes)
+    covered = sum(int(m) for _k, _l, _f, m in reachable)
+    gate = {"kind": case["reference"], "n_entries": len(reference),
+            "n_reachable": len(reachable), "modes_covered": covered,
+            "modes_asked": n_modes}
+    if case["reference"] != "analytic":
+        gate["reference_mesh_ok"] = (out["uniform"]
+                                     .get(str(REFINE_FACTORS[-1])) or {}) \
+            .get("mesh_ok")
+        if gate["reference_mesh_ok"] is False:
+            gate["incomplete"] = ("the build the reference came from is not a "
+                                  "finite (n, 3) node cloud")
+    if covered < n_modes:
+        gate["incomplete"] = (
+            f"the reference covers {covered} of the {n_modes} asked-for modes"
+            f"{' -- a partially built reference' if case['reference'] != 'analytic' else ''}")
+    meta["reference_gate"] = gate
+    if gate.get("incomplete"):
+        return {"label": case["label"], "verdict": "UNMEASURED",
+                "detail": "the reference is incomplete: " + gate["incomplete"],
+                "case": out, "meta": meta}
+
     graded = REF.score_multiplets(kb_graded, reference, n_requested=n_modes)
     uniform = REF.score_multiplets(levels[1.0], reference, n_requested=n_modes)
+    # ``matched`` is kept as well as the summary counts: the per-multiplet
+    # SIGNED errors (item 2) are recomputed from these pairs, and a derived
+    # table whose source pairs were dropped from the artifact cannot be checked
+    # against its own evidence. The pairs cost a handful of floats.
     out["graded_score"] = {k: graded[k] for k in
                            ("n_matched", "n_clusters", "n_returned",
-                            "worst_rel_error") if k in graded}
+                            "worst_rel_error", "matched") if k in graded}
     out["uniform_score"] = {k: uniform[k] for k in
                             ("n_matched", "n_clusters", "n_returned",
-                             "worst_rel_error") if k in uniform}
+                             "worst_rel_error", "matched") if k in uniform}
 
     # The uniform side's PER-REGION build, beside the graded side's. The bench's
     # uniform mesh is one part with no regions (see ``_uniform``), so on its own
@@ -802,12 +1163,90 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
         except Exception as exc:  # noqa: BLE001
             out["bands_error"] = f"{type(exc).__name__}: {exc}"
 
+    # SIGNED per-mode errors for BOTH sides, and the zero crossings among them.
+    # The scorer returns magnitudes; two errors on opposite sides of the
+    # reference are indistinguishable in a magnitude, so the sign is recovered
+    # from the pairs it kept. See ``signed_pairs``.
+    rows = per_mode_table(graded, uniform)
+    out["modes_errors"] = rows
+    crossings = zero_crossings(rows)
+    if crossings:
+        out["zero_crossings"] = [
+            {"l": r["l"], "family": r["family"], "reference_kb": r["reference_kb"],
+             "graded_signed_rel": r.get("graded_signed_rel"),
+             "uniform_signed_rel": r.get("uniform_signed_rel")}
+            for r in crossings]
+
+    # The refinement ladder the uniform side ALREADY builds, scored. It is the
+    # only check on whether these errors track discretisation at all, and it
+    # costs no solve -- every level was built for the reference.
+    errors = level_errors(levels, reference, n_modes)
+    out["uniform_level_errors"] = errors
+
+    # The tolerance, from the solver's own measured residual on each side: two
+    # meshes whose scores differ by less than the solver's noise have not been
+    # shown to differ. The sum is used because the comparison subtracts two
+    # independent solves, so their errors add; a missing residual on EITHER
+    # side leaves the tolerance unavailable rather than zero, and the run says
+    # so, because a strict comparison presented as a justified one is worse than
+    # no tolerance at all.
+    residuals = [graded_res := modes.get("solver_worst_residual"),
+                 out["uniform"].get("1.0", {}).get("worst_residual")]
+    tol = (sum(r for r in residuals) if all(isinstance(r, float) for r in residuals)
+           else 0.0)
+    out["tolerance"] = tol
+    out["tolerance_from_residuals"] = {
+        "graded": graded_res,
+        "uniform": out["uniform"].get("1.0", {}).get("worst_residual")}
+    if not tol:
+        out["tolerance_unavailable"] = (
+            "no measured residual on "
+            + ", ".join(t for t, r in zip(("graded", "uniform"), residuals)
+                        if not isinstance(r, float))
+            + " (the CPU factorisation records none), so the comparison is "
+              "strict")
+
+    # Item 3: judge on BUILT counts, at the printed mark. The estimator
+    # overshoots (c4-thin: 161,389 predicted against 61,244 built), so a case
+    # that only the estimate puts over the mark is measured, not refused.
+    built_sides = {"graded": out.get("n_tets_graded"),
+                   "uniform": out["uniform"].get("1.0", {}).get("n_tets")}
+    over = [tag for tag, n in built_sides.items()
+            if n is not None and n > TIER2_MAX_TETS]
+    out["built_sides"] = built_sides
+
+    # Item 1: same mesh. The lead's rule is "same plan AND same tet count", and
+    # both halves are needed. A uniform PLAN with different counts is a real
+    # difference (the two build paths disagree even at one edge -- the estimator
+    # finding), while a graded plan that happened to land on the same count is
+    # still graded. Only both together mean grading did nothing here.
+    out["plan_uniform"] = plan_is_uniform(plan)
+    graded_tets = built_sides.get("graded")
+    uniform_tets = built_sides.get("uniform")
+    same_mesh = bool(out["plan_uniform"]) and graded_tets is not None \
+        and graded_tets == uniform_tets
+    out["same_mesh"] = same_mesh
+
     # A side with no number says which side it is and what it produced, rather
     # than "one of the two worst errors is missing".
     reason = (missing_side_reason("the GRADED mesh", graded, reference)
               or missing_side_reason("the UNIFORM mesh", uniform, reference))
     verdict, detail = criterion(graded.get("worst_rel_error"),
-                                uniform.get("worst_rel_error"), reason)
+                                uniform.get("worst_rel_error"), reason,
+                                same_plan=same_mesh,
+                                tol=tol, sides_over_mark=over,
+                                reference_convergence=meta.get("reference_convergence"))
+    # A verdict that cannot be trusted is not a verdict. It is kept as the
+    # provisional reading and NOT reported as PASS: the case is UNRELIABLE.
+    n_targets = reference_multiplets_in_reach(reference, n_modes)
+    out["reference_multiplets_in_reach"] = n_targets
+    unreliable = reliability(errors, n_targets, rows)
+    out["reliability"] = unreliable
+    if unreliable and verdict in ("PASS", "FAIL"):
+        out["provisional_verdict"] = verdict
+        verdict, detail = ("UNRELIABLE",
+                           f"the comparison reads {verdict} ({detail}) but the "
+                           f"case cannot carry it: {unreliable}")
     # Item 5's bound, recorded with the verdict it is a bound on. ``None`` for
     # an analytic reference (an exact one has no convergence to give away).
     bound = favourable_bound(uniform.get("worst_rel_error"),
@@ -863,6 +1302,126 @@ def predicted_counts(case) -> dict:
             "counts": counts,
             "over_ceiling": sorted(k for k, n in counts.items()
                                    if n > TIER2_MAX_TETS)}
+
+
+def _read_built(results_dir):
+    """``{label: {"graded": n, "uniform": n, "source": path}}`` from run JSONs.
+
+    Only ``run_case``'s own output counts, and only counts that came from a
+    BUILD (``n_tets_graded`` / ``uniform['1.0'].n_tets``) -- an estimate read
+    back as a built count would be the estimator checked against itself, which
+    is exactly the comparison this table exists to replace.
+    """
+    built = {}
+    for path in sorted(Path(results_dir).glob("*.json")):
+        try:
+            d = json.loads(path.read_text())
+        except Exception:  # noqa: BLE001 - an unreadable result is a gap
+            continue
+        cases = d if isinstance(d, list) else [d]
+        for c in cases:
+            if not isinstance(c, dict):
+                continue
+            label = c.get("label") or (c.get("case") or {}).get("label")
+            body = c.get("case") if isinstance(c.get("case"), dict) else c
+            if not label or not isinstance(body, dict):
+                continue
+            n_g = body.get("n_tets_graded")
+            n_u = (body.get("uniform") or {}).get("1.0", {}).get("n_tets")
+            if n_g is None and n_u is None:
+                continue
+            built[label] = {"graded": n_g, "uniform": n_u,
+                            "source": path.name}
+    return built
+
+
+def estimator_table(cases, results_dir=None) -> int:
+    """Item 5: the estimator's two paths against BUILT counts, one row a case.
+
+    ``web.meshing.estimate_tets`` is what the live site ROUTES on (``web/app.py``:
+    GPU above 15,000, refuse above 1,200,000), so a case where the estimate and
+    the mesher disagree by a large factor is a routing finding about the product,
+    not a bench artefact. Reported, not changed: the lead's instruction was to
+    report it.
+
+    The two estimate columns are the two API paths, and they are different
+    functions of the input -- ``materials=<parts>`` routes through the
+    region-aware plan, ``min_feature_m=`` through the legacy single-feature
+    floor -- so where they disagree the estimate does not depend on the mesh
+    alone but on which call the caller happens to make.
+    """
+    import meshing as WEBMESH
+    import config as CFG
+
+    built = _read_built(results_dir) if results_dir else {}
+    c = CFG.est_tets_c()
+    # The thresholds are READ from the product, never retyped: web/app.py:1136
+    # routes on CFG.gpu_min_tets() and web/app.py:1127 refuses above
+    # CFG.upload_refuse_tets(), so a bench constant here would be a second
+    # source of truth for a routing decision the product makes.
+    #
+    # The app's own comment (web/config.py:248) says the refuse threshold sits at
+    # twice the cap "because the estimate can be up to 2x high". The table below
+    # is the test of that assumption, and the warning line reports every case
+    # that breaks it.
+    print(f"live routing (read from config): route to GPU at or above "
+          f"{CFG.gpu_min_tets():,}; refuse an upload above "
+          f"{CFG.upload_refuse_tets():,} (= 2x the real cap "
+          f"{CFG.max_tets():,}); tier-2 mark {TIER2_MAX_TETS:,} (built counts "
+          f"judge that, not estimates)")
+    print(f"{'case':>13} {'est(materials=)':>15} {'est(min_feature_m=)':>19} "
+          f"{'built graded':>13} {'built uniform':>14} {'built/est':>9}  source")
+    incomplete = 0
+    for case in cases:
+        try:
+            built_case = _build(case, case["n_modes"])
+            outer = _outer_surface(built_case["parts"])
+            est_m = int(WEBMESH.estimate_tets(
+                outer, case["n_modes"], "mm", c=c,
+                parts=built_case["parts"], materials=case["materials"]))
+            est_f = int(WEBMESH.estimate_tets(
+                outer, case["n_modes"], "mm", c=c,
+                min_feature_m=built_case["h_min_mm"] * 1e-3))
+        except Exception as exc:  # noqa: BLE001 - a failed estimate is data
+            print(f"{case['label']:>13}   --- ESTIMATE FAILED: "
+                  f"{type(exc).__name__}: {exc}")
+            incomplete += 1
+            continue
+        b = built.get(case["label"]) or {}
+        g, u = b.get("graded"), b.get("uniform")
+        ratio = (f"{g / est_m:.2f}x" if g and est_m else "----")
+        over = []
+        if g and g > TIER2_MAX_TETS:
+            over.append("built graded")
+        if u and u > TIER2_MAX_TETS:
+            over.append("built uniform")
+        print(f"{case['label']:>13} {est_m:>15,} {est_f:>19,} "
+              f"{(f'{g:,}' if g else 'not built'):>13} "
+              f"{(f'{u:,}' if u else 'not built'):>14} {ratio:>9}  "
+              f"{b.get('source', 'no built counts here')}")
+        if over:
+            print(f"{'':>13}   ! over the tier-2 mark {TIER2_MAX_TETS:,} on "
+                  f"{' and '.join(over)} -- UNMEASURED whatever the estimate "
+                  f"said ({est_m:,} materials=, {est_f:,} min_feature_m=)")
+        if u and est_f and abs(est_f / u - 1.0) > 0.25:
+            print(f"{'':>13}   ! the min_feature_m= estimate is "
+                  f"{est_f / u:.2f}x the BUILT uniform count ({est_f:,} vs "
+                  f"{u:,}); the bench builds its uniform side by this path")
+        # The documented bound is 2x (web/config.py:248). Anything above it is a
+        # case the refuse threshold was not sized for.
+        for tag, est_v, built_v in (("materials=", est_m, g),
+                                    ("min_feature_m=", est_f, u)):
+            if built_v and est_v > 2.0 * built_v:
+                print(f"{'':>13}   ! the {tag} estimate is "
+                      f"{est_v / built_v:.2f}x the BUILT count ({est_v:,} vs "
+                      f"{built_v:,}) -- above the 2x the refuse threshold "
+                      f"(web/config.py:248) is documented to allow")
+    if not built:
+        print("\nno built counts: pass --results DIR (a directory of this "
+              "bench's own --json output) to compare the estimate with what "
+              "the mesher actually built. The two estimate columns need no "
+              "solve; the built columns do, so they come from a run's files.")
+    return MATRIX_INCOMPLETE if incomplete else MATRIX_OK
 
 
 def list_cases(cases, as_json=False) -> int:
@@ -952,10 +1511,21 @@ def main(argv=None) -> int:
     p.add_argument("--list", action="store_true",
                    help="print the case list with predicted element counts")
     p.add_argument("--case", default=None, help="run ONE case by label")
+    p.add_argument("--estimator", action="store_true",
+                   help="item 5: the estimator's two paths vs BUILT counts, "
+                        "one row per case (no solves; pair with --results)")
+    p.add_argument("--results", default=None,
+                   help="a directory of this bench's own --json output; its "
+                        "build counts fill the BUILT columns of --estimator")
     p.add_argument("--grid", type=int, default=40)
     p.add_argument("--backend", default="gpu", choices=("cpu", "gpu"))
     p.add_argument("--json", default=None, help="write the case result here")
     p.add_argument("--work", default=None)
+    p.add_argument("--ladder", action="store_true",
+                   help="also build and solve ONE coarser rung (h_min/0.8) per "
+                        "case, so the uniform side's error can be seen from both "
+                        "sides of the reference and a zero crossing is "
+                        "measurable rather than argued (item 2)")
     p.add_argument("--baseline", default="product", choices=("product", "probe"),
                    help="resolution of the uniform side: 'product' = the "
                         "finest edge the product's own plan asks for (the rule "
@@ -970,9 +1540,12 @@ def main(argv=None) -> int:
 
     if args.list:
         return list_cases(MATRIX)
+    if args.estimator:
+        return estimator_table(MATRIX, results_dir=args.results)
     labels = [c["label"] for c in MATRIX]
     if not args.case:
-        print("nothing to do: pass --list or --case <label>", file=sys.stderr)
+        print("nothing to do: pass --list, --estimator or --case <label>",
+              file=sys.stderr)
         return MATRIX_USAGE
     if args.case not in labels:
         print(f"unknown case {args.case!r}; known: {labels}", file=sys.stderr)
@@ -985,7 +1558,7 @@ def main(argv=None) -> int:
     try:
         result = run_case(case, grid=args.grid, backend=args.backend, work=work,
                           verbose=not args.quiet, bands=args.bands,
-                          baseline=args.baseline)
+                          baseline=args.baseline, ladder=args.ladder)
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
         print(f"[matrix] case RAISED: {type(exc).__name__}: {exc}")
@@ -1018,6 +1591,53 @@ def main(argv=None) -> int:
         if out.get("uniform_regions_error"):
             print(f"[matrix]   uniform per-region build FAILED: "
                   f"{out['uniform_regions_error']}")
+    # Item 1: say it in words, not only as an exit code -- "the plan was uniform
+    # so both sides are the same mesh" is the finding, and a verdict string
+    # alone does not carry it.
+    if out.get("plan_uniform") is not None:
+        print(f"[matrix] plan uniform: {bool(out['plan_uniform'])}"
+              + (f"; same mesh as the uniform side: {out['same_mesh']} "
+                 f"({out.get('built_sides', {}).get('graded'):,} tets both)"
+                 if out.get("same_mesh") else ""))
+    # Item 2: the signed per-multiplet errors, both sides, and the crossings.
+    rows_m = out.get("modes_errors") or []
+    if rows_m:
+        print("[matrix] per-multiplet SIGNED error (graded / uniform):")
+        for r in rows_m:
+            g = r.get("graded_signed_rel")
+            u = r.get("uniform_signed_rel")
+            print(f"[matrix]   l={r['l']} {r['family']} ref "
+                  f"{_num(r['reference_kb'])} GHz: "
+                  + (f"graded {g * 100:+.4f}%" if g is not None
+                     else "graded not matched")
+                  + "  |  "
+                  + (f"uniform {u * 100:+.4f}%" if u is not None
+                     else "uniform not matched"))
+        for c in (out.get("zero_crossings") or []):
+            print(f"[matrix]   ZERO CROSSING at ref {_num(c['reference_kb'])} GHz "
+                  f"(l={c['l']} {c['family']}): graded "
+                  f"{_num(c['graded_signed_rel'])} vs uniform "
+                  f"{_num(c['uniform_signed_rel'])} -- magnitudes here are not "
+                  "comparable")
+    ladder = out.get("uniform_level_errors") or []
+    if ladder:
+        print("[matrix] uniform ladder (worst error vs the reference): "
+              + ", ".join(f"k={e['k']:g} "
+                          + (f"{_num(e['worst_rel_error'])}"
+                             if e.get('worst_rel_error') is not None
+                             else f"unmatched({e.get('n_matched')})")
+                          for e in ladder))
+    if out.get("tolerance") is not None and out.get("n_tets_graded"):
+        if out.get("tolerance"):
+            print(f"[matrix] tolerance from the solver's measured residual: "
+                  f"{out['tolerance']:.3e} (graded "
+                  f"{_num(out['tolerance_from_residuals']['graded'])}, uniform "
+                  f"{_num(out['tolerance_from_residuals']['uniform'])})")
+        else:
+            print(f"[matrix] tolerance: none available -- "
+                  f"{out.get('tolerance_unavailable')}")
+    if out.get("reliability"):
+        print(f"[matrix] verdict reliability: {out['reliability']}")
     if result.get("meta", {}).get("reference_convergence") is not None:
         print("[matrix] reference's own convergence (coarse vs finest): "
               f"{result['meta']['reference_convergence'] * 100:.3f}%")
@@ -1044,7 +1664,9 @@ def main(argv=None) -> int:
         print("[matrix] bands: " + "  ".join(
             f"{k} {v['edge_mm']:.4f} mm" for k, v in out["bands"].items()))
     return {"PASS": MATRIX_OK, "FAIL": MATRIX_FAIL,
-            "UNMEASURED": MATRIX_INCOMPLETE}[result["verdict"]]
+            "UNMEASURED": MATRIX_INCOMPLETE, "SAME MESH": MATRIX_SAME_MESH,
+            "UNRELIABLE": MATRIX_UNRELIABLE,
+            "NO VERDICT": MATRIX_NO_VERDICT}[result["verdict"]]
 
 
 if __name__ == "__main__":

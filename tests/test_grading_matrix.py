@@ -338,7 +338,7 @@ def test_a_bound_needs_all_three_operands():
 GRADED_FREQ_HZ = 1.0
 
 
-def _fake_run_case(monkeypatch, baseline: str = "product"):
+def _fake_run_case(monkeypatch, baseline: str = "product", ladder: bool = False):
     """``run_case`` with every heavy call faked out. Returns ``(result, seen)``.
 
     ``seen`` records the floor the uniform side was built at, which is the
@@ -372,7 +372,11 @@ def _fake_run_case(monkeypatch, baseline: str = "product"):
     def fake_uniform(materials, obj, case, h_min_mm, *, k, layers, backend,
                      np_verbose=False):
         seen.setdefault("uniform_floors", []).append((k, h_min_mm))
-        return None, np.zeros((7, 4), int), np.array([2.0])
+        # A NODE CLOUD, not None. The runner now checks the points a level's
+        # build returned before a reference is allowed to come from it, so a
+        # fake that returned None would model a producer the runner refuses --
+        # and every level would come back as a failed build.
+        return np.zeros((7, 3), float), np.zeros((7, 4), int), np.array([2.0])
 
     def fake_uniform_regions(case, obj, h_min_mm, verbose=False):
         seen["region_aware_floor"] = h_min_mm
@@ -393,12 +397,30 @@ def _fake_run_case(monkeypatch, baseline: str = "product"):
     monkeypatch.setattr(GM, "_graded", fake_graded)
     monkeypatch.setattr(GM, "_uniform", fake_uniform)
     monkeypatch.setattr(GM, "_uniform_regions", fake_uniform_regions)
-    monkeypatch.setattr(GM, "_clusters_pairs", lambda kb: [(1.0, 0, "f", 1)])
+    # The reference covers the five modes the case asks for: a reference that
+    # did NOT would be refused by the runner's reference gate, which is a
+    # different test's subject.
+    monkeypatch.setattr(GM, "_clusters_pairs", lambda kb: [(1.0, 0, "f", 5)])
     monkeypatch.setattr(GM.REF, "score_multiplets", fake_score)
     case = next(c for c in GM.MATRIX if c["label"] == "box-sphere")
     result = GM.run_case(case, grid=10, backend="cpu", work=Path("/tmp"),
-                         verbose=False, baseline=baseline)
+                         verbose=False, baseline=baseline, ladder=ladder)
     return result, seen
+
+
+def _fake_run_case_with(monkeypatch, **overrides):
+    """``_fake_run_case`` with named runner functions replaced, then re-run.
+
+    ``_fake_run_case`` patches the whole call graph, so an override has to be
+    applied after it and the case rebuilt; this keeps that ordering in one
+    place instead of in each test that needs a different producer.
+    """
+    _fake_run_case(monkeypatch)
+    for name, fn in overrides.items():
+        monkeypatch.setattr(GM, name, fn)
+    case = next(c for c in GM.MATRIX if c["label"] == "box-sphere")
+    return GM.run_case(case, grid=10, backend="cpu", work=Path("/tmp"),
+                       verbose=False)
 
 
 def test_the_uniform_side_is_sized_by_the_products_own_floor(monkeypatch):
@@ -593,6 +615,285 @@ def test_the_case_print_block_survives_a_result_with_gaps(monkeypatch, capsys):
     assert "baseline product: h_min 0.3368 mm (product 0.3368, probe 0.7511)" in out, out
     assert "graded region 0: asked 1.0 units, built None" in out, out
     assert "uniform region 0: asked 0.3368 units, built 0.9" in out, out
+
+
+# ------------------------------------------------- step 2b: the five items
+#
+# 1  SAME MESH when the plan is uniform and the counts match
+# 2  signed per-mode errors for both sides, and UNRELIABLE when they cannot be
+#    read (non-monotone ladder, one multiplet, a crossing)
+# 3  the tier-2 mark read off BUILT counts, not estimates
+# 5  the estimator's two paths against what the mesher built
+
+
+def test_a_uniform_plan_is_recognised_by_its_targets():
+    """Item 1's plan half: all regions asking the same edge is a uniform plan."""
+    assert GM.plan_is_uniform({"0": {"edge_m": 1e-3}, "1": {"edge_m": 1e-3}})
+    assert not GM.plan_is_uniform({"0": {"edge_m": 1e-3}, "1": {"edge_m": 2e-3}})
+    # One region has no contrast to flatten, so it is not evidence about
+    # grading either way -- and calling it SAME MESH would retire a case that
+    # never tested anything as if it had passed.
+    assert not GM.plan_is_uniform({"0": {"edge_m": 1e-3}})
+    assert not GM.plan_is_uniform({})
+    assert not GM.plan_is_uniform(None)
+
+
+def test_same_mesh_outranks_pass_and_fail():
+    """Grading that did nothing is neither a win nor a loss, whatever the numbers."""
+    verdict, detail = GM.criterion(0.001, 0.001, None, same_plan=True)
+    assert verdict == "SAME MESH", (verdict, detail)
+    assert "same mesh" in detail
+    # Even when the graded mesh is STRICTLY worse -- the comparison is vacuous
+    # either way, so the worse reading must not be promoted to a FAIL.
+    assert GM.criterion(0.010, 0.001, None, same_plan=True)[0] == "SAME MESH"
+
+
+def test_the_real_c2_thin_pair_is_same_mesh_and_the_strict_mutant_is_not():
+    """The lead's item 1, on the Orin's own c2-thin numbers.
+
+    c2-thin's graded plan asks both regions for 1.0825 mm, so the graded build
+    IS the uniform build: 22,947 elements both sides, and the solver's two
+    readings differ in the 13th digit. Under the old strict ``<=`` that pair
+    reads FAIL -- the graded number is larger -- which is how a case that
+    exercised nothing came back as a loss.
+
+    The mutant is the second half: the SAME numbers with the guard removed must
+    come back FAIL, or the guard is not what produced SAME MESH and this test
+    would pass with the fix reverted.
+    """
+    graded, uniform = 0.0019135674962923, 0.0019135674962911
+    guard = GM.criterion(graded, uniform, None, same_plan=True)
+    assert guard[0] == "SAME MESH", guard
+
+    mutant = GM.criterion(graded, uniform, None)      # guard removed
+    assert mutant[0] == "FAIL", mutant
+    assert graded > uniform                           # why it flips
+
+
+def test_the_tolerance_is_the_measured_residual_or_nothing():
+    """Item 1's other half: no picked number, and no silent zero."""
+    graded, uniform, residual = 0.051, 0.050, 0.002
+    assert GM.criterion(graded, uniform, None, tol=0.0)[0] == "FAIL"
+    verdict, detail = GM.criterion(graded, uniform, None, tol=residual)
+    assert verdict == "PASS", detail
+    assert "measured residual" in detail and "2.00e-03" in detail
+    # A gap wider than the residual is still a real difference.
+    assert GM.criterion(graded + 0.003, uniform, None, tol=residual)[0] == "FAIL"
+
+
+def test_the_runner_reports_a_missing_residual_as_unavailable(monkeypatch):
+    """No residual anywhere means a strict comparison, said out loud."""
+    import sys
+    import types
+
+    stub = types.ModuleType("mse_eigen")           # no LAST_WORST_RESIDUAL
+    monkeypatch.setitem(sys.modules, "mse_eigen", stub)
+    assert GM._last_residual() is None
+    # The success path is the control: a module that HAS the attribute is read.
+    stub.LAST_WORST_RESIDUAL = 1.5e-5
+    assert GM._last_residual() == 1.5e-5
+
+
+def test_the_ladder_flag_adds_exactly_one_coarser_rung(monkeypatch):
+    """Item 2's instrument: a rung below 1.0, and it is opt-in."""
+    _result, seen = _fake_run_case(monkeypatch)
+    assert sorted(k for k, _h in seen["uniform_floors"]) == [1.0, 1.25, 1.5]
+    _result, seen = _fake_run_case(monkeypatch, ladder=True)
+    ks = sorted(k for k, _h in seen["uniform_floors"])
+    assert ks == [GM.COARSE_RUNG, 1.0, 1.25, 1.5], ks
+    assert GM.COARSE_RUNG < 1.0, "the rung must be COARSER, not finer"
+
+
+def test_a_reference_that_does_not_cover_the_asked_modes_is_unmeasured(monkeypatch):
+    """The gate, and its positive control.
+
+    A reference covering one of five asked-for modes cannot answer the case's
+    question, and the scorer would not complain: it matches what it can and
+    reports the rest unmatched, so the verdict would read as a comparison
+    against one target. The control is the same fake with a covering reference,
+    which must NOT carry the gate's message.
+    """
+    partial = GM._clusters_pairs
+    result = _fake_run_case_with(
+        monkeypatch, _clusters_pairs=lambda kb: [(1.0, 0, "f", 1)])
+    assert result["verdict"] == "UNMEASURED", result["verdict"]
+    assert "covers 1 of the 5" in result["detail"], result["detail"]
+    assert partial is not None
+
+    control = _fake_run_case_with(monkeypatch)      # 5-fold reference
+    assert "covers" not in (control.get("detail") or ""), control
+
+
+def test_a_reference_build_that_is_not_a_mesh_is_named(monkeypatch):
+    """The build-time half of the gate: a partial cloud, refused by name.
+
+    ``np.zeros((0, 3))`` is the shape an incremental build leaves behind when
+    its refinement is refused -- truthy but empty -- so the check has to look
+    at the array, not at whether the call returned something.
+    """
+    import numpy as np
+
+    def empty_uniform(materials, obj, case, h_min_mm, *, k, layers, backend,
+                      np_verbose=False):
+        return np.zeros((0, 3), float), np.zeros((7, 4), int), np.array([2.0])
+
+    result = _fake_run_case_with(monkeypatch, _uniform=empty_uniform)
+    assert result["verdict"] == "UNMEASURED", result["verdict"]
+    assert "not a finite (n, 3) node cloud" in result["detail"], result["detail"]
+
+
+def test_signed_errors_keep_the_side_of_the_reference():
+    """Item 2's core: a magnitude rectifies, a sign does not."""
+    # ``centre`` is the key the real scorer (run_multimaterial_bench) emits;
+    # reading anything else would mean this test passes on a schema the
+    # producer never writes.
+    score = {"matched": [
+        {"l": 1, "family": "TE", "reference_kb": 4.0, "centre": 4.04,
+         "count": 3, "reference_multiplicity": 3},
+        {"l": 2, "family": "TM", "reference_kb": 8.0, "centre": 7.92,
+         "count": 5, "reference_multiplicity": 5},
+    ]}
+    rows = GM.signed_pairs(score)
+    assert [round(r["signed_rel"], 6) for r in rows] == [0.01, -0.01]
+    # A mode whose reference energy is zero has no relative error, and that is
+    # reported as missing rather than as +inf or 0.
+    assert GM.signed_pairs({"matched": [
+        {"l": 1, "family": "TE", "reference_kb": 0.0, "centre": 1.0}]})[0][
+        "signed_rel"] is None
+
+
+def test_the_per_mode_table_joins_both_sides_and_finds_crossings():
+    graded = {"matched": [{"l": 1, "family": "TE", "reference_kb": 4.0,
+                           "centre": 4.0004}]}
+    uniform = {"matched": [{"l": 1, "family": "TE", "reference_kb": 4.0,
+                            "centre": 3.9996}]}
+    rows = GM.per_mode_table(graded, uniform)
+    assert len(rows) == 1 and rows[0]["reference_kb"] == 4.0
+    assert rows[0]["graded_signed_rel"] > 0 > rows[0]["uniform_signed_rel"]
+    assert GM.zero_crossings(rows) == rows
+    # Same side: no crossing, and that must not be reported as one.
+    same = GM.per_mode_table(graded, {"matched": [{"l": 1, "family": "TE",
+                                                   "reference_kb": 4.0,
+                                                   "centre": 4.0002}]})
+    assert GM.zero_crossings(same) == []
+    # A pair only one side matched cannot be a crossing: absent is not equal.
+    assert GM.zero_crossings(GM.per_mode_table(graded, {"matched": []})) == []
+
+
+def test_reliability_names_the_reason_it_refuses():
+    """Each route to UNRELIABLE, and the control that must stay reliable."""
+    rung = lambda w: {"k": 1.0, "worst_rel_error": w, "n_matched": 1}
+    monotone = [rung(0.03), rung(0.02), rung(0.01)]
+    assert GM.reliability(monotone, 2, []) is None
+    up = [rung(0.01), rung(0.02)]
+    assert "does not fall" in GM.reliability(up, 2, [])
+    # The finest rung of a uniform-refined case IS the reference, so its error is
+    # 0 by construction -- monotone, and invisible to this check. That is a
+    # blind spot of the ladder, not a verdict; --ladder adds a coarser rung to
+    # see the other side of a crossing (its own test).
+    assert GM.reliability([rung(0.02), rung(0.0)], 2, []) is None
+    assert "one signed" in GM.reliability(monotone, 1, [])
+    cross = [{"l": 1, "family": "TE", "reference_kb": 4.0,
+              "graded_signed_rel": 0.001, "uniform_signed_rel": -0.001}]
+    assert "change sign" in GM.reliability(monotone, 2, cross)
+    assert "did not match" in GM.reliability(
+        [rung(0.03), {"k": 1.25, "worst_rel_error": None, "n_matched": 0}], 2, [])
+
+
+def test_the_reachable_multiplets_are_the_ones_the_budget_can_see():
+    """One target for three modes on a triplet; the spectrum's tail is not it."""
+    triplet = [(4.0, 1, "TE", 3)] + [(9.0 + i, 2, "TM", 5) for i in range(6)]
+    assert GM.reference_multiplets_in_reach(triplet, 3) == 1
+    assert GM.reference_multiplets_in_reach(triplet, 5) == 2
+    assert GM.reference_multiplets_in_reach(triplet, 40) == 7
+    assert GM.reference_multiplets_in_reach([], 3) == 1     # never zero
+
+
+def test_a_case_over_the_mark_on_built_counts_is_unmeasured():
+    """Item 3: the mark is judged on what was BUILT, and it refuses to guess."""
+    verdict, detail = GM.criterion(0.001, 0.002, None, sides_over_mark=["graded"])
+    assert verdict == "UNMEASURED", (verdict, detail)
+    assert "BUILT counts" in detail and "200,000" in detail
+    assert GM.criterion(0.001, 0.002, None)[0] == "PASS"
+
+
+def test_a_gap_under_the_references_convergence_gets_no_verdict():
+    """box-sphere's shape of answer: the reference cannot resolve the gap."""
+    verdict, detail = GM.criterion(0.01452, 0.01442, None,
+                                   reference_convergence=0.01007)
+    assert verdict == "NO VERDICT", (verdict, detail)
+    assert "smaller than the reference's own convergence" in detail
+    # A gap wider than the convergence is judged normally.
+    assert GM.criterion(0.0300, 0.01442, None,
+                        reference_convergence=0.01007)[0] == "FAIL"
+
+
+def test_every_non_verdict_has_its_own_exit_code():
+    """A script must not read "no answer" as "fine"."""
+    codes = {GM.MATRIX_OK, GM.MATRIX_USAGE, GM.MATRIX_FAIL,
+             GM.MATRIX_INCOMPLETE, GM.MATRIX_SAME_MESH, GM.MATRIX_UNRELIABLE,
+             GM.MATRIX_NO_VERDICT}
+    assert len(codes) == 7, codes
+    assert GM.MATRIX_SAME_MESH not in (GM.MATRIX_OK, GM.MATRIX_FAIL)
+    assert GM.MATRIX_NO_VERDICT not in (GM.MATRIX_OK, GM.MATRIX_INCOMPLETE)
+
+
+def test_the_print_block_shows_both_sides_signed_errors(monkeypatch, capsys):
+    """The new stdout path, driven through the real print block."""
+    import numpy as np
+
+    # The two sides are told apart by their SPECTRUM (the graded one comes back
+    # through ``_kb`` and is tiny; the uniform rung's is 2.0), and each carries
+    # the opposite SIGN about the same reference -- which is the whole point of
+    # item 2 and must survive to stdout.
+    def scored(kb, reference, n_requested):
+        graded = float(np.asarray(kb)[0]) < 1.0
+        worst = 0.0 if graded else 0.02
+        centre = 4.0 * (1 + (0.0001 if graded else -0.0001))
+        return {"worst_rel_error": worst, "n_clusters": 1, "n_matched": 1,
+                "n_returned": 3, "spurious": [], "unmatched_reference": [],
+                "matched": [{"l": 1, "family": "TE", "reference_kb": 4.0,
+                             "centre": centre, "count": 3,
+                             "reference_multiplicity": 3}]}
+
+    _fake_run_case(monkeypatch)
+    monkeypatch.setattr(GM.REF, "score_multiplets", scored)
+    case = next(c for c in GM.MATRIX if c["label"] == "box-sphere")
+    rc = GM.main(["--case", "box-sphere", "--grid", "10", "--backend", "cpu",
+                  "--quiet"])
+    out = capsys.readouterr().out
+    assert "per-multiplet SIGNED error" in out, out
+    assert "l=1 TE ref 4.0 GHz" in out, out
+    assert "graded +0.0100%" in out and "uniform -0.0100%" in out, out
+    # The graded side is 0.0 and the uniform 0.02, so the reading is a PASS; but
+    # the reference has ONE reachable multiplet, so one signed number would
+    # decide it and the lead asked for exactly that to be flagged. It must leave
+    # as UNRELIABLE, not as a PASS with a number in it.
+    assert rc == GM.MATRIX_UNRELIABLE, (rc, out)
+    assert case["label"] == "box-sphere"
+
+
+def test_the_estimator_table_reports_both_paths_against_built(monkeypatch, capsys,
+                                                             tmp_path):
+    """Item 5: the table, with a real result file behind the built columns."""
+    import json
+
+    (tmp_path / "c4-thin.json").write_text(json.dumps(
+        {"label": "c4-thin", "n_tets_graded": 61244,
+         "uniform": {"1.0": {"n_tets": 57872}}}))
+    (tmp_path / "c3-thin.json").write_text(json.dumps(
+        {"label": "c3-thin", "n_tets_graded": 220160,
+         "uniform": {"1.0": {"n_tets": 154673}}}))
+    _fake_run_case(monkeypatch)                      # patches _build
+    monkeypatch.setattr(GM, "_outer_surface", lambda parts: None)
+    monkeypatch.setattr("meshing.estimate_tets", lambda *a, **k: 1234)
+    rc = GM.estimator_table(GM.MATRIX, results_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert rc == GM.MATRIX_OK, (rc, out)
+    assert "est(materials=)" in out and "est(min_feature_m=)" in out
+    assert "61,244" in out and "57,872" in out, out
+    assert "no built counts here" in out           # the cases without a file
+    assert "over the tier-2 mark 200,000 on built graded" in out, out
 
 
 if __name__ == "__main__":  # pragma: no cover
