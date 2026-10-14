@@ -39,7 +39,30 @@ THE REFERENCE, per case, is one of two things and the case says which:
 WHAT THIS FILE DOES NOT DO. It does not change the grading rule; it measures it.
 And nothing here is a constant fitted to a case: the per-region edges come from
 ``mse_common.region_plan`` and the predicted counts from
-``web.meshing.estimate_tets``, both production functions.
+``web.meshing.estimate_tets``, both production functions, and the estimator's
+constant from ``web.config.CFG.est_tets_c()``, the value ``web/app.py`` routes
+on.
+
+SIZING, AND WHAT IT COSTS. Each case is sized so every mesh it builds fits tier
+2: one solve at a time on the Orin, under 5 GB and 30 minutes. The binding cost
+is the UNIFORM reference -- every region meshed at the finest region's edge --
+and the measured law is steep: it costs ``contrast**3 * n_modes`` elements, and
+nothing else moves it (the outer size cancels, because the target edge scales
+with it; the shell thickness does not enter it at all, since ``h_min`` comes
+from the densest region and not from the wall). So a contrast-4 sphere predicts
+650,465 elements at the other bench's ten modes, 3.3x the mark, and the two
+contrast-4 cases therefore run at three modes -- the first complete degenerate
+triplet -- saying so in their notes. The mode count is the only lever that moves
+the uniform reference; on the thin cases it moves only the core, because the
+clamp pins the wall's edge near its thickness, so c4-thin needs three modes to
+bring its graded side down too, while c3-thin is left at ten modes carrying a
+graded side of 220,160 -- flagged, not quietly resized, because the row asks
+which cases the Orin cannot solve. THE MARK is the row's own: the n3 uniform
+mesh at 199,062 elements OOMed once and solved once. Predicted counts come from
+the product's estimator, which reads ~1.4x high on the one case where the
+estimate and the built mesh are both known (274,415 predicted, 199,062 built),
+so a flagged case may still solve; the flag means expect UNMEASURED, never a
+pass.
 
 USAGE
     python3 benchmarks/run_grading_matrix.py --list
@@ -88,10 +111,18 @@ MATRIX_INCOMPLETE = 4
 #: the row asks to be made visible.
 TIER2_MAX_TETS = 200_000
 
-#: The uniform reference's refinement factors. The finest is the reference the
-#: errors are scored against; the coarser levels measure the reference's own
-#: convergence, and K = 1.5 costs a third of what K = 2 costs.
-REFINE_FACTORS = (1.5, 2.0)
+#: The uniform reference's refinement levels. The finest is the reference the
+#: errors are scored against; the coarser one measures the reference's own
+#: convergence. Both are uniform meshes at ``h_min/K``, so each level costs
+#: ``K**3`` times the comparison mesh -- K = 2.0 is 8x, which no case whose
+#: outside is a 10 mm sphere can afford on tier 2: the offset-sphere case at its
+#: first sizing predicted 1,097,656 elements there, five times the mark. The
+#: pair is one constant for every case rather than a per-case choice, because a
+#: factor picked to make one case fit is the fixture-fitted tuning this row
+#: exists to rule out. The cost of that choice is stated where it is used: the
+#: reference is 1.5x finer than the mesh it judges, and the convergence check
+#: between the two levels is what has to carry its trust.
+REFINE_FACTORS = (1.25, 1.5)
 
 
 # ---------------------------------------------------------------- the fixtures
@@ -215,7 +246,12 @@ MATRIX = [
                                  {"wall": 1.0, "core": 4.0}, te),
           {"wall": 1.0, "core": 4.0}, "analytic",
           {"contrast": 4.0, "shell": "thick", "regions": 2,
-           "shape": "concentric"}),
+           "shape": "concentric"},
+          n_modes=3,
+          note="contrast 4 costs 19x the contrast-1.5 case: at the sibling's ten "
+               "modes its uniform reference predicts 650,465 elements, 3.3x the "
+               "tier-2 mark. Three modes -- the first complete degenerate "
+               "triplet -- brings it to the mark."),
     _case("c2-thin",
           lambda te: _concentric({"wall": B_MM, "core": A_THIN},
                                  {"wall": 1.0, "core": 2.0}, te),
@@ -228,21 +264,35 @@ MATRIX = [
                                  {"wall": 1.0, "core": 3.0}, te),
           {"wall": 1.0, "core": 3.0}, "analytic",
           {"contrast": 3.0, "shell": "thin", "regions": 2,
-           "shape": "concentric"}),
+           "shape": "concentric"},
+          note="the clamp pins the wall near 1.0 mm, so the graded side is "
+               "220,160 elements at ten modes against c3-thick's 35,314 on the "
+               "same rule -- and its uniform reference is the SAME 274,415-"
+               "element mesh c3-thick builds, because h_min comes from the "
+               "core, not the wall."),
     _case("c4-thin",
           lambda te: _concentric({"wall": B_MM, "core": A_THIN},
                                  {"wall": 1.0, "core": 4.0}, te),
           {"wall": 1.0, "core": 4.0}, "analytic",
           {"contrast": 4.0, "shell": "thin", "regions": 2,
-           "shape": "concentric"}),
+           "shape": "concentric"},
+          n_modes=3,
+          note="contrast 4 AND a wall the clamp pins near 1.0 mm: at ten modes "
+               "the pair is 494,772 graded against 650,465 uniform, both over "
+               "the mark, and three modes brings them to 161,389 and 195,139 -- "
+               "2.4% under. The narrowest window the case fits in."),
     _case("three-region",
           lambda te: _concentric({"wall": B_MM, "mid": 0.6 * B_MM,
                                   "core": 0.25 * B_MM},
-                                 {"wall": 1.0, "mid": 2.0, "core": 4.0}, te),
-          {"wall": 1.0, "mid": 2.0, "core": 4.0}, "uniform-refined",
-          {"contrast": 4.0, "shell": "thick", "regions": 3,
+                                 {"wall": 1.0, "mid": 1.5, "core": 2.0}, te),
+          {"wall": 1.0, "mid": 1.5, "core": 2.0}, "uniform-refined",
+          {"contrast": 2.0, "shell": "thick", "regions": 3,
            "shape": "concentric"},
-          n_modes=5, note="three distinct indices: no closed-form spectrum"),
+          n_modes=5,
+          note="three distinct indices: no closed-form spectrum. The ramp is "
+               "mild (1/1.5/2) because the reference's own finer level costs "
+               "contrast**3: at 1/2/4 the K=2.0 level predicted 2,601,856 "
+               "elements, thirteen times the mark."),
     _case("box-sphere",
           lambda te: _box_sphere((5.0, 3.5, 2.5), 1.6,
                                  {"wall": 1.0, "core": 3.0}, te),
@@ -250,10 +300,16 @@ MATRIX = [
           {"contrast": 3.0, "shell": "thick", "regions": 2, "shape": "box"},
           n_modes=5, note="non-spherical cavity: a 10x7x5 box"),
     _case("offset-sphere",
-          lambda te: _offset(B_MM, 2.5, 4.0, {"wall": 1.0, "core": 3.0}, te),
-          {"wall": 1.0, "core": 3.0}, "uniform-refined",
-          {"contrast": 3.0, "shell": "thick", "regions": 2, "shape": "offset"},
-          n_modes=5, note="non-concentric: the core is 4 mm off centre"),
+          lambda te: _offset(B_MM, 2.5, 4.0, {"wall": 1.0, "core": 2.0}, te),
+          {"wall": 1.0, "core": 2.0}, "uniform-refined",
+          {"contrast": 2.0, "shell": "thick", "regions": 2, "shape": "offset"},
+          n_modes=5,
+          note="non-concentric: the core is 4 mm off centre. What this case "
+               "carries is the SHAPE -- contrast 3 is box-sphere's -- because "
+               "the reference costs contrast**3: at contrast 3 and five modes "
+               "its levels predicted 463,074 and 1,097,656 elements, and at "
+               "contrast 3 and three modes still 277,844 at K=1.5, over the "
+               "mark. At contrast 2 the whole pair fits."),
 ]
 
 
@@ -509,18 +565,23 @@ def predicted_counts(case) -> dict:
     The numbers are the product's own estimator (``web.meshing.estimate_tets``,
     the function that ROUTES an upload), not a re-derivation, so a case that
     would route to the GPU here is the case that would route there in
-    production. The refined levels are that estimate scaled by ``k**3`` -- the
-    exact factor when the only thing changing is the edge.
+    production. Its constant comes from ``web.config.CFG.est_tets_c()`` -- the
+    same value ``web/app.py`` routes on -- rather than a number written here,
+    because a constant chosen in a benchmark is the fixture-fitted tuning this
+    row exists to rule out. The refined levels are that estimate scaled by
+    ``k**3`` -- the exact factor when the only thing changing is the edge.
     """
     import meshing as WEBMESH
+    import config as CFG      # app.py:34 imports it the same way
 
     _obj, parts, plan, h_min, _layers, _scale = _build(case, case["n_modes"])
     outer = _outer_surface(parts)
+    c = CFG.est_tets_c()
     counts = {
-        "graded": int(WEBMESH.estimate_tets(outer, case["n_modes"], "mm", c=14.0,
+        "graded": int(WEBMESH.estimate_tets(outer, case["n_modes"], "mm", c=c,
                                             parts=parts,
                                             materials=case["materials"])),
-        "uniform": int(WEBMESH.estimate_tets(outer, case["n_modes"], "mm", c=14.0,
+        "uniform": int(WEBMESH.estimate_tets(outer, case["n_modes"], "mm", c=c,
                                              min_feature_m=h_min * 1e-3)),
     }
     if case["reference"] == "uniform-refined":
@@ -545,8 +606,8 @@ def list_cases(cases, as_json=False) -> int:
     if as_json:
         print(json.dumps(rows, indent=2))
         return MATRIX_INCOMPLETE if incomplete else MATRIX_OK
-    print(f"{'case':>13} {'ref':>6} {'reg':>4} {'h_min':>7} {'graded':>9} "
-          f"{'uniform':>9}  axes")
+    print(f"{'case':>13} {'ref':>6} {'reg':>4} {'modes':>5} {'h_min':>7} "
+          f"{'graded':>9} {'uniform':>9}  axes")
     for r in rows:
         if "error" in r:
             print(f"{r['label']:>13} {r['reference']:>6}   --- COUNT FAILED: "
@@ -556,6 +617,7 @@ def list_cases(cases, as_json=False) -> int:
         extra = ("" if r["reference"] == "analytic"
                  else f"  refs {[c[f'ref{k}'] for k in REFINE_FACTORS]}")
         print(f"{r['label']:>13} {r['reference']:>6} {r['axes']['regions']:>4} "
+              f"{r['n_modes']:>5} "
               f"{r['h_min_mm']:>7.4f} {c['graded']:>9,} {c['uniform']:>9,}  "
               f"{r['axes']['shape']}, {r['axes']['shell']}, "
               f"n={r['axes']['contrast']}{extra}")
@@ -565,7 +627,24 @@ def list_cases(cases, as_json=False) -> int:
     print("\naxes covered: "
           + "; ".join(f"{k}={sorted(v, key=str)}" for k, v in
                       _coverage(cases).items()))
+    print(f"tier-2 mark is {TIER2_MAX_TETS:,} elements. " + _routing_note())
     return MATRIX_INCOMPLETE if incomplete else MATRIX_OK
+
+
+def _routing_note() -> str:
+    """Production's own ceilings, so the list says which cases can never ship.
+
+    Above ``upload_refuse_tets`` the upload route refuses the job outright, so a
+    case past it would never be graded in production no matter how it scores.
+    Read from the same config the route reads; a failure to read it is printed
+    rather than skipped, because a missing ceiling must not read as no ceiling.
+    """
+    import config as CFG
+    try:
+        return (f"production refuses an upload above {CFG.upload_refuse_tets():,} "
+                f"and sends one above {CFG.gpu_min_tets():,} to the GPU")
+    except Exception as exc:  # noqa: BLE001 - report the read failure
+        return f"PRODUCTION CEILINGS UNAVAILABLE ({type(exc).__name__}: {exc})"
 
 
 def main(argv=None) -> int:

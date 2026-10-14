@@ -178,3 +178,76 @@
       Note for step 2's operation: `benchmarks/probe_n3_bands.py` is tier 1
       (24,887 tets, seconds) and must be run with OMP/MKL/OPENBLAS threads
       pinned to 1-2 -- unpinned it took 23 BLAS threads.
+
+- [x] 5.5 STEP 2 of row `600283f7`: the Orin validation matrix, as a bench mode
+      (`benchmarks/run_grading_matrix.py`: `--list` / `--case <label>` /
+      `--json`), with its tier-1 suite in `tests/test_grading_matrix.py` (14
+      tests, exit 0). Axes: contrast {1.5, 2, 3, 4}, shell thickness (clamp
+      biting / not), regions {2, 3}, shape (non-spherical box, non-concentric
+      offset core), reference (analytic / uniform-refined). The criterion per
+      case is the owner's: graded error no worse than the uniform mesh's, both
+      solved through the product's own pipeline and scored against the SAME
+      reference at the same mode count. UNMEASURED -- a failed reference solve,
+      a failed graded solve, a fixture the producer rejects -- is its own
+      outcome and never a pass. The Orin runs themselves are the lead's; nothing
+      in this entry was run on the Orin.
+
+      SIZING, measured with the product's estimator (`web.meshing.estimate_tets`
+      at `web.config.CFG.est_tets_c()`, the function and value that route an
+      upload): the uniform reference costs `contrast**3 * n_modes` and nothing
+      else moves it -- the outer size cancels (the target edge scales with it)
+      and the shell thickness does not enter it, because h_min comes from the
+      densest region, not the wall. Contrast 4 at the sibling's ten modes
+      predicts 650,465 elements, 3.3x the 200,000 tier-2 mark, so the two
+      contrast-4 cases run at 3 modes, the first complete degenerate triplet.
+      The non-analytic reference is a uniform solve per level at `h_min/K`,
+      costing `K**3`; K = 2.0 is 8x and unaffordable for any case whose outside
+      is a 10 mm sphere (1,097,656 predicted for the offset case, 2,601,856 for
+      three-region's first 1/2/4 ramp), so `REFINE_FACTORS = (1.25, 1.5)` is ONE
+      constant for every case. A per-case factor would be exactly the
+      fixture-fitted tuning this row exists to rule out; its cost, stated where
+      it is used, is that the reference is only 1.5x finer than the mesh it
+      judges and the convergence check between the two levels has to carry the
+      trust argument. three-region's ramp is 1/1.5/2 for the same reason, and
+      box-sphere carries contrast 3 while offset-sphere carries 2, since that
+      case's axis is the SHAPE.
+
+      THE LIST, predicted element counts (the estimator reads ~1.4x high where
+      both numbers are known -- 274,415 predicted, 199,062 built -- so these are
+      upper bounds). `--list` prints it, plus the production ceilings an upload
+      is routed by. Measured output (2026-10-14, tier 1, `.venv-mse`, exit 0):
+
+      ```text
+               case    ref  reg modes   h_min    graded   uniform  axes
+         c1.5-thick analytic    2    10  1.1923    14,958    34,301  concentric, thick, n=1.5
+           c2-thick analytic    2    10  0.8942    20,676    81,308  concentric, thick, n=2.0
+           c3-thick analytic    2    10  0.5961    35,314   274,415  concentric, thick, n=3.0
+                      ! over the tier-2 mark 200,000: ['uniform'] -- expect UNMEASURED, not a pass
+           c4-thick analytic    2     3  0.6679    16,215   195,139  concentric, thick, n=4.0
+            c2-thin analytic    2    10  0.8942    75,262    81,308  concentric, thin, n=2.0
+            c3-thin analytic    2    10  0.5961   220,160   274,415  concentric, thin, n=3.0
+                      ! over the tier-2 mark 200,000: ['graded', 'uniform'] -- expect UNMEASURED, not a pass
+            c4-thin analytic    2     3  0.6679   161,389   195,139  concentric, thin, n=4.0
+       three-region uniform-refined    3     5  1.1266    11,974    40,654  concentric, thick, n=2.0  refs [79402, 137207]
+         box-sphere uniform-refined    2     5  0.7511    18,466    11,564  box, thick, n=3.0  refs [22586, 39028]
+      offset-sphere uniform-refined    2     5  1.1266     9,659    40,654  offset, thick, n=2.0  refs [79402, 137207]
+
+      axes covered: contrast=[1.5, 2.0, 3.0, 4.0]; shell=['thick', 'thin'];
+      regions=[2, 3]; shape=['box', 'concentric', 'offset'];
+      reference=['analytic', 'uniform-refined']
+      tier-2 mark is 200,000 elements. production refuses an upload above
+      1,200,000 and sends one above 15,000 to the GPU.
+      ```
+
+      WHICH CASES THE ORIN CANNOT SOLVE UNIFORM, plainly: c3-thick's uniform
+      reference predicts 274,415 (the row's own case: built 199,062, OOMed once,
+      solved once) and c3-thin carries the SAME uniform mesh -- h_min is the
+      core's, so the wall's thickness does not change it -- plus a graded side of
+      220,160, because the clamp pins a thin wall's edge near 1.0 mm. Both are
+      flagged by `--list` and locked by the test's `EXPECTED_OVER_MARK`.
+      c4-thick and c4-thin's uniform references predict 195,139, 2.4% under the
+      mark: if the estimator's ~1.4x-high reading holds they build near 140k and
+      solve, and if it does not they are the next two over -- reporting
+      UNMEASURED, never a pass. Everything else predicts at or under 195,139 and
+      every reference level at or under 137,207. STEP 3 -- the product rule --
+      waits for the lead's go: no product rule is changed by this entry.
