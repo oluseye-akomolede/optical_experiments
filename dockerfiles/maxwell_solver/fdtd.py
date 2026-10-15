@@ -884,6 +884,34 @@ def _normalise_probes(probes):
     return out
 
 
+def _window(n: int, window: str | None):
+    """The window's own samples for a record of ``n`` steps.
+
+    The one place a window is chosen. :func:`spectrum` takes the magnitude of
+    the result; the dipole measurements multiply two of these, and their ratio
+    is only a ratio of two measurements of the same signal if both went through
+    the same window.
+    """
+    if window == "hann":
+        return np.hanning(n)
+    if window in (None, "none"):
+        return np.ones(n)
+    raise FDTDError(f"unknown window {window!r}; use 'hann' or None")
+
+
+def _windowed_rfft(values, dt: float, window: str | None, xp=None):
+    """``(frequencies_hz, spectrum, window)`` from one windowed rfft."""
+    xp = np if xp is None else xp
+    values = xp.asarray(values)
+    n = int(values.shape[0])
+    if n < 2:
+        raise FDTDError(f"a spectrum needs at least 2 samples, got {n}")
+    scale = _window(n, window)
+    values = values.astype(xp.float64) * xp.asarray(scale)
+    frequencies = np.fft.rfftfreq(n, d=dt)
+    return frequencies, xp.fft.rfft(values), scale
+
+
 def spectrum(trace, dt: float, *, window: str | None = "hann", xp=None):
     """``(frequencies_hz, amplitude)`` from the rfft of a windowed trace.
 
@@ -894,20 +922,613 @@ def spectrum(trace, dt: float, *, window: str | None = "hann", xp=None):
     """
     if xp is None:
         xp = np
-    values = xp.asarray(trace)
-    n = int(values.shape[0])
-    if n < 2:
-        raise FDTDError(f"a spectrum needs at least 2 samples, got {n}")
-    if window == "hann":
-        scale = np.hanning(n)
-    elif window in (None, "none"):
-        scale = np.ones(n)
-    else:
-        raise FDTDError(f"unknown window {window!r}; use 'hann' or None")
-    values = values.astype(xp.float64) * xp.asarray(scale)
-    amplitude = xp.abs(xp.fft.rfft(values))
-    frequencies = np.fft.rfftfreq(n, d=dt)
-    return frequencies, amplitude
+    frequencies, values, _ = _windowed_rfft(trace, dt, window, xp)
+    return frequencies, xp.abs(values)
+
+
+# --------------------------------------------------------------------------
+# a dipole's radiated power, and its Purcell factor
+# --------------------------------------------------------------------------
+
+def source_cell_volume(spacings, cell, component) -> float:
+    """The volume a point source's current fills: its own E node's cell.
+
+    The source adds ``dt * S`` to one E component at one node, so the current it
+    stands for fills the cell that node owns -- dual along the component's own
+    axis, node-width along the other two, which are the weights ``simulate``'s
+    energy sum builds with ``volumes({a})``. On a graded grid that is not the
+    primal cell, and the power below is proportional to it.
+
+    ``spacings`` is a run's own ``"spacings"``: three arrays of primal lengths.
+    """
+    if component not in COMPONENTS:
+        raise FDTDError(
+            f"a source cell volume is asked for a component among "
+            f"{COMPONENTS}, got {component!r}")
+    if len(spacings) != 3:
+        raise FDTDError(f"spacings is one entry per axis, got {len(spacings)}")
+    axis = COMPONENTS.index(component)
+    volume = 1.0
+    for a, spacing in enumerate(spacings):
+        primal = np.asarray(spacing, dtype=np.float64)
+        if primal.ndim != 1 or primal.size < 1:
+            raise FDTDError(
+                f"axis {a} takes its primal lengths, got shape {primal.shape}")
+        thickness = (_dual_thickness(primal) if a == axis
+                     else _node_thickness(primal))
+        index = int(cell[a])
+        if not 0 <= index < thickness.size:
+            raise FDTDError(
+                f"cell {tuple(cell)!r} is off the {primal.size + 1}-node grid "
+                f"on axis {a}")
+        volume *= float(thickness[index])
+    return volume
+
+
+def _span_weights(primal: np.ndarray, lo: int, hi: int) -> np.ndarray:
+    """Trapezoid weights over the nodes ``lo..hi``: half a cell at each end.
+
+    They sum to ``x[hi] - x[lo]`` exactly, whatever the grid's grading -- the
+    node-axis counterpart of a face's other partition, which is
+    :func:`_dual_thickness` on the component's own axis. Each sample here sits
+    ON a node, so the quadrature that spans the box's own rectangle is the
+    trapezoid rule.
+
+    The cell widths around the nodes (:func:`_node_thickness`) are the weights
+    the energy sum wants and they are the wrong ones here: each would reach half
+    a cell beyond the end node, two faces would each poke out past the other's
+    layer, and the six faces would no longer meet along their shared edges. The
+    surface would not be closed, and a flux through an open surface is not the
+    power the source radiated.
+    """
+    primal = np.asarray(primal, dtype=np.float64)
+    weights = np.empty(hi - lo + 1)
+    weights[0] = 0.5 * primal[lo]
+    weights[-1] = 0.5 * primal[hi - 1]
+    # interior nodes: half of the cell either side
+    weights[1:-1] = 0.5 * (primal[lo:hi - 1] + primal[lo + 1:hi])
+    return weights
+
+
+def flux_faces(box, shape, primal, pml=0):
+    """The six faces of a closed box, as ``(component, slab, areas)`` terms.
+
+    ``box`` is ``(centre, half_extent)`` in cells: ``centre`` and ``half_extent``
+    are three integers each, the box's faces come out as the NODE layers
+    ``centre +/- half_extent`` on the three axes, and their corners meet exactly
+    -- the surface is closed.
+
+    On a face normal to axis ``a`` at node layer ``i``, the box's own samples are
+    the two E components tangential to that face, and in this layout those are
+    exactly the two that lie ON it (``Ey[i, j, k]`` is dual in y, node in z;
+    ``Ez[i, j, k]`` is node in y, dual in z). So a sample is a field value times
+    the area of the face cell it owns, with nothing interpolated, and each of the
+    two components is a quadrature of the face's own rectangle:
+
+    * along the component's own axis the samples sit on the dual nodes, and the
+      weight is the primal cell each one sits in (:func:`_dual_thickness`);
+    * along the other tangential axis they sit on the nodes, and the weight is
+      the trapezoid's, half a cell at each end (:func:`_span_weights`).
+
+    Both partitions therefore span exactly the rectangle between the box's two
+    node layers, one with ``(jh - jl)`` cells and the other with
+    ``(kh - kl + 1)``, so every face is the box's own and no more. That is what
+    closes the surface, and closure is what makes the flux the source's radiated
+    power rather than the answer for whatever surface the weights happened to
+    describe.
+
+    The layers must be strictly inside the live region, 1..n-2: the outermost
+    node layer is never written by the update (a wall copies the boundary value
+    onto it), so a face there would measure a field that is not the field. That
+    also keeps every sample's own axis in its own live range.
+
+    ``pml`` is the damping layer's depth, the count of node layers the absorbing
+    boundary occupies at each end of an axis: a scalar, or one count per axis
+    (zero where that axis has no absorber, as on a periodic one). A face inside
+    it is refused, because the field there is the damped one -- on a fixture whose
+    whole floor sat two nodes above a six-node absorber the surface measured a
+    dipole 0.52 times its own radiated power, and a mirror plane buried in the
+    layer moved it by 0.2 per cent. Nothing raises on its own: the sum is finite
+    and plausible. The first CPML-free E node is layer ``pml`` (the outermost
+    ``pml`` primal cells carry the profile, and its ramp reaches zero at the
+    interface), so these faces are the deepest a closed surface can be drawn.
+
+    ``areas`` is the outer product of the two face-cell widths, pre-broadcast to
+    one leading axis so a step's sum is ``sum(values**2 * areas)``.
+    """
+    try:
+        centre, half = box
+        centre = tuple(int(c) for c in centre)
+        half = tuple(int(h) for h in half)
+    except (TypeError, ValueError):
+        raise FDTDError(
+            f"flux_box is (centre_cell, half_extent_cells), three integers each,"
+            f" got {box!r}") from None
+    if len(centre) != 3 or len(half) != 3:
+        raise FDTDError(
+            f"flux_box needs three cell indices and three half extents, got "
+            f"{centre!r} and {half!r}")
+    if any(h < 1 for h in half):
+        raise FDTDError(
+            f"a flux box is at least one cell each way, got {half!r}")
+    try:
+        depth = [int(p) for p in pml]
+    except TypeError:
+        depth = [int(pml)] * 3
+    if len(depth) != 3 or min(depth) < 0:
+        raise FDTDError(
+            f"pml is the absorbing layer's depth, a non-negative scalar "
+            f"or one count per axis, got {pml!r}")
+    lo = [centre[a] - half[a] for a in range(3)]
+    hi = [centre[a] + half[a] for a in range(3)]
+    for a in range(3):
+        n = int(shape[a])
+        if lo[a] < 1 or hi[a] > n - 2:
+            raise FDTDError(
+                f"the flux box's faces are node layers {lo[a]}..{hi[a]} on axis "
+                f"{a}, and a face must be inside the live layers 1..{n - 2} "
+                f"there (the outermost layer is never updated); the grid has "
+                f"{n} nodes on that axis")
+        if depth[a] and (lo[a] < depth[a] or hi[a] > n - 1 - depth[a]):
+            raise FDTDError(
+                f"the flux box's faces are node layers {lo[a]}..{hi[a]} on axis "
+                f"{a} of {n}, and {depth[a]} of those nodes are the absorbing "
+                f"layer: a surface inside it measures the damped field, not the "
+                f"wave that left, so its faces must lie in "
+                f"{depth[a]}..{n - 1 - depth[a]}. Widen the grid, or shrink the "
+                f"box, by {max(depth[a] - lo[a], hi[a] - (n - 1 - depth[a]))} "
+                f"cells on that axis")
+    dual = [_dual_thickness(np.asarray(p, dtype=np.float64)) for p in primal]
+    span = [_span_weights(p, lo[a], hi[a]) for a, p in enumerate(primal)]
+    faces = []
+    for a in range(3):
+        b, c = (a + 1) % 3, (a + 2) % 3
+        for i in (hi[a], lo[a]):
+            for component in (COMPONENTS[b], COMPONENTS[c]):
+                along = COMPONENTS.index(component)
+                other = c if along == b else b
+                slab = [slice(lo[axis], hi[axis] + 1) for axis in range(3)]
+                slab[a] = slice(i, i + 1)
+                slab[along] = slice(lo[along], hi[along])
+                w_along = dual[along][lo[along]:hi[along]]
+                w_other = span[other]
+                # the outer product, laid out the way the slab is: a singleton
+                # on the face's own axis and the two widths on the two axes
+                # they belong to (which are not always their own order)
+                areas = np.empty((1, w_along.size, w_other.size))
+                areas[0] = w_along[:, None] * w_other[None, :]
+                axes = [0, 0, 0]
+                axes[a], axes[along], axes[other] = 0, 1, 2
+                faces.append((component, tuple(slab), areas.transpose(axes)))
+    return faces
+
+
+def _flux_step(field, faces, xp):
+    """``sum |E|^2 * area`` over every face: the box's instantaneous flux.
+
+    Stays on the device, like the probe traces: the box is one scalar a step, so
+    a caller gets a whole record from a single transfer at the end and the loop
+    takes no sync.
+
+    Cast to float64 before squaring, exactly as the energy sum is: a sample of
+    ~1e-16 squared times a face cell of ~1e-14 m^2 is ~1e-46, under float32's
+    smallest normal (1.2e-38), and the box then reports a flux of zero for a
+    field that is radiating.
+    """
+    total = None
+    for component, slab, areas in faces:
+        values = field[component][slab].astype(xp.float64)
+        term = xp.sum(values * values * areas)
+        total = term if total is None else total + term
+    return total
+
+
+def _windowed_at(values, dt: float, frequency: float, scale):
+    """The AMPLITUDE at one frequency: ``2 sum(w v e^{-i w t}) / sum(w)``.
+
+    The same sum :func:`_windowed_rfft` bins (its ``rfft[k]`` at
+    ``f = k / (n dt)``), normalised into the number a measurement wants: for a
+    tone ``a(t) = A cos(w t + phi)`` that sum is ``(A/2) e^{i phi} sum(w)``, so
+    twice it over the window's own sum is the amplitude ``A`` -- a drive whose
+    peak is 1 pays ``|A| = 1``. (A rectangular window has ``sum(w) = n``, and
+    this is the familiar ``2 |X_k| / n``.)
+
+    The frequency is free rather than binned, so a measurement does not have to
+    tie its record length to its drive (``f = k / (n dt)``) and waste the steps
+    between bins; an unsampled skirt cannot leak into the number either.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    weight = float(np.sum(scale))
+    if not weight > 0:
+        raise FDTDError(f"the window sums to {weight!r} over these steps")
+    phase = np.exp(-2j * np.pi * frequency * dt * np.arange(values.size))
+    return 2.0 * np.sum(scale * values * phase) / weight
+
+
+def _steady_tail(values, dt: float, frequency: float, periods: int, *,
+                 what: str):
+    """The LAST ``periods`` drive periods of a record, as a slice.
+
+    Every CW measurement here means the driven steady state, and a CW record
+    carries its own turn-on: :func:`cw_profile` ramps over 5 periods, so a window
+    over a whole record is a window over the ramp and the settling as well. The
+    record's own length must not be part of the answer -- and it is, loudly: one
+    dipole in vacuum (16 cells per wavelength, 25 nodes, absorber at 6) read as
+    F = 1.33361 over the last 8 periods of a 296-step record against 2.10286 over
+    the whole of it (296 steps is 10.7 periods there, so a window that long still
+    reaches back into the 5-period ramp), and on a 1343-step record the same two
+    windows read 1.00937 and 1.01854. A ratio of two numbers taken over the same
+    window is what a Purcell factor is, so the window has to be one the caller
+    chose and both readings share.
+    """
+    values = np.asarray(values)
+    if int(periods) < 1:
+        raise FDTDError(f"a mean is over at least one period, got {periods!r}")
+    steps = int(round(int(periods) / (float(frequency) * dt)))
+    if steps < 1:
+        raise FDTDError(
+            f"one drive period is {1.0 / float(frequency)!r} s against a step of "
+            f"{dt!r} s: dt is too coarse to sample the drive at all")
+    if steps > values.size:
+        raise FDTDError(
+            f"{int(periods)} periods is {steps} steps and the {what} is "
+            f"{values.size} steps: record longer, or ask for fewer periods")
+    return values[values.size - steps:]
+
+
+def dipole_moment(drive, dt: float, *, volume: float, eps_r: float,
+                  frequency: float, periods: int = 8,
+                  window: str | None = "hann") -> float:
+    """``|p~(w)|`` in C.m: the moment the source's own current stands for.
+
+    The source adds ``dt * S(t)`` to one E component at one node, so the current
+    it stands for is ``J = -eps0 eps_r S`` filling that node's cell ``volume``,
+    and ``p~ = J~ / (-i w)``. With the amplitude :func:`_windowed_at` returns
+    (``a(t) = Re[A e^{-i w t}]`` gives ``A = 2 S~ / W``, ``W = sum(window)``
+    and ``S~`` the windowed sum),
+
+        |p~(w)| = eps0 eps_r V * 2 |S~(w)| / (w W).
+
+    ``drive`` is ``simulate(..., record_drive=True)``'s record. Derived, never
+    fitted: the same run's far field carries this moment's Larmor power, which is
+    what makes F a statement about the structure and not about the mesh.
+
+    The amplitude is read over the last ``periods`` drive periods, as in
+    :func:`delivered_power` and :func:`radiated_power` -- this is the numerator's
+    own denominator, and a window over the drive's 5-period ramp would bias it
+    against a power measured after the ramp. Pass the same ``periods`` you pass
+    there and the ratio is two readings of one steady state.
+    """
+    if not volume > 0:
+        raise FDTDError(f"a cell volume is positive, got {volume!r}")
+    if not eps_r > 0:
+        raise FDTDError(f"the relative permittivity is positive, got {eps_r!r}")
+    omega = 2.0 * np.pi * float(frequency)
+    if not omega > 0:
+        raise FDTDError(f"a dipole moment is asked for at a positive frequency, "
+                        f"got {frequency!r} Hz")
+    drive = np.asarray(drive)
+    if drive.ndim != 1 or drive.size < 2:
+        raise FDTDError(
+            f"a drive record is one trace of at least 2 steps, got shape "
+            f"{drive.shape}")
+    tail = _steady_tail(drive, dt, frequency, periods, what="drive record")
+    return (EPS0 * float(eps_r) * float(volume)
+            * abs(_windowed_at(tail, dt, frequency, _window(tail.size, window)))
+            / omega)
+
+
+def larmor_power(moment: float, frequency: float, *, index: float) -> float:
+    """(watts) ``P0 = mu0 index w^4 |p~|^2 / (12 pi c)`` in a medium.
+
+    The power the same moment radiates in a homogeneous medium of index
+    ``index`` -- the denominator of the Purcell factor, at the index the dipole
+    itself sits in, which is what makes F a statement about the structure and
+    not about the mesh.
+    """
+    if not moment > 0:
+        raise FDTDError(f"a dipole moment is positive, got {moment!r}")
+    if not index > 0:
+        raise FDTDError(f"a medium's index is positive, got {index!r}")
+    omega = 2.0 * np.pi * float(frequency)
+    if not omega > 0:
+        raise FDTDError(f"a Larmor power is asked for at a positive frequency, "
+                        f"got {frequency!r} Hz")
+    return (MU0 * float(index) * omega ** 4 * float(moment) ** 2
+            / (12.0 * np.pi * C0))
+
+
+def delivered_power(drive, trace, dt: float, *, volume: float, eps_r: float,
+                    frequency: float, periods: int = 8,
+                    window: str | None = "hann") -> float:
+    """(watts) The time-averaged power a soft point source hands the grid.
+
+    ``trace`` is a probe at the source's own cell and component and ``drive``
+    the same run's record of the profile value ``S(t)`` (``record_drive=True``).
+    This is the power the dipole DELIVERS -- radiated plus absorbed -- which is
+    the numerator a Purcell factor wants in a structure that absorbs, where a
+    surface only ever sees what leaves the box (see :func:`radiated_power`).
+
+    The source adds ``dt S(t)`` to one E component each step, so the energy it
+    gives that element during step ``n`` is that element's own change of energy,
+
+        W_n = eps0 eps_r V dt S_n (post_n + post_{n-1}) / 2,
+
+    the two recorded field values being the ones on either side of the
+    injection. This is the scheme's identity, not a model. On the closed-box
+    fixture's own run -- 17 nodes, 16 cells per wavelength, a 30-period CW
+    drive, no CPML and no dispersive term, so the source is the only thing that
+    can move the energy -- the sum of the work above is 0.9999997 of the energy
+    the grid gained over the same steps, while the one-sided spelling
+    ``post - dt S / 2`` (the same midpoint, one step out) is -40.2180 of it: not
+    merely wrong in size, but on the other side of zero. The leftover is a
+    source-side constant at omega^0, so against a radiated power that goes as
+    omega^2 it grows as (wavelength/dx)^2 without bound -- 4.7, 11.7 and 26.3 at
+    10, 16 and 24 cells per wavelength, the measurement that made this module's
+    earlier version call the delivered power the wrong instrument.
+
+    Both series are tones once the drive has settled, so the mean of their
+    product over whole periods is ``eps0 eps_r V Re[E~ S~*] / 2`` with the
+    amplitudes :func:`_windowed_at` returns. The mean is over the LAST
+    ``periods`` drive periods, as in :func:`radiated_power`, and that is what
+    makes it the steady state: a CW record carries its own turn-on, and a Purcell
+    factor is a statement about the driven steady state. Measured on a
+    homogeneous open box (a dipole in vacuum, 16 cells per wavelength, 45
+    nodes), the last 8 periods read 1.006 of the Larmor power at pml 6 and
+    1.007 at pml 10, and the same trunk of the run read as a whole record
+    instead -- a Hann over every step since the drive was switched on -- reads
+    1.48; stretching that run until the transient is one part in thirty of it
+    pulls the whole-record number down to 1.03 without moving the tail's own. A
+    high-Q cavity builds up for tens of periods (a mode of Q = 225 takes ~36),
+    so the record has to be longer than the build-up; the mean does not create
+    the steady state, it declines to average anything else. Hann by default, so
+    the seam at the window's own ends does not leak into a number read off a
+    single frequency.
+
+    The delivered power is the one measurement that needs no surface: it is the
+    same number wherever the field is later lost (PEC walls, absorber, a metal's
+    absorption), so it has none of a flux box's exposure to where the surface
+    can safely be put.
+    """
+    drive = np.asarray(drive, dtype=np.float64)
+    trace = np.asarray(trace, dtype=np.float64)
+    if drive.ndim != 1 or trace.ndim != 1 or drive.size != trace.size:
+        raise FDTDError(
+            f"a drive and the trace of its own cell are one record each, got "
+            f"shapes {drive.shape} and {trace.shape}")
+    if drive.size < 2:
+        raise FDTDError(f"a record is at least 2 steps, got {drive.size}")
+    if not volume > 0:
+        raise FDTDError(f"a cell volume is positive, got {volume!r}")
+    if not eps_r > 0:
+        raise FDTDError(f"the relative permittivity is positive, got {eps_r!r}")
+    if not frequency > 0:
+        raise FDTDError(f"a delivered power is asked for at a positive frequency, "
+                        f"got {frequency!r} Hz")
+    if int(periods) < 1:
+        raise FDTDError(f"a mean is over at least one period, got {periods!r}")
+    steps = int(round(int(periods) / (float(frequency) * dt)))
+    if steps < 1:
+        raise FDTDError(
+            f"one drive period is {1.0 / float(frequency)!r} s against a step of "
+            f"{dt!r} s: dt is too coarse to sample the drive at all")
+    if steps > drive.size:
+        raise FDTDError(
+            f"{int(periods)} periods is {steps} steps and the record is "
+            f"{drive.size} steps: record longer, or ask for fewer periods")
+    # the two field samples either side of each injection, on the full record so
+    # that the tail's own first sample still gets its real predecessor; the
+    # record's first step has none, and stands in for it rather than an invented
+    # zero.
+    mid = 0.5 * (trace + np.concatenate((trace[:1], trace[:-1])))
+    drive_tail = drive[drive.size - steps:]
+    mid_tail = mid[mid.size - steps:]
+    scale = _window(steps, window)
+    source = _windowed_at(drive_tail, dt, frequency, scale)
+    field = _windowed_at(mid_tail, dt, frequency, scale)
+    return float(0.5 * EPS0 * float(eps_r) * float(volume)
+                 * np.real(field * np.conj(source)))
+
+
+def delivered_power_spectrum(drive, trace, dt: float, *, volume: float,
+                             eps_r: float, window: str | None = None,
+                             band=None):
+    """``(frequencies_hz, watts)`` for one broadband run's whole band.
+
+    The same ``eps0 eps_r V Re[E~ S~*] / 2`` as :func:`delivered_power`, bin by
+    bin, from ONE pulse instead of one CW run per frequency: a three-point
+    frequency ladder costs one run and one record, not three of each, and the
+    curve between the points is measured rather than interpolated. Both
+    transforms carry the same normalisation as the CW arm's ``_windowed_at`` --
+    twice the windowed sum over the window's own sum -- so a bin the drive's own
+    band sits on reads what the CW measurement reads at that frequency. A fixture
+    pins that (measured: a vacuum pulse at 24 cells per wavelength reads F =
+    1.00443 at its own bin against the CW arm's 1.00525 in the same box, one part
+    in 800 apart), because a factor of two or a dropped window sum would survive
+    every qualitative check. Over a sweep in frequency the same arm's delivered
+    power follows the sampled bins' omega^2 -- measured exponent 1.966 across
+    1.667x in omega, bins 0.015751, 0.012601 and 0.009450 GHz carrying 2.569484e-24,
+    1.716588e-24 and 9.412558e-25 W -- since a fixed-current dipole's reaction on
+    itself has one factor of omega from the moment and one from the field it
+    drives.
+
+    ``trace`` is a probe at the source's own cell and component and ``drive``
+    the run's ``record_drive``. The field is read at the two samples either side
+    of each injection, the CW arm's own half-step, so the two arms share a phase
+    convention: at 24 cells per wavelength the half-step lag is 4.29 degrees
+    (``½ ω dt``, and 6.43 at 16 cells and 3.43 at 30), which a band-wide glance
+    would not notice and a single-frequency comparison would.
+
+    The transform is over the WHOLE record and the default window is the boxcar,
+    because a pulse is over at ``t = 0``: the record IS the signal, and the
+    drive's own spectrum is the band. Windowing is then a choice with a cost, and
+    the cost is measured. This estimator is a cross-spectral density, so it reads
+    the drive's own response only where the window weights the drive and the
+    field alike; a window that does not is not a small error, it is a sign error.
+    Measured in a vacuum box at 24 cells per wavelength, F over 0.7-1.3 f0: a
+    pulse centred in a 10-sigma record (which is what the drive's own
+    ``start=5`` sigma delay does to it) reads 1.00143 to 1.00657 with the boxcar
+    and 0.98530 to 1.16101 under a Hann; the SAME pulse in a 20-sigma record, its
+    peak at 26 per cent of the window, reads -65.30 to -8.09 under a Hann, and at
+    18 per cent of a 30-sigma record, -94.34 to -8.21. A longer record is therefore
+    worse, not better, and the drive's delay is fixed: the record is what a
+    caller moves to put the pulse in the window's middle. (:func:`cw_profile`'s
+    steady state is the opposite case -- its record never decays, so a tail
+    window is mandatory there and the record's own length is made moot by it.)
+
+    It is a PULSE arm and not a substitute for the CW one on a resonator: a
+    cavity's ring-down outlives any record the drive's fixed delay can be
+    centred in, and the ratio above then divides a windowed drive by a field
+    that is mostly ring-down. A high-Q structure wants :func:`delivered_power`
+    once per frequency.
+
+    ``band=(f_low, f_high)`` in Hz keeps the bins between them, both ends
+    included: outside the drive's own band the ratio of two small transforms is
+    noise, and at ``f = 0`` there is no dipole to radiate at all.
+    """
+    drive = np.asarray(drive, dtype=np.float64)
+    trace = np.asarray(trace, dtype=np.float64)
+    if drive.ndim != 1 or trace.ndim != 1 or drive.size != trace.size:
+        raise FDTDError(
+            f"a drive and the trace of its own cell are one record each, got "
+            f"shapes {drive.shape} and {trace.shape}")
+    if drive.size < 2:
+        raise FDTDError(f"a record is at least 2 steps, got {drive.size}")
+    if not volume > 0:
+        raise FDTDError(f"a cell volume is positive, got {volume!r}")
+    if not eps_r > 0:
+        raise FDTDError(f"the relative permittivity is positive, got {eps_r!r}")
+    mid = 0.5 * (trace + np.concatenate((trace[:1], trace[:-1])))
+    frequencies, drive_hat, scale = _windowed_rfft(drive, dt, window)
+    _, mid_hat, _ = _windowed_rfft(mid, dt, window)
+    amplitude = 2.0 / float(np.sum(scale))
+    power = (0.5 * EPS0 * float(eps_r) * float(volume) * amplitude ** 2
+             * np.real(mid_hat * np.conj(drive_hat)))
+    return _band(frequencies, (power,), band, what="delivered-power")
+
+
+def _band(frequencies, values, band, *, what: str):
+    """The bands' own bins of ``frequencies`` and of every array in ``values``.
+
+    Returns everything unchanged when ``band`` is None, and raises rather than
+    returning empty arrays when the band holds no bin: an empty curve looks like
+    a measurement that found nothing, which is not what happened.
+    """
+    if band is None:
+        return (frequencies, *values)
+    low, high = (float(edge) for edge in band)
+    keep = (frequencies >= low) & (frequencies <= high)
+    if not keep.any():
+        raise FDTDError(
+            f"no bin of this {what} record lies between {low!r} and {high!r} "
+            f"Hz; its own bins run from {frequencies[0]!r} to "
+            f"{frequencies[-1]!r} Hz")
+    return (frequencies[keep], *(at[keep] for at in values))
+
+
+def purcell_spectrum(drive, trace, dt: float, *, volume: float, eps_r: float,
+                     index: float, window: str | None = None, band=None):
+    """``(frequencies_hz, power, reference, F)`` across one broadband run's band.
+
+    :func:`delivered_power_spectrum` over that same run's own
+    :func:`larmor_power` band -- the moment follows from the drive alone, so the
+    denominator costs no second run and the ratio is two readings of one
+    excitation at every frequency at once. ``index`` is the dipole's host index,
+    as in :func:`purcell_factor`, which this is the band-wide spelling of; the
+    reference is built by calling :func:`larmor_power` bin by bin, so the
+    denominator has one spelling and this function cannot drift from it.
+
+    The DC bin has no moment (``p~ = J~ / (-i w)`` at ``w = 0`` is not a dipole),
+    so the moment, the reference and F are all 0 there rather than divided by:
+    a free dipole's own reaction vanishes at zero frequency and F would
+    otherwise be 0/0. The delivered power is left as the record's own DC bin
+    measured it, since that is a reading and not a definition; any band a caller
+    names of interest is above DC, and the drive's own band never reaches it.
+    ``band`` trims all four arrays together, as in
+    :func:`delivered_power_spectrum`.
+    """
+    frequencies, power = delivered_power_spectrum(
+        drive, trace, dt, volume=volume, eps_r=eps_r, window=window)
+    drive = np.asarray(drive, dtype=np.float64)
+    if drive.ndim != 1 or drive.size < 2:
+        raise FDTDError(
+            f"a drive record is one trace of at least 2 steps, got shape "
+            f"{drive.shape}")
+    _, drive_hat, scale = _windowed_rfft(drive, dt, window)
+    amplitude = 2.0 * np.abs(drive_hat) / float(np.sum(scale))
+    omega = 2.0 * np.pi * frequencies
+    moment = np.zeros_like(omega)
+    live = omega > 0
+    moment[live] = (EPS0 * float(eps_r) * float(volume) * amplitude[live]
+                    / omega[live])
+    reference = np.array([
+        0.0 if m <= 0 else larmor_power(float(m), float(f), index=index)
+        for m, f in zip(moment, frequencies)])
+    f_factor = np.zeros_like(reference)
+    live = reference > 0.0
+    f_factor[live] = power[live] / reference[live]
+    return _band(frequencies, (power, reference, f_factor), band,
+                 what="Purcell-spectrum")
+
+
+def radiated_power(flux, dt: float, *, index: float, frequency: float,
+                   periods: int = 8) -> float:
+    """(watts) The power the flux box's surface carried out, over whole periods.
+
+    ``flux`` is ``simulate(..., flux_box=...)``'s record: every step, ``sum
+    |E|^2 * area`` over the box's six faces. In the wave zone the field on the
+    surface is locally an outgoing plane wave, so the Poynting flux through the
+    surface is ``|E|^2 / eta`` with ``eta = eta0 / index`` the medium's impedance
+    there. (This is the statement the far field was already checked against: its
+    amplitude carried the source moment's Larmor power to 1%.)
+
+    The mean is over the LAST ``periods`` drive periods, so the record must end
+    in the steady state. An instantaneous sample swings at 2w about the mean, so
+    a fractional period leaves part of that swing in the answer; the tail is
+    rounded to whole steps and the residual falls off as ``1/periods``.
+
+    It is the RADIATED power: what crosses the surface. A lossy structure inside
+    the box absorbs part of what the dipole delivers, and a Purcell factor for
+    one wants that part added back in.
+    """
+    flux = np.asarray(flux)
+    if flux.ndim != 1 or flux.size < 2:
+        raise FDTDError(
+            f"a flux record is one trace of at least 2 steps, got shape "
+            f"{flux.shape}")
+    if not index > 0:
+        raise FDTDError(f"the surface's index is positive, got {index!r}")
+    if not frequency > 0:
+        raise FDTDError(f"the drive frequency is positive, got {frequency!r}")
+    if int(periods) < 1:
+        raise FDTDError(f"a mean is over at least one period, got {periods!r}")
+    steps = int(round(int(periods) / (float(frequency) * dt)))
+    if steps < 1:
+        raise FDTDError(
+            f"one drive period is {1.0 / float(frequency)!r} s against a step of "
+            f"{dt!r} s: dt is too coarse to sample the drive at all")
+    if steps > flux.size:
+        raise FDTDError(
+            f"{int(periods)} periods is {steps} steps and the record is "
+            f"{flux.size} steps: record longer, or ask for fewer periods")
+    return float(np.mean(flux[flux.size - steps:].astype(np.float64))) \
+        * float(index) / ETA0
+
+
+def purcell_factor(power: float, larmor: float) -> float:
+    """```F = P / P0``: the Purcell factor of a dipole in a structure.
+
+    ``power`` is what the box carried away (:func:`radiated_power`) and
+    ``larmor`` is the same dipole's power in a homogeneous medium
+    (:func:`larmor_power`), both watts. F is 1 for a dipole in a homogeneous
+    medium; it is only as accurate as the grid's own dipole, so a value is
+    quoted with its mesh.
+    """
+    if not power > 0:
+        raise FDTDError(f"a radiated power is positive, got {power!r}")
+    if not larmor > 0:
+        raise FDTDError(f"a homogeneous power is positive, got {larmor!r}")
+    return float(power) / float(larmor)
 
 
 # --------------------------------------------------------------------------
@@ -1473,7 +2094,10 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
              *, spacings=None, dx: float = 1.0,
              boundary: str = "metal", pec=None, pml_cells: int = DEFAULT_PML_CELLS,
              xp=None, record_energy: bool = False, energy_region=None,
-             record_peak: bool = False, ade_terms=(), check=None,
+             record_peak: bool = False, record_drive: bool = False,
+             record_source_field: bool = False,
+             flux_box=None,
+             ade_terms=(), check=None,
              frames=None, bloch=None) -> dict:
     """Run the grid and return the probe traces.
 
@@ -1500,7 +2124,9 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     needs it); ``"dt"`` in the result is the step actually used.
 
     Returns ``{"traces": (n_probes, n_steps) float32, "dt", "steps",
-    "spacings", "energy", "peak"}``, and every one of them is HOST numpy whatever ``xp``
+    "spacings", "energy", "peak", "drive", "source_field", "flux",
+    "source_volume"}``, and every
+    one of them is HOST numpy whatever ``xp``
     was: the arrays live on the device for the whole run and cross back in a
     single transfer at the end, so a consumer never has to know which backend
     ran (and never pays a per-element transfer of its own). ``energy`` is the
@@ -1536,6 +2162,38 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     probes on the sin set (``None`` on the real path), energy sums both sets,
     a frame is the complex field's ``|E|``, and ``peak`` is the cos set's. A
     paired run refuses a plane wave and polarisation terms (metals).
+
+    ``record_drive`` adds ``"drive"``: the value a point source added at each
+    step, as recorded where the update read it, not recomputed from the
+    ``Source`` afterwards. A measurement that needs the source's own moment
+    (:func:`dipole_moment`) takes it from here, so it can never disagree with
+    the waveform the run used. ``None`` when not asked for, and also when there
+    is no point source to drive with (a plane wave, or a paired set, whose cos
+    set is the only one driven).
+
+    ``record_source_field`` adds ``"source_field"``: that same source cell's own
+    E component each step, read just after the injection, under the same
+    conditions. It is the other half of :func:`delivered_power` and it is
+    recorded by the simulator rather than asked for as a probe, because a probe
+    is a pair of indices the caller supplies and a delivered power computed
+    against a probe anywhere else would be a plausible number for the wrong cell.
+
+    ``source_volume`` is the cell the point source's current fills
+    (:func:`source_cell_volume`), the volume a moment is derived over. ``None``
+    with no point source.
+
+    ``flux_box`` adds ``"flux"``: ``(centre, half_extent)`` in cells (three
+    integers each) makes a closed box of NODE layers, and the result is one
+    per-step record of ``sum |E|^2 * area`` over its six faces
+    (:func:`flux_faces`). That is the radiated power through the surface up to
+    the wave-zone factor ``1 / eta`` (:func:`radiated_power`), and it is one
+    scalar a step rather than a trace per surface cell, so it fits a production
+    grid. The box must be strictly inside the live layers 1..n-2 on every axis,
+    outside the absorbing layer (``pml_cells`` deep on an open axis: in the
+    absorber the surface measures the damped field and reads low without
+    complaining), and in the wave zone: at least a wavelength from every
+    scatterer, so that the field on it is an outgoing wave. A paired (Bloch) run
+    has no physical field to put a surface around and refuses a box.
 
     ``check``, if given, is called as ``check(step)`` before step 0 and every
     ``CHECK_EVERY`` steps after it, on the host; it stops the run by raising
@@ -1813,6 +2471,36 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     traces_sin = (xp.zeros((len(probe_list), n_steps), dtype=f32)
                   if paired else None)
     energy: list[float] | None = [] if record_energy else None
+    # The drive a point source added, where the update read it. Only the cos set
+    # is driven, so a paired run has nothing to record beyond the plane-wave
+    # case below; both end as None rather than an array of zeros.
+    drive: list[float] | None = (
+        [] if record_drive and not paired and source.kind == "point" else None)
+    # The field at the source's own cell and component, each step after the
+    # injection -- the other half of :func:`delivered_power`. Recorded here,
+    # where the source's cell is already in hand, so a caller cannot pair a
+    # drive with a probe that happens to sit somewhere else.
+    source_field = (xp.zeros(n_steps, dtype=f32)
+                    if record_source_field and plane is None and not paired
+                    and source.kind == "point" else None)
+    if flux_box is not None and paired:
+        raise FDTDError(
+            "a flux box needs the physical field, and away from k = 0 and the "
+            "zone edge a Bloch run's cos set is not it (the field is the cos "
+            "set plus i times the sin set); drop flux_box or the Bloch phase")
+    flux_terms = (None if flux_box is None else
+                  [(component, slab, xp.asarray(areas))
+                   for component, slab, areas in flux_faces(
+                       flux_box, shape, primal,
+                       [int(pml_cells) if sides[axis] == "open" else 0
+                        for axis in range(3)])])
+    flux_array = (None if flux_terms is None
+                  else xp.zeros(n_steps, dtype=xp.float64))
+    # The volume the source's own moment is taken over -- computed here, from
+    # the grid the run actually used, so a consumer cannot pair a moment with
+    # another run's cell.
+    source_volume = (source_cell_volume(primal, source.cell, source.component)
+                     if source.kind == "point" else None)
     peak = ({c: xp.zeros(shape, dtype=f32) for c in COMPONENTS}
             if record_peak else None)
     movie = frame_at = sampled = None
@@ -2038,7 +2726,12 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
 
         # ---- source ------------------------------------------------------
         if plane is None:
-            field[source.component][source.cell] += dt * source.value(t)
+            value = source.value(t)
+            field[source.component][source.cell] += dt * value
+            if drive is not None:
+                drive.append(value)
+            if source_field is not None:
+                source_field[step] = field[source.component][source.cell]
 
         # ---- PEC ---------------------------------------------------------
         for f in sets:
@@ -2078,12 +2771,21 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             for component in COMPONENTS:
                 xp.maximum(peak[component], xp.abs(field[component]),
                            out=peak[component])
+        if flux_array is not None:
+            flux_array[step] = _flux_step(field, flux_terms, xp)
 
     if peak is not None:
         peak = {c: _host_result(values, xp) for c, values in peak.items()}
     return {"traces": _host_result(traces, xp), "dt": dt, "steps": n_steps,
             "spacings": [np.array(p) for p in primal], "energy": energy,
             "peak": peak,
+            "drive": (None if drive is None
+                      else np.array(drive, dtype=np.float64)),
+            "source_field": (_host_result(source_field, xp)
+                             if source_field is not None else None),
+            "flux": (None if flux_array is None
+                     else _host_result(flux_array, xp)),
+            "source_volume": source_volume,
             "frames": None if movie is None else _host_result(movie, xp),
             "traces_sin": (_host_result(traces_sin, xp) if paired
                            else None)}

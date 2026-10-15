@@ -95,10 +95,12 @@ def test_v2_by_default_gates_only_probes_the_spec_puts_in_the_far_field():
     """The spec's V2 probes sit at r >= 2 wavelengths; the default must too.
 
     Read against the spec's own floor, so a default of 1 wavelength (where the
-    near field still bends r * |E|) cannot pass as the spec's benchmark.
+    near field still bends r * |E|) cannot pass as the spec's benchmark. The
+    live spec, not the change that wrote it: time-domain-fdtd was archived on
+    2026-10-12 and a change directory stops existing the moment it is archived,
+    so this assertion spent three days reading a path that was gone.
     """
-    spec = (ROOT / "openspec" / "changes" / "time-domain-fdtd" / "specs"
-            / "time-domain" / "spec.md").read_text()
+    spec = (ROOT / "openspec" / "specs" / "time-domain" / "spec.md").read_text()
     assert "r ≥ 2λ" in spec
     args = bench2.build_parser().parse_args([])
     assert args.r_min >= 2.0, f"V2's default --r-min is {args.r_min}, under 2"
