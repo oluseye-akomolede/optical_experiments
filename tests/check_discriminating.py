@@ -554,6 +554,213 @@ CASES.append(Case(
     test_file=IMAGE_TEST_FILE,
 ))
 
+RESONANCES = ROOT / "dockerfiles" / "maxwell_solver" / "resonances.py"
+RESONANCES_TEST_FILE = "tests/test_resonances.py"
+
+# Each test in tests/test_resonances.py names the mutation it goes red on;
+# these are those mutations, with the exact failing set each one produces.
+
+CASES.append(Case(
+    name="resonances-gamma-halved",
+    why="a decay rate off by a factor reports Q wrong by that factor",
+    edits=[(
+        RESONANCES,
+        "    f = -np.angle(u) / (2 * np.pi * dt)\n"
+        "    gamma = -np.log(np.abs(u)) / dt\n"
+        "    modes = list(zip(f, gamma, a))",
+        "    f = -np.angle(u) / (2 * np.pi * dt)\n"
+        "    gamma = -np.log(np.abs(u)) / (2 * dt)\n"
+        "    modes = list(zip(f, gamma, a))",
+    )],
+    expect_failing={
+        "test_q_1e5_from_a_twentieth_of_a_decay_time[False-fdm]",
+        "test_q_1e5_from_a_twentieth_of_a_decay_time[False-pencil]",
+        "test_q_1e5_from_a_twentieth_of_a_decay_time[True-fdm]",
+        "test_q_1e5_from_a_twentieth_of_a_decay_time[True-pencil]",
+        "test_q_1e5_at_1536_nm_in_si_units",
+        "test_two_close_modes_beside_a_strong_distant_one[window0-fdm]",
+        "test_two_close_modes_beside_a_strong_distant_one[window0-pencil]",
+        "test_two_close_modes_beside_a_strong_distant_one[window1-fdm]",
+        "test_two_close_modes_beside_a_strong_distant_one[window1-pencil]",
+        "test_noise_sweep_bars_bound_the_error[False]",
+        "test_noise_sweep_bars_bound_the_error[True]",
+        "test_raw_fdm_and_raw_pencil_agree[False]",
+        "test_raw_fdm_and_raw_pencil_agree[True]",
+        "test_real_path_equals_complex_path[fdm]",
+        "test_real_path_equals_complex_path[pencil]",
+    },
+    test_file=RESONANCES_TEST_FILE,
+))
+
+CASES.append(Case(
+    name="resonances-f-per-sample",
+    why="a frequency in cycles per sample instead of Hz lands nothing in the window",
+    edits=[(
+        RESONANCES,
+        "    f = -np.angle(u) / (2 * np.pi * dt)\n"
+        "    gamma = -np.log(np.abs(u)) / dt\n"
+        "    modes = list(zip(f, gamma, a))",
+        "    f = -np.angle(u) / (2 * np.pi)\n"
+        "    gamma = -np.log(np.abs(u)) / dt\n"
+        "    modes = list(zip(f, gamma, a))",
+    )],
+    expect_failing={
+        "test_q_1e5_from_a_twentieth_of_a_decay_time[False-fdm]",
+        "test_q_1e5_from_a_twentieth_of_a_decay_time[False-pencil]",
+        "test_q_1e5_from_a_twentieth_of_a_decay_time[True-fdm]",
+        "test_q_1e5_from_a_twentieth_of_a_decay_time[True-pencil]",
+        "test_q_1e5_at_1536_nm_in_si_units",
+        "test_two_close_modes_beside_a_strong_distant_one[window0-fdm]",
+        "test_two_close_modes_beside_a_strong_distant_one[window0-pencil]",
+        "test_two_close_modes_beside_a_strong_distant_one[window1-fdm]",
+        "test_two_close_modes_beside_a_strong_distant_one[window1-pencil]",
+        "test_noise_sweep_bars_bound_the_error[False]",
+        "test_noise_sweep_bars_bound_the_error[True]",
+        "test_pure_noise_reports_nothing[False-fdm]",
+        "test_pure_noise_reports_nothing[True-fdm]",
+        "test_raw_fdm_and_raw_pencil_agree[False]",
+        "test_raw_fdm_and_raw_pencil_agree[True]",
+        "test_real_path_equals_complex_path[fdm]",
+        "test_real_path_equals_complex_path[pencil]",
+    },
+    test_file=RESONANCES_TEST_FILE,
+))
+
+CASES.append(Case(
+    name="resonances-fdm-threshold-coarse",
+    why="a coarse U0 threshold projects out the weaker of two close modes",
+    edits=[(RESONANCES, "SINGULAR_THRESHOLD = 1e-7", "SINGULAR_THRESHOLD = 1e-1")],
+    expect_failing={
+        "test_raw_fdm_and_raw_pencil_agree[False]",
+        "test_raw_fdm_and_raw_pencil_agree[True]",
+        "test_two_close_modes_beside_a_strong_distant_one[window0-fdm]",
+        "test_two_close_modes_beside_a_strong_distant_one[window1-fdm]",
+    },
+    test_file=RESONANCES_TEST_FILE,
+))
+
+CASES.append(Case(
+    name="resonances-pencil-rank-one",
+    why="a pencil capped at one pole cannot hold a pair",
+    edits=[(RESONANCES, "        K = min(K, L // 2)", "        K = min(K, 1)")],
+    expect_failing={
+        "test_q_1e5_from_a_twentieth_of_a_decay_time[True-pencil]",
+        "test_raw_fdm_and_raw_pencil_agree[False]",
+        "test_raw_fdm_and_raw_pencil_agree[True]",
+        "test_real_path_equals_complex_path[pencil]",
+        "test_two_close_modes_beside_a_strong_distant_one[window0-pencil]",
+        "test_two_close_modes_beside_a_strong_distant_one[window1-pencil]",
+    },
+    test_file=RESONANCES_TEST_FILE,
+))
+
+CASES.append(Case(
+    name="resonances-no-background",
+    why="without the pencil's far poles a strong mode outside the window biases the pair inside",
+    edits=[(
+        RESONANCES,
+        "                    background: bool = True, **options) -> list[Resonance]:",
+        "                    background: bool = False, **options) -> list[Resonance]:",
+    )],
+    expect_failing={
+        "test_two_close_modes_beside_a_strong_distant_one[window0-fdm]",
+    },
+    test_file=RESONANCES_TEST_FILE,
+))
+
+CASES.append(Case(
+    name="resonances-bars-too-narrow",
+    why="a noise variance 100 times too small gives bars 10 times too narrow",
+    edits=[(
+        RESONANCES,
+        "    std = cramer_rao(modes, dt, N, sigma2, real=real)",
+        "    std = cramer_rao(modes, dt, N, sigma2 / 100, real=real)",
+    )],
+    expect_failing={
+        "test_noise_sweep_bars_bound_the_error[False]",
+        "test_noise_sweep_bars_bound_the_error[True]",
+        "test_two_close_modes_beside_a_strong_distant_one[window0-fdm]",
+        "test_two_close_modes_beside_a_strong_distant_one[window0-pencil]",
+        "test_two_close_modes_beside_a_strong_distant_one[window1-fdm]",
+        "test_two_close_modes_beside_a_strong_distant_one[window1-pencil]",
+        "test_raw_fdm_and_raw_pencil_agree[False]",
+        "test_raw_fdm_and_raw_pencil_agree[True]",
+    },
+    test_file=RESONANCES_TEST_FILE,
+))
+
+CASES.append(Case(
+    name="resonances-accept-everything",
+    why="with no significance test every pole fitted to noise is reported",
+    edits=[(
+        RESONANCES,
+        "        if best_gain < min_significance ** 2 * quad:",
+        "        if best_gain < 0:",
+    )],
+    expect_failing={
+        "test_pure_noise_reports_nothing[False-fdm]",
+        "test_pure_noise_reports_nothing[True-fdm]",
+        "test_noise_sweep_bars_bound_the_error[False]",
+        "test_noise_sweep_bars_bound_the_error[True]",
+        "test_raw_fdm_and_raw_pencil_agree[False]",
+        "test_raw_fdm_and_raw_pencil_agree[True]",
+        "test_two_close_modes_beside_a_strong_distant_one[window0-fdm]",
+        "test_two_close_modes_beside_a_strong_distant_one[window1-fdm]",
+    },
+    test_file=RESONANCES_TEST_FILE,
+))
+
+CASES.append(Case(
+    name="resonances-pencil-shift-swapped",
+    why="the pencil's shift the wrong way round gives the poles 1/u (Q changes sign)",
+    edits=[(
+        RESONANCES,
+        "    V1, V2 = Vk[:, :-1], Vk[:, 1:]",
+        "    V1, V2 = Vk[:, 1:], Vk[:, :-1]",
+    )],
+    expect_failing={
+        "test_raw_fdm_and_raw_pencil_agree[False]",
+        "test_raw_fdm_and_raw_pencil_agree[True]",
+        "test_q_1e5_from_a_twentieth_of_a_decay_time[False-pencil]",
+        "test_real_path_equals_complex_path[pencil]",
+        "test_two_close_modes_beside_a_strong_distant_one[window0-fdm]",
+        "test_two_close_modes_beside_a_strong_distant_one[window0-pencil]",
+        "test_two_close_modes_beside_a_strong_distant_one[window1-pencil]",
+    },
+    test_file=RESONANCES_TEST_FILE,
+))
+
+CASES.append(Case(
+    name="resonances-real-half-amplitude",
+    why="a real record's cosine amplitude is twice the complex half-amplitude",
+    edits=[(
+        RESONANCES,
+        "            d = 2 * d[:K]",
+        "            d = d[:K]",
+    )],
+    expect_failing={
+        "test_real_path_equals_complex_path[fdm]",
+        "test_real_path_equals_complex_path[pencil]",
+        "test_q_1e5_from_a_twentieth_of_a_decay_time[True-fdm]",
+        "test_q_1e5_from_a_twentieth_of_a_decay_time[True-pencil]",
+    },
+    test_file=RESONANCES_TEST_FILE,
+))
+
+CASES.append(Case(
+    name="resonances-nyquist-unchecked",
+    why="a window above Nyquist must be refused, not aliased",
+    edits=[(
+        RESONANCES,
+        "        if f_min < 0 or f_max > nyq:",
+        "        if f_min < 0:",
+    )],
+    expect_failing={
+        "test_bad_inputs_are_refused_with_a_message",
+    },
+    test_file=RESONANCES_TEST_FILE,
+))
+
 
 def run_case(case: Case) -> bool:
     saved = case.snapshot()
