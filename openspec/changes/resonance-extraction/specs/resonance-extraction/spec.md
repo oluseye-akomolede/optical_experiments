@@ -67,13 +67,19 @@ variance read from the window periodogram of the residual. Source:
 
 ### Requirement: Spurious modes SHALL not be reported
 
-A mode SHALL be reported only if the power its pole removes from the
-residual is at least `min_significance` (default 6) squared noise variances
-per quadrature, judged against a noise level that no mode fitted to noise
-has lowered (the level is read from the record's own window periodogram
-first, then from the residual of the accepted modes); `error.significance`
-SHALL be the amplitude in units of its own standard deviation. Source:
-`_greedy_select` in `dockerfiles/maxwell_solver/resonances.py`.
+A mode SHALL be reported only if it passes two significance tests at
+`min_significance` (default 6) noise standard deviations: the power its
+pole removes from the residual given the poles already accepted, and,
+after the polish, its amplitude against its own standard deviation from
+the full Fisher matrix; `error.significance` SHALL be the latter ratio.
+Source: `_greedy_select` and `_package` in
+`dockerfiles/maxwell_solver/resonances.py`.
+
+#### Scenario: the noise level is not lowered by noise-fitted poles
+- **WHEN** the forward test judges a candidate
+- **THEN** the noise level it is judged against comes from the record's
+  own window periodogram first and then from the residual of the accepted
+  modes only, never from a fit that includes the candidate
 
 #### Scenario: pure noise
 - **WHEN** the record is white Gaussian noise, real or complex, three seeds

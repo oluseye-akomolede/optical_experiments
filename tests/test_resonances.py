@@ -172,8 +172,8 @@ def test_noise_sweep_bars_bound_the_error(real):
     that for a real record) within a factor 2. The curve is printed.
 
     Mutation (``resonances-bars-too-narrow``): ``sigma2 / 100`` in
-    ``_package``'s ``cramer_rao`` call makes the bars 10 times too narrow
-    and the bound fails at every SNR.
+    ``_bars``'s ``cramer_rao`` call makes the bars 10 times too narrow and
+    the bound fails at every SNR.
     """
     Q = 1e4
     gamma = math.pi * F0 / Q
@@ -215,8 +215,8 @@ def test_pure_noise_reports_nothing(method, real):
     record, so the empty list is the test's doing.
 
     Mutation (``resonances-accept-everything``): in ``_greedy_select``
-    replace ``if best_gain < min_significance ** 2 * quad: break`` by ``if
-    best_gain < 0: break``: every FDM candidate is accepted and the FDM
+    replace ``if gains[best] < min_significance ** 2 * quad: break`` by
+    ``if gains[best] < 0: break``: every FDM candidate is accepted and the FDM
     cases fail on every seed. The pencil cases stay green under it because
     the pencil's rank selection (``NOISE_GAP`` over the singular-value
     floor) already gives noise zero poles; ``resonances-f-per-sample``
