@@ -19,13 +19,17 @@ against the same caps the web app enforces, so the grid this prints is a grid
 the web form would refuse or accept -- not this script's opinion of one.
 
 Geometry. Every dimension is an argument, and the defaults are the numbers the
-fetched text gives -- a wire of 1375 nm by 420 nm, a 12 nm SiO2 buffer over the
-gold, and a dipole on the axis 30 nm below the top facet. NONE OF THEM IS
-ASSERTED: the fetched abstract describes a quasi-BIC cavity from two coupled
-modes while the fetched caption describes a gold-mirror cavity, so the lead pins
-the real dimensions from the PDF and passes them here. ``--hex`` says what
---diameter measures across and ``--hex-rotation`` turns the prism about its
-axis, because neither is in the fetched text.
+row pins from the PDF -- a wire of 1375 nm by 420 nm, a 12 nm SiO2 buffer over
+the gold, a dipole on the axis 30 nm below the top facet, and a 10 nm mesh in
+the wire. The 420 nm is read through the paper's own relation for the wire --
+"The diameter of a hexagonal nanowire is related to a cylindrical nanowire by
+2s = 1.14 D", s the hexagon's side -- so it fixes the corner-to-corner width at
+1.14 x 420 = 478.8 nm and the flat-to-flat at 414.6 nm, and ``report`` prints
+both. ``--hex corners`` and ``--hex flats`` read the quoted number off that axis
+directly instead, for the comparison runs. ``--hex-rotation`` turns the prism
+about its axis. A grown wire's crown is NOT modelled: the paper's peak ~17 is
+the idealised flat-facet cavity, and its own crown sweep keeps a real wire's
+enhancement above 10 while the crown stays under 90 nm.
 
 Why the grid is the shape it is. x and y are uniform at ``--dx``, and so is z
 until a rule tightens it: the 12 nm oxide is thinner than four cells, so
@@ -111,6 +115,7 @@ import fdtd_layout  # noqa: E402
 C = fdtd.C0
 NM = 1e-9
 N_INP = 3.44          # wurtzite InP at 900 nm
+HEX_NW_RATIO = 1.14   # the paper's own relation for the wire: 2s = 1.14 D
 N_SIO2 = 1.45         # thermal oxide at 900 nm
 TIER2_SECONDS = 1800.0
 SETTLED_PERIODS = 16.0  # measured: a hard-started CW drive's settling, in periods
@@ -189,9 +194,15 @@ def scene(args):
     ``OPEN_PAD_CELLS`` cells, absorber included, so the parts never reach the
     absorber.
     """
-    radius = args.diameter * NM / 2.0
-    if args.hex == "flats":            # --diameter across flats -> circumradius
-        radius /= math.cos(math.pi / 6.0)
+    # --diameter names one width and --hex says which: by default the paper's own
+    # relation for the wire (2s = 1.14 D), otherwise the quoted number taken
+    # directly across the corners or across the flats.
+    if args.hex == "paper":            # the paper's relation: 2s = 1.14 D
+        radius = args.diameter * HEX_NW_RATIO * NM / 2.0
+    elif args.hex == "flats":          # --diameter across flats -> circumradius
+        radius = args.diameter * NM / (2.0 * math.cos(math.pi / 6.0))
+    else:                              # --diameter across corners
+        radius = args.diameter * NM / 2.0
     z_gold1 = args.gold * NM
     z_ox1 = z_gold1 + args.oxide * NM
     z_top = z_ox1 + args.height * NM
@@ -582,9 +593,9 @@ def report(args, lay, request, geom, measured):
           f" (skin depth {depth:.1f} nm at {f0 / 1e12:.1f} THz), SiO2"
           f" {args.oxide:.0f} nm, InP {args.height:.0f} nm on a"
           f" {2 * geom['half'] / NM:.0f} nm mirror; the wire is"
-          f" {args.diameter:.0f} nm across {args.hex}"
-          f" ({(args.diameter * math.cos(math.pi / 6.0) if args.hex == 'corners' else args.diameter / math.cos(math.pi / 6.0)):.1f}"
-          f" nm across {'flats' if args.hex == 'corners' else 'corners'})")
+          f" {2 * geom['radius'] / NM:.1f} nm across corners,"
+          f" {2 * geom['radius'] * math.cos(math.pi / 6.0) / NM:.1f} nm across flats"
+          f" (--diameter {args.diameter:.0f} nm, --hex {args.hex})")
     cell = lay["cell"]
     x, y = np.asarray(lay["nodes"][0]), np.asarray(lay["nodes"][1])
     print(f"dipole    node ({cell[0]}, {cell[1]}, {cell[2]}): z"
@@ -954,8 +965,12 @@ def PARSER_ARGUMENTS(p) -> None:
     p.add_argument("--pml", type=int, default=fdtd.DEFAULT_PML_CELLS,
                    help=f"absorber cells (the layout's pad is"
                         f" {fdtd_layout.OPEN_PAD_CELLS})")
-    p.add_argument("--hex", choices=("corners", "flats"), default="corners",
-                   help="what --diameter measures across")
+    p.add_argument("--hex", choices=("paper", "corners", "flats"),
+                   default="paper",
+                   help="what --diameter measures: paper (the paper's relation,"
+                        " 2s = 1.14 D, so the corners are 1.14 x the quoted"
+                        " number), or the quoted number across the corners or"
+                        " across the flats")
     p.add_argument("--hex-rotation", type=float, default=0.0, help="degrees")
     p.add_argument("--wavelength", type=float, default=900.0, help="vacuum nm")
     p.add_argument("--band-half", type=float, default=70.0,

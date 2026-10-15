@@ -317,17 +317,10 @@ linewidth is not.
       estimated, the rung the lead ran) fits the 1,800 s clock; dx 10 pad 400 (1,567.7 s) does
       not, and dx 10 pad 200 (903.2 s, 3,222,828 cells) does -- and dx 10 is the paper's own
       mesh, so the pad's convergence run is what buys the comparable rung.
-- [x] **The 420 nm reading is decided by the paper's own relation, and the scene's default
-      reads it the other way.** The text says "The diameter of a hexagonal nanowire is
-      related to a cylindrical nanowire by 2s = 1.14 D" and quotes "the optimal cavity
-      dimensions (height of 1375 nm and width of 420 nm)". With s the hexagon's side, 2s is
-      the corner-to-corner width, so D = 1.754 s and the flat-to-flat width is 1.732 s =
-      0.987 D -- the paper's 420 nm is across the FLATS, and its corners are 1.14 x 420 =
-      478.8 nm. The scene's default (`--hex corners --diameter 420`) puts the corners at
-      420 nm and the flats at 363.7 nm, 12 per cent narrow; `--hex flats --diameter 420` is
-      the paper's reading (flats 420, corners 485.1). The two are one dx 20 run apart (~570 s
-      against ~600 s estimated), and the choice redefines the scene, so it is the lead's to
-      bless before the dx 10 run rather than a flag to flip quietly.
+- [x] **The reading superseded one the scene had.** `--hex corners` (corner-to-corner = the
+      quoted number) made the flats 363.7 nm, 12 per cent narrow, and was the default until
+      the lead's decision below. It stays runnable, because run 1 is the comparison point for
+      the reading.
 - [x] The dipole's placement is the paper's, in its own words: "The QD emitter placed
       on-axis at 30 nm below the top." (Figure 2a) and "we placed the QD at the second
       antinode from the top" -- on a wire whose in-material half wave is 130.8 nm, 30 nm is
@@ -335,8 +328,32 @@ linewidth is not.
       30 nm under the top facet, and `report` now prints the node it actually chose and the
       gap to what was asked (tiny scene: 57.11 nm delivered against 60 asked, inside one
       finest cell; 3.33 nm off-axis on a 60 nm wire, well inside the paper's own +-100 nm
-      displacement tolerance). The paper's crown is not modelled -- the design tolerates one,
-      F > 10 while the crown stays under 90 nm -- and that is a named simplification.
+      displacement tolerance). The coarse grid misses the ask by more, and the arm says so:
+      on the dx 20 Orin run the line reads "z 1497.01 nm, 39.99 nm below the top facet at
+      1537.00 nm (--qd-below 30 asked); in plane +9.93, -9.57 nm off the wire's axis", i.e.
+      10 nm deep and 13.8 nm off axis, because neither the depth nor the axis is a Yee node.
+      Priced rather than waved through: over 10 nm of depth the in-material field falls by
+      1 - cos(2*pi*3.44*10/900) = 2.9 per cent, and 13.8 nm is inside the central plateau of a
+      210 nm-radius wire, so the two are worth a few per cent of F -- not the factor of eight
+      under investigation, and inside the paper's own displacement scan. A finer z cell at the
+      source is the fix, owed once the rungs are chosen. The paper's crown is not modelled, and the text says
+      which F belongs to which geometry: the ~17 is `for this cavity`, the optimised
+      one, defined by height, width and the 12 nm oxide alone, while the crown enters
+      only as the growth's own deviation -- "It is difficult to achieve a perfectly
+      flat top facet of the NW with the bottom-up growth process" -- whose sweep
+      "provides a Purcell enhancement greater than 10 for crown heights smaller than
+      90 nm". So a plain prism is the right thing to compare with 17, and no crown can
+      explain reading ~2. (The crown figure's caption transposes the labels --
+      "D=1375 nm and H= 420 nm" where the text says height 1375 and width 420 -- the
+      numbers agree, the letters do not; this scene follows the text.)
+- [x] **The 420 nm reading is the paper's own relation, and it is now the default**
+      (the lead, 2026-10-15): 2s = 1.14 D with s the hexagon's side, so the quoted
+      number fixes the corner-to-corner width at 1.14 x 420 = 478.8 nm and the
+      flat-to-flat at 414.6 nm. `--hex paper` is that reading and the default;
+      `--hex corners` (corners = the quoted number) and `--hex flats` (flats = the
+      quoted number) remain, because run 1 below is the comparison point for the
+      reading and has to stay runnable. `report` prints both widths and the flag it
+      used, and the docstring cites the sentence.
 - [ ] The pad is not a cost knob to turn quietly: it is the mirror's own lateral extent, and
       the paper's mode is a quasi-BIC, whose field is the kind that reaches the mirror's
       edge. Shrinking it to 200 nm to fit the dx 10 rung inside the clock therefore owes a
