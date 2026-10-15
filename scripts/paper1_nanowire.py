@@ -582,7 +582,18 @@ def report(args, lay, request, geom, measured):
           f" (skin depth {depth:.1f} nm at {f0 / 1e12:.1f} THz), SiO2"
           f" {args.oxide:.0f} nm, InP {args.height:.0f} nm on a"
           f" {2 * geom['half'] / NM:.0f} nm mirror; the wire is"
-          f" {args.diameter:.0f} nm across {args.hex}")
+          f" {args.diameter:.0f} nm across {args.hex}"
+          f" ({(args.diameter * math.cos(math.pi / 6.0) if args.hex == 'corners' else args.diameter / math.cos(math.pi / 6.0)):.1f}"
+          f" nm across {'flats' if args.hex == 'corners' else 'corners'})")
+    cell = lay["cell"]
+    x, y = np.asarray(lay["nodes"][0]), np.asarray(lay["nodes"][1])
+    print(f"dipole    node ({cell[0]}, {cell[1]}, {cell[2]}): z"
+          f" {z[cell[2]] / NM:.2f} nm, {(geom['z_top'] - z[cell[2]]) / NM:.2f} nm"
+          f" below the top facet at {geom['z_top'] / NM:.2f} nm"
+          f" (--qd-below {args.qd_below:g} asked); in plane"
+          f" {(x[cell[0]] - geom['half']) / NM:+.2f},"
+          f" {(y[cell[1]] - geom['half']) / NM:+.2f} nm off the wire's axis,"
+          f" {args.axis}-polarised")
     print(f"timestep  {est['dt']:.6e} s  ({1.0 / (f0 * est['dt']):.1f} steps per"
           f" optical period)")
     print(f"record    {est['steps']:,} steps = {est['steps'] * est['dt'] * f0:.1f}"
@@ -651,7 +662,14 @@ def _run(args, lay, request, measured):
                         boundary=request["boundary"], pec=lay["pec"],
                         pml_cells=args.pml, ade_terms=terms, xp=args.xp,
                         record_drive=True, record_source_field=True)
-    print(f"run       {time.monotonic() - started:.1f} s wall")
+    wall = time.monotonic() - started
+    estimate = measured["est"]["seconds"]
+    # The run reports its own prediction ratio, so a logged run carries the
+    # evidence that the table's rate does or does not hold on this machine. It
+    # is printed, not folded into a new constant: one contended run cannot set
+    # a rate that the next machine has to live with.
+    print(f"run       {wall:.1f} s wall  ({wall / estimate:.2f} x the"
+          f" {estimate:.1f} s estimate)")
     return sim, volume, index, eps_cell
 
 
@@ -684,6 +702,11 @@ def measure_spectrum(args, lay, request, measured):
     top = int(np.argmax(F))
     print(f"spectrum  {len(f)} bins, {lam[0]:.0f}-{lam[-1]:.0f} nm at"
           f" {measured['dlambda_nm']:.2f} nm per bin")
+    # Every bin, not only the peak. A peak sitting on the band's edge, or a band
+    # whose floor never comes back to 1, is itself the diagnosis, and the shape
+    # string alone cannot say how far above 1 the floor is.
+    for wavelength, value in zip(lam, F):
+        print(f"bin       {wavelength:7.1f} nm   F = {value:9.4f}")
     print(f"peak      F = {F[top]:.4f} at {lam[top]:.1f} nm")
     span = max(float(np.max(F)), 1e-30)
     print("shape     " + "".join(

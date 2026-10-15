@@ -81,6 +81,34 @@ def test_the_tiny_scene_reads_one_across_the_band_in_vacuum():
     done = run("--tiny", "--spectrum")
     assert done.returncode == 0, done.stdout + done.stderr
     assert "tiny: all controls hold" in done.stdout
+    # Every bin, not only the peak: the shape string cannot say how far above 1
+    # the band's floor sits, and a peak on the band's edge is itself a reading.
+    bins = re.findall(r"^bin\s+(\d+\.\d) nm\s+F =\s+([\d.]+)$", done.stdout, re.M)
+    assert len(bins) == 6, done.stdout
+    peak = re.search(r"^peak\s+F = ([\d.]+) at ([\d.]+) nm$", done.stdout, re.M)
+    assert peak, done.stdout
+    values = {wavelength: float(value) for wavelength, value in bins}
+    # the peak line is one of the bins, not its own reading of the record
+    assert float(peak.group(2)) in [float(w) for w, _ in bins], done.stdout
+    assert float(peak.group(1)) == max(values.values()), done.stdout
+    # the reading and its own prediction, both on the record of the run
+    assert re.search(r"^run\s+\d+\.\d s wall\s+\(\d+\.\d\d x the"
+                     r" \d+\.\d s estimate\)$", done.stdout, re.M), done.stdout
+    # the dipole line says where the node is and what was asked for it, so the
+    # gap between them is a quantisation and must be inside one finest cell
+    dipole = re.search(r"^dipole\s+node \((\d+), (\d+), (\d+)\): z\s+([\d.]+) nm,"
+                       r"\s+([\d.]+) nm below the top facet at ([\d.]+) nm"
+                       r"\s+\(--qd-below (\S+) asked\); in plane\s+([+\-][\d.]+),"
+                       r"\s+([+\-][\d.]+) nm off the wire's axis, (\w)-polarised$",
+                       done.stdout, re.M)
+    assert dipole, done.stdout
+    finest = float(re.search(r"z ([\d.]+) nm finest", done.stdout).group(1))
+    node_z, depth, top = (float(dipole.group(4)), float(dipole.group(5)),
+                          float(dipole.group(6)))
+    # the line's own arithmetic: the printed depth is the two printed z values
+    assert abs((top - node_z) - depth) < 1e-9, done.stdout
+    # and the node it picked is within one finest cell of the depth asked for
+    assert abs(depth - float(dipole.group(7))) <= finest, done.stdout
 
 
 def test_every_rung_over_the_cap_is_reported_not_skipped():

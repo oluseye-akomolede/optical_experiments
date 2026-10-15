@@ -229,9 +229,35 @@ The lead's four steps (queue row, 2026-10-15). One commit each, local only; the 
       holding 2.8 GB of ~7 GB, and the estimate's 0.66 GiB is on top of the CUDA runtime. If
       the bench stays busy, the dx 12 rung (3,973,800 cells, 1,125.8 s, 0.48 GiB, 22 ppw in
       InP) buys margin at a coarser mesh.
-- [ ] The output to read: the printed grid and estimate, `measured F = ... at ... nm`, the
-      spectrum's peak and its FWHM against the 27.66 nm bin, and whether the shape is the
-      paper's table's. Step 3's ladder (`--height` over the paper's H) is one command per rung.
+- [x] **The run came back** (the lead, tier 2, `--spectrum --dx 12 --mirror-pad 400`, not the
+      dx 10 block above): exit 0, 1,458.6 s wall against 1,125.8 s estimated, `peak F = 2.2839
+      at 976.3 nm`, and six pairs of `NvMapMemAlloc ... error 12` at the start. 976.3 nm is
+      not a resonance: it is the band's own top bin (the band is centred at 900 nm in
+      frequency, so its wavelength edges are 836.8 and 976.4 nm), and the shape string came
+      back uniform -- every bin read F ~ 2. The paper's line is 4 nm wide at 900 nm and this
+      record's bins are 27.66 nm wide, which is the wall section 3a names; what it does not
+      answer is where in the band the cavity sits, and that is the CW arm's question
+      (section 4), because a monochromatic drive reads F at exactly its own wavelength
+      instead of averaging it over a bin.
+- [x] **The estimate was 29 per cent short, and structurally so.** `seconds = cells * steps /
+      (RATE_SAFETY * rate)` is the step loop alone -- the voxeliser and the spectrum's own
+      pass are not in it -- and `RATE_SAFETY = 0.9` times the *slowest* recorded dispersive
+      row (45.30 Mcell-steps/s, over two 300-step cupy runs) already errs long. The gap is
+      the machine: 3,973,800 cells x 11,550 steps over 1,458.6 s is 31.5 Mcell-steps/s, 69
+      per cent of that slowest row, and the Orin was holding another rig's realtime demo
+      (5,540 MB of 7,619 MB used, 469 MB free, when the re-run below was launched). The six
+      `NvMapMemAlloc` failures are the same contention seen from the allocator; the arm's own
+      estimate is 0.48 GiB, so nothing in this scene asks for the ~1 GB those errors name.
+      The re-run keeps stderr beside stdout to read the exact lines and the memory at the
+      moment they appear, rather than to guess the allocation from here.
+- [x] What was added instead of a new constant: the arm prints its own ratio, `run 1458.6 s
+      wall  (1.29 x the 1125.8 s estimate)`, so every logged run says whether the table's
+      rate held on that machine. `RATE_SAFETY` is left alone -- one contended run cannot set
+      a constant the next machine has to live with.
+- [ ] The consequence for choosing rungs, measured rather than assumed: at 1.29x, a rung must
+      be estimated under about 1,400 s to survive the 1,800 s tier-2 clock. dx 10 at pad 400
+      (1,567.7 s) is therefore out, and dx 10 at pad 200 (903.2 s, 3,222,828 cells) is in --
+      which matters because the paper's own mesh is "10 nm in all three co-ordinates".
 
 ## 3a. The tail arm (the lead's ruling, 2026-10-15)
 
@@ -287,7 +313,39 @@ linewidth is not.
       turn quietly.
 - [ ] CW Purcell at 900 nm and a few neighbouring wavelengths (`--wavelength`), the CW arm's
       own reading of the peak value. Nothing here lengthens a record past the cap to buy
-      linewidth.
+      linewidth. The rungs, priced with the measured 1.29x in hand: dx 12 pad 400 (1,127.5 s
+      estimated, the rung the lead ran) fits the 1,800 s clock; dx 10 pad 400 (1,567.7 s) does
+      not, and dx 10 pad 200 (903.2 s, 3,222,828 cells) does -- and dx 10 is the paper's own
+      mesh, so the pad's convergence run is what buys the comparable rung.
+- [x] **The 420 nm reading is decided by the paper's own relation, and the scene's default
+      reads it the other way.** The text says "The diameter of a hexagonal nanowire is
+      related to a cylindrical nanowire by 2s = 1.14 D" and quotes "the optimal cavity
+      dimensions (height of 1375 nm and width of 420 nm)". With s the hexagon's side, 2s is
+      the corner-to-corner width, so D = 1.754 s and the flat-to-flat width is 1.732 s =
+      0.987 D -- the paper's 420 nm is across the FLATS, and its corners are 1.14 x 420 =
+      478.8 nm. The scene's default (`--hex corners --diameter 420`) puts the corners at
+      420 nm and the flats at 363.7 nm, 12 per cent narrow; `--hex flats --diameter 420` is
+      the paper's reading (flats 420, corners 485.1). The two are one dx 20 run apart (~570 s
+      against ~600 s estimated), and the choice redefines the scene, so it is the lead's to
+      bless before the dx 10 run rather than a flag to flip quietly.
+- [x] The dipole's placement is the paper's, in its own words: "The QD emitter placed
+      on-axis at 30 nm below the top." (Figure 2a) and "we placed the QD at the second
+      antinode from the top" -- on a wire whose in-material half wave is 130.8 nm, 30 nm is
+      that second antinode, so the two sentences agree. The scene puts the dipole on the axis
+      30 nm under the top facet, and `report` now prints the node it actually chose and the
+      gap to what was asked (tiny scene: 57.11 nm delivered against 60 asked, inside one
+      finest cell; 3.33 nm off-axis on a 60 nm wire, well inside the paper's own +-100 nm
+      displacement tolerance). The paper's crown is not modelled -- the design tolerates one,
+      F > 10 while the crown stays under 90 nm -- and that is a named simplification.
+- [ ] The pad is not a cost knob to turn quietly: it is the mirror's own lateral extent, and
+      the paper's mode is a quasi-BIC, whose field is the kind that reaches the mirror's
+      edge. Shrinking it to 200 nm to fit the dx 10 rung inside the clock therefore owes a
+      convergence run (dx 20 at pad 200/400/600) rather than an assumption. The layout's own
+      16-cell pad sits outside the box on every axis, so no `--mirror-pad` value can reach the
+      absorber; what changes with it is how much gold the mode sees.
+- [ ] The gold is Rakić Lorentz-Drude here and Palik's measurements in the paper ("For the
+      Gold mirror, Palik's experimental permittivity data was used"). Both are metals at
+      900 nm; the difference is a named one, to be read out of a run rather than argued.
 - [ ] Q from the ring-down of the short record (section 3a), reported with its error -- or
       reported as unresolved with the bound it gives. Those are the two accepted outcomes.
 - [ ] NA 0.8 collection waits for the far-field cloud job that is in flight; it is not an arm
@@ -313,7 +371,12 @@ linewidth is not.
 
 ## Not verified here
 
-- The paper's method section and its table: what the fetch tool returned is summarised text
-  from a page whose design does not match the abstract. The lead reads the PDF.
+- The paper's figures and its table's exact digits: what the fetch tool returned is the text
+  of the design and method sections, quoted above where a number is used. It is the right
+  paper -- the abstract page and the full text agree on the nanowire cavity, and the "quasi-BIC
+  formed by strong coupling of two resonant optical modes" of the abstract is the mirror-backed
+  wire of the body, not a different design (an earlier reading of this file said the opposite;
+  the quotes above are what settled it). The figure numbers themselves (Figure 1b, Figure 2a,
+  Figure 6) name where a reader should look in the PDF; the lead has the PDF.
 - The Lumerical page: 403.
 - Anything at tier 2 or 3: the Orin run is the lead's.
