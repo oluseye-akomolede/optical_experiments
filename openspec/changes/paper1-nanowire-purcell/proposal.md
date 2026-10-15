@@ -65,12 +65,16 @@ Not verified, and not used as fact here:
 - `scripts/paper1_nanowire.py` (step 2): the paper's stack as a scene this product's own
   layout builds -- a gold slab, the SiO2 buffer, a hexagonal InP prism, a dipole on or off
   the axis -- with the grid, the estimate and the record's resolution printed before anything
-  runs, and two measurement arms (CW, and one pulse through `purcell_spectrum`). It is a
-  bench script: it reads `fdtd.py`, `fdtd_grid.py` and `fdtd_layout.py` and edits none of
-  them, so it adds no requirement to the spec. Its scenarios stay in `tasks.md`, by this
-  change's own rule, until the lead's Orin run passes.
-- `tests/test_paper1_nanowire.py` (step 2): the tiny scene's 13 controls, two of them seen
-  red on purpose, and the refusals the Jetson arm shares with the tier-1 arm.
+  runs, and three measurement arms (CW, one pulse through `purcell_spectrum`, and the same
+  pulse read as a decay: `--ringdown` cuts the record at the drive's own end and fits one
+  decaying sinusoid, reporting Q with the error it gets rather than a linewidth the record's
+  bins cannot resolve). It is a bench script: it reads `fdtd.py`, `fdtd_grid.py` and
+  `fdtd_layout.py` and edits none of them, so it adds no requirement to the spec. Its
+  scenarios stay in `tasks.md`, by this change's own rule, until the lead's Orin run passes.
+- `tests/test_paper1_nanowire.py` (step 2): the tiny scene's 15 controls, two of them seen
+  red on purpose, the fitter checked both ways against synthetic tails (one with a known tau,
+  one with no decay in its window at all), and the refusals the Jetson arm shares with the
+  tier-1 arm.
 
 ## Impact
 

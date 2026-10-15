@@ -228,6 +228,53 @@ The lead's four steps (queue row, 2026-10-15). One commit each, local only; the 
       spectrum's peak and its FWHM against the 27.66 nm bin, and whether the shape is the
       paper's table's. Step 3's ladder (`--height` over the paper's H) is one command per rung.
 
+## 3a. The tail arm (the lead's ruling, 2026-10-15)
+
+The step-2 report named the wall: the record's own bins are 27.66 nm wide at dx 10, the paper's
+line is 4 nm, and reaching it by lengthening the record is 79,856 steps against a 20,000 cap.
+The lead's ruling is not to lengthen records past the cap, but to read the *decay*: the drive
+is over partway through a pulse record, and the tail after it is one decaying sinusoid --
+`a_dip(t) = c + exp(-t/tau) (a cos wt + b sin wt)` -- giving Q = pi f tau with a covariance
+error off the model's own residual. If the fit cannot pin Q from the short record, the arm
+reports it as unresolved with the bound it gives. Both outcomes are accepted; a silent
+linewidth is not.
+
+- [x] `--tail-periods` puts whole drive periods of record after the pulse is over, and
+      `--ringdown` reads them. `arm_conflicts` keeps the two readings off one another's
+      records: the band arm needs its drive centred in its own record (its estimator is a
+      cross-spectral density, and the delta records the -94 dB that a mostly-ring-down record
+      costs it), and the tail arm needs the tail the band arm cannot have.
+- [x] The window is a reading of the pulse, not a retyped constant: `pulse_end_sigma()` is
+      `5 + sqrt(-ln floor)` sigma off the product's own envelope, and `drive_done()` finds the
+      same cut in the run's recorded drive. `--estimate`/`report` prints the planned tail
+      before anything runs; the arm prints the measured one.
+- [x] Tier 1, both directions (the fixture is `test_the_fitter_recovers_a_decay_and_refuses_to_invent_one`):
+      synthetic tails with a known tau come back within a few of their own statistical errors
+      (10 fs over a 30 fs window: -0.00002%; 5 fs: -0.0033%; 20 fs: +0.0009%; 0.5 s each), and
+      a sinusoid with no decay in its window returns `resolved = False` with `at_edge = True`.
+      The first spelling of the fit stopped on its own scan grid -- 0.4% to 2.6% off, a hundred
+      times its own error -- and the fix is a coordinate descent (golden-section per axis)
+      rather than a fixed number of linspace rounds.
+- [ ] **What the fit's error is not.** It is the model's, not the geometry's: a tail holding
+      two decays still fits one of them, and a fast CPML transient fits as well as a cavity
+      mode. The arm prints that caveat in its own output, and `--vacuum` is the same arm on the
+      same scene with no cavity, so the two taus read side by side say which is which. Neither
+      has been run on the Orin.
+
+## 4. Step 3's shape (the lead, 2026-10-15)
+
+- [ ] CW Purcell at 900 nm and a few neighbouring wavelengths: one command per wavelength
+      (`--wavelength`), which is what the paper's table is. Nothing here lengthens a record
+      past the cap to buy linewidth.
+- [ ] Q from the ring-down of the short record (section 3a), reported with its error -- or
+      reported as unresolved with the bound it gives. Those are the two accepted outcomes.
+- [ ] NA 0.8 collection waits for the far-field cloud job that is in flight; it is not an arm
+      of this script today, and nothing here claims it.
+- [ ] The 4 nm line, stated honestly: the record's bins resolve 27.66 nm, so the mode's width
+      is not in them. The `--ringdown` arm says so in its own output, and the ladder's 4 nm
+      line says so when `--ringdown` is set, rather than leaving a reader to conclude the mode
+      was resolved.
+
 ## Deferred by the lead, recorded here so it is not dropped
 
 - [ ] **The dielectric as a function, not a constant** (the lead's step-1 item (7), called a

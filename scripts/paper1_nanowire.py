@@ -45,11 +45,21 @@ it is in rather than quote the paper's number anyway.
 What this measures, and what it does not. ``--spectrum`` runs a band-limited
 pulse centred in its own record and reads the enhancement bin by bin
 (``purcell_spectrum``): that is the arm the paper's 830-970 nm figure can be
-read against, and it is a PULSE arm -- a pulse cannot ring a high-Q cavity up,
-so a 4 nm-wide mode is measured through a window wider than the mode. The CW arm
-(``--periods``) measures a settled steady state at one frequency per run.
-Neither substitutes for the other; the printed resolution says which one a given
-run is.
+read against, and its bins resolve tens of nanometres, so the paper's 4 nm mode
+is measured through a window wider than the mode. The CW arm (``--periods``)
+measures a settled steady state at one frequency per run. Neither substitutes
+for the other; the printed resolution says which one a given run is.
+
+``--ringdown`` is the third reading, and the one that answers the linewidth
+question without a longer record: the same pulse, with ``--tail-periods`` of
+record after its drive is over, fitted as one decaying sinusoid
+(``fit_decay``). Its Q = pi f tau with a covariance error, and it says which of
+the two outcomes it reached -- a Q with an error, or an unresolved tail with the
+bound that is all the record can give. That is what the lead's ruling asks for:
+the 4 nm line is read from the decay rather than bought with steps the cap
+refuses. What its error is not: the model's covariance knows about the residual
+and nothing about the geometry, so the same arm on ``--vacuum`` (no cavity at
+all) is the reading to put beside it.
 
 Item (7) of the handoff (a dielectric that is a function, not a scalar) does not
 bind the measurement this script makes: the dipole sits on the wire's axis, 30
@@ -59,7 +69,8 @@ normalisation needs. The field update around it is still the product's scalar
 path.
 
 Exit codes: 0 measured, 1 a control failed, 2 refused (over a cap, or over the
-tier-2 envelope).
+tier-2 envelope), 3 measured but the record does not pin what was asked for (the
+tail arm's unresolved reading).
 
 The tier-2 commands (the Jetson bench, one run at a time; the lead runs them).
 The bench's python is the worker venv -- that is where cupy lives, and the
@@ -70,6 +81,12 @@ script's own imports expect the repo's paths to be kept:
     ssh jetson 'cd ~/mse-bench/paper1 && ulimit -v 5000000; nice -n 10 \
         timeout 30m ~/mse-worker/venv/bin/python scripts/paper1_nanowire.py \
         --xp cupy --spectrum --dx 10 --mirror-pad 400'
+
+The ring-down command is the same with ``--ringdown`` in place of ``--spectrum``
+(the two arms read one record two ways, so they are two runs) plus whatever
+``--tail-periods`` the time budget allows: at dx 15 a 20-period tail puts the
+pulse arm at 18,649 steps and 1,317 s estimated, still inside the 1,800 s
+envelope, where dx 12 does not fit with a tail at all.
 
 The stage-2 ladder (step 3) is ``--height`` over the paper's H, one command per
 rung.
@@ -98,6 +115,23 @@ N_SIO2 = 1.45         # thermal oxide at 900 nm
 TIER2_SECONDS = 1800.0
 SETTLED_PERIODS = 16.0  # measured: a hard-started CW drive's settling, in periods
 PAPER_FWHM_NM = 4.0
+DRIVE_FLOOR = 1e-4      # of the drive's own peak: where the pulse is over
+MIN_TAIL_PERIODS = 6.0  # a decay needs at least this many periods to be fitted
+TAU_EDGE = 20.0         # the fit's own tau grid reaches this far in windows
+DEFAULT_TAIL_PERIODS = 20.0   # asked for only by --ringdown
+
+
+def paper_clock(args, request):
+    """The paper's mode as the two numbers a decay can be read against.
+
+    Both are DERIVED from the paper's own quoted pair -- 4 nm at 900 nm -- and
+    neither is asserted: Q = lambda / dlambda = 225 and the amplitude decay time
+    is Q / (pi f) = 215 fs. The ring-down arm prints them next to what it fits, so
+    a reader can see how much of the decay the record's own tail holds.
+    """
+    q = args.wavelength / PAPER_FWHM_NM
+    tau = q / (math.pi * float(request["frequency_hz"]))
+    return q, tau
 
 
 def part(vertices, faces):
@@ -200,10 +234,18 @@ def solve_scene(args):
 
 
 def steps_for(args, request, dt: float) -> int:
-    """The record this arm wants: periods at CW, a ten-sigma span for a pulse."""
+    """The record this arm wants: periods at CW, a sigma span plus tail for a pulse.
+
+    The pulse spans ``--pulse-span`` sigma of its own envelope and the drive is
+    centred at 5 sigma, so a span of 8 leaves about one period of tail. The
+    ``--tail-periods`` after it are whole drive periods of record in which the
+    pulse is over and the cavity is free to decay -- what the ring-down arm
+    reads, and what the band arm must not have (see ``arm_conflicts``).
+    """
     if args.profile == "pulse":
         sigma = 1.0 / (math.pi * request["bandwidth"])
-        return int(math.ceil(args.pulse_span * sigma / dt))
+        steps = int(math.ceil(args.pulse_span * sigma / dt))
+        return steps + int(math.ceil(args.tail_periods / (request["frequency_hz"] * dt)))
     return int(math.ceil(args.periods / (request["frequency_hz"] * dt)))
 
 
@@ -248,6 +290,245 @@ def refusals(args, measured) -> str:
     if measured["exceeded"]:
         return f"refused: {measured['exceeded']}"
     return ""
+
+
+def arm_conflicts(args) -> str:
+    """The refusal the arms owe each other, before any scene is built.
+
+    Argument-level, so it runs first and costs nothing. Three flags would
+    otherwise be inert or quietly wrong: ``--tail-periods`` on a CW arm is never
+    read by ``steps_for``; ``--ringdown`` without a pulse has no tail to read;
+    and a tail on the band arm moves the pulse off the centre of its own record.
+    That last one is the reason ``fdtd.delivered_power_spectrum`` carries a
+    centred-drive requirement -- its own docstring measures a mostly-ring-down
+    record at -94 dB, which this check keeps out of reach rather than
+    rediscovering.
+    """
+    if args.tail_periods < 0.0:
+        return (f"refused: --tail-periods {args.tail_periods:g} is negative; a"
+                f" record cannot end before it starts")
+    if args.tail_periods and args.profile != "pulse":
+        return (f"refused: --tail-periods belongs to a pulse record; this arm is"
+                f" {args.profile} and its drive never stops")
+    if args.tail_periods and args.spectrum:
+        return ("refused: --tail-periods with --spectrum: the band arm reads a"
+                " cross-spectral density against a record the pulse has to stay"
+                " centred in, and a tail is exactly the record that costs it -94"
+                " dB. Read --ringdown for the tail, or drop --tail-periods")
+    if args.ringdown and args.spectrum:
+        return ("refused: --ringdown and --spectrum read one record two ways, and"
+                " the tail one needs is the tail the other cannot have; run them"
+                " as two records")
+    if args.ringdown and args.profile != "pulse":
+        return (f"refused: --ringdown reads a pulse's own decay; a {args.profile}"
+                f" record is a driven steady state with nothing to decay")
+    if args.ringdown and args.tail_periods < MIN_TAIL_PERIODS:
+        return (f"refused: --ringdown needs a drive-free tail of at least"
+                f" {MIN_TAIL_PERIODS:g} periods to fit a decay to, got"
+                f" {args.tail_periods:g}")
+    return ""
+
+
+def pulse_end_sigma(floor: float = DRIVE_FLOOR) -> float:
+    """Where the product's pulse falls under ``floor`` of its peak, in sigma.
+
+    ``fdtd.pulse_profile`` is a Gaussian envelope centred at 5 sigma of its own
+    width, so the drive is under ``floor`` past ``5 + sqrt(-ln floor)`` sigma.
+    Derived from the envelope rather than picked, so the pre-run plan here and
+    the measured cut in ``drive_done`` describe the same record.
+    """
+    return 5.0 + math.sqrt(-math.log(floor))
+
+
+def drive_done(drive, floor: float = DRIVE_FLOOR) -> int:
+    """The first step at which the drive is over: under ``floor`` of its peak.
+
+    Read off the run's own recorded drive rather than recomputed from the
+    profile's constants, so a moved ``pulse_profile`` moves the window with it
+    instead of leaving the fit pointed at steps the drive still occupies.
+    """
+    drive = np.asarray(drive, dtype=np.float64).reshape(-1)
+    if drive.size < 2:
+        raise ValueError(f"a drive record is at least 2 steps, got {drive.size}")
+    peak = float(np.max(np.abs(drive)))
+    if not peak > 0.0:
+        raise ValueError("the drive record is all zeros, so there is no pulse")
+    above = np.flatnonzero(np.abs(drive) > floor * peak)
+    return int(above[-1]) + 1 if above.size else 0
+
+
+def _decay_scan(t, y, taus, omegas):
+    """Least squares over one decaying sinusoid plus a constant, on a grid."""
+    best = None
+    for tau in taus:
+        env = np.exp(-t / tau)
+        for omega in omegas:
+            basis = np.column_stack((env * np.cos(omega * t),
+                                     env * np.sin(omega * t), np.ones(t.size)))
+            coef, *_ = np.linalg.lstsq(basis, y, rcond=None)
+            resid = y - basis @ coef
+            rss = float(resid @ resid)
+            if best is None or rss < best[0]:
+                best = (rss, float(tau), float(omega), coef)
+    return best
+
+
+def _golden(f, lo: float, hi: float, iterations: int = 40) -> float:
+    """The minimum of a unimodal ``f`` on ``[lo, hi]``, by golden-section search."""
+    phi = (math.sqrt(5.0) - 1.0) / 2.0
+    a, b = float(lo), float(hi)
+    c, d = b - phi * (b - a), a + phi * (b - a)
+    fc, fd = f(c), f(d)
+    for _ in range(iterations):
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = b - phi * (b - a)
+            fc = f(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + phi * (b - a)
+            fd = f(d)
+    return 0.5 * (a + b)
+
+
+def fit_decay(values, dt: float, start: int, *, frequency: float) -> dict:
+    """(f, tau, Q) from one record's tail, or the bound that says it cannot.
+
+    The model is a single decaying sinusoid over a constant: a_dip(t) =
+    c + e^{-t/tau} (a cos wt + b sin wt), on the record's own sample times from
+    ``start``. Linear in (a, b, c) at fixed (tau, w) and nonlinear in those two,
+    so it is a grid scan, then a coordinate descent on the two of them, then a
+    covariance. Nothing here reads the frequency from the DFT's bins: those are
+    1/window apart, far too coarse for a mode the record's own length cannot
+    resolve, and reading the decay is the way to beat them.
+
+    ``resolved`` is the fit's own significance test, and it is the honest part:
+    tau is reported with a covariance error from the model's own residual, and a
+    decay shorter than a few of those errors is not a measurement. A tau at the
+    grid's top edge means the data prefer "no decay", which bounds Q from below
+    rather than measuring it. The error is the model's, not the geometry's --
+    the arm says so beside the number, because a tail holding two decays still
+    fits one of them.
+    """
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if start < 0 or start + 3 > values.size:
+        raise ValueError(f"a tail from step {start} of {values.size} is too short")
+    y = values[start:]
+    n = y.size
+    t = np.arange(n) * dt
+    window = n * dt
+    w0 = 2.0 * math.pi * frequency
+
+    def rss_at(tau, omega):
+        env = np.exp(-t / tau)
+        basis = np.column_stack((env * np.cos(omega * t),
+                                 env * np.sin(omega * t), np.ones(n)))
+        coef, *_ = np.linalg.lstsq(basis, y, rcond=None)
+        resid = y - basis @ coef
+        return float(resid @ resid), coef
+
+    taus = np.logspace(math.log10(window / 100.0), math.log10(window * TAU_EDGE), 31)
+    omegas = w0 * (1.0 + np.linspace(-0.05, 0.05, 21))
+    rss, tau, omega, coef = _decay_scan(t, y, taus, omegas)
+    at_edge = math.isclose(tau, float(taus[-1]), rel_tol=1e-9)
+    # The scan's grid is coarse (a quarter of an octave in tau), far too coarse
+    # to stop on: descend each axis in turn, which is exact to the search's own
+    # tolerance rather than to a grid step. Measured against synthetic tails, a
+    # fixed number of linspace rounds left tau on the grid -- 0.4% to 2.6% off at
+    # a hundred times its own error -- where this recovers it to the noise.
+    step_tau = (taus[-1] - taus[0]) / (taus.size - 1)
+    step_w = (omegas[-1] - omegas[0]) / (omegas.size - 1)
+    for sweep in range(3):
+        tau = _golden(lambda v: rss_at(v, omega)[0],
+                      max(tau - 1.5 * step_tau, 1e-3 * window), tau + 1.5 * step_tau)
+        omega = _golden(lambda v: rss_at(tau, v)[0],
+                        omega - 1.5 * step_w, omega + 1.5 * step_w)
+        if sweep == 0:                 # the scan's step is used up: tighten
+            step_tau, step_w = step_tau * 0.05, step_w * 0.05
+    rss, coef = rss_at(tau, omega)
+
+    def model(p):
+        a, b, c, tau, om = p
+        return c + np.exp(-t / tau) * (a * np.cos(om * t) + b * np.sin(om * t))
+
+    p = np.array([coef[0], coef[1], coef[2], tau, omega])
+    jac = np.empty((n, 5))
+    steps = np.array([abs(p[0]), abs(p[1]), abs(p[2]), tau, omega]) * 1e-5
+    steps[3] = tau * 1e-5
+    steps[4] = omega * 1e-7
+    for k in range(5):
+        if steps[k] <= 0.0:
+            steps[k] = 1e-12 * (1.0 + abs(p[k]))
+        hi, lo = p.copy(), p.copy()
+        hi[k] += steps[k]
+        lo[k] -= steps[k]
+        jac[:, k] = (model(hi) - model(lo)) / (2.0 * steps[k])
+    resid = y - model(p)
+    rss = float(resid @ resid)
+    sigma2 = rss / max(n - 5, 1)
+    cov = sigma2 * np.linalg.pinv(jac.T @ jac)
+    tau_err = math.sqrt(max(cov[3, 3], 0.0))
+    f_err = math.sqrt(max(cov[4, 4], 0.0)) / (2.0 * math.pi)
+    f = omega / (2.0 * math.pi)
+    q = math.pi * f * tau
+    q_err = math.pi * math.hypot(tau * f_err, f * tau_err)
+    return {"f": f, "f_err": f_err, "tau": tau, "tau_err": tau_err,
+            "q": q, "q_err": q_err, "samples": n, "window": window,
+            "rms": math.sqrt(rss / n), "peak": float(np.max(np.abs(y))),
+            "at_edge": at_edge, "resolved": bool(tau > 3.0 * tau_err and not at_edge)}
+
+
+def ringdown(args, lay, request, measured):
+    """The tail arm: one pulse record, its decay, and the Q it does or does not pin.
+
+    Returns (fit, code). The code is 0 when the fit is significant, 3 when the
+    record's own tail leaves Q unpinned -- not a failure to hide, and not a
+    measurement to invent: the fit's own error is printed either way.
+    """
+    sim, volume, index, eps_cell = _run(args, lay, request, measured)
+    dt = measured["est"]["dt"]
+    f0 = float(request["frequency_hz"])
+    start = drive_done(sim["drive"])
+    tail_steps = int(measured["steps"]) - start
+    window = tail_steps * dt
+    periods = window * f0
+    print(f"tail      the drive is under {DRIVE_FLOOR:g} of its own peak from step"
+          f" {start:,} ({start * dt / 1e-15:.1f} fs); the tail is {tail_steps:,} steps"
+          f" = {window / 1e-15:.1f} fs = {periods:.1f} periods")
+    q_paper, tau_paper = paper_clock(args, request)
+    print(f"paper     the paper's own pair -- {args.wavelength:.0f} nm at a"
+          f" {PAPER_FWHM_NM:.0f} nm line -- is Q = {q_paper:.0f}, an amplitude"
+          f" decay of {tau_paper / 1e-15:.0f} fs; it would hold"
+          f" {window / tau_paper:.2f} of this tail")
+    if periods < MIN_TAIL_PERIODS:
+        print(f"refused: the drive is over only {periods:.1f} periods before the"
+              f" record ends, short of the {MIN_TAIL_PERIODS:g} a decay needs."
+              f" --pulse-span must clear the drive's own end: the pulse is centred"
+              f" at 5 sigma and under {DRIVE_FLOOR:g} of its peak past"
+              f" {pulse_end_sigma():.1f}")
+        return None, 2
+    fit = fit_decay(sim["source_field"], dt, start, frequency=f0)
+    print(f"fit       f = {fit['f'] / 1e12:.4f} THz +- {fit['f_err'] / 1e12:.2g}"
+          f" (the drive is {f0 / 1e12:.2f}), tau = {fit['tau'] / 1e-15:.3f} fs"
+          f" +- {fit['tau_err'] / 1e-15:.2g}, rms {fit['rms']:.3e} against a"
+          f" {fit['peak']:.3e} peak")
+    print(f"caveat    tau's error is the fit's own, not the geometry's: a tail"
+          f" holding two decays still fits one of them. --vacuum is the same arm"
+          f" on the transient this scene has with no cavity at all")
+    if fit["resolved"]:
+        print(f"Q         {fit['q']:.4g} +- {fit['q_err']:.2g}, a line of"
+              f" {args.wavelength / fit['q']:.2f} nm against the paper's"
+              f" {PAPER_FWHM_NM:.0f} nm -- read from the decay, not from this"
+              f" record's {measured['dlambda_nm']:.2f} nm bins")
+        return fit, 0
+    floor = max(fit["tau"] - 3.0 * fit["tau_err"], 0.0)
+    tail = ("tau ran to the top of the fit's own grid"
+            if fit["at_edge"] else "tau is not three of its own errors")
+    print(f"unresolved: {tail}, so this tail does not pin Q. What it bounds is"
+          f" Q > {math.pi * fit['f'] * floor:.1f} (the 3-sigma floor of the fit);"
+          f" a decay slower than the {window / 1e-15:.0f} fs window stays inside the"
+          f" bounds the two other arms already cover")
+    return fit, 3
 
 
 def _oxide_slice(z, geom):
@@ -306,6 +587,16 @@ def report(args, lay, request, geom, measured):
     print(f"record    {est['steps']:,} steps = {est['steps'] * est['dt'] * f0:.1f}"
           f" periods, {est['seconds']:.1f} s estimated on the Jetson"
           f" ({est['setup']} rates)")
+    if args.profile == "pulse" and args.tail_periods:
+        sigma = 1.0 / (math.pi * request["bandwidth"])
+        planned = int(math.ceil(pulse_end_sigma() * sigma / est["dt"]))
+        print(f"tail      the drive is under {DRIVE_FLOOR:g} of its peak past"
+              f" {pulse_end_sigma():.2f} sigma (the pulse is centred at 5), i.e."
+              f" step {planned:,}, so the tail is {est['steps'] - planned:,} steps"
+              f" = {(est['steps'] - planned) * est['dt'] * f0:.1f} periods"
+              f" (--tail-periods {args.tail_periods:g} asked for"
+              f" {args.tail_periods:g}); the mode is read from this decay, not from"
+              f" the {measured['dlambda_nm']:.2f} nm bins")
     print(f"memory    {est['bytes'] / 2 ** 30:.2f} GiB estimated"
           f"  (metals {sorted(lay['metals']) or 'none'},"
           f" {'pec' if lay['pec'] is not None else 'no pec'},"
@@ -413,7 +704,11 @@ def tiny(args) -> int:
     absorber, the scene this script builds inside the same
     caps a Jetson run answers to, and the normalisation reading F = 1 on a
     homogeneous scene through this script's own path. The geometry controls are
-    read off the real scene's layout, which needs no solve.
+    read off the real scene's layout, which needs no solve. Two more are the
+    tail arm's own: the cut through the record it fits is put against the
+    product's pulse envelope's algebra, and the band and tail arms are asked to
+    refuse each other's record. With --ringdown the homogeneous scene runs the
+    tail arm instead of the band arm, so the fit itself is exercised here too.
     """
     base = dict(args.__dict__)
     ok = []
@@ -439,6 +734,36 @@ def tiny(args) -> int:
     if why:
         print(why)
         return 2
+
+    # The tail arm's window is a cut through the record at the drive's own end.
+    # The control drives a record with the product's own pulse profile and asks
+    # the cut to land where that envelope's algebra says it should -- two
+    # readings of one pulse, so a floor or a time base that drifts shows up here.
+    dt = measured["est"]["dt"]
+    sigma = 1.0 / (math.pi * request["bandwidth"])
+    synth = argparse.Namespace(**{**base, "profile": "pulse", "spectrum": False,
+                                  "ringdown": True, "tail_periods": 8.0})
+    n_syn = steps_for(synth, request, dt)
+    drive = np.array([fdtd.pulse_profile(k * dt, float(request["frequency_hz"]),
+                                         float(request["bandwidth"]))
+                      for k in range(n_syn)])
+    cut = drive_done(drive)
+    want = pulse_end_sigma() * sigma
+    tail = (n_syn - cut) * dt * float(request["frequency_hz"])
+    ok.append((f"the product's own pulse ends where its envelope says"
+               f" ({cut * dt / sigma:.2f} sigma against {want / sigma:.2f}) and a"
+               f" span of 8 plus a tail of 8 leaves {tail:.1f} periods of it",
+               abs(cut * dt - want) < 0.25 * sigma and tail >= MIN_TAIL_PERIODS))
+
+    as_tail = argparse.Namespace(**{**base, "profile": "pulse", "ringdown": True,
+                                    "spectrum": True, "tail_periods": 20.0})
+    as_band = argparse.Namespace(**{**base, "profile": "pulse", "ringdown": False,
+                                    "spectrum": True, "tail_periods": 0.0})
+    ok.append(("the band arm and the tail arm refuse to share one record"
+               f" ({arm_conflicts(as_tail)[:40] or 'NOTHING'}), and the band arm"
+               f" alone is clean",
+               bool(arm_conflicts(as_band)) is False
+               and bool(arm_conflicts(as_tail)) is True))
 
     z = np.asarray(lay["nodes"][2])
     oxide = _oxide_slice(z, geom)
@@ -482,7 +807,17 @@ def tiny(args) -> int:
     vac = argparse.Namespace(**{**base, "vacuum": True})
     lay_v, request_v, geom_v = solve_scene(vac)
     measured_v = filled(vac, lay_v, request_v)
-    if vac.profile == "pulse":
+    if vac.ringdown:
+        fit, code = ringdown(vac, lay_v, request_v, measured_v)
+        ok.append((f"the tail arm runs on a homogeneous scene and answers either"
+                   f" way (tau {fit['tau'] / 1e-15:.3f} fs +-"
+                   f" {fit['tau_err'] / 1e-15:.2g},"
+                   f" {'pinned' if not code else 'unresolved'})"
+                   if fit is not None else
+                   "the tail arm answers on a homogeneous scene (it refused this"
+                   " window's own drive instead)",
+                   fit is not None and code in (0, 3)))
+    elif vac.profile == "pulse":
         _, F_bins = measure_spectrum(vac, lay_v, request_v, measured_v)
         worst = float(np.max(np.abs(np.asarray(F_bins) - 1.0)))
         ok.append((f"vacuum F = 1 across the band (worst bin {worst:.4f})",
@@ -530,7 +865,9 @@ def ladder(args) -> int:
     print(f"\nresolving the paper's {PAPER_FWHM_NM:.0f} nm mode needs"
           f" {sub.wavelength / PAPER_FWHM_NM:.0f} periods of record, i.e."
           f" {steps_for_4nm(est['dt'], sub.wavelength):,} steps at dx"
-          f" {sub.dx:.1f} nm; the product's cap is {fdtd.MAX_STEPS:,}")
+          f" {sub.dx:.1f} nm; the product's cap is {fdtd.MAX_STEPS:,}"
+          + ("  -- the tail arm does not wait for that: it reads the decay and"
+             " reports the error it gets" if sub.ringdown else ""))
     return 0
 
 
@@ -553,8 +890,12 @@ def build_parser(argv=None) -> argparse.ArgumentParser:
 
 def parse_args(argv=None):
     args = build_parser(argv).parse_args(argv)
-    if args.spectrum:
+    if args.spectrum or args.ringdown:
         args.profile = "pulse"
+    if args.tail_periods is None:
+        # only the ring-down arm wants a tail; the band arm's drive has to stay
+        # centred in its own record, so an unasked-for tail is no tail
+        args.tail_periods = DEFAULT_TAIL_PERIODS if args.ringdown else 0.0
     args.xp_name = args.xp           # the spelling, for run's own warning
     if args.xp == "cupy":            # pragma: no cover -- the Jetson arm
         import cupy as xp
@@ -587,6 +928,15 @@ def PARSER_ARGUMENTS(p) -> None:
     p.add_argument("--pulse-span", type=float, default=8.0,
                    help="pulse record, in sigma (the band arm needs it centred;"
                         " 10 sigma does not fit at --dx 10 -- see the docstring)")
+    p.add_argument("--tail-periods", type=float, default=None,
+                   help=f"drive periods of record after the pulse is over: what the"
+                        f" ring-down arm reads its decay from (the product's own"
+                        f" pulse is centred at 5 sigma and over by 8, so a span of"
+                        f" 8 leaves almost none). Default {DEFAULT_TAIL_PERIODS:g}"
+                        f" with --ringdown, 0 otherwise")
+    p.add_argument("--ringdown", action="store_true",
+                   help="a pulse run read as a decay: one decaying sinusoid fitted"
+                        " to the tail, giving Q and its own error instead of bins")
     p.add_argument("--periods", type=float, default=32.0, help="CW record, periods")
     p.add_argument("--window-periods", type=float, default=8.0,
                    help="the CW reading's tail window, in drive periods")
@@ -606,6 +956,10 @@ def PARSER_ARGUMENTS(p) -> None:
 def main(argv=None) -> int:
     args = parse_args(argv)
 
+    why = arm_conflicts(args)        # argument-level, so before any scene
+    if why:
+        print(why)
+        return 2
     if args.estimate:
         return ladder(args)          # --tiny --estimate is the table at the tiny dims
     if args.tiny:
@@ -623,6 +977,8 @@ def main(argv=None) -> int:
     if args.xp_name == "numpy":
         print("warning: --xp numpy; the estimate's seconds are fdtd_rate.py's cupy"
               " rates, so the real run takes a large factor longer")
+    if args.ringdown:
+        return ringdown(args, lay, request, measured)[1]
     if args.spectrum:
         measure_spectrum(args, lay, request, measured)
     else:

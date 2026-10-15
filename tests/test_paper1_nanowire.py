@@ -23,6 +23,12 @@ and estimates, never voxelises or solves, so it stays tier 1 -- which is how a
 ladder with every rung refused is seen to report that rather than read the last
 rung it happened to try.
 
+The tail arm -- a pulse record whose drive is over partway through, fitted to one
+decaying sinusoid -- is covered three ways: the fit itself against synthetic
+tails with a known tau (and against one with no decay at all, so a fit that
+invents a decay is caught), the window it cuts at read against the product's own
+pulse envelope, and the refusals a band arm and a too-short span owe it.
+
 The tiny scene is deliberately small -- 20 nm cells, a 100 nm wire -- so it runs
 in tier 1. It exercises the same code path the Jetson run does, not the same
 physics.
@@ -31,10 +37,13 @@ physics.
 from __future__ import annotations
 
 import importlib.util
+import math
+import re
 import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import trimesh
 
@@ -61,8 +70,8 @@ def test_the_tiny_scene_holds_every_control():
     assert done.returncode == 0, done.stdout + done.stderr
     assert "tiny: all controls hold" in done.stdout
     assert "FAIL" not in done.stdout
-    # 13 controls: a scene that quietly loses one still has to be caught here
-    assert done.stdout.count("\n  ok   ") == 13, done.stdout
+    # 15 controls: a scene that quietly loses one still has to be caught here
+    assert done.stdout.count("\n  ok   ") == 15, done.stdout
     # and the settled record the small scene runs must not warn about itself
     assert "warning: the record is" not in done.stdout
 
@@ -137,6 +146,86 @@ def test_a_record_that_is_not_settled_is_flagged():
     assert "warning: the record is" in done.stdout, done.stdout + done.stderr
     assert "Raise --periods." in done.stdout
     assert "tiny: all controls hold" not in done.stdout
+
+
+def test_the_fitter_recovers_a_decay_and_refuses_to_invent_one():
+    """The fit both ways, on synthetic tails whose tau is known.
+
+    Two fixtures, because one would measure nothing: a decaying sinusoid at a tau
+    the window is long enough to see, and a sinusoid that does not decay at all
+    inside the window. A fit that reports a decay either way fails the second,
+    and a fit that reports none fails the first.
+    """
+    module = _load()
+    f0, dt, n = 3.331e14, 5.0e-18, 6000
+    t = np.arange(n) * dt
+    rng = np.random.default_rng(7)
+    tau = 1.0e-14                                  # 10 fs over a 30 fs window
+    values = 1.0 + np.exp(-t / tau) * np.cos(2.0 * np.pi * f0 * t)
+    values = values + 1e-4 * rng.standard_normal(n)
+    fit = module.fit_decay(values, dt, 0, frequency=f0)
+    assert abs(fit["tau"] - tau) / tau < 0.02, fit
+    assert abs(fit["f"] - f0) / f0 < 0.02, fit
+    assert abs(fit["q"] - math.pi * f0 * tau) / (math.pi * f0 * tau) < 0.05, fit
+    assert fit["resolved"]
+
+    flat = 1.0 + np.cos(2.0 * np.pi * f0 * t)      # no decay this window can see
+    nope = module.fit_decay(flat, dt, 0, frequency=f0)
+    assert not nope["resolved"], nope
+    assert nope["at_edge"], nope
+
+
+def test_the_drive_cut_needs_a_pulse_to_cut():
+    """An all-zero drive has no end, and the cut says so instead of returning 0."""
+    module = _load()
+    with pytest.raises(ValueError):
+        module.drive_done(np.zeros(100))
+
+
+def test_the_tail_arm_reads_the_decay_of_a_drive_free_record():
+    """--tiny --ringdown: the window is the drive's own end, and the arm answers.
+
+    Vacuum has no cavity, so either verdict is a pass here -- what this pins is
+    that the arm reaches one through the script's own path, over a tail of the
+    length the record was asked for, and that ``tiny``'s own control sees it.
+    """
+    done = run("--tiny", "--ringdown")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "tiny: all controls hold" in done.stdout
+    assert "the tail arm runs on a homogeneous scene" in done.stdout
+    assert "tail      the drive is under" in done.stdout
+    found = re.search(r"= ([0-9.]+) periods\n", done.stdout)
+    assert found and float(found.group(1)) >= 6.0, done.stdout
+    assert "\nQ         " in done.stdout or "unresolved:" in done.stdout, done.stdout
+
+
+def test_the_band_arm_refuses_a_tail():
+    """A tail moves the pulse off the centre of its own record: -94 dB."""
+    done = run("--tiny", "--spectrum", "--tail-periods", "10")
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "-94 dB" in done.stdout
+
+
+def test_a_span_that_ends_inside_the_drive_leaves_no_tail():
+    """--pulse-span 5 with the tail's own 8 periods: the record ends first."""
+    done = run("--tiny", "--ringdown", "--pulse-span", "5", "--tail-periods", "8")
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "refused: the drive is over only" in done.stdout, done.stdout
+    assert "FAIL" in done.stdout
+
+
+def test_the_ladder_says_the_tail_arm_does_not_wait_for_the_record():
+    """Both ways: the 4 nm line is a bar the tail arm is not held to, and only when it runs.
+
+    The ladder prices a record long enough to resolve 4 nm; the tail arm reads a decay
+    instead, so the bar has to be marked as not applying to it -- and marked only when
+    it is the arm in play, or the line says it of a CW run the reader is about to make.
+    """
+    plain = run("--tiny", "--estimate")
+    assert "resolving the paper's 4 nm mode needs" in plain.stdout, plain.stdout
+    assert "the tail arm does not wait for that" not in plain.stdout, plain.stdout
+    tail = run("--tiny", "--estimate", "--ringdown")
+    assert "the tail arm does not wait for that" in tail.stdout, tail.stdout
 
 
 if __name__ == "__main__":       # pragma: no cover
