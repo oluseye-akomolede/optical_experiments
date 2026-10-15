@@ -70,36 +70,59 @@ consistency of the eigen-solution (Harminv's "error"); it is near round-off
 for a well-represented pole and is a check on the algebra, not a confidence
 interval, and it does not tell a noise-fitted mode from a real one.
 
-SPURIOUS MODES. A mode is reported only if its amplitude is at least
-``min_significance`` noise standard deviations (the single-mode Cramér-Rao
-std of |a|). The noise level is first bounded from above by the record's own
-periodogram inside the window, then read from what the significant modes
-leave behind, and the selection is repeated until it is stable, so a weak
-mode hidden under a strong one's leakage is recovered on the second pass
-and a mode fitted to noise never lowers the level it is judged against.
+SPURIOUS MODES. A mode is reported only if it passes two tests at
+``min_significance`` noise standard deviations: forward, the power its pole
+removes from the residual given the poles already accepted (a chi-square
+on the amplitude fit, with the noise level first bounded from above by the
+record's own window periodogram and then read from what the accepted modes
+leave behind, so a weak mode under a strong one's leakage is found on the
+next round and a pole fitted to noise never lowers the level it is judged
+against); and backward, after the polish, its amplitude against its own
+standard deviation from the full Fisher matrix, with the other poles'
+frequencies and decays free (a second pole that only explained the misfit
+of a raw first pole is dropped here). ``error.significance`` is the second.
 
-NUMERICAL LIMITS (measured in ``tests/test_resonances.py`` and written up in
-``docs/resonances.md``):
+NUMERICAL LIMITS (measured in ``tests/test_resonances.py`` and
+``docs/resonances.md``; f = 1, 4 samples per period unless stated):
 
-* Round-off: with no noise, f is recovered to about 1e-13 relative and Q to
-  about 1e-9 relative at gamma T = 0.05; the Q figure scales as 1/(gamma T).
-* Record length: the relative Q error from noise is
-  sqrt(6 / (SNR N)) / (gamma T) (twice that for a real record). Below about
-  gamma T = 1e-3 the decay is not determined at any practical SNR, and the
-  bound says so.
-* Resolution: two modes closer than about 1/T in frequency are resolved only
-  if the SNR is high; the joint bound grows with their overlap and the
-  reported errors say when the pair is not determined.
-* Window: a mode outside the window is not in the basis; a strong one close
-  to the edge perturbs the modes inside (measured below 1e-6 relative in f
-  and 1e-3 relative in Q for a mode 100 times stronger at 40/T away).
-  Include it in the window when that matters. The pencil has no window in
-  its algebra and is not affected.
-* Memory and time: the FDM basis is streamed in blocks (``_BLOCK_BYTES``) so
-  N of 1e6 with J of 1e3 runs in bounded memory; the pencil caps its Hankel
-  matrix at ``MAX_ROWS`` x (``MAX_PENCIL`` + 1), which keeps it under a
-  second but makes it less noise-efficient than the N/3 pencil of Hua &
-  Sarkar (the polish recovers that).
+* Round-off: with no noise, Q = 1e5 from a record of gamma T = 0.05 comes
+  back with f exact to the last bit and Q to 5e-12 relative (polished; the
+  raw FDM and pencil give 3e-11 to 1e-10), and the same to 63 samples
+  (gamma T = 5e-4). There is no record-length floor without noise.
+* Noise: the relative Q error is sqrt(6 / (SNR N)) / (gamma T) for a
+  complex record and twice that for a real one, within the 20% by which
+  the short-record formula under-states the full Fisher bound at
+  gamma T = 0.5. The polished estimate reaches the bound (its scatter is
+  1.03 times it over 40 seeds); the raw FDM scatters at 2.5 to 3.5 times
+  it and the capped pencil at about 2 times, which is why the polish is
+  on by default and why ``polish=False`` bars should not be trusted.
+* Bars: ``error_sigma = 3`` held at every seed from 10 dB up in a 240-draw
+  sweep of complex records (largest excursion 3.1 sigma) and in all but
+  one draw of real records (one seed at 3.7 to 4.3 sigma, the same noise
+  realisation at every SNR, with the same excursion against the bound
+  computed from the true noise). At 0 dB per-sample SNR on a real record
+  the likelihood is no longer single-peaked and one seed in 40 was 5.4
+  sigma off: do not read the bars as bounds below about 10 dB.
+* Resolution: two equal modes at 40 dB with gamma T = 0.5 are both found
+  down to 0.2 Fourier bins (1/T) apart, with the worst Q error growing
+  from 1e-3 at 2 bins to 7e-2 at 0.2 bins and the bars with it; at 0.1
+  bins the pair is reported as one mode (the second is not significant
+  once the first one's f and gamma are free).
+* Window: without noise the raw FDM is exact whatever lies outside the
+  window. With noise a strong mode outside the window is smeared over
+  spurious poles at the window edge and biases the modes inside unless
+  it is in the model; ``background=True`` (the pencil's out-of-window
+  poles) is what keeps the three-mode test right in a window that holds
+  only its close pair.
+* Spurious modes: white noise gives no mode at the default
+  ``min_significance`` (the largest FDM candidate significance on noise
+  was 1.7 against the threshold of 6). The eigen ``residual`` does not
+  tell a noise-fitted pole from a real one (86 of 87 FDM poles fitted to
+  0 dB noise had residual below 1e-4) and is kept as an algebra check.
+* Cost: O(J N) for the FDM matrices plus O(K_cand N) per selection round,
+  the pencil's SVD capped at ``MAX_ROWS`` x (``MAX_PENCIL`` + 1), and the
+  polish at O(N K^2) per iteration; the FDM basis is streamed in
+  ``_BLOCK_BYTES`` blocks. Timings are in ``docs/resonances.md``.
 
 Only numpy is required; scipy is not used.
 """
@@ -666,14 +689,8 @@ def _candidates(u, d, residual, dt, n, real, residual_threshold):
     return np.flatnonzero(ok)
 
 
-def _columns(u, n, real):
-    """Model columns of one pole: one complex column, or two real ones for a real record."""
-    v = _vandermonde(np.atleast_1d(u), n)[:, 0]
-    if real:
-        cols = np.stack([v.real, -v.imag], axis=1)      # Re(a v) = a_r Re v - a_i Im v
-    else:
-        cols = v[:, None]
-    return cols
+#: Bytes of candidate columns built at once in the selection.
+_SELECT_BYTES = 64 << 20
 
 
 def _greedy_select(c, dt, f_min, f_max, real, u, idx, min_significance):
@@ -689,39 +706,71 @@ def _greedy_select(c, dt, f_min, f_max, real, u, idx, min_significance):
     model, and a mode fitted to noise never lowers the level it is judged
     against. Returns the chosen candidate indices (in order of acceptance)
     and the noise variance.
+
+    A complex record's pole is one complex column; a real record's is the
+    two real columns Re v and -Im v (Re(a v) = a_r Re v - a_i Im v). The
+    gains are computed for blocks of candidates at once.
     """
     N = c.size
     r = c.astype(float if real else complex)
     sigma2 = _noise_variance(c, dt, f_min, f_max, real, 0)
     chosen = []
     Qsel = np.zeros((N, 0), float if real else complex)
-    remaining = list(idx)
-    while remaining and sigma2 > 0:
-        best, best_gain, best_q = None, -1.0, None
-        for k in remaining:
-            cols = _columns(u[k], N, real)
-            cols = cols - Qsel @ (Qsel.conj().T @ cols)
-            q, rr = np.linalg.qr(cols)
-            # a (near) dependent column adds nothing: drop it
-            keep = np.abs(np.diag(rr)) > 1e-8 * max(np.linalg.norm(cols), 1e-300)
-            q = q[:, keep]
-            if q.shape[1] == 0:
-                continue
-            proj = q.conj().T @ r
-            gain = float(np.vdot(proj, proj).real)
-            if gain > best_gain:
-                best, best_gain, best_q = k, gain, q
-        if best is None:
-            break
+    remaining = np.array(idx, int)
+    block = max(1, _SELECT_BYTES // (16 * N))
+    while remaining.size and sigma2 > 0:
+        gains = np.zeros(remaining.size)
+        for j0 in range(0, remaining.size, block):
+            cand = remaining[j0:j0 + block]
+            V = _vandermonde(u[cand], N)                    # N x B
+            if real:
+                W1 = V.real - Qsel @ (Qsel.T @ V.real)
+                W2 = -V.imag - Qsel @ (Qsel.T @ (-V.imag))
+                g11 = np.einsum("nk,nk->k", W1, W1)
+                g22 = np.einsum("nk,nk->k", W2, W2)
+                g12 = np.einsum("nk,nk->k", W1, W2)
+                p1 = W1.T @ r
+                p2 = W2.T @ r
+                det = g11 * g22 - g12 ** 2
+                # the two-column fit, or the better single column where
+                # the pair is (near) dependent (a pole at 0 or Nyquist)
+                single = np.maximum(p1 ** 2 / np.maximum(g11, 1e-300),
+                                    p2 ** 2 / np.maximum(g22, 1e-300))
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    pair = (g22 * p1 ** 2 - 2 * g12 * p1 * p2 + g11 * p2 ** 2) / det
+                ok = det > 1e-16 * np.maximum(g11 * g22, 1e-300)
+                gains[j0:j0 + cand.size] = np.where(ok, pair, single)
+            else:
+                W = V - Qsel @ (Qsel.conj().T @ V)
+                norms = np.einsum("nk,nk->k", W.conj(), W).real
+                proj = W.conj().T @ r
+                gains[j0:j0 + cand.size] = np.abs(proj) ** 2 / np.maximum(norms, 1e-300)
+        best = int(np.argmax(gains))
         quad = sigma2 if real else 0.5 * sigma2
-        if best_gain < min_significance ** 2 * quad:
+        if gains[best] < min_significance ** 2 * quad:
             break
-        chosen.append(best)
-        remaining.remove(best)
-        r = r - best_q @ (best_q.conj().T @ r)
-        Qsel = np.concatenate([Qsel, best_q], axis=1)
+        k = remaining[best]
+        cols = _columns(u[k], N, real)
+        cols = cols - Qsel @ (Qsel.conj().T @ cols)
+        q, rr = np.linalg.qr(cols)
+        keep = np.abs(np.diag(rr)) > 1e-8 * max(np.linalg.norm(cols), 1e-300)
+        q = q[:, keep]
+        chosen.append(k)
+        remaining = np.delete(remaining, best)
+        r = r - q @ (q.conj().T @ r)
+        Qsel = np.concatenate([Qsel, q], axis=1)
         sigma2 = _noise_variance(r, dt, f_min, f_max, real, len(chosen))
     return np.array(chosen, int), sigma2
+
+
+def _columns(u, n, real):
+    """Model columns of one pole: one complex column, or two real ones for a real record."""
+    v = _vandermonde(np.atleast_1d(u), n)[:, 0]
+    if real:
+        cols = np.stack([v.real, -v.imag], axis=1)      # Re(a v) = a_r Re v - a_i Im v
+    else:
+        cols = v[:, None]
+    return cols
 
 
 def _model(modes, dt, n, real):
@@ -747,6 +796,20 @@ def _pole_to_mode(u, d, dt, real):
     return f, gamma, a
 
 
+def _bars(c, dt, f_min, f_max, real, u, a):
+    """``(modes, sigma2, std)``: the fitted modes, the noise they leave, their bounds."""
+    N = c.size
+    f = -np.angle(u) / (2 * np.pi * dt)
+    gamma = -np.log(np.abs(u)) / dt
+    modes = list(zip(f, gamma, a))
+    if modes:
+        sigma2 = _noise_variance(c - _model(modes, dt, N, real), dt, f_min, f_max,
+                                 real, len(modes))
+    else:
+        sigma2 = _noise_variance(c, dt, f_min, f_max, real, 0)
+    return modes, sigma2, cramer_rao(modes, dt, N, sigma2, real=real)
+
+
 def _package(c, dt, f_min, f_max, real, u, d, residual, *, residual_threshold,
              min_significance, min_Q, error_sigma, do_polish):
     """Significance selection, polish, noise level, error bars, window; sorted by f.
@@ -760,30 +823,28 @@ def _package(c, dt, f_min, f_max, real, u, d, residual, *, residual_threshold,
     keep, sigma2 = _greedy_select(c, dt, f_min, f_max, real, u, idx, min_significance)
     u, residual = u[keep], residual[keep]
     if do_polish and u.size:
-        # Polish, then test the polished poles again: a raw pole a few bars
-        # off the truth leaves a misfit that a second raw pole explains
-        # "significantly", and once the pair is polished together the
-        # second one explains only noise. Repeat while the set shrinks.
-        for _ in range(4):
+        # Polish, then judge each polished pole by its joint significance
+        # |a| / std(|a|) from the full Fisher matrix: the forward selection
+        # tests a pole against the others' amplitudes only, so a raw pole a
+        # few bars off the truth lets a second pole explain its misfit
+        # "significantly"; once they are polished together, with the
+        # others' f and gamma free, that second pole explains only noise.
+        # Drop the least significant and polish again while that happens.
+        for _ in range(8):
             u, a = polish(c, dt, u, real=real)
-            again, _ = _greedy_select(c, dt, f_min, f_max, real, u,
-                                      np.arange(u.size), min_significance)
-            if again.size == u.size:
+            modes, sigma2, std = _bars(c, dt, f_min, f_max, real, u, a)
+            signif = np.where(std[:, 2] > 0, 1.0 / np.maximum(std[:, 2], 1e-300), np.inf)
+            if u.size == 0 or signif.min() >= min_significance:
                 break
-            again = np.sort(again)
-            u, residual = u[again], residual[again]
+            keep = np.arange(u.size) != int(np.argmin(signif))
+            u, residual = u[keep], residual[keep]
         if u.size == 0:
             a = np.zeros(0, complex)
     else:
         a = _amplitudes(c, _with_conjugates(u, real))[:u.size]
         a = 2 * a if real else a
-    f = -np.angle(u) / (2 * np.pi * dt)
-    gamma = -np.log(np.abs(u)) / dt
-    modes = list(zip(f, gamma, a))
-    if modes:
-        fit = _model(modes, dt, N, real)
-        sigma2 = _noise_variance(c - fit, dt, f_min, f_max, real, len(modes))
-    std = cramer_rao(modes, dt, N, sigma2, real=real)
+    modes, sigma2, std = _bars(c, dt, f_min, f_max, real, u, a)
+    f = np.array([m[0] for m in modes])
     out = []
     for k in np.argsort(f):
         fk, gk, ak = modes[k]

@@ -673,8 +673,8 @@ CASES.append(Case(
     why="a noise variance 100 times too small gives bars 10 times too narrow",
     edits=[(
         RESONANCES,
-        "    std = cramer_rao(modes, dt, N, sigma2, real=real)",
-        "    std = cramer_rao(modes, dt, N, sigma2 / 100, real=real)",
+        "    return modes, sigma2, cramer_rao(modes, dt, N, sigma2, real=real)",
+        "    return modes, sigma2, cramer_rao(modes, dt, N, sigma2 / 100, real=real)",
     )],
     expect_failing={
         "test_noise_sweep_bars_bound_the_error[False]",
@@ -694,8 +694,8 @@ CASES.append(Case(
     why="with no significance test every pole fitted to noise is reported",
     edits=[(
         RESONANCES,
-        "        if best_gain < min_significance ** 2 * quad:",
-        "        if best_gain < 0:",
+        "        if gains[best] < min_significance ** 2 * quad:",
+        "        if gains[best] < 0:",
     )],
     expect_failing={
         "test_pure_noise_reports_nothing[False-fdm]",

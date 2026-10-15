@@ -63,9 +63,12 @@ Both go through one pipeline, in this order:
    87 noise-fitted FDM poles had residual below 1e-4.
 3. **Polish** (`polish=True`): Levenberg-Marquardt on (f T, gamma T) with
    the amplitudes eliminated (variable projection, Kaufman Jacobian), a
-   step cap of 0.5 Fourier bins, never worse than its start. The selection
-   is repeated on the polished poles (a raw pole a few bars off leaves a
-   misfit that a second raw pole "explains"; polished together, the second
+   step cap of 0.5 Fourier bins, never worse than its start. Then each
+   polished pole is judged again by its amplitude against its own standard
+   deviation from the full Fisher matrix, the least significant is dropped
+   if below `min_significance`, and the polish repeats (a raw pole a few
+   bars off leaves a misfit that a second raw pole "explains" given the
+   first one's amplitude; with the first one's f and gamma free, the second
    explains only noise). A real record keeps its conjugate symmetry: only
    the positive-frequency pole is free.
 4. **Bars**: Cramér-Rao bound of the full multi-mode model (Kay 1993,
@@ -116,25 +119,39 @@ polished numbers; both reach the same maximum-likelihood point).
 | complex | 40 dB | 6.0e-4 | 6.1e-4 | 7.9e-4 | 2.9 | 2.8 |
 | complex | 60 dB | 6.0e-5 | 6.1e-5 | 7.9e-5 | 2.9 | 2.8 |
 | real | 0 dB | 9.9e-2 | 1.2e-1 | 1.4e-1 | 5.4 | 2.7 |
-REAL_ROWS
+| real | 10 dB | 3.2e-2 | 3.9e-2 | 4.8e-2 | 4.3 | 2.7 |
+| real | 20 dB | 1.0e-2 | 1.2e-2 | 1.5e-2 | 3.9 | 2.7 |
+| real | 30 dB | 3.2e-3 | 3.9e-3 | 4.9e-3 | 3.8 | 2.7 |
+| real | 40 dB | 1.0e-3 | 1.2e-3 | 1.6e-3 | 3.7 | 2.7 |
+| real | 60 dB | 1.0e-4 | 1.2e-4 | 1.6e-4 | 3.7 | 2.7 |
 
 Reading the table: the median actual error is 0.67 to 0.8 of the reported
 1-sigma (0.674 for an efficient Gaussian estimator), so the bars are
 neither loose nor optimistic; the short-record formula is a 20% optimistic
 version of the full Fisher bound at gamma T = 0.5 (it assumes gamma T << 1).
-The default `error_sigma = 3` bar held at every seed from 10 dB up (largest
-excursion 3.1 sigma in 240 draws). At 0 dB on a real record one seed in 40
-was 5.4 sigma off in Q: at a per-sample SNR of 1 the likelihood in (f,
-gamma) is no longer single-peaked and Q = pi f / gamma has a heavy upper
-tail when gamma is only determined to 12%. The test runs seeds 0, 1 and 2
-at 0, 10, 20, 40 and 60 dB and asserts the 3-sigma bound at each; it is
-deterministic, and a reseeded run at 0 dB can legitimately see a 3-sigma
-excursion once in a few hundred draws.
+The default `error_sigma = 3` bar held at every seed from 10 dB up on
+complex records (largest excursion 3.1 sigma in 240 draws). On real records
+one seed (25) sits at 3.7 to 4.3 sigma at every SNR: it is the same noise
+realisation scaled, and against the bound computed from the *true* noise
+variance it is 3.4 to 3.5 sigma, so it is a genuine tail draw, not a bar
+error (over 40 seeds at 40 dB the reported bar is 0.97 +- 0.04 of the
+true-noise bound and the scatter of the estimate is 1.03 bounds). At 0 dB
+on a real record one seed in 40 was 5.4 sigma off in Q: at a per-sample
+SNR of 1 the likelihood in (f, gamma) is no longer single-peaked and
+Q = pi f / gamma has a heavy tail when gamma is only determined to 12%.
+The test runs seeds 0, 1 and 2 at 0, 10, 20, 40 and 60 dB and asserts the
+3-sigma bound at each; it is deterministic, and a reseeded run can
+legitimately see a 3-sigma excursion once in a few hundred draws.
 
 Raw methods at 20 dB (`polish=False`), median |dQ| in reported 1-sigma
 units (0.674 if efficient):
 
-RAW_ROWS
+| record | method | median \|dQ\| / reported 1-sigma | largest |
+|---|---|---|---|
+| complex | fdm | 1.76 | 5.6 |
+| complex | pencil | 1.34 | 5.9 |
+| real | fdm | 1.34 | 5.9 |
+| real | pencil | 1.25 | 5.3 |
 
 This is why the polish is on by default: the raw FDM scatters at 2.5 to
 3.5 times the bound and the capped pencil at about 2 times, and bars
@@ -160,33 +177,75 @@ linewidths (2 f/Q = 1e-4, which is 0.32 of a Fourier bin at gamma T =
 | 60 dB | pair only | fdm | 5e-8, 1e-7 (bars 1.0e-7, 2.0e-7) | 52, 122 (bars 81, 192) |
 | 60 dB | all three | fdm | same, third mode 1e-9 | same, third mode 3e-3 (bar 2e-2) |
 
-Two equal modes (Q = 2e4, 40 dB, five seeds), separation in Fourier bins:
+Two equal modes (Q = 2e4, 40 dB, five seeds), separation in Fourier bins.
+At 0.1 bins the second pole is no longer significant once the first one's
+f and gamma are free, and the backward test reports the pair as one mode
+rather than two badly determined ones:
 
-RES_ROWS
+| separation | both found (5 seeds) | worst relative Q error |
+|---|---|---|
+| 2 bins | 5/5 | 1.2e-3 |
+| 1 bin | 5/5 | 2.6e-3 |
+| 0.5 bin | 5/5 | 1.3e-2 |
+| 0.32 bin | 5/5 | 3.0e-2 |
+| 0.2 bin | 5/5 | 6.7e-2 |
+| 0.1 bin | 0/5 (reported as one mode) | - |
 
 ### A strong mode outside the window
 
-Q = 1e5 mode at f = 1 with gamma T = 0.05 (N = 6366), window [0.99,
-1.01]; a second mode of Q = 5e3 outside the window.
+Without noise the raw FDM is exact whatever lies outside the window: a
+Q = 1e5 mode at gamma T = 0.05 with a Q = 5e3 mode 1 or 100 times stronger
+at 20 or 159 Fourier bins outside a [0.99, 1.01] window comes back with
+f exact and Q to 5e-12, `background` on or off (the far pole is in the
+record's Krylov space and the basis spans it). With noise the far pole is
+not separable from the noise directions of the basis. The three-mode
+record above (pair at f = 1, mode 40 times stronger at 480 bins, 60 dB) in
+the narrow window [0.98, 1.02]:
 
-FAR_ROWS
+| `background` | modes reported | pair's f errors | pair's Q errors (bars) |
+|---|---|---|---|
+| True (default) | 2 | 2.7e-8, 4.4e-8 (bars 1.0e-7, 2.0e-7) | 30, 78 (bars 80, 189) |
+| False | 53 | 1.8e-2, 1.8e-2 | 6347, 28453 (one of them negative) |
 
-Without noise the raw FDM is exact whatever is outside the window (the
-far pole is in the record's Krylov space and the basis spans it). With
-noise the far pole is not separable from the noise directions of the
-basis, and the `background` pencil pass is what keeps the in-window mode
-right. A far mode 100 times stronger is still fine with it.
+Without the pencil's far pole the leakage of the strong mode is modelled
+by dozens of edge poles, each "significant" against the leakage-inflated
+noise level, and the pair is lost. The mutation case
+`resonances-no-background` is exactly this.
 
 ### Record length (no noise, Q = 1e5)
 
-RECORD_ROWS
+| gamma T | N | relative f error | relative Q error |
+|---|---|---|---|
+| 0.05 | 6366 | 0 | 4.9e-12 |
+| 0.01 | 1273 | 0 | 4.9e-12 |
+| 0.002 | 254 | 0 | 4.9e-12 |
+| 0.0005 | 63 | 0 | 4.9e-12 |
 
-The round-off floor on Q scales as 1/(gamma T): the pole must be placed to
-gamma dt in modulus, and gamma dt = gamma T / N.
+Without noise there is no record-length floor down to 63 samples; the
+residual 5e-12 is the polish's stopping tolerance. With noise the floor is
+the bound above: the relative Q error is sqrt(6/(SNR N)) / (gamma T), so a
+record of gamma T = 0.05 needs SNR N above 2.4e7 (40 dB over 2400
+samples, say) for Q to 1%.
 
 ### Cost
 
-TIMING_ROWS
+Two modes (Q = 1e5 and 5e4, 0.01 apart) at 60 dB, window [0.99, 1.02],
+`find_resonances` end to end, 2 threads:
+
+| N | fdm (complex) | fdm (real) | pencil |
+|---|---|---|---|
+| 6366 | 1.0 s | 0.3 s | 0.3 s |
+| 50000 | 4.3 s | 4.4 s | 0.6 s |
+| 200000 | 37 s | 71 s | 2.5 s |
+
+The FDM path grows as J N for the matrices and as (candidates x N) per
+selection round, with J = 1.1 x window width x N dt / 2 basis functions
+(825 at N = 200000 here, twice that for the mirrored real window), plus
+the eigen-solve of the J x J pencil; the pencil path is capped at a
+8192 x 257 Hankel matrix and grows only through the amplitude fit and the
+polish. For a long FDTD record, decimate to a few samples per period of
+the band of interest before calling, or use `method="pencil"` for a
+first look.
 
 `polish` is O(N K^2) per iteration for K poles (a few to 50 iterations);
 the pencil's SVD is capped at 8192 x 257; the FDM is O(J N) with its basis
@@ -211,7 +270,24 @@ python tests/check_discriminating.py resonances-real-half-amplitude
 python tests/check_discriminating.py resonances-nyquist-unchecked
 ```
 
-MUTATION_TABLE
+| case | edit | tests that go red |
+|---|---|---|
+| gamma-halved | `_package`: gamma / (2 dt) | the Q = 1e5 tests (5), the three-mode tests (4), the sweep (2), raw agreement (2), real path (2) |
+| f-per-sample | `_package`: f without / dt | all of the above plus the FDM pure-noise tests (17) |
+| fdm-threshold-coarse | `SINGULAR_THRESHOLD` 1e-1 | the three-mode FDM tests (2), raw agreement (2) |
+| pencil-rank-one | `K = min(K, 1)` | the three-mode pencil tests (2), raw agreement (2), Q = 1e5 real pencil, real path pencil |
+| no-background | `background=False` default | the three-mode FDM narrow-window test alone |
+| bars-too-narrow | `cramer_rao(..., sigma2 / 100)` | the sweep (2), the three-mode tests (4), raw agreement (2) |
+| accept-everything | no significance test | the FDM pure-noise tests (2), the sweep (2), raw agreement (2), three-mode FDM (2) |
+| pencil-shift-swapped | `V1, V2` swapped | raw agreement (2), Q = 1e5 complex pencil, real path pencil, three-mode (3) |
+| real-half-amplitude | `polish`: `d = d[:K]` | real path (2), Q = 1e5 real (2) |
+| nyquist-unchecked | `_check_window` without the `f_max > nyq` arm | the bad-inputs test |
+
+Every case was run on 2026-10-15 and reported `OK - exactly the expected
+tests fail, and only they` once the sets above were recorded; the pencil
+pure-noise tests stay green under `accept-everything` because the pencil's
+rank floor already gives noise zero poles (the f-per-sample case is what
+fails them).
 
 ## Reproducing the sweep
 
@@ -223,5 +299,91 @@ The 40-seed table and the other sweeps above come from the script below
 (run it from the repository root; it takes about six minutes):
 
 ```python
-SWEEP_SCRIPT
+"""Final numbers for docs/resonances.md (40 seeds per point)."""
+import sys, time, math
+import numpy as np
+sys.path.insert(0, "dockerfiles/maxwell_solver")
+import resonances as R
+
+f0 = 1.0
+dt = 0.25
+Q1 = 1e4
+g1 = math.pi * f0 / Q1
+T1 = 0.5 / g1
+N1 = int(T1 / dt)
+SEEDS = 40
+print(f"N={N1} gammaT={g1*T1:.2f} seeds={SEEDS}")
+print("# polished (default) FDM: median |dQ|/Q, CRB(short-record formula), CRB(full Fisher, reported 1-sigma median), max |dQ|/bar(1s), max |df|/bar(1s)")
+for real in (False, True):
+    for snr_db in (0, 10, 20, 30, 40, 60):
+        snr = 10 ** (snr_db / 10)
+        eq, rq, rf, bars = [], [], [], []
+        for seed in range(SEEDS):
+            sig = R.damped_sinusoids([(f0, Q1, 1.0)], dt, N1, real=real, noise=1 / math.sqrt(snr), rng=seed)
+            res = R.find_resonances(sig, dt, 0.95, 1.05, error_sigma=1.0)
+            r = max(res, key=lambda r: abs(r.amplitude))
+            eq.append(abs(r.Q - Q1) / Q1); rq.append(abs(r.Q - Q1) / r.error.Q); rf.append(abs(r.f - f0) / r.error.f); bars.append(r.error.Q / Q1)
+        crb = math.sqrt(6 / (snr * N1)) / (g1 * T1) * (2 if real else 1)
+        print(f"real={real!s:5} {snr_db:2d} dB | median|dQ|/Q {np.median(eq):.2e} | formula {crb:.2e} | reported 1s {np.median(bars):.2e} | max|dQ|/1s {max(rq):.2f} | max|df|/1s {max(rf):.2f}")
+print("# raw methods (polish=False) at 20 dB: median |dQ|/Q relative to the reported 1-sigma")
+for real in (False, True):
+    for method in ("fdm", "pencil"):
+        rq = []
+        for seed in range(SEEDS):
+            sig = R.damped_sinusoids([(f0, Q1, 1.0)], dt, N1, real=real, noise=0.1, rng=seed)
+            res = R.find_resonances(sig, dt, 0.95, 1.05, method=method, polish=False, error_sigma=1.0)
+            r = max(res, key=lambda r: abs(r.amplitude))
+            rq.append(abs(r.Q - Q1) / r.error.Q)
+        print(f"real={real!s:5} {method:6s} raw: median |dQ|/1s {np.median(rq):.2f} (0.674 for an efficient estimator), max {max(rq):.2f}")
+print("# round-off floor: Q=1e5, gammaT=0.05, no noise")
+Q0 = 1e5; g0 = math.pi * f0 / Q0; N0 = int(0.05 / g0 / dt)
+for real in (False, True):
+    for method in ("fdm", "pencil"):
+        sig = R.damped_sinusoids([(f0, Q0, 0.7 - 0.2j)], dt, N0, real=real)
+        for pol in (False, True):
+            r = R.find_resonances(sig, dt, 0.99, 1.01, method=method, polish=pol)[0]
+            print(f"real={real!s:5} {method:6s} polish={pol!s:5} |df|/f={abs(r.f-f0):.1e} |dQ|/Q={abs(r.Q-Q0)/Q0:.1e} residual={r.error.residual:.1e}")
+print("# gammaT floor: Q=1e5 no noise, shorter records")
+for frac in (0.05, 0.01, 0.002, 0.0005):
+    N = int(frac / g0 / dt)
+    sig = R.damped_sinusoids([(f0, Q0, 1.0)], dt, N)
+    r = R.find_resonances(sig, dt, 0.99, 1.01)[0]
+    print(f"gammaT={frac} N={N}: |df|/f={abs(r.f-f0):.1e} |dQ|/Q={abs(r.Q-Q0)/Q0:.1e}")
+print("# a mode outside the window (FDM, Q=1e5 mode at f=1 with gammaT=0.05; strong mode of Q=5e3 outside the window [0.99,1.01])")
+for amp, dist in ((1.0, 0.0125), (100.0, 0.0125), (100.0, 0.1)):
+    sig = R.damped_sinusoids([(f0, Q0, 1.0), (f0 + dist, 5e3, amp)], dt, N0)
+    for bg in (True, False):
+        res = R.find_resonances(sig, dt, 0.99, 1.01, background=bg)
+        r = [x for x in res if abs(x.f - f0) < 0.005]
+        if r:
+            r = r[0]
+            print(f"amp {amp} at {dist*N0*dt:.0f}/T background={bg}: |df|/f={abs(r.f-f0):.1e} |dQ|/Q={abs(r.Q-Q0)/Q0:.1e} bar/Q={r.error.Q/Q0:.1e} modes={len(res)}")
+        else:
+            print(f"amp {amp} at {dist*N0*dt:.0f}/T background={bg}: mode missing ({len(res)} reported)")
+    sig = R.damped_sinusoids([(f0, Q0, 1.0), (f0 + dist, 5e3, amp)], dt, N0, noise=1e-3, rng=0)
+    for bg in (True, False):
+        res = R.find_resonances(sig, dt, 0.99, 1.01, background=bg)
+        r = [x for x in res if abs(x.f - f0) < 0.005]
+        if r:
+            r = r[0]
+            print(f"  with 60 dB noise, background={bg}: |df|/f={abs(r.f-f0):.1e} |dQ|/Q={abs(r.Q-Q0)/Q0:.1e} bar/Q={r.error.Q/Q0:.1e} modes={len(res)}")
+        else:
+            print(f"  with 60 dB noise, background={bg}: mode missing ({len(res)} reported)")
+print("# resolution: two equal modes at separation s/T, Q=2e4, gammaT=0.5, 40 dB; found both?")
+Q2 = 2e4; g2 = math.pi * f0 / Q2; N2 = int(0.5 / g2 / dt); T2 = N2 * dt
+for sep in (2.0, 1.0, 0.5, 0.32, 0.2, 0.1):
+    found = 0; errs = []
+    for seed in range(5):
+        sig = R.damped_sinusoids([(f0, Q2, 1.0), (f0 + sep / T2, Q2, 1.0j)], dt, N2, noise=1e-2, rng=seed)
+        res = R.find_resonances(sig, dt, 0.98, 1.02)
+        found += len(res) == 2
+        if len(res) == 2:
+            errs.append(max(abs(res[0].Q - Q2), abs(res[1].Q - Q2)) / Q2)
+    print(f"separation {sep}/T: both found in {found}/5 seeds; worst |dQ|/Q {max(errs) if errs else float('nan'):.2e}")
+print("# timing")
+for N in (6366, 50000, 200000):
+    sig = R.damped_sinusoids([(f0, 1e5, 1.0), (f0 + 0.01, 5e4, 0.5)], dt, N, noise=1e-3, rng=0)
+    for method in ("fdm", "pencil"):
+        t0 = time.time(); res = R.find_resonances(sig, dt, 0.99, 1.02, method=method); el = time.time() - t0
+        print(f"N={N} {method}: {len(res)} modes in {el:.2f} s")
 ```
