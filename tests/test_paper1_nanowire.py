@@ -228,5 +228,56 @@ def test_the_ladder_says_the_tail_arm_does_not_wait_for_the_record():
     assert "the tail arm does not wait for that" in tail.stdout, tail.stdout
 
 
+def test_the_ladder_prices_the_rung_that_was_asked_for():
+    """--dx 5 is not one of the ladder's own rungs, so it has to be priced on request.
+
+    Left alone, --estimate --dx 5 prints a table of other rungs and says nothing about
+    the one the caller named -- which reads exactly like the asked rung was priced and
+    fitted. Both directions: the marker means something only if a standard run lacks it.
+    """
+    done = run("--estimate", "--dx", "5", "--mirror-pad", "400")
+    row = [line for line in done.stdout.splitlines()
+           if line.strip().startswith("5.0")]
+    assert row, done.stdout + done.stderr
+    assert "as asked" in row[0], done.stdout          # priced, and marked as the ask
+    assert "over the limit of 8,000,000" in row[0], done.stdout
+    plain = run("--estimate", "--dx", "20", "--mirror-pad", "400")
+    assert "as asked" not in plain.stdout, plain.stdout
+
+
+def test_the_unresolved_outcome_is_reported_with_its_bound(capsys):
+    """The lead's second accepted outcome, forced rather than hoped for.
+
+    No scene produces an unresolved tail on demand -- the tiny vacuum tail resolved to
+    Q = 2 when it was run -- so the fit is stubbed and the arm asked directly. Two
+    things this deliberately does not claim: `--tiny` returns its controls' verdict (0,
+    the control line naming the answer the arm gave) rather than the arm's code, and the
+    non-tiny path's pass-through of that code is a tier-2 reading, not a tier-1 one. In
+    process, because a stub cannot reach a subprocess.
+    """
+    m = _load()
+    args = m.parse_args(["--tiny", "--ringdown"])
+    lay, request, geom = m.solve_scene(args)
+    measured = m.filled(args, lay, request)
+    real = m.fit_decay
+
+    def stub(values, dt, start, **kwargs):
+        return {"f": 3.331e14, "f_err": 1.0e12, "tau": 9.7e-14, "tau_err": 3.0e-14,
+                "q": 97.0, "q_err": 30.0, "resolved": False, "at_edge": False,
+                "rms": 1.0e-6, "peak": 1.0e-2, "n": 5_000, "window": 9.7e-14,
+                "dof": 4_995}
+
+    m.fit_decay = stub
+    try:
+        _, code = m.ringdown(args, lay, request, measured)
+    finally:
+        m.fit_decay = real
+    out = capsys.readouterr().out
+    assert code == m.UNRESOLVED == 3, out
+    assert "unresolved" in out, out
+    assert "Q >" in out, out                         # the bound is what it reports
+    assert "Q         " not in out, out              # and not a Q it did not measure
+
+
 if __name__ == "__main__":       # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

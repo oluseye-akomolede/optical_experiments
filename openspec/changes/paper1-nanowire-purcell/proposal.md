@@ -75,6 +75,14 @@ Not verified, and not used as fact here:
   red on purpose, the fitter checked both ways against synthetic tails (one with a known tau,
   one with no decay in its window at all), and the refusals the Jetson arm shares with the
   tier-1 arm.
+- `scripts/paper1_nanowire.py` (step 2b): `--estimate` prices the rung the caller named when
+  it is not one of the ladder's own pairs, marked in the verdict column -- before this it
+  overrode `--dx`/`--mirror-pad` on every row it printed, so `--estimate --dx 5` was silent
+  about dx 5 and read like the asked rung had been priced and fitted. Its "finest fitting
+  rung" is now the minimum-dx fitting rung rather than the last row to fit, which was the
+  same thing only by the luck of the table's order. Measured at dx 5 / pad 400:
+  26,873,280 cells, 3.4x over the cap, so the owner's 2x-finer step-3 run is not reachable
+  at this pad; the reachable convergence pair is dx 20 -> dx 10.
 
 ## Impact
 

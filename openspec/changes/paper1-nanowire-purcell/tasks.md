@@ -162,24 +162,29 @@ The lead's four steps (queue row, 2026-10-15). One commit each, local only; the 
       16`, and the script's own default is 32. (The first spelling of the guard tested the
       ratio and the tier-1 fixture that runs 8/4 -- a 2x record -- went red, which is how the
       mistake was caught.)
-- [x] `--tiny`: 13 controls, every one of them a claim that can go red (two of them are seen
+- [x] `--tiny`: 15 controls, every one of them a claim that can go red (two of them are seen
       red on purpose in the tier-1 file): the prism mesh closed and its volume the hexagon's,
       the product's own clock the tier-2 timeout, the buffer keeping cells of its own and
       inside the thin rule's cap and finer than the coarse cell, the product's own
       `check_axis`, the gold a region and at the part's own z and clear of the absorber, the
-      source in InP and clear of both the facet and the absorber, and F = 1 in vacuum through
-      the script's own path (band arm when `--spectrum`). The scene is deliberately small --
+      source in InP and clear of both the facet and the absorber, F = 1 in vacuum through
+      the script's own path (band arm when `--spectrum`, the tail arm when `--ringdown`),
+      the drive ending where its own envelope's algebra says it does, and the two readings
+      of one record refusing to share it. The scene is deliberately small --
       20 nm cells, a 100 nm wire -- and exercises the same code path, not the same physics.
-- [x] `tests/test_paper1_nanowire.py`: 8 tests, `8 passed in 184.44s` (task `bvvw9vj3u`, exit 0;
-      tier 1, `nice -n 19`, one worker, `(ulimit -v 4194304; ...)`). The run is on this branch
-      rebased onto main `9a1bc55` and on exactly the two files committed below -- the commit
-      adds the change docs only, not a line of the script or the test: the 13-control
-      verdict with its count pinned, the band arm through the same path, the facet control seen
-      red (`--qd-below 25`), the prism control seen red (a mesh with a face removed), the three
-      refusals/warnings -- a record shorter than its tail, a record over `fdtd.MAX_STEPS`
-      (4,000 periods, through the same `refusals` the Jetson arm uses), and a record the drive
-      has not settled -- and the ladder saying so when every rung is over a cap instead of
-      reading the last rung it tried.
+- [x] `tests/test_paper1_nanowire.py`, the step-2 file: 8 tests, `8 passed in 184.44s` (task
+      `bvvw9vj3u`, exit 0; tier 1, `nice -n 19`, one worker, `(ulimit -v 4194304; ...)`). That
+      run is on this branch rebased onto main `9a1bc55` and on exactly the two files committed
+      below -- the commit adds the change docs only, not a line of the script or the test: the
+      tiny scene's controls with their count pinned (13 of them at that commit; 15 after
+      section 3a), the band arm through the same path, the facet
+      control seen red (`--qd-below 25`), the prism control seen red (a mesh with a face
+      removed), the three refusals/warnings -- a record shorter than its tail, a record over
+      `fdtd.MAX_STEPS` (4,000 periods, through the same `refusals` the Jetson arm uses), and a
+      record the drive has not settled -- and the ladder saying so when every rung is over a
+      cap instead of reading the last rung it tried. The file stands at 15 tests after section
+      3a: `14 passed in 308.58s` at step 2a (task `bw74qywga`), and the three ladder tests
+      re-run green after 2b (section 3a's last bullet) before the full file was run again.
 - [x] Bench scenarios stay here, not in the spec, until the lead's Orin run passes. Step 2
       changes nothing in the product: `fdtd.py`, `fdtd_grid.py` and `fdtd_layout.py` are read,
       not edited, and the script lives in `scripts/`.
@@ -260,12 +265,29 @@ linewidth is not.
       mode. The arm prints that caveat in its own output, and `--vacuum` is the same arm on the
       same scene with no cavity, so the two taus read side by side say which is which. Neither
       has been run on the Orin.
+- [x] The estimate path grew with it: `--estimate` overrode `--dx`/`--mirror-pad` on every row
+      it printed, so `--estimate --dx 5` was silent about dx 5 -- which reads like the rung the
+      caller named had been priced and fitted, and is the first command step 3's finer-grid run
+      needs. The caller's own rung is now priced too and marked in the verdict column (a refused
+      one as well, since that is the row a reader most needs marked), and "the finest fitting
+      rung" is the minimum-dx rung that fits rather than the last row in the table that did.
 
 ## 4. Step 3's shape (the lead, 2026-10-15)
 
-- [ ] CW Purcell at 900 nm and a few neighbouring wavelengths: one command per wavelength
-      (`--wavelength`), which is what the paper's table is. Nothing here lengthens a record
-      past the cap to buy linewidth.
+- [ ] The owner's step 3 as scoped in the row: the Purcell spectrum 850-950 nm at H=1375, a
+      short H sweep (1300/1375/1450) to show the peak moves, and a run at a finer grid to
+      show the peak is converged rather than asserted. The spectrum is the band arm's -- one
+      pulse record covers the octave -- and the sweep is `--height`.
+- [ ] The finer-grid run, measured rather than assumed: the ladder's own rungs stop at dx 10
+      (5,593,868 cells at pad 400, 1,567.7 s), and `--estimate --dx 5` prices 26,873,280
+      cells, 3.4x over the 8,000,000 cap, so dx 5 is not reachable at this pad. The pair
+      that is reachable is dx 20 -> dx 10 (2,037,156 -> 5,593,868 cells). Reaching dx 5
+      means shrinking the mirror pad, which is the scene's own physical geometry (what the
+      mirror and the CPML need), so it is the owner's decision rather than a cost knob to
+      turn quietly.
+- [ ] CW Purcell at 900 nm and a few neighbouring wavelengths (`--wavelength`), the CW arm's
+      own reading of the peak value. Nothing here lengthens a record past the cap to buy
+      linewidth.
 - [ ] Q from the ring-down of the short record (section 3a), reported with its error -- or
       reported as unresolved with the bound it gives. Those are the two accepted outcomes.
 - [ ] NA 0.8 collection waits for the far-field cloud job that is in flight; it is not an arm

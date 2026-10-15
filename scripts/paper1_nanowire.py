@@ -118,6 +118,7 @@ PAPER_FWHM_NM = 4.0
 DRIVE_FLOOR = 1e-4      # of the drive's own peak: where the pulse is over
 MIN_TAIL_PERIODS = 6.0  # a decay needs at least this many periods to be fitted
 TAU_EDGE = 20.0         # the fit's own tau grid reaches this far in windows
+UNRESOLVED = 3          # measured, but the record's tail leaves Q unpinned
 DEFAULT_TAIL_PERIODS = 20.0   # asked for only by --ringdown
 
 
@@ -528,7 +529,7 @@ def ringdown(args, lay, request, measured):
           f" Q > {math.pi * fit['f'] * floor:.1f} (the 3-sigma floor of the fit);"
           f" a decay slower than the {window / 1e-15:.0f} fs window stays inside the"
           f" bounds the two other arms already cover")
-    return fit, 3
+    return fit, UNRESOLVED
 
 
 def _oxide_slice(z, geom):
@@ -838,30 +839,41 @@ def ladder(args) -> int:
     """The grid/estimate table to choose a rung from, before any run."""
     print(f"{'dx':>5} {'pad':>6} {'cells':>12} {'steps':>8} {'s':>8} {'GiB':>6}"
           f" {'dlam':>6}  verdict")
+    rungs = [(dx, pad) for dx in (20.0, 15.0, 12.0, 10.0)
+             for pad in (400.0, 600.0)]
+    asked = (float(args.dx), float(args.mirror_pad))
+    extra = asked not in rungs          # the caller's own rung, if it is not one
+    if extra:
+        rungs.append(asked)
     finest = None
-    for dx in (20.0, 15.0, 12.0, 10.0):
-        for pad in (400.0, 600.0):
-            sub = argparse.Namespace(**args.__dict__)
-            sub.dx, sub.mirror_pad = dx, pad
-            try:
-                plan, request, geom = planned_scene(sub)
-                est = fdtd_layout.estimate(plan, request, record_frames=False)
-                steps = steps_for(sub, request, est["dt"])
-                request["duration_s"] = steps * est["dt"]
-                est = fdtd_layout.estimate(plan, request, record_frames=False)
-                fdtd.check_limits(est)
-            except fdtd.FDTDError as exc:
-                print(f"{dx:5.1f} {pad:6.0f}   refused: {str(exc)[:64]}")
-                continue
-            dlam = (sub.wavelength * NM) ** 2 / (C * est["steps"] * est["dt"]) / NM
-            print(f"{dx:5.1f} {pad:6.0f} {est['cells']:12,} {est['steps']:8,}"
-                  f" {est['seconds']:8.1f} {est['bytes'] / 2 ** 30:6.2f}"
-                  f" {dlam:6.2f}  fits (the caps carry the tier-2 clock)")
+    for dx, pad in rungs:
+        sub = argparse.Namespace(**args.__dict__)
+        sub.dx, sub.mirror_pad = dx, pad
+        asked_row = extra and (dx, pad) == asked
+        try:
+            plan, request, geom = planned_scene(sub)
+            est = fdtd_layout.estimate(plan, request, record_frames=False)
+            steps = steps_for(sub, request, est["dt"])
+            request["duration_s"] = steps * est["dt"]
+            est = fdtd_layout.estimate(plan, request, record_frames=False)
+            fdtd.check_limits(est)
+        except fdtd.FDTDError as exc:
+            print(f"{dx:5.1f} {pad:6.0f}   refused"
+                  f"{' (as asked)' if asked_row else ''}: {str(exc)[:64]}")
+            continue
+        dlam = (sub.wavelength * NM) ** 2 / (C * est["steps"] * est["dt"]) / NM
+        print(f"{dx:5.1f} {pad:6.0f} {est['cells']:12,} {est['steps']:8,}"
+              f" {est['seconds']:8.1f} {est['bytes'] / 2 ** 30:6.2f}"
+              f" {dlam:6.2f}  fits ("
+              + ("as asked" if asked_row else "the caps carry the tier-2 clock")
+              + ")")
+        if finest is None or dx < finest[0].dx:     # the finest spacing that fits
             finest = (sub, est)
     if finest is None:
         print("every rung above was refused")
         return 2
-    sub, est = finest           # the finest spacing that fits, not the last tried
+    sub, est = finest
+
     print(f"\nresolving the paper's {PAPER_FWHM_NM:.0f} nm mode needs"
           f" {sub.wavelength / PAPER_FWHM_NM:.0f} periods of record, i.e."
           f" {steps_for_4nm(est['dt'], sub.wavelength):,} steps at dx"
