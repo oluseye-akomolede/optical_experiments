@@ -1110,7 +1110,7 @@ def _handle_upload(app, store, jobs_db):
             return redirect(url_for("index"))
 
     surface = load_surface(data)
-    est_tets = estimate_tets(surface, n_modes, units, c=CFG.est_tets_c(),
+    est_tets = estimate_tets(surface, n_modes, units, margin=CFG.est_tets_margin(),
                              min_feature_m=min_feature_m, scale=scale,
                              parts=parts, materials=materials)
 

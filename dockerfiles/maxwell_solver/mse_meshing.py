@@ -39,6 +39,7 @@ from mse_common import (  # noqa: F401
     MAX_EDGE_OVERSHOOT,
     REROUTE_TOKEN,
     TETGEN_VOLUME_SLACK,
+    TETS_PER_UNIT_VOLUME,
     UNIT_SCALE,
     VTK_TETRA,
     WEYL_SAFETY,
@@ -74,19 +75,111 @@ CAP_RETRY_RESPONSE = 0.20
 
 
 def _coarse_message(n_modes: int, achieved: float, target: float,
-                    units: str) -> str:
-    """Plain English for 'the mesh cannot resolve what you asked for'."""
+                    units: str, region: str | None = None,
+                    index: float | None = None) -> str:
+    """Plain English for 'the mesh cannot resolve what you asked for'.
+
+    One-part uploads (``region is None``) keep the original wording: a single
+    cavity has no region to blame, and there is no finer diagnostic available to
+    the user than "too large or detailed".
+
+    A multi-region upload NAMES the failing region instead, because that failure
+    is LOCAL: the object can be small enough to mesh comfortably and still hold a
+    region -- a dense core -- whose own resolution needs elements far finer than
+    the wall around it. ``achieved`` and ``target`` are then BOTH in the user's
+    ``units`` (``target`` is the region's OWN required edge, not the wall's).
+    "a smaller object" is deliberately absent from this arm: it cannot help,
+    because scaling the object scales the region's requirement with it, so the
+    ratio the guard reads is size-invariant. What can give is the mode count or
+    the region's refractive index. The allowance is INTERPOLATED from
+    ``MAX_EDGE_OVERSHOOT`` rather than retyped, so the sentence cannot drift from
+    the number the guard actually used.
+    """
+    if region is None:
+        return (
+            f"This object is too large or detailed to resolve {n_modes} modes within "
+            "the solver's size limit. Try fewer modes, a smaller object, or a lower "
+            "refractive index."
+        )
+    at_index = f" at its {index:g}x refractive index" if index else ""
     return (
-        f"This object is too large or detailed to resolve {n_modes} modes within "
-        "the solver's size limit. Try fewer modes, a smaller object, or a lower "
-        "refractive index."
+        f"The '{region}' region needs elements about {target:g} {units} across to "
+        f"resolve {n_modes} modes{at_index}, but they came out about {achieved:g} "
+        f"{units} -- past the {MAX_EDGE_OVERSHOOT:g}x the resolution rule allows. "
+        "Try fewer modes, or a lower refractive index for that region."
     )
 
 
+def _resolution_verdict(region_plan, points, tets, attrib, achieved,
+                        allowed_edge, unit_scale_m):
+    """The resolution rule, applied to EACH REGION's own required edge.
 
+    Returns ``(too_coarse, worst)``. ``too_coarse`` is True when the mesh cannot
+    resolve what was asked; ``worst`` describes the region that came out furthest
+    past ITS OWN allowance, as
 
+        (ratio, region_name, index, target_units, achieved_units)
 
+    ``ratio`` is achieved / allowance for that region, ``target_units`` is the
+    region's OWN required edge -- NOT the wall's -- and ``achieved_units`` the
+    measured median edge of its tets, both in the upload's own units, ready for
+    the refusal message. ``region_name`` is ``None`` for a one-part upload, where
+    there is no region to name and the message must not invent one.
 
+    WHY PER REGION. The guard used to compare the WHOLE mesh's median edge
+    against ``MAX_EDGE_OVERSHOOT * edge_m`` -- the WALL's allowance -- for every
+    upload. But ``maxvolume`` comes from ``h_min``, the finest region's edge, and
+    a cap retry can raise ``maxvolume`` until a dense region is built several
+    times coarser than its own rule while the wall's median still sits inside the
+    wall's allowance. A high index is exactly where that hurts: 1.6x the wall is
+    5.6x the rule for an n=3.5 core. Each region is now judged against
+    ``MAX_EDGE_OVERSHOOT * own_edge_units`` (the per-region rule that
+    ``mse_common.region_edges`` states), and the verdict is the WORST region in
+    the mesh. The wall itself is unchanged -- its own edge IS ``edge_m``, so its
+    allowance is the one the old global check applied, and an upload whose densest
+    part is the wall reduces to exactly the old test.
+
+    A region that received no tets is skipped rather than scored 0: TetGen
+    returns one attribute per tet, so an empty region simply has none, and the
+    region that IS present is still judged.
+    """
+    if region_plan is None or attrib is None:
+        ratio = achieved / allowed_edge if allowed_edge > 0 else 0.0
+        own_edge_units = allowed_edge / MAX_EDGE_OVERSHOOT / unit_scale_m
+        return ratio > 1.0, (ratio, None, None, own_edge_units,
+                             achieved / unit_scale_m)
+
+    worst = None
+    for region_id, info in region_plan["shared"].items():
+        mask = attrib == int(region_id)
+        if not mask.any():
+            continue
+        achieved_m = achieved_edge_length(points * unit_scale_m, tets[mask])
+        own_units = float(info["own_edge_units"])
+        allowed_units = MAX_EDGE_OVERSHOOT * own_units
+        ratio = (achieved_m / unit_scale_m / allowed_units
+                 if allowed_units > 0 else 0.0)
+        if worst is None or ratio > worst[0]:
+            worst = (ratio, info["part"], float(info["n"]), own_units,
+                     achieved_m / unit_scale_m)
+
+    if worst is None:
+        # No tet carried a region id the plan knows. TetGen's attributes have
+        # agreed with the plan on every upload measured, so this is a defensive
+        # arm rather than a live path -- and it must not read as "passed". With
+        # no per-region measurement available, judge the WHOLE mesh against the
+        # TIGHTEST region's own allowance: the strictest reading of the same
+        # rule, and the one that fails closed.
+        region_id, info = min(region_plan["shared"].items(),
+                              key=lambda kv: float(kv[1]["own_edge_units"]))
+        own_units = float(info["own_edge_units"])
+        allowed_units = MAX_EDGE_OVERSHOOT * own_units
+        ratio = (achieved / unit_scale_m / allowed_units
+                 if allowed_units > 0 else 0.0)
+        worst = (ratio, info["part"], float(info["n"]), own_units,
+                 achieved / unit_scale_m)
+
+    return worst[0] > 1.0, worst
 
 
 def load_surface(obj_bytes_or_path, units: str = "mm"):
@@ -387,6 +480,17 @@ def tetrahedralize(
     it. The rename of that local to ``unit_scale_m`` is the fix's own guard:
     the shadowing cannot come back if the names cannot collide.
 
+    The resolution guard is PER REGION for a multi-part upload: each region's
+    measured median edge is compared against ``MAX_EDGE_OVERSHOOT`` times THAT
+    region's own required edge (``own_edge_units``, from
+    :func:`mse_common.region_edges`), and a mesh is refused when any region is
+    past its own allowance. A regionLESS (one-part) upload keeps the single
+    global comparison it always had -- its whole-mesh median against
+    ``MAX_EDGE_OVERSHOOT * edge_m`` -- which is also exactly the wall's own test
+    in the multi-part case, so an upload whose densest part is the wall is
+    unchanged. See ``_resolution_verdict`` for why the wall's allowance cannot
+    stand in for a dense core's.
+
     TetGen is handed the surface in a CANONICAL internal frame -- centred on its
     bounding box and divided by the longest side -- and the points are mapped
     back before returning. This is not tidiness: TetGen's Steiner insertion
@@ -455,11 +559,16 @@ def tetrahedralize(
     physics_m = target_edge_length(
         surface, n_modes=n_modes, units=units, n_index=n_index
     ) * unit_scale_m
-    # ``parts``/``materials`` go in so a multi-part upload's edge is the
-    # SMALLEST h/n_region -- the whole-object edge alone under-resolves a
-    # high-index region while every count still looks right. This is the
-    # GLOBAL edge both the mesher and the app's estimate route on, so the rule
-    # lives in ``mse_common`` and both callers take it from there.
+    # ``parts``/``materials`` go in because ``effective_edge_m`` must know this
+    # is a multi-part upload, but the value it returns is the WALL's edge -- it
+    # does NOT shrink to a denser region (see its docstring: an earlier version
+    # took ``min(base / n_r)`` here and over-predicted the count by more than
+    # 10x). For a multi-part upload the one-part edge is only a starting point:
+    # ``region_plan`` below pulls ``edge_units`` down to ``h_min``, the finest
+    # region's own requirement, before ``maxvolume`` is taken from it. So
+    # ``edge_m`` here is the GLOBAL one-part edge the mesher and the app's
+    # estimate share, and the rule that turns it into the region edge lives in
+    # ``mse_common`` where both callers take it from.
     edge_m = effective_edge_m(
         surface, n_modes=n_modes, units=units,
         min_feature_m=min_feature_m, n_index=n_index,
@@ -567,6 +676,12 @@ def tetrahedralize(
     allowed_edge = MAX_EDGE_OVERSHOOT * edge_m
 
     n_tets, tets, points = 0, None, None
+    # ``attrib`` is the per-tet region attribute, and it only exists for a
+    # multi-part upload -- but it is initialised here rather than only inside the
+    # ``region_plan is not None`` branch below, because the verdict helper takes
+    # it as an argument on EVERY pass and ``None`` is what tells that helper the
+    # mesh has one region.
+    attrib = None
     achieved = 0.0
     previous_tets = None
     for attempt in range(MAX_MESH_ATTEMPTS):
@@ -699,7 +814,17 @@ def tetrahedralize(
 
         achieved = achieved_edge_length(points * unit_scale_m, tets)
         over_cap = n_tets > max_tets
-        too_coarse = achieved > allowed_edge
+        # The coarse/fine test is PER REGION when the upload has regions: each
+        # region's measured median edge against ``MAX_EDGE_OVERSHOOT`` times that
+        # region's OWN required edge. See ``_resolution_verdict``. ``achieved``
+        # stays the whole-mesh median -- it is what the log line and the app's
+        # resolution caption report, and it is NOT what this test uses.
+        too_coarse, worst = _resolution_verdict(
+            region_plan, points, tets, attrib, achieved, allowed_edge,
+            unit_scale_m,
+        )
+        (worst_ratio, worst_region, worst_index, worst_target_units,
+         worst_achieved_units) = worst
 
         if not over_cap and not too_coarse:
             break
@@ -709,11 +834,13 @@ def tetrahedralize(
             # against the cap deliberately, and say so, because a mesh this
             # coarse gives frequencies we would otherwise refuse to report.
             if verbose:
+                where = (f" the '{worst_region}' region" if worst_region else "")
                 print(
-                    f"[mse] WARNING: mesh is {achieved / allowed_edge:.1f}x "
-                    f"coarser than the resolution rule allows "
-                    f"(achieved median edge {achieved / unit_scale_m:.4g} "
-                    f"{units}, limit {allowed_edge / unit_scale_m:.4g} "
+                    f"[mse] WARNING: mesh is {worst_ratio:.1f}x "
+                    f"coarser than the resolution rule allows{where} "
+                    f"(achieved median edge {worst_achieved_units:.4g} "
+                    f"{units}, limit "
+                    f"{worst_target_units * MAX_EDGE_OVERSHOOT:.4g} "
                     f"{units}); solving anyway because enforce_resolution was "
                     "disabled",
                     flush=True,
@@ -726,7 +853,9 @@ def tetrahedralize(
             # worse, so there is no path to a correct answer. Refuse, rather
             # than report frequencies we know are wrong.
             raise MeshingError(
-                _coarse_message(n_modes, achieved, edge_m, units)
+                _coarse_message(n_modes, worst_achieved_units,
+                                worst_target_units, units,
+                                region=worst_region, index=worst_index)
             )
 
         if too_coarse:
@@ -735,15 +864,20 @@ def tetrahedralize(
             # wrong frequencies shown with confidence are worse than no answer.
             if attempt == MAX_MESH_ATTEMPTS - 1:
                 raise MeshingError(
-                    _coarse_message(n_modes, achieved, edge_m, units)
+                    _coarse_message(n_modes, worst_achieved_units,
+                                    worst_target_units, units,
+                                    region=worst_region, index=worst_index)
                 )
-            # tets ~ 1/maxvolume, so scale by the third power of the edge ratio
-            ratio = achieved / allowed_edge
+            # tets ~ 1/maxvolume, so scale by the third power of the edge ratio.
+            # The WORST region's ratio, not the whole-mesh one: refining to the
+            # mesh median can leave the region that is actually failing short.
+            ratio = worst_ratio
             maxvolume /= max(ratio, 1.0) ** 3
             if verbose:
+                where = (f" ('{worst_region}' region)" if worst_region else "")
                 print(
-                    f"[mse] mesh is {ratio:.1f}x too coarse; refining with "
-                    f"maxvolume {maxvolume:.4g}",
+                    f"[mse] mesh is {ratio:.1f}x too coarse{where}; refining "
+                    f"with maxvolume {maxvolume:.4g}",
                     flush=True,
                 )
             continue

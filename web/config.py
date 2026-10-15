@@ -84,13 +84,49 @@ TICK_SECONDS = float(os.environ.get("MSE_TICK_SECONDS", "5"))
 # Routing: which machine an upload goes to (dispatch 2/3)
 # --------------------------------------------------------------------------
 
-#: coefficient of the upload-time tet estimate, ``est_tets = C * V / h^3``.
-#: Fitted on 13 measured meshes (the lead's runs); C = 14 is the CONSERVATIVE
-#: fit, chosen so the estimate is at or above the measured count on nearly
-#: every point. Under-estimating sends a big job to the CPU where it dies;
-#: over-estimating costs a small job about a second on the GPU. The asymmetry
-#: is the whole reason for the constant.
-EST_TETS_C = 14.0
+#: how much margin the upload-time estimate keeps over the VOLUME LAW -- the
+#: geometric count of regular tets that fit in the object's volume.
+#:
+#: ``est_tets = EST_TETS_MARGIN * 6*sqrt(2) * V / h^3``. The law itself is exact
+#: (``mse_common.TETS_PER_UNIT_VOLUME``, the same constant the mesher inverts to
+#: ask TetGen for an edge); the margin covers the fact that TetGen does not land
+#: on the law. It is one-sided on purpose: the estimate ROUTES the job, so a job
+#: routed as small is then built far larger than predicted on the machine chosen
+#: for the predicted size, while over-estimating costs a small job a second of
+#: queue. So the margin is meant to be the WORST under-estimate (the highest
+#: ``built / law``) measured across the shape families, measured rather than
+#: fitted -- except that the sweep found under-estimates ABOVE it, which no
+#: margin can cover without wrecking the other direction (see below). See
+#: ``benchmarks/estimate_vs_built.py`` and the tables in
+#: ``openspec/changes/fix-upload-tet-estimate/proposal.md``.
+#:
+#: Measured at the PRODUCT's own cap, the worst ``built / law`` is 1.414 (a
+#: one-part 6 mm cube with a 3.5x finer core: 358,307 elements built against an
+#: estimate of 342,129, so the estimate reads 0.95x of the mesh). 1.35 covers the
+#: other ten builds in the shipped sweep, but not that one, and not the same
+#: families at HALF their mode counts (a legitimate upload: the user picks the
+#: mode count), where a bumpy sphere's fine facets floor the delivery at 1.868 of
+#: the law and the estimate reads 0.72x of the real mesh.
+#:
+#: One family is far outside all of this: a 3-region object of nested thin
+#: sheets, where TetGen over-refines 3x below the edge it was asked for (94.3% of
+#: its tetrahedra are more than an octave finer than the request), builds 419,176
+#: elements where the law says 46,825, and leaves the estimate reading 0.15x of
+#: the real mesh. No margin over the law reaches that: covering 8.952 would make
+#: the ten other families read 6-12x their meshes and turn their routing into
+#: guesswork. It is a MESHER defect -- recorded in the change's proposal with its
+#: fixture numbers, and out of scope for an estimator change (the lead,
+#: 2026-10-15).
+#:
+#: So 1.35 is a measurement of one point in the (mode count, geometry) space and
+#: not a bound over it, and it is left there rather than raised: raising it to 1.9
+#: (enough to cover the swept 1.868) scales every estimate by 1.9/1.35 = 1.41, so
+#: the worst over-estimate becomes 2.1 * 1.41 = 2.95 -- and it drags the refusal
+#: threshold down with it, to 2 * 600,000 * 0.715 / 1.9 = 451,579 real elements on
+#: the plate family, i.e. it would refuse an upload at 75% of the cap that fits.
+#: Which failure the product prefers is the open decision recorded in the change's
+#: proposal; a constant cannot remove both.
+EST_TETS_MARGIN = 1.35
 
 #: at or above this estimate the job is queued for the Jetson GPU instead of the
 #: cluster. This is the cluster's *routing* boundary, not its capability limit;
@@ -143,9 +179,68 @@ def _common_dir() -> str:
 _common_dir()
 from mse_common import DEFAULT_CPU_MAX_TETS, DEFAULT_MAX_TETS  # noqa: E402
 
-#: an upload is refused outright only above TWICE that, because the estimate can
-#: be up to 2x high (worst over-estimate measured) and refusing at 1x would turn
-#: away jobs that fit.
+#: the widest the estimate has been measured to read ABOVE the real mesh, as
+#: ``est_tets / built``. A RECORD of the sweep, not an input to a derivation.
+#:
+#: This is a property of the MESHER, not of the formula. Across nine shape
+#: families (single part, 2 and 3 regions, thin and thick shells, off-centre,
+#: sphere, plate) the delivered mesh came back anywhere from 0.715x to 8.952x
+#: the volume law: one global request per object, and TetGen's own quality
+#: refinement deciding what it actually builds, nowhere near the request. The
+#: estimate can only read the request, so it misses in BOTH directions:
+#:
+#:   * coarse deliveries (plate, cube, thin wall: 0.643-0.805 of the law) make
+#:     the estimate read high -- 1.89x the real mesh on the plate family at the
+#:     shipped setting, 2.098x at half the mode counts, which is the number
+#:     recorded here.
+#:   * fine deliveries make it read low, and one family does so by 6.7x; see
+#:     EST_TETS_MARGIN and the proposal's found issue.
+#:
+#: 2.1 is 2.098 rounded to a tenth: a high-water mark of the measured sweep, not
+#: a bound over the product. The 14x between the two ends IS the mesher's
+#: delivery spread, and it is invariant to the estimate -- the constant moves
+#: both ends together. Tightening the mesher's volume bound does not narrow it
+#: either: ``benchmarks/mesher_slack_probe.py`` re-runs these families at
+#: ``TETGEN_VOLUME_SLACK`` 4.0/2.0/1.0/0.5 and the delivery gets FINER as the
+#: bound tightens (built/volaw 0.715-8.952 at 4.0, 1.472-3.818 at 2.0), because
+#: the bound is a ceiling and TetGen refines below it for quality. The tables are
+#: in ``openspec/changes/fix-upload-tet-estimate/proposal.md``.
+#:
+#: This is DELIBERATELY not the refusal factor; see below.
+EST_TETS_WORST_OVER = 2.1
+
+#: an upload is refused outright only above this many times the real cap.
+#:
+#: UNCHANGED by this change: 2, the value main ships. The two-sided derivation
+#: belongs here rather than in the change, because its answer is that no single
+#: factor is both safe and tight over the measured spread:
+#:
+#:   * never wrongly refuse -- accept every upload whose real mesh fits -- needs
+#:     a factor at or above the worst over-estimate, 2.1 (the half-mode-count
+#:     cube). The lead ruled wrongly accepting an oversized mesh the worse
+#:     failure (2026-10-15), and widening the factor widens that arm.
+#:   * never wrongly accept needs the factor at or below 1/2.1 = 0.48, which
+#:     would refuse almost every upload.
+#:   * 2 sits just inside the first bound. The refusal threshold is
+#:     2 x 600,000 x built/volaw / 1.35 = 888,889 x built/volaw real elements:
+#:     at the shipped setting the coarsest family measured (0.715) puts it at
+#:     635,556, above the cap, and only the half-mode-count cube (0.643) reaches
+#:     below it, to 571,000 -- 5% under the cap, and the whole of this change's
+#:     wrongful-refusal exposure. Main's fitted constant put the same threshold
+#:     at 557,000 for the plate and the cube, so this change refuses strictly
+#:     less than main and never more.
+#:   * the other arm, measured the same way: acceptance needs
+#:     ``est <= 1.2M``, so the largest real mesh that slips through at a family's
+#:     ratio r = est/real is 1.2M/r -- nothing above 1.26M at the shipped setting
+#:     (smallest r 0.95), and up to 1.67M at half the mode counts (smallest r
+#:     0.72), i.e. 2.8x the cap, which the mesher's own over-cap retry then
+#:     coarsens to fit. A quality loss, not an OOM.
+#:
+#: The spread is not a property of the formula, so no choice of factor narrows
+#: it: the delivered element size varies 0.34-0.71 mm across family plans that
+#: are near-identical, and the mesher has no per-region lever to steer it
+#: (per-region ``max_vol`` is measured inert -- see ``mse_meshing.py``).
+#: Narrowing it is a MESHER row. Re-deriving this factor is the lead's decision.
 UPLOAD_REFUSE_FACTOR = 2
 
 #: how long a GPU job may sit unclaimed before the app gives up and puts it back
@@ -209,13 +304,13 @@ def _positive_int(env: str, default: int) -> int:
     return value if value > 0 else default
 
 
-def est_tets_c() -> float:
-    """Coefficient of the upload-time estimate. See :data:`EST_TETS_C`."""
+def est_tets_margin() -> float:
+    """Margin over the volume law. See :data:`EST_TETS_MARGIN`."""
     try:
-        value = float(os.environ.get("MSE_EST_TETS_C", EST_TETS_C))
+        value = float(os.environ.get("MSE_EST_TETS_MARGIN", EST_TETS_MARGIN))
     except (TypeError, ValueError):
-        return EST_TETS_C
-    return value if value > 0 else EST_TETS_C
+        return EST_TETS_MARGIN
+    return value if value > 0 else EST_TETS_MARGIN
 
 
 def gpu_min_tets() -> int:
@@ -248,9 +343,12 @@ def cpu_max_tets() -> int:
 def upload_refuse_tets() -> int:
     """Estimate above which an upload is refused before it is ever queued.
 
-    Twice the real cap, because the estimate can be up to 2x high: refusing at
-    1x would turn away jobs that fit. Refusing here is the only guard that
-    costs the owner nothing -- nothing has been meshed yet.
+    ``UPLOAD_REFUSE_FACTOR`` times the real cap, unchanged by this change.
+    Refusing here is the only guard that costs the owner nothing -- nothing has
+    been meshed yet -- but it is also the only one that can refuse something
+    that would have worked, and the measured spread does not admit a factor that
+    avoids both sides of that trade. See :data:`UPLOAD_REFUSE_FACTOR` for the
+    two-sided derivation, the numbers, and which failure it prefers.
     """
     return UPLOAD_REFUSE_FACTOR * max_tets()
 

@@ -2248,7 +2248,7 @@ def test_an_upload_with_materials_stores_the_table_and_routes_on_it(tmp_path):
     # before the materials branch would have used.
     import meshing as MESHALIAS
     one_part = MESHALIAS.estimate_tets(
-        MESHALIAS.load_surface(data), 10, "mm", c=CFG.est_tets_c())
+        MESHALIAS.load_surface(data), 10, "mm", margin=CFG.est_tets_margin())
     assert job["est_tets"] != one_part, (
         f"the row's estimate ({job['est_tets']:,}) equals the ONE-PART estimate "
         f"on the same file; the multi-part branch did not run and this job was "

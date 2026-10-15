@@ -72,11 +72,12 @@ def test_the_estimate_grows_exactly_linearly_with_the_mode_count():
 
 def test_the_estimate_matches_the_fitted_constant_on_a_known_box():
     """Pin the arithmetic against the closed form, not against a remembered
-    number: `C * V / h^3` computed here from the solver's own volume and edge.
+    number: the volume law ``6*sqrt(2) * V / h^3`` times the margin, computed
+    here from the solver's own volume, edge and law constant.
 
-    This is the guard that a wrong constant fails -- and it reads the value out
-    of the solver rather than restating it, because a test that retyped C would
-    only be checking its own copy.
+    This is the guard that a wrong law or a wrong margin fails -- and it reads
+    both out of the solver rather than restating them, because a test that
+    retyped ``6*sqrt(2)`` would only be checking its own copy.
     """
     import mse_meshing as MESHSOLVER
 
@@ -86,7 +87,10 @@ def test_the_estimate_matches_the_fitted_constant_on_a_known_box():
     volume = MESHSOLVER.enclosure_volume_m3(surface, "mm")
     edge = MESHSOLVER.target_edge_length(surface, 20, units="mm")
     scale = MESHSOLVER.unit_scale("mm")
-    want = int(CFG.est_tets_c() * volume / (edge * scale) ** 3)
+    # Parenthesised the way ``estimate_tets`` associates it, so this compares
+    # the product before the int() rather than two differently-rounded ones.
+    want = int(CFG.est_tets_margin() * (
+        MESHSOLVER.TETS_PER_UNIT_VOLUME * volume / (edge * scale) ** 3))
     assert got == want
 
 
@@ -101,14 +105,24 @@ def test_an_unusable_surface_estimates_zero_not_small():
     assert MESH.estimate_tets(None, 20, "mm") == 0
 
 
-def test_the_coefficient_is_the_conservative_one():
-    """C is 14 and is not silently lowered.
+def test_the_margin_is_one_sided_and_the_two_copies_agree():
+    """The margin keeps the estimate at or above the law, and does not drift.
 
     Under-estimating sends a big job to the CPU where it dies at the memory
-    limit; over-estimating costs a small job about a second on the GPU. The
-    asymmetry is the whole reason for the value, so it is pinned.
+    limit; over-estimating costs a small job about a second on the GPU. That
+    asymmetry is the whole reason the margin exists, so the DIRECTION is pinned
+    here as a rail. Its SIZE is deliberately not pinned to a literal: it is a
+    measurement, and the measurement is asserted against real meshes in
+    ``tests/test_estimate_families.py``.
+
+    The two copies must be one number. ``meshing.EST_TETS_MARGIN`` is the
+    fallback a caller gets when it passes no margin (tests, and any internal
+    call), ``config.EST_TETS_MARGIN`` is what the upload route passes; only the
+    config one is on the real path, so a change to it alone would leave the
+    fallback describing a different estimate.
     """
-    assert CFG.est_tets_c() >= 14.0
+    assert CFG.est_tets_margin() >= 1.0
+    assert MESH.EST_TETS_MARGIN == CFG.EST_TETS_MARGIN
 
 
 # ---------------------------------------------------------------------------
@@ -171,10 +185,18 @@ def test_a_small_estimate_is_routed_to_the_cluster(tmp_path, monkeypatch):
 def test_an_upload_too_big_even_at_the_worst_over_estimate_is_refused(tmp_path):
     """Refused at upload, before anything is stored or queued.
 
-    The refusal threshold is TWICE the real cap: the estimate can be up to 2x
-    high, and refusing at 1x would turn away jobs that fit. A job refused here
-    is refused because even the most pessimistic reading says it cannot run --
-    and nothing at all should have been created.
+    The refusal threshold is TWICE the real cap. That is NOT the estimate's
+    measured over-read -- the sweep measured up to 2.1x -- it is the smaller
+    side of a two-sided trade: a factor at the measured top would accept an
+    upload the mesher then has to coarsen to fit, at up to 2.1 x 600,000 = 1.26M
+    real elements' worth of estimate (fewer, worse elements rather than an OOM,
+    but still the failure the lead preferred to avoid). So the app prefers
+    refusing a mesh that would have fit over accepting one that would not
+    (``web/config.py``, ``UPLOAD_REFUSE_FACTOR``). What that costs on the other
+    side is measured: only the half-mode-count coarse families reach below the
+    threshold, by about 5% (``tests/test_estimate_families.py``). A job refused
+    here is refused because even a pessimistic reading says it cannot run -- and
+    nothing at all should have been created.
     """
     # The plain box must NOT be refused at the real coefficient. This half
     # matters as much as the refusal: a guard that fires on everything passes
@@ -187,13 +209,13 @@ def test_an_upload_too_big_even_at_the_worst_over_estimate_is_refused(tmp_path):
 def test_the_refusal_fires_when_the_estimate_is_over_the_threshold(tmp_path):
     """The same box, the same code path, a coefficient that clears the cap.
 
-    Raising the coefficient is the honest way to build this case: the refusal is
+    Raising the margin is the honest way to build this case: the refusal is
     a comparison against `upload_refuse_tets()`, and no reachable real upload
     would need a mesh large enough to exercise it on this machine.
     """
     import os
 
-    os.environ["MSE_EST_TETS_C"] = "100000000"
+    os.environ["MSE_EST_TETS_MARGIN"] = "100000000"
     try:
         app, _store, jobs_db, _launcher = _make(tmp_path)
         import trimesh
@@ -206,13 +228,21 @@ def test_the_refusal_fires_when_the_estimate_is_over_the_threshold(tmp_path):
         assert resp.status_code == 302
         assert not jobs_db.jobs, "a refused upload must create no job"
     finally:
-        os.environ.pop("MSE_EST_TETS_C", None)
+        os.environ.pop("MSE_EST_TETS_MARGIN", None)
 
 
-def test_the_refusal_threshold_is_twice_the_cap():
-    """The factor is the lead's decision and is load-bearing on its own: at 1x
-    we would refuse fits. Pinned as a relation, not a number."""
-    assert CFG.upload_refuse_tets() == 2 * CFG.max_tets()
+def test_the_refusal_threshold_is_the_cap_times_the_shipped_factor():
+    """The factor is a product trade, not the estimate's measured over-read.
+
+    At 1x we would refuse uploads whose real mesh fits; at the measured top
+    (2.1x) we would accept uploads the mesher has to coarsen to fit. What the
+    factor is, why it sits where it does, and what each side costs, is in
+    ``web/config.py``; that it is still the SHIPPED value -- this change did not
+    move the refusal rule -- is asserted with the band it trades against in
+    ``tests/test_estimate_families.py``. Here it is pinned as a RELATION, so the
+    number itself lives in one place.
+    """
+    assert CFG.upload_refuse_tets() == CFG.UPLOAD_REFUSE_FACTOR * CFG.max_tets()
 
 
 def test_a_bad_mode_count_is_refused(tmp_path):
@@ -1803,11 +1833,14 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
     elements is estimated at 3k and sent to the Jetson to die.
 
     So the assertion is not "the estimate grew". It is that the estimate and the
-    count TetGen actually returns agree within the fitted coefficient's own
-    slack -- and the multi-part estimate is asserted to be EXACTLY the one-part
-    formula at h_min (here 8x the one-part count at h, because the core's index
-    halves the edge), which is what makes this a test of the multi-part branch
-    rather than of arithmetic both paths share.
+    count TetGen actually returns stay within the band the family sweep measured
+    -- two-sided, against REAL built meshes (this one and the families in
+    tests/test_estimate_families.py) -- and that the multi-part estimate is
+    EXACTLY the one-part formula at h_min (here 8x the one-part count at h,
+    because the core's index halves the edge), which is what makes this a test
+    of the multi-part branch rather than of arithmetic both paths share. That
+    second assertion is exempt from TetGen's judgement: it is the law itself,
+    and it is the one that stays true whatever the mesher delivers.
     """
     parts, merged = _nested_parts()
     materials = {"wall": 1.0, "core": 2.0}
@@ -1827,14 +1860,29 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
     )
 
     ratio = estimate / actual
-    # The slack is the coefficient's own: EST_TETS_C is calibrated against real
-    # tetrahedralizations to within a small factor, and the whole point is that
-    # the TWO PATHS share it. A ratio near 1.5 is the fitted factor; a ratio of
-    # 0.15 is not a slack, it is the wrong formula.
-    assert 0.5 <= ratio <= 3.0, (
+    # The estimate is a PREDICTION of a mesh TetGen decides for itself, so the
+    # comparison is a measurement with two sides, not a one-sided bound. On this
+    # fixture it reads 0.96x: 18,755 estimated against 19,436 built, because
+    # TetGen refines the core's narrowed edge below the maxvolume it was asked
+    # for (the same direction as the recorded under-reads in
+    # tests/test_estimate_families.py, where a three-region object reads 0.15x).
+    # That is a real property of the mesher and the estimate cannot read it --
+    # what it CAN do is stay on the law, which the exact-factor assertion below
+    # checks independently of TetGen. So the band here is the measured one, and
+    # pinning it makes a drift in either the formula or the mesher visible.
+    assert 0.5 <= ratio <= CFG.EST_TETS_WORST_OVER, (
         f"the estimate ({estimate:,}) and the mesh ({actual:,}) disagree by "
-        f"{ratio:.2f}x -- the app would route this job on a number the mesher "
-        f"does not confirm"
+        f"{ratio:.2f}x, outside the measured band [0.5, "
+        f"{CFG.EST_TETS_WORST_OVER}] -- above the top the estimate has stopped "
+        f"describing this mesher, and far below the bottom it is no longer the "
+        f"law at h_min"
+    )
+    assert ratio == pytest.approx(0.96, abs=0.05), (
+        f"the estimate ({estimate:,}) reads {ratio:.3f}x of the real mesh "
+        f"({actual:,}) on this nested fixture, not the 0.96 measured when the "
+        f"band was recorded. Re-measure before trusting the band: this is one of "
+        f"the fixture's documented under-reads, and deliberately NOT asserted as "
+        f"'>1' -- that was false, and a bound that could not fail was hiding it."
     )
 
     # THE DISCRIMINATOR. Under the uniform rule the multi-part estimate IS the
@@ -1842,7 +1890,7 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
     # the EDGE, not about two formulas existing: this object has a core at n=2 in
     # a wall at n=1, so h_min = h/2 and the estimate must be the one-part count
     # at that finer edge -- 2^3 = 8x the one-part count at h, same volume, same
-    # coefficient. A branch that forgot the index (leaving h_min = h) gives 1x; a
+    # margin. A branch that forgot the index (leaving h_min = h) gives 1x; a
     # branch that squared the edge instead of cubing gives 2x or 4x.
     #
     # This is deliberately NOT `one_part != estimate` as a bare inequality: that
@@ -1857,11 +1905,14 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
     plan = COMMON.region_plan(parts, materials, h, "mm")
     h_min = plan[0]["edge_units"]
     v_cavity = sum(info["filled_volume_m3"] for info in plan.values())
-    expected = int(MESH.EST_TETS_C * v_cavity / (h_min ** 3))
+    # Associated exactly as the product is, so this compares the code's own
+    # number before its int() rather than two differently-rounded ones.
+    expected = int(MESH.EST_TETS_MARGIN * MESHSOLVER.TETS_PER_UNIT_VOLUME
+                   * (v_cavity / (h_min ** 3)))
     assert estimate == expected, (
-        f"the multi-part estimate ({estimate:,}) is not the one-part formula at "
-        f"h_min ({expected:,}); the two paths must share the expression and the "
-        f"calibration constant, or the route and the mesh disagree"
+        f"the multi-part estimate ({estimate:,}) is not the law at h_min on the "
+        f"filled volume ({expected:,}); the two paths must share the expression, "
+        f"or the route and the mesh disagree"
     )
 
     # THE VOLUME IS THE FILLED SUM, NOT THE MERGED SURFACE'S ENCLOSED VOLUME.
@@ -1892,15 +1943,17 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
         f"n=2-in-n=1 shape this test is built on"
     )
     # THE 8x, MEASURED AGAINST THE EXACT ONE-PART EXPRESSION, NOT ITS ROUNDED
-    # COUNT. `estimate_tets` returns `int(c*V/h^3)`, so comparing against
+    # COUNT. `estimate_tets` returns an int, so comparing against
     # `one_part_at_h * 8 * (vc/me)` would multiply an ALREADY-TRUNCATED integer:
     # the one-part count is int(2971.4508) = 2971, and 2971*8*(216/224) = 22919.1
     # against the true 22922.6 -- a 3.5-element gap invented entirely by where the
     # int() sits. The claim is about the FORMULA (the multi-part path is the
-    # one-part formula at h_min on the filled volume), so both sides are compared
+    # one-part law at h_min on the filled volume), so both sides are compared
     # before truncation and the code's own int() is asserted separately below.
-    exact_one_part = (MESH.EST_TETS_C * merged_enclosed / (h ** 3))
-    exact_multi = MESH.EST_TETS_C * v_cavity / (h_min ** 3)
+    exact_one_part = (MESH.EST_TETS_MARGIN * MESHSOLVER.TETS_PER_UNIT_VOLUME
+                      * (merged_enclosed / (h ** 3)))
+    exact_multi = (MESH.EST_TETS_MARGIN * MESHSOLVER.TETS_PER_UNIT_VOLUME
+                   * (v_cavity / (h_min ** 3)))
     assert exact_multi == pytest.approx(exact_one_part * 8.0 * (v_cavity / merged_enclosed),
                                         rel=1e-12), (
         f"the multi-part formula ({exact_multi:.4f}) is not the one-part formula "
@@ -2309,22 +2362,26 @@ def test_the_dense_core_upload_routes_on_the_real_mesh_not_the_estimate(tmp_path
 
 
 def test_a_dense_core_upload_too_big_is_refused_on_the_real_mesh(tmp_path):
-    """The other half of test 2: a refusal must be about a mesh that exists.
+    """A refusal must be about a mesh that could exist, and must create no job.
 
-    The refusal threshold is TWICE the cap, so a refused upload must produce a
-    real mesh that genuinely exceeds the cap. This test drives the REAL route
-    with a coefficient raised to force the refusal, then builds the real mesh
-    and shows it is over -- the refusal is not an estimate refusing itself.
+    This test drives the REAL route with the margin raised through the
+    environment, which is the only way to reach the refusal on this machine:
+    the threshold is the measured factor times the cap, and no fixture that fits
+    in a test builds a mesh that size. What it proves is the route's half -- the
+    upload is refused and NO job row is created (a queued job would be sent to a
+    machine that cannot run it). The other half, that a refused upload's real
+    mesh genuinely exceeds the cap, is asserted where real meshes are built:
+    ``tests/test_estimate_families.py``.
     """
     import os
 
     import trimesh
 
-    # The coefficient goes through the ENVIRONMENT, because that is where
-    # ``CFG.est_tets_c()`` reads it: an ``app.config`` key is silently ignored
-    # and the upload is accepted, which is how the first version of this test
-    # failed -- a green-looking refusal test that refused nothing.
-    os.environ["MSE_EST_TETS_C"] = "100000"
+    # The margin goes through the ENVIRONMENT, because that is where
+    # ``CFG.est_tets_margin()`` reads it: an ``app.config`` key is silently
+    # ignored and the upload is accepted, which is how the first version of this
+    # test failed -- a green-looking refusal test that refused nothing.
+    os.environ["MSE_EST_TETS_MARGIN"] = "100000"
     try:
         wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
         core = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
@@ -2345,7 +2402,7 @@ def test_a_dense_core_upload_too_big_is_refused_on_the_real_mesh(tmp_path):
             "queued for a machine that cannot run it"
         )
     finally:
-        os.environ.pop("MSE_EST_TETS_C", None)
+        os.environ.pop("MSE_EST_TETS_MARGIN", None)
 
     # AND THE REAL MESH, at the same settings, is genuinely large. The point is
     # not that it exceeds the (raised-coefficient) threshold -- that is
@@ -2498,9 +2555,9 @@ def test_the_multipart_estimate_is_invariant_to_the_upload_units():
         edge = COMMON.effective_edge_m(merged, n_modes=10, units=units,
                                        parts=parts, materials=materials)
         multi[units] = COMMON.estimate_tets_by_region(
-            parts, materials, edge, merged, units, MESH.EST_TETS_C)
+            parts, materials, edge, merged, units, MESH.EST_TETS_MARGIN)
         one_part[units] = MESH.estimate_tets(
-            merged, n_modes=10, units=units, c=MESH.EST_TETS_C)
+            merged, n_modes=10, units=units, margin=MESH.EST_TETS_MARGIN)
 
     base = multi["mm"]
     for units, value in multi.items():
@@ -2624,7 +2681,7 @@ def test_a_nanometre_multipart_upload_is_not_refused_by_a_unit_bug(tmp_path):
         parts=parts_mm, materials={"wall": 1.0, "core": 2.0})
     est_mm = COMMON.estimate_tets_by_region(
         parts_mm, {"wall": 1.0, "core": 2.0}, edge_mm, merged_mm, "mm",
-        MESH.EST_TETS_C)
+        MESH.EST_TETS_MARGIN)
 
     assert job["est_tets"] == pytest.approx(est_mm, rel=1e-6), (
         f"the nm upload estimated {job['est_tets']:,} where the identical mm "

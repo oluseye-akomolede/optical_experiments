@@ -278,6 +278,238 @@ def test_a_resolvable_mesh_is_accepted(monkeypatch):
     assert points.shape[1] == 3
 
 
+# ---------------------------------------------------------------------------
+# The guard is PER REGION: a region is judged against its OWN required edge.
+#
+# The defect these pin: the guard compared the WHOLE mesh's median edge against
+# MAX_EDGE_OVERSHOOT times the WALL's edge for every upload, while ``maxvolume``
+# comes from ``h_min``. A dense core can therefore be built several times coarser
+# than the rule its own refractive index sets, with the wall's fine mesh hiding it
+# in the median. The units that make this worst: 1.6x the wall is 5.6x the rule
+# for an n=3.5 core.
+# ---------------------------------------------------------------------------
+class FakeTwoRegionTetGen(FakeTetGen):
+    """A two-region mesh with a FINE wall and a COARSE core, labelled per region.
+
+    Everything the mesher READS from a real ``tetgen.TetGen`` in the multi-part
+    branch, and nothing else: ``.node``/``.elem`` (the base fake's contract),
+    ``.attributes`` -- one region id per tet as ``(n, 1)`` float64, the shape the
+    real wrapper returns -- and ``add_region``.
+
+    Both regions reuse the ``_CUBE_TETS`` Kuhn split, so a region's MEDIAN edge
+    is that cube's face diagonal times the side it is given. The mesher hands
+    its vertices in the CANONICAL frame and maps the points back by
+    ``1/canonical_scale``; on a 1 mm fixture ``canonical_scale`` is 1.0, so these
+    sides ARE the achieved edges in millimetres and the test can DERIVE its
+    expectation instead of reading the verdict out of the code under test.
+
+    The mesh deliberately does not conform to the surface it was handed: a fake
+    cannot be a tetrahedralization of an arbitrary input, and what is under test
+    here is the guard's reading of ``(points, tets, attrib)``, not TetGen. The
+    real, surface-conforming two-region mesh is covered by
+    ``test_the_region_attribute_array_is_tet_indexed_and_names_the_regions``.
+    """
+
+    wall_side = 0.1
+    core_side = 1.0
+    wall_region_id = 0
+    core_region_id = 1
+
+    def add_region(self, region_id, seed):
+        self.regions = getattr(self, "regions", [])
+        self.regions.append((int(region_id), tuple(seed)))
+
+    def tetrahedralize(self, order=1, mindihedral=20, minratio=2.0,
+                       maxvolume=None, fixedvolume=False, regionattrib=False,
+                       docheck=False):
+        type(self).calls.append(float(maxvolume))
+        n = len(_CUBE_POINTS)
+        self.node = np.vstack([
+            _CUBE_POINTS * self.wall_side,
+            _CUBE_POINTS * self.core_side + np.array([2.0, 0.0, 0.0]),
+        ])
+        self.elem = np.vstack([_CUBE_TETS, _CUBE_TETS + n])
+        self.attributes = np.concatenate([
+            np.full(len(_CUBE_TETS), float(self.wall_region_id)),
+            np.full(len(_CUBE_TETS), float(self.core_region_id)),
+        ]).reshape(-1, 1)
+
+
+def _two_region_parts():
+    """A nested wall (1 mm cube) and core (0.4 mm cube) as a real ``PartSet``.
+
+    Real rather than faked on purpose: the plan the guard reads is derived from
+    it, so a hand-built stand-in would let the fixture and the rule drift apart.
+    The 1 mm wall also fixes ``canonical_scale`` at 1.0, which is what lets the
+    fake's canonical sides be read as millimetres.
+    """
+    import mse_parts as PARTS
+
+    wall = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    core = trimesh.creation.box(extents=(0.4, 0.4, 0.4))
+    parts = PARTS.load_parts(
+        trimesh.Scene({"wall": wall, "core": core}).export(
+            file_type="obj").encode("utf-8"),
+        units="mm",
+    )
+    assert len(parts) == 2, "this fixture needs a two-region upload"
+    return parts
+
+
+def _wire_two_region(monkeypatch, core_side):
+    import mse_parts as PARTS
+
+    parts = _two_region_parts()
+    names = list(parts.names)
+    monkeypatch.setattr(FakeTwoRegionTetGen, "core_side", core_side)
+    monkeypatch.setattr(FakeTwoRegionTetGen, "wall_region_id",
+                        int(parts.region_of_part[names.index("wall")]))
+    monkeypatch.setattr(FakeTwoRegionTetGen, "core_region_id",
+                        int(parts.region_of_part[names.index("core")]))
+    _install(monkeypatch, FakeTwoRegionTetGen)
+    # One target edge for every region, so the ONLY difference between the wall's
+    # allowance and the core's is the core's refractive index.
+    monkeypatch.setattr(MESH, "target_edge_length", lambda *a, **k: TARGET_MM)
+    return parts, PARTS.merged_surface(parts)
+
+
+#: The wall's target edge, in the upload's units. Chosen so the three numbers the
+#: fixture is ABOUT are comfortably separated -- see the test docstring.
+TARGET_MM = 0.6
+
+#: The index ratio the fixture uses. n=3 makes the core's own required edge a
+#: third of the wall's, so a core at the wall's allowance is 3x past its own.
+CORE_INDEX = 3.0
+
+
+def test_a_coarse_core_is_refused_by_its_own_rule(monkeypatch):
+    """The hole: a fine wall hides a coarse core from a whole-mesh median.
+
+    Fixture arithmetic, all derived from the fixture rather than the guard and
+    reproduced by running it:
+
+      * every edge is in mm (a 1 mm fixture, so ``canonical_scale`` is 1.0);
+      * the wall's median edge is ``wall_side`` face diagonals = 0.141 mm
+        (0.147x the wall's allowance, so the wall PASSES);
+      * the core's is ``core_side`` face diagonals      = 1.414 mm;
+      * the core's OWN edge is 0.6 / 3 = 0.2 mm, so its allowance is 0.32 mm
+        -> the core is 4.42x past its own rule.
+
+    The whole-mesh median over all 36 tet edges is 0.587 mm -- NOT the mean of
+    the two per-region medians, because each region's median is itself an
+    average of its own two middle edges -- and that sits INSIDE the wall's
+    0.96 mm allowance at 0.61x. So the old whole-mesh test accepted this mesh.
+    That is the defect, and it is why this test reds (with this docstring's own
+    message) if the verdict is reverted to the global comparison.
+    """
+    parts, surface = _wire_two_region(monkeypatch, core_side=1.0)
+
+    with pytest.raises(MESH.MeshingError) as excinfo:
+        MESH.tetrahedralize(surface, "mm", n_modes=20, n_index=1.0,
+                            max_tets=10_000, verbose=False,
+                            materials={"wall": 1.0, "core": CORE_INDEX},
+                            parts=parts)
+    message = str(excinfo.value)
+    # The refusal must NAME the region and give the user something to change.
+    assert "core" in message, (
+        f"the refusal does not name the failing region: {message!r}"
+    )
+    assert "refractive index" in message
+    assert "fewer modes" in message
+    # The allowance in the sentence is the constant the guard used, not a retyped
+    # number, so it must agree with it.
+    assert f"{MESH.MAX_EDGE_OVERSHOOT:g}x" in message
+    # ...and it must NOT be the one-part refusal, which says nothing about
+    # regions and would send the owner to "a smaller object", which cannot help.
+    assert "too large or detailed" not in message
+
+    # The refine arm was tried, not skipped: within the cap, a too-coarse region
+    # is refined before it is refused. One attempt would mean the guard refused
+    # without using the lever it has.
+    assert len(FakeTetGen.calls) >= 2, (
+        f"the guard refused after {len(FakeTetGen.calls)} attempt(s) without "
+        f"refining -- the refine arm did not run"
+    )
+
+
+def test_a_fine_core_is_accepted(monkeypatch):
+    """The control: the SAME two-region path must pass when the core is fine.
+
+    Without this, "the guard names the core" would also be satisfied by a guard
+    that refuses every multi-region upload. The core here is finer than its own
+    allowance, so the mesh must come back with both regions tagged and no
+    refusal.
+    """
+    parts, surface = _wire_two_region(monkeypatch, core_side=0.1)
+
+    points, tets, region_of_tet = MESH.tetrahedralize(
+        surface, "mm", n_modes=20, n_index=1.0, max_tets=10_000, verbose=False,
+        materials={"wall": 1.0, "core": CORE_INDEX}, parts=parts,
+    )
+    assert tets.shape[0] == 2 * len(_CUBE_TETS)
+    assert len(np.unique(region_of_tet)) == 2, (
+        "the accepted mesh must still carry both region ids"
+    )
+
+
+def test_the_per_region_rule_reduces_to_the_global_one_for_one_part():
+    """One region: the per-region verdict IS the whole-mesh verdict.
+
+    The product requirement is that a one-part upload's verdict does not move.
+    A one-part upload never enters the region branch (``region_plan is None``),
+    so this pins the branch that DOES: with one region in the plan whose index
+    equals the wall's, its own edge is the wall's edge, and the per-region verdict
+    must equal the global one computed from the same points and tets. Two
+    different code paths, one answer.
+    """
+    import mse_common as COMMON
+
+    # A one-region plan, built by the real helper from a real PartSet of one box.
+    import mse_parts as PARTS
+
+    box = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    one = PARTS.load_parts(
+        trimesh.Scene({"wall": box}).export(file_type="obj").encode("utf-8"),
+        units="mm",
+    )
+    # ``n_wall`` is passed explicitly: a one-part PartSet has no wall part to
+    # infer it from, and the point here is the RULE, not the inference.
+    plan_shared = COMMON.region_plan(one, {"wall": 1.0}, 0.6, "mm", n_wall=1.0)
+    region_plan = {"shared": plan_shared, "region_of_part": one.region_of_part}
+    (region_id,) = list(plan_shared)
+    assert plan_shared[region_id]["own_edge_units"] == pytest.approx(0.6), (
+        "a wall-only region's own edge must be the wall's edge"
+    )
+
+    # The same tets at two spacings: one too coarse for the rule, one inside it.
+    # BOTH verdicts must agree, or the branch a caller takes would change the
+    # answer -- an accept on one path and a refusal on the other.
+    for unit_scale, label in ((1e-3, "too coarse"), (1e-4, "fine")):
+        points = _CUBE_POINTS.copy()
+        tets = _CUBE_TETS.copy()
+        attrib = np.zeros(len(tets), dtype=np.int64)
+        achieved_m = MESH.achieved_edge_length(points * unit_scale, tets)
+        allowed_edge = MESH.MAX_EDGE_OVERSHOOT * 0.6 * unit_scale
+
+        global_verdict = MESH._resolution_verdict(
+            None, points, tets, None, achieved_m, allowed_edge, unit_scale)
+        region_verdict = MESH._resolution_verdict(
+            region_plan, points, tets, attrib, achieved_m, allowed_edge,
+            unit_scale)
+
+        assert region_verdict[0] == global_verdict[0], (
+            f"the one-region and one-part verdicts disagree on a {label} mesh: "
+            f"{region_verdict[0]} against {global_verdict[0]}"
+        )
+        assert region_verdict[1][0] == pytest.approx(global_verdict[1][0]), (
+            "the one-region verdict and the one-part verdict disagree about the "
+            "ratio, so a caller switching branches would change an answer"
+        )
+        assert region_verdict[1][3] == pytest.approx(global_verdict[1][3]), (
+            "the one-region own edge is not the wall's edge"
+        )
+
+
 def test_the_guard_measures_in_one_space_at_scale_1000(monkeypatch):
     """The leg that was broken, and the one no existing test covered.
 

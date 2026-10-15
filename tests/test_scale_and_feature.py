@@ -153,7 +153,7 @@ def test_one_object_spelled_three_ways_meshes_and_estimates_the_same():
         edge_m = MESH.effective_edge_m(scaled, 20, units,
                                        min_feature_m=feature_m)
         allowed_m = MESH.MAX_EDGE_OVERSHOOT * edge_m
-        est = WEB.estimate_tets(surface, 20, units, c=14.0,
+        est = WEB.estimate_tets(surface, 20, units,
                                 min_feature_m=feature_m, scale=scale)
         rows.append((units, edge_m, allowed_m, est))
 
@@ -221,7 +221,7 @@ def test_a_nanometre_object_with_a_nanometre_feature_meshes_sensibly():
     assert edge_m == pytest.approx(feature_m)
     assert 0 < edge_m < 1e-6
 
-    est = WEB.estimate_tets(surface, 4, "nm", c=14.0,
+    est = WEB.estimate_tets(surface, 4, "nm",
                             min_feature_m=feature_m, scale=1.0)
     assert est > 0, "the nm estimate came back 0, which routes as could-not-ask"
 
@@ -276,8 +276,8 @@ def test_auto_is_byte_identical_to_the_previous_behaviour():
     catches a pass-through that re-derives the edge through a different formula.
     """
     surface = _box_surface()
-    without = WEB.estimate_tets(surface, 20, "mm", c=14.0)
-    with_auto = WEB.estimate_tets(surface, 20, "mm", c=14.0,
+    without = WEB.estimate_tets(surface, 20, "mm")
+    with_auto = WEB.estimate_tets(surface, 20, "mm",
                                   min_feature_m=None, scale=1.0)
 
     assert without == with_auto
@@ -296,8 +296,8 @@ def test_a_smaller_feature_raises_the_estimate_not_just_the_edge():
     surface = _box_surface()
     physics_m = (WEB.target_edge_length_mm(surface, 20, "mm")
                  * MESH.unit_scale("mm"))
-    auto = WEB.estimate_tets(surface, 20, "mm", c=14.0)
-    fine = WEB.estimate_tets(surface, 20, "mm", c=14.0,
+    auto = WEB.estimate_tets(surface, 20, "mm")
+    fine = WEB.estimate_tets(surface, 20, "mm",
                              min_feature_m=physics_m / 4.0)
 
     assert fine > auto
@@ -355,8 +355,8 @@ def test_a_scaled_object_meshes_to_the_same_element_count():
     'it went up'.
     """
     surface = _box_surface()
-    base = WEB.estimate_tets(surface, 20, "mm", c=14.0)
-    bigger = WEB.estimate_tets(surface, 20, "mm", c=14.0, scale=10.0)
+    base = WEB.estimate_tets(surface, 20, "mm")
+    bigger = WEB.estimate_tets(surface, 20, "mm", scale=10.0)
 
     # A ten-times-larger object needs a ten-times-longer edge, so the count goes
     # as 10^3 / 10^3 ... but the volume is the ENCLOSED volume and the edge is
@@ -569,7 +569,7 @@ def test_the_estimate_is_linear_in_the_mode_count():
     Linear -- not N^1.5. I asserted N^1.5 first and the measurement refuted it.
     """
     surface = trimesh.creation.box(extents=[10.0, 7.0, 5.0])
-    counts = {n: WEB.estimate_tets(surface, n, "mm", c=14.0) for n in (5, 20, 80)}
+    counts = {n: WEB.estimate_tets(surface, n, "mm") for n in (5, 20, 80)}
 
     assert counts[20] == pytest.approx(4 * counts[5], rel=0.01)
     assert counts[80] == pytest.approx(16 * counts[5], rel=0.01)
@@ -592,10 +592,10 @@ def test_the_scale_cannot_move_the_estimate_and_that_is_correct():
     ``test_a_smaller_feature_raises_the_estimate_not_just_the_edge``.
     """
     surface = trimesh.creation.box(extents=[10.0, 7.0, 5.0])
-    base = WEB.estimate_tets(surface, 20, "mm", c=14.0)
+    base = WEB.estimate_tets(surface, 20, "mm")
 
     for factor in (2.0, 10.0, 1000.0, 1e6):
-        assert WEB.estimate_tets(surface, 20, "mm", c=14.0,
+        assert WEB.estimate_tets(surface, 20, "mm",
                                  scale=factor) == base, (
             f"scale {factor} moved the estimate; if the scale is meant to reach "
             f"the mesher as a similarity transform it must not"
@@ -614,8 +614,8 @@ def test_the_feature_size_is_what_moves_the_estimate():
     # while the feature the app passes down is metres.
     physics_m = (WEB.target_edge_length_mm(surface, 20, "mm")
                  * MESH.unit_scale("mm"))
-    auto = WEB.estimate_tets(surface, 20, "mm", c=14.0)
-    fine = WEB.estimate_tets(surface, 20, "mm", c=14.0,
+    auto = WEB.estimate_tets(surface, 20, "mm")
+    fine = WEB.estimate_tets(surface, 20, "mm",
                              min_feature_m=physics_m / 4.0)
 
     assert fine == pytest.approx(64 * auto, rel=0.05), (

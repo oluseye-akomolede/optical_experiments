@@ -137,24 +137,53 @@ def load_surface(data: bytes):
 # real element count is to run TetGen, which is the expensive thing being
 # scheduled. So the count is predicted from the geometry alone.
 #
-# The model: ``est_tets = C * V / h^3``, where V is the ENCLOSED volume (the
-# solver's own sizing input) and h the target edge length the solver would use
-# at this mode count. C was fitted on 13 measured meshes spanning smooth boxes,
-# a sphere and a bumpy sphere at 7-25 edges per wavelength.
+# The model has two parts, and they are now separated on purpose:
 #
-# C = 14 is the CONSERVATIVE fit: it keeps the estimate at or above the measured
-# count on nearly every point. The asymmetry is deliberate -- an under-estimate
-# sends a big job to the CPU, where it dies at the memory limit after minutes of
-# work, while an over-estimate costs a small job about a second on the GPU.
+#   est = MARGIN * sum_r filled_V_r / h_r^3   (in tet-per-volume terms:)
+#       = MARGIN * 6*sqrt(2) * sum_r filled_V_r / h_r^3
 #
-# A term for the surface was tried and dropped. The measured meshes include a
-# non-monotonic pair (the bumpy sphere needs FEWER elements at 25 edges per
-# wavelength than at 22) because the surface floors the interior: a fine or
-# curved surface forces refinement the volume law cannot see, and C absorbs that
-# in the conservative direction instead. See the rig memory on this.
+# The first, ``6*sqrt(2)``, is GEOMETRY and is exact: it is the number of
+# regular tets of edge h that fit in a unit volume (a regular tet of edge h has
+# volume h^3/(6 sqrt(2))). It is ``mse_common.TETS_PER_UNIT_VOLUME`` -- the same
+# constant ``target_maxvolume`` inverts to ask TetGen for an edge. Nothing is
+# fitted here and nothing can drift: the estimate and the mesh share one
+# expression for the shape of the lattice.
+#
+# The second, MARGIN, is MEASURED, and it exists because TetGen does not put the
+# elements on a regular lattice: with ``TETGEN_VOLUME_SLACK`` = 4 it may legally
+# land well BELOW the law, and a curved or fine surface can force it above. It
+# is one-sided by design -- an under-estimate sends a big job to the CPU, where
+# it dies at the memory limit after minutes of work, while an over-estimate
+# costs a small job about a second on the GPU -- so the margin is meant to cover
+# the worst case measured across the shape families, not the median one. The
+# sweep found cases above it anyway (see below and ``config.EST_TETS_MARGIN``),
+# which is a fact about the mesher and not about this formula.
+#
+# The previous form of this comment described a fitted coefficient C = 14 over
+# ``V/h^3``. 14/(6 sqrt(2)) = 1.650 was that fit's largest single component: the
+# lattice constant, which is now written down exactly instead of absorbed into a
+# number nobody could read. The rest of that fit was the tilt for where TetGen
+# lands, which is what MARGIN is. Splitting them is what makes the estimate
+# auditable: the geometry part can only change if the mesh definition changes,
+# and the margin's size is a measurement that lives in the sweep's table.
+#
+# The measured band, and the one thing that is out of it, are in
+# ``openspec/changes/fix-upload-tet-estimate/``; ``benchmarks/estimate_vs_built.py``
+# reproduces the table by building REAL meshes through this product's own calls.
 
-#: coefficient of the fit; overridden by MSE_EST_TETS_C
-EST_TETS_C = 14.0
+#: margin over the volume law; overridden by MSE_EST_TETS_MARGIN.
+#:
+#: 1.35 is the step-1 measurement of the worst under-estimate the family sweep
+#: produced (a 2-region object with a 2x finer core at 1.289), rounded up to the
+#: next 0.05 -- ~5% of headroom. It is NOT a bound: measured at the product's own
+#: cap, a 3.5x finer core measures 1.414 and leaves this reading 0.95x of the
+#: real mesh, the same families at half their mode counts measure 1.868 (0.72x),
+#: and a three-region object of nested thin sheets measures 8.952 (0.15x). See
+#: ``config.EST_TETS_MARGIN`` for those and for why none of them is answered by
+#: raising the constant here. Held equal to ``config.EST_TETS_MARGIN`` by a test,
+#: because this one is the fallback for callers that pass no margin and that one
+#: is what the upload route passes.
+EST_TETS_MARGIN = 1.35
 
 
 def _common_module():
@@ -233,7 +262,8 @@ def effective_edge_mm(surface, n_modes: int, units: str,
     )) / COMMON.unit_scale(units)
 
 
-def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
+def estimate_tets(surface, n_modes: int, units: str,
+                  margin: float | None = None,
                   min_feature_m: float | None = None,
                   scale: float = 1.0,
                   parts=None, materials: dict | None = None) -> int:
@@ -254,9 +284,11 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
     ``parts``/``materials`` are a MULTI-PART upload (a validated
     ``PartSet`` and its name -> n table), and are ``None`` for the one-part
     upload that this function has always handled. With them the answer is the
-    ONE-PART FORMULA at ``h_min``, the finest region edge, on the cavity's total
-    FILLED volume -- because that is the mesh the solver now builds (every
-    region at one edge; see ``mse_common.region_edges``). The count is what
+    volume law summed over the plan's regions, each at the edge that region is
+    meshed to (see ``mse_common.estimate_tets_by_region``). On today's mesher
+    those edges are all the same ``h_min`` -- one cavity, one edge -- so this is
+    the same number the uniform calculation gives; it is written against the
+    plan so it follows the plan if that ever stops being true. The count is what
     ROUTES the job, so the estimate and the mesh must be the same expression:
     using the wall's edge alone would under-predict a job with a dense core and
     send it to the GPU to die, which is what this branch exists to prevent.
@@ -283,27 +315,20 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
         COMMON = _common_module()
 
         surface = COMMON.apply_scale(surface, scale)
-        coefficient = EST_TETS_C if c is None else float(c)
+        margin_value = EST_TETS_MARGIN if margin is None else float(margin)
         if materials and parts is not None and getattr(parts, "is_multi", False):
-            # MULTI-PART: the ONE-PART formula, on the whole cavity, at h_min
-            # (the finest region edge). The mesh is built uniformly at h_min, so
-            # this is exactly the expression the mesher realises -- and it shares
-            # the one-part calibration constant, so there is no second fit and no
-            # second formula that could drift from the first.
-            #
-            # ``filled_volume_m3`` per region is still what is summed, because
-            # the wall's ENCLOSED volume double-counts everything nested in it
-            # and the count is what ROUTES the job.
-            #
-            # The edge is the SAME ``effective_edge_m`` the mesher calls, so the
-            # base the two work from cannot differ; the helper resolves h_min
-            # from the shared region plan.
+            # MULTI-PART: the volume law per region, at the edge each region is
+            # meshed to. The edges come from the shared region plan, so the
+            # estimate cannot describe a different mesh than the mesher builds,
+            # and ``filled_volume_m3`` per region is what is summed -- the wall's
+            # ENCLOSED volume double-counts everything nested in it, and the
+            # count is what ROUTES the job.
             edge_units = COMMON.effective_edge_m(
                 surface, n_modes=n_modes, units=units,
                 min_feature_m=min_feature_m, parts=parts, materials=materials,
             )
             return COMMON.estimate_tets_by_region(
-                parts, materials, edge_units, surface, units, coefficient
+                parts, materials, edge_units, surface, units, margin_value
             )
 
         volume_m3 = COMMON.enclosure_volume_m3(surface, units)
@@ -317,7 +342,8 @@ def estimate_tets(surface, n_modes: int, units: str, c: float | None = None,
         return 0
     if not np.isfinite(edge_m) or edge_m <= 0:
         return 0
-    return int(coefficient * volume_m3 / (edge_m ** 3))
+    law = COMMON.TETS_PER_UNIT_VOLUME * volume_m3 / (edge_m ** 3)
+    return int(margin_value * law)
 
 
 # --------------------------------------------------------------------------

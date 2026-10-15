@@ -71,6 +71,19 @@ VTK_TETRA = 10
 #: ``target_maxvolume`` actually lands near the requested edge length.
 TETGEN_VOLUME_SLACK = 4.0
 
+#: THE VOLUME LAW: how many elements a volume holds at a given edge length.
+#:
+#: A regular tetrahedron of edge ``h`` has volume ``h^3 / (6 sqrt(2))``, so a
+#: tetrahedralisation of a volume ``V`` whose elements all sat at edge ``h``
+#: holds ``6 sqrt(2) * V / h^3`` = ``8.4853 * V / h^3`` elements. This is the
+#: quantity ``target_maxvolume`` inverts (it asks TetGen for
+#: ``TETGEN_VOLUME_SLACK * h^3 / TETS_PER_UNIT_VOLUME``), and it is the law the
+#: upload-time estimate is built on (``web.meshing.estimate_tets`` multiplies it
+#: by a measured margin). ONE law with two users: the estimate is what ROUTES an
+#: upload and the mesher is what runs it, so the two must not each keep their own
+#: version of the geometry.
+TETS_PER_UNIT_VOLUME = 6.0 * np.sqrt(2.0)
+
 #: How much larger than the requested edge length the achieved median edge may
 #: be before we refuse to solve. A mesh this coarse no longer resolves the
 #: requested modes, and the frequencies would be wrong without anything failing.
@@ -320,7 +333,9 @@ def target_maxvolume(surface, edge_length: float) -> float:
     ``MSE_MAX_TETS`` cap is enforced on the count TetGen actually returns.
     """
     h = float(edge_length)
-    return TETGEN_VOLUME_SLACK * (h ** 3) / (6.0 * np.sqrt(2.0))
+    # Bit-identical to the ``(6.0 * np.sqrt(2.0))`` this used to divide by: the
+    # constant IS that expression, so the one-part mesh stays byte-identical.
+    return TETGEN_VOLUME_SLACK * (h ** 3) / TETS_PER_UNIT_VOLUME
 
 
 def estimate_tet_count(surface, edge_length: float) -> tuple[int, float]:
@@ -338,27 +353,35 @@ def estimate_tet_count(surface, edge_length: float) -> tuple[int, float]:
 
 
 def region_edges(h: float, n_wall: float, materials: dict, parts) -> dict:
-    """``{region_id: h_r}`` -- the per-region target edge for a multi-part mesh.
+    """``{region_id: h_r}`` -- each region's OWN required edge, multi-part mesh.
 
-    THE ONE HELPER. The mesher and the web estimate both call this, so the
-    edge a region is built to and the edge the route was decided on cannot
-    drift apart. ``min`` over the values it returns is ``h_min``, the SINGLE
-    edge the whole cavity is meshed at -- see below.
+    THE ONE HELPER. The mesher and the web estimate both call this, so the edge
+    a region is MEASURED against and the edge the route was decided on cannot
+    drift apart.
 
-    THE RULE: UNIFORM AT THE FINEST REGION EDGE. Every region gets the same
-    edge,
+    THE PER-REGION RULE. Every region is held to
 
-        h_min = min_r ( h * n_wall / n_r )  ==  h * n_wall / max_r(n_r)
+        h_r = h * n_wall / n_r
 
-    and never coarser than ``h`` (the wall's own edge is ``h`` by construction,
-    so the min is at most ``h``). A dense region therefore sets the resolution
-    for the WHOLE cavity, wall included -- denser than necessary in the wall,
-    which is the deliberate price.
+    -- a denser region must be FINER, because the wavelength it has to resolve
+    is shorter, so ``h_r`` falls as ``n_r`` rises. This is the requirement the
+    resolution GUARD reads, region by region: no region may come out coarser
+    than ``MAX_EDGE_OVERSHOOT * h_r``.
 
-    WHY UNIFORM, and what this replaced. The previous rule gave each region
-    ``h * n_wall / n_r`` as its OWN target, on the theory that a region denser
-    than the wall should be finer and a less dense one coarser. That theory is
-    sound and the mechanism to implement it is NOT AVAILABLE in this build:
+    ``min`` over these values, floored at ``h``, is ``h_min`` -- the SINGLE edge
+    the whole cavity is MESHED at, which :func:`region_plan` stores as a
+    region's ``edge_units``. The two are different questions and both are real:
+    ``h_r`` is what a region's own resolution forbids exceeding, ``h_min`` is
+    what the mesher builds to. A dense core's ``h_r`` is far below ``h_min`` and
+    the core only reaches it because ``h_min`` is finer still -- which is why a
+    guard that read ``h_min``'s allowance for every region could pass a core
+    that its own rule refuses.
+
+    WHY THE MESHER STILL BUILDS UNIFORM AT ``h_min``. A per-region MESHING
+    target means handing ``h * n_wall / n_r`` to TetGen as that region's own
+    size, on the theory that a region denser than the wall should be finer and a
+    less dense one coarser. That theory is sound and the mechanism to implement
+    it is NOT AVAILABLE in this build:
     TetGen's per-region volume, supplied through ``add_region``'s ``max_vol``,
     was measured INERT on a nested PLC -- a nine-order sweep of the core's
     region volume moved the core's own element count by exactly zero, with
@@ -395,12 +418,14 @@ def region_edges(h: float, n_wall: float, materials: dict, parts) -> dict:
             "a multi-part mesh needs at least one region with a refractive "
             "index to mesh to, and this upload has none."
         )
-    # ONE edge for every region. `min(h, ...)` rather than the raw ratio so a
-    # region LESS dense than the wall cannot coarsen the wall: h_min is a
-    # resolution floor for the cavity, not a function of the densest region
-    # alone.
-    h_min = min(float(h), float(h) * float(n_wall) / n_max)
-    return {int(region_id): h_min for region_id in by_region}
+    # The raw per-region ratio, NOT a min: the floor that keeps ``h_min`` at or
+    # below the wall's edge is applied by the CALLER (``region_plan``), so this
+    # stays the single expression of the rule and the value a region is guarded
+    # against is the same arithmetic the estimate routes on.
+    return {
+        int(region_id): float(h) * float(n_wall) / float(n_region)
+        for region_id, n_region in by_region.items()
+    }
 
 
 def region_plan(parts, materials, edge_units: float, units: str,
@@ -420,7 +445,15 @@ def region_plan(parts, materials, edge_units: float, units: str,
       edge (``edge_units * n_wall / max n_r``, floored at ``edge_units``). The
       whole cavity is meshed at it -- see ``region_edges`` for why per-region
       targets are not realisable in this TetGen build, which is why the plan
-      reports one edge and not a distinct edge per region.
+      reports one MESHING edge and not a distinct one per region.
+    * ``own_edge_units`` is DIFFERENT per region: ``h_r = edge_units * n_wall /
+      n_r``, the edge that region's OWN resolution forbids exceeding. It is what
+      the resolution GUARD reads -- a region built coarser than
+      ``MAX_EDGE_OVERSHOOT * own_edge_units`` is refused -- and it is NOT what
+      the mesher builds to. A dense core's ``own_edge_units`` is far below
+      ``edge_units``, so reading the guard's allowance from ``edge_units`` for
+      every region lets a core be built several times coarser than its own rule
+      while the guard passes. That is the defect ``own_edge_units`` closes.
     * the volume is the region's FILLED volume, not its enclosed one:
       ``PartSet.filled_volume_m3`` subtracts everything nested inside it. The
       wall's enclosed volume counts its core twice. (The estimate now works on
@@ -457,12 +490,20 @@ def region_plan(parts, materials, edge_units: float, units: str,
                 "must contain every other part."
             )
         n_wall = float(by_region[int(parts.region_of_part[wall_index])])
-    edges = region_edges(edge_units, n_wall, materials, parts)
+    own_edges = region_edges(edge_units, n_wall, materials, parts)
+    # ONE edge for every region: the finest region's own requirement, floored at
+    # the wall's. Resolved as a MIN over the plan rather than recomputed from the
+    # materials, so this is the value the estimate also routed on. `min(...,
+    # edge_units)` rather than the raw ratio so a region LESS dense than the wall
+    # cannot coarsen the wall: h_min is a resolution floor for the cavity, not a
+    # function of the densest region alone.
+    h_min = min([float(edge_units), *(float(e) for e in own_edges.values())])
     out = {}
     for part_index, region_id in enumerate(parts.region_of_part):
         out[int(region_id)] = {
             "part": parts.names[part_index],
-            "edge_units": edges[int(region_id)],
+            "edge_units": h_min,
+            "own_edge_units": float(own_edges[int(region_id)]),
             "filled_volume_m3": parts.filled_volume_m3(part_index, units),
             "n": float(by_region[region_id]),
         }
@@ -470,24 +511,40 @@ def region_plan(parts, materials, edge_units: float, units: str,
 
 
 def estimate_tets_by_region(parts, materials, edge_units: float,
-                            surface, units: str, c: float) -> int:
-    """Weyl-free element estimate for a multi-part upload.
+                            surface, units: str, margin: float) -> int:
+    """Element estimate for a multi-part upload: the VOLUME LAW, summed per region.
 
-    THE ONE-PART FORMULA, on the whole cavity, at ``h_min``:
+        est = margin * TETS_PER_UNIT_VOLUME * sum_r filled_V_r / h_r^3
 
-        est = c * V_cavity / h_min^3
+    ``h_r`` is the edge the mesher applies IN REGION ``r`` -- the plan's own
+    ``edge_units`` for that region, the same number the mesher hands
+    ``target_maxvolume``. On today's mesher that number is the SAME for every
+    region (the plan's uniform rule, applied in ``region_plan``: one cavity, one
+    edge, ``h_min``), so the sum
+    collapses to the one-part expression at ``h_min`` on the filled total.
+    Written per region it follows the plan if a per-region target ever becomes
+    realisable in this TetGen build, instead of silently describing a mesher
+    that no longer exists. (The per-region mechanism was measured INERT -- a
+    nine-order sweep of ``add_region``'s ``max_vol`` moved a region's own count
+    by zero -- so that is the shape to expect if it is ever revisited.)
 
-    This is deliberately NOT a per-region sum any more. Under the uniform rule
-    every region is meshed at the SAME edge, so ``sum_r V_r / h_min^3`` is
-    ``V_cavity / h_min^3`` -- algebraically the one-part expression. Writing it
-    as the one-part expression is the point: the mesh and the estimate then
-    agree through the calibration constant ``c`` that the one-part path already
-    has, with NO new fitting, and there is no second formula that could drift
-    from the first.
+    ``filled_V_r`` is the region's FILLED volume, not its enclosed one: the
+    wall's enclosed volume counts everything nested in it a second time, and the
+    count is what ROUTES the job.
 
-    ``V_cavity`` is the sum of the regions' FILLED volumes, which is the
-    cavity's own volume with no double counting (a nested part's every point is
-    inside its parent, so summing enclosed volumes would count the core twice).
+    ``margin`` is the MEASURED factor the volume law needs to stay at or above
+    the mesh TetGen actually builds. TetGen's delivery is not the request:
+    ``maxvolume`` (see ``TETGEN_VOLUME_SLACK``) is a CEILING on the element size,
+    so a compliant mesh measures at or below the law in count, and TetGen refines
+    well below it wherever its own quality rules demand -- measured at the
+    product's cap, the delivered count runs 0.715x to 8.952x the law across the
+    shape families. The estimate can only read the request, so the margin has to
+    cover the worst case measured, not the average one, and no single margin can
+    cover the whole measured range (the 8.952 end would make every other family
+    read 6-12x its mesh). It is passed in, from the app's own config, and is
+    deliberately NOT derived here: the sweep that measures it is
+    ``benchmarks/estimate_vs_built.py --families`` and the tables it produced are
+    in ``openspec/changes/fix-upload-tet-estimate/``.
 
     UNITS -- NO CONVERSION HAPPENS HERE, and that is a measured claim, not a
     stylistic one. This function produced a 2.3e13-element estimate for a 19k
@@ -500,25 +557,19 @@ def estimate_tets_by_region(parts, materials, edge_units: float,
         unit_scale('mm')             -> 1.0e-03
 
     ``effective_edge_m`` returns METRES (1.018e-3 m is 1.018 mm, the right edge
-    for a 6 mm box), and ``region_edges`` divides by a bare index ratio, so the
-    plan's ``edge_units`` is in the SAME metres -- the name says "units" but the
+    for a 6 mm box), ``region_edges`` divides by a bare index ratio, and the
+    plan's ``h_min`` is a MIN over that same space (the raw edge and the
+    per-region edges), so the plan's ``edge_units`` is in the SAME metres -- the
+    name says "units" but the
     value is metres, because that is what the caller feeds it. ``filled_volume_m3``
     is cubic metres by construction. So the pair is already coherent and
     ``unit_scale`` here applies the factor a SECOND time, making the count wrong
     by ``1/scale^3`` = 1e9 for mm. That is the "one quantity, two spaces" shape
     this rig keeps meeting: the quantity was already in the target space and a
     second conversion was invisible to reading.
-
-    ``c`` is the SAME constant the one-part estimate uses -- passed in, never
-    re-derived here, so the two paths cannot disagree about it.
     """
     plan = region_plan(parts, materials, edge_units, units)
-    h_m = None
-    v_m3 = 0.0
-    for info in plan.values():
-        h_m = info["edge_units"] if h_m is None else h_m
-        v_m3 += float(info["filled_volume_m3"])
-    if h_m is None:
+    if not plan:
         # No regions at all -- not a multi-part upload. Refuse rather than
         # return 0, which would look like "a tiny job" and route it to the GPU.
         raise MeshingError(
@@ -526,12 +577,22 @@ def estimate_tets_by_region(parts, materials, edge_units: float,
             "this is the one-part path's job and calling it here would route "
             "a job on a number of zero."
         )
-    h_m = float(h_m)
-    if not (h_m > 0) or not (v_m3 > 0):
-        # Could not ask. A zero here would route a real job to the fast machine
-        # on the strength of a number nothing computed -- refuse instead.
-        raise MeshingError(
-            f"the multi-part estimate got h={h_m:g} m and V={v_m3:g} m3 from "
-            f"the region plan; neither can be used to size a mesh."
-        )
-    return int(float(c) * v_m3 / (h_m ** 3))
+    law = 0.0
+    by_edge: dict[float, float] = {}
+    for region_id, info in plan.items():
+        h_r = float(info["edge_units"])
+        v_r = float(info["filled_volume_m3"])
+        if not (h_r > 0) or not (v_r > 0):
+            # Could not ask. A zero here would route a real job to the fast
+            # machine on the strength of a number nothing computed -- refuse.
+            raise MeshingError(
+                f"region {region_id} of the plan gave h={h_r:g} m and "
+                f"V={v_r:g} m3; neither can be used to size a mesh."
+            )
+        # Grouped by edge so that regions sharing an edge are summed before the
+        # division: on today's uniform plan that makes this expression EXACTLY
+        # the one-part count at ``h_min`` on the filled total (the identity the
+        # suite pins), and a graded plan would still sum each edge's own volume.
+        by_edge[h_r] = by_edge.get(h_r, 0.0) + v_r
+    law = sum(v / (h ** 3) for h, v in by_edge.items())
+    return int(float(margin) * TETS_PER_UNIT_VOLUME * law)
