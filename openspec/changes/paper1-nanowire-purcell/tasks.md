@@ -383,6 +383,52 @@ linewidth is not.
       line says so when `--ringdown` is set, rather than leaving a reader to conclude the mode
       was resolved.
 
+## 3b. The tier-2 runs on the Orin (the lead's approval, 2026-10-15), one rung at a time
+
+- [x] **Run 1** `--wavelength 900 --hex corners --dx 20 --mirror-pad 400`, the comparison
+      point for the old reading: grid 121 x 123 x 139 = 2,037,477 cells, 11,426 steps = 32.0
+      periods, **F = 3.2295 at 900 nm**, 727.6 s wall against a 570.9 s estimate (**1.27x**).
+- [x] **Run 2** the paper's own reading (`--hex paper`: 478.8 nm across corners, 414.7 nm
+      across flats): 123 x 124 x 138 = 2,104,776 cells, 11,426 steps, **F = 0.1971 at
+      900 nm**, 753.0 s against 589.9 s (**1.28x**). The geometry moved F by 16x -- 3.2295 to
+      0.1971 -- i.e. away from the paper's 17, not toward it.
+- [x] **Run 3** (pad convergence at the smaller pad) `--mirror-pad 200`: 103 x 104 x 138 =
+      1,478,256 cells, 11,426 steps, **F = 0.2288 at 900 nm**, 514.6 s against 414.3 s
+      (**1.24x**, the quiet bench: load 1.66).
+- [x] **The pad decision the lead's rule makes** (2026-10-15: "If either pad moves F by more
+      than 10%, use the larger pad for the pulse run and say so"). Pad 200 reads 0.2288 and
+      pad 400 reads 0.1971: 16.1 per cent apart, over the line, so **the pulse run takes the
+      larger pad, 600 nm**. Priced there: 2,841,696 cells, 17,948 steps, 1,251.0 s estimated
+      -- about 1,550 s, 26 min, at the measured 1.24x, inside the 1,800 s clock. dx 15 at pad
+      600 and every dx 12 or finer rung are refused at that pad.
+- [ ] The two-point pad sweep is a rule applied, not a convergence proved: run 3b (pad 600,
+      CW at 900 nm, about 16 min) is the run that would prove it. It is held back rather than
+      spent, because the CW point at the fitted wavelength (also pad 600) may already supply
+      the same 600-vs-400 comparison for free, and that is known once the pulse run lands.
+      If the fitted wavelength is far from 900 nm, the pad's convergence at 900 nm stays
+      unmeasured and the report says so.
+
+## 3c. The tail arm's two faults, found and fixed in tier 1
+
+- [x] **The fit's window was not the drive's band** (`12b674f`). `fit_decay` searched a fixed
+      +-5 per cent of the drive's frequency, while the priced pulse run's band (900-1100 nm,
+      `--band-half 100`) excites 9-11 per cent either side of the drive. A mode excited
+      between 900 nm and the old window's own edge would have been fitted *at* that edge and
+      printed as a line -- a window artefact that costs the run. The window now follows the
+      band it is given, the fit returns `f_edge`, and the arm prints "AT THE EDGE of that
+      band, so this f is the search's own edge and the mode is outside it" rather than
+      leaving a reader to take the edge for a peak. The narrow window's failure is asserted
+      in the controls, so the fix cannot pass by both windows agreeing.
+- [x] **A tail could not outlive its run** (2f). One decaying sinusoid is the model the arm
+      fits; a tail holding two of them needs a second model, and without the samples on disk
+      that model costs the Orin again. `--save-tail PATH` writes the record with its `dt`,
+      its start step, the drive's frequency and its band (`save_record`), and `load_record`
+      reads back the argument the writer was handed -- including `np.savez`'s own `.npz`,
+      which is why the arm prints the name it actually wrote. Control: a synthetic tail saved
+      and read back re-fits to the line fitted in memory, bit for bit (`again["f"] ==
+      wide["f"]`), off 2,972 samples on disk. 17 controls hold: `tiny: all controls hold`,
+      exit 0.
+
 ## Deferred by the lead, recorded here so it is not dropped
 
 - [ ] **The dielectric as a function, not a constant** (the lead's step-1 item (7), called a
@@ -407,4 +453,6 @@ linewidth is not.
   the quotes above are what settled it). The figure numbers themselves (Figure 1b, Figure 2a,
   Figure 6) name where a reader should look in the PDF; the lead has the PDF.
 - The Lumerical page: 403.
-- Anything at tier 2 or 3: the Orin run is the lead's.
+- Anything at tier 3 (the cluster) or beyond: not this change's. Tier 2 is the lead-approved
+  Orin rungs in section 3b, run one at a time with the tier-2 wrapper (5 GiB, `nice -n 10`,
+  a 30-minute clock); a rung that the clock refuses is named, not substituted silently.

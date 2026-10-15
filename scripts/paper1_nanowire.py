@@ -100,6 +100,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -510,6 +511,42 @@ def fit_decay(values, dt: float, start: int, *, frequency: float,
             "resolved": bool(tau > 3.0 * tau_err and not at_edge)}
 
 
+def _npz_path(path) -> str:
+    """What np.savez will actually write -- it appends .npz, so we must too.
+
+    Printing the path as given would name a file that is not there.
+    """
+    path = str(path)
+    return path if path.endswith(".npz") else path + ".npz"
+
+
+def save_record(path, values, dt: float, start: int, request) -> str:
+    """Write one record so its tail can be re-fitted without another Orin run.
+
+    One decaying sinusoid is the model ``fit_decay`` fits. A tail holding two of
+    them needs a second model, and without the samples on disk that model costs
+    the run again. So the dt and the drive travel with the values:
+    ``load_record`` returns exactly what the arm fitted, which is the whole
+    difference between a re-analysis and a repeat. Returns the path written.
+    """
+    np.savez(path, values=np.asarray(values), dt=float(dt), start=int(start),
+             frequency_hz=float(request["frequency_hz"]),
+             bandwidth=float(request["bandwidth"]))
+    return _npz_path(path)
+
+
+def load_record(path) -> dict:
+    """The other half of ``save_record``: values, dt, start, frequency, band.
+
+    Reads the argument the writer was given, not the file it wrote.
+    """
+    z = np.load(_npz_path(path))
+    f = float(z["frequency_hz"])
+    half = float(z["bandwidth"])
+    return {"values": z["values"], "dt": float(z["dt"]), "start": int(z["start"]),
+            "frequency": f, "band": (f - half, f + half)}
+
+
 def ringdown(args, lay, request, measured):
     """The tail arm: one pulse record, its decay, and the Q it does or does not pin.
 
@@ -539,6 +576,11 @@ def ringdown(args, lay, request, measured):
               f" at 5 sigma and under {DRIVE_FLOOR:g} of its peak past"
               f" {pulse_end_sigma():.1f}")
         return None, 2
+    if args.save_tail:
+        wrote = save_record(args.save_tail, sim["source_field"], dt, start, request)
+        print(f"tail      {np.size(sim['source_field']):,} samples and the dt they"
+              f" were taken with in {wrote}: load_record plus fit_decay re-fits this"
+              f" tail without another run")
     half = float(request["bandwidth"])
     fit = fit_decay(sim["source_field"], dt, start, frequency=f0,
                     band=(f0 - half, f0 + half))
@@ -821,10 +863,12 @@ def tiny(args) -> int:
     # narrow default cannot. The narrow reading is asserted to FAIL on it, so
     # the control cannot pass by both windows agreeing.
     f_c = float(request["frequency_hz"])
+    half_syn, f_off = 0.15 * f_c, 0.90 * f_c
+    band_syn = (f_c - half_syn, f_c + half_syn)
+    req_syn = {"frequency_hz": f_c, "bandwidth": half_syn}
     t_syn = np.arange(max(400, int(12.0 / (dt * f_c)))) * dt
-    f_off = 0.90 * f_c
     syn = np.exp(-t_syn / (6.0 / f_off)) * np.cos(2.0 * math.pi * f_off * t_syn)
-    wide = fit_decay(syn, dt, 0, frequency=f_c, band=(0.85 * f_c, 1.15 * f_c))
+    wide = fit_decay(syn, dt, 0, frequency=f_c, band=band_syn)
     narrow = fit_decay(syn, dt, 0, frequency=f_c)
     ok.append((f"the fit searches the band it is given, not a fixed +-5 per cent"
                f" ({wide['f'] / 1e12:.2f} THz against {f_off / 1e12:.2f} sought,"
@@ -834,6 +878,25 @@ def tiny(args) -> int:
                and not wide["f_edge"]
                and abs(narrow["f"] - f_off) > 0.03 * f_off
                and narrow["f_edge"] is True))
+
+    # The record has to outlive the run. One decay is the model the arm fits and a
+    # second one is a second model, so without the samples a two-mode fit means
+    # another Orin run. The control is the round trip, and it is read back by the
+    # same argument the writer was handed rather than by the path it wrote: what
+    # comes off disk must re-fit to the line that was fitted in memory, or the
+    # file is decoration.
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = save_record(tmp + "/tail", syn, dt, 0, req_syn)
+        back = load_record(tmp + "/tail")
+        again = fit_decay(back["values"], back["dt"], back["start"],
+                          frequency=back["frequency"], band=back["band"])
+    ok.append((f"a saved tail re-fits to the line it was fitted to"
+               f" ({again['f'] / 1e12:.4f} THz against {wide['f'] / 1e12:.4f} in"
+               f" memory, from {back['values'].size} samples written to"
+               f" {saved.rsplit('/', 1)[-1]})",
+               saved == tmp + "/tail.npz"
+               and back["values"].size == syn.size
+               and again["f"] == wide["f"] and again["tau"] == wide["tau"]))
 
     as_tail = argparse.Namespace(**{**base, "profile": "pulse", "ringdown": True,
                                     "spectrum": True, "tail_periods": 20.0})
@@ -1032,6 +1095,9 @@ def PARSER_ARGUMENTS(p) -> None:
     p.add_argument("--ringdown", action="store_true",
                    help="a pulse run read as a decay: one decaying sinusoid fitted"
                         " to the tail, giving Q and its own error instead of bins")
+    p.add_argument("--save-tail", metavar="PATH",
+                   help="write the recorded field with its dt and drive, so its"
+                        " tail can be re-fitted offline instead of by another run")
     p.add_argument("--periods", type=float, default=32.0, help="CW record, periods")
     p.add_argument("--window-periods", type=float, default=8.0,
                    help="the CW reading's tail window, in drive periods")
