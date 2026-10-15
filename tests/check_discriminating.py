@@ -554,6 +554,109 @@ CASES.append(Case(
     test_file=IMAGE_TEST_FILE,
 ))
 
+FARFIELD = ROOT / "dockerfiles" / "maxwell_solver" / "farfield.py"
+FARFIELD_TEST_FILE = "tests/test_farfield.py"
+
+# The near-to-far-field transform: one reversion per mutation a test docstring
+# in tests/test_farfield.py names. Every formula sign and weight here has a
+# closed-form dipole result that reads it, and the sets below are what was
+# measured, not what was hoped: a mutation that breaks the formula breaks
+# several closed forms at once, and a normalised pattern or a ratio is blind to
+# a missing weight, which is why the absolute-power tests exist.
+#: The closed-form tests a wrong far-field FORMULA (a sign in the equivalence
+#: or in the phase) turns red. test_halving_the_spacing_converges is not among
+#: them: it compares two resolutions of the same wrong answer and stays green,
+#: which is why it is never the only test on a formula.
+_FORMULA_TESTS = {
+    "test_z_dipole_intensity_is_sin_squared", "test_far_field_power_equals_surface_power",
+    "test_x_dipole_pattern", "test_collection_fraction_matches_closed_form",
+    "test_off_centre_dipole_in_non_cubic_box_has_the_same_pattern",
+    "test_pec_image_reproduces_the_dipole_over_a_mirror",
+    "test_open_bottom_without_image_misses_the_reflection",
+}
+#: What a wrong far-field SCALE turns red: the absolute-intensity and the
+#: power tests, and the convergence test's power-against-closed-form line.
+_SCALE_TESTS = {
+    "test_z_dipole_intensity_is_sin_squared", "test_far_field_power_equals_surface_power",
+    "test_halving_the_spacing_converges",
+    "test_pec_image_reproduces_the_dipole_over_a_mirror",
+    "test_open_bottom_without_image_misses_the_reflection",
+}
+for _name, _why, _old, _new, _fails in (
+    ("farfield-m-sign",
+     "M_s = +n x E makes the J and M halves of the equivalence interfere the wrong way",
+     "        ms.append(-np.cross(n, e))          # M_s = -n x E",
+     "        ms.append(np.cross(n, e))           # M_s = -n x E",
+     _FORMULA_TESTS),
+    ("farfield-exponent-sign",
+     "exp(+ik r^.r') is the far field of the mirrored surface; a centred cube's pattern cannot see it",
+     "        phase = np.exp(-1j * k * (rh @ points.T))         # (chunk, n)",
+     "        phase = np.exp(1j * k * (rh @ points.T))          # (chunk, n)",
+     _FORMULA_TESTS),
+    ("farfield-no-area-weight",
+     "a sample without its cell area: a ratio on uniform cells stays right, the power scales with "
+     "the sample count and the non-cubic box weights its faces wrongly",
+     "    jw = J * dS[:, None]\n    mw = M * dS[:, None]",
+     "    jw = J + 0.0 * dS[:, None]\n    mw = M + 0.0 * dS[:, None]",
+     _SCALE_TESTS | {"test_off_centre_dipole_in_non_cubic_box_has_the_same_pattern"}),
+    ("farfield-scale",
+     "dropping k from i k / (4 pi): every normalised pattern passes, the absolute intensity and power do not",
+     "    scale = 1j * k / (4.0 * math.pi)",
+     "    scale = 1j / (4.0 * math.pi)",
+     _SCALE_TESTS),
+    ("farfield-e-phi-sign",
+     "E_phi with +L_theta: the x-dipole pattern reads it directly; the z-dipole's E_phi, zero only "
+     "because its J and M parts cancel, becomes 2 eta N_phi",
+     "                    scale * (ETA0 * N_p - L_t))",
+     "                    scale * (ETA0 * N_p + L_t))",
+     {"test_x_dipole_pattern", "test_collection_fraction_matches_closed_form",
+      "test_z_dipole_intensity_is_sin_squared", "test_halving_the_spacing_converges",
+      "test_off_centre_dipole_in_non_cubic_box_has_the_same_pattern"}),
+    ("farfield-poynting-half",
+     "the time average without its 1/2 doubles the surface power",
+     "        poynting = 0.5 * np.real(np.cross(face.E, np.conj(face.H), axis=0))  # (3, n_u, n_v)",
+     "        poynting = np.real(np.cross(face.E, np.conj(face.H), axis=0))  # (3, n_u, n_v)",
+     {"test_z_dipole_surface_power_matches_jackson", "test_far_field_power_equals_surface_power",
+      "test_pec_image_reproduces_the_dipole_over_a_mirror",
+      "test_open_bottom_without_image_misses_the_reflection"}),
+    ("farfield-na-as-angle",
+     "the NA used as the cone angle in radians reads 0.124 for the z-dipole instead of 0.208, "
+     "and NA 1 is no longer the hemisphere",
+     "    inside = cone_power(faces, frequency, math.asin(na), **kwargs)",
+     "    inside = cone_power(faces, frequency, na, **kwargs)",
+     {"test_collection_fraction_matches_closed_form",
+      "test_collection_fraction_is_one_at_full_aperture"}),
+    ("farfield-image-sign",
+     "a magnetic-wall image (horizontal J kept, vertical negated) instead of the PEC one",
+     "        J_img = J * np.array([-1.0, -1.0, 1.0])",
+     "        J_img = J * np.array([1.0, 1.0, -1.0])",
+     {"test_pec_image_reproduces_the_dipole_over_a_mirror",
+      "test_bottom_face_on_the_mirror_plane_is_redundant_with_the_image"}),
+    ("farfield-in-plane-order",
+     "the +-y faces with (z, x) in-plane axes: sample_box stays consistent with face_points, "
+     "only the layout test reads the documented order",
+     "_IN_PLANE = {0: (1, 2), 1: (0, 2), 2: (0, 1)}",
+     "_IN_PLANE = {0: (1, 2), 1: (2, 0), 2: (0, 1)}",
+     {"test_in_plane_axes_are_the_non_normal_axes_in_increasing_order"}),
+    ("farfield-square-cell-area",
+     "a cell area of du^2: invisible wherever the cells are square, wrong on the 18 x 16 x 20 box "
+     "and the graded face",
+     "        return np.diff(self.u_edges)[:, None] * np.diff(self.v_edges)[None, :]",
+     "        return np.diff(self.u_edges)[:, None] * np.diff(self.u_edges)[None, :]",
+     {"test_off_centre_dipole_in_non_cubic_box_has_the_same_pattern",
+      "test_graded_edges_use_each_cells_own_area",
+      "test_in_plane_axes_are_the_non_normal_axes_in_increasing_order"}),
+    ("farfield-first-cell-area",
+     "every cell weighted by the first cell's width: a uniform grid cannot tell",
+     "        return np.diff(self.u_edges)[:, None] * np.diff(self.v_edges)[None, :]",
+     "        return np.full(self.u_edges.size - 1, self.u_edges[1] - self.u_edges[0])[:, None] "
+     "* np.diff(self.v_edges)[None, :]",
+     {"test_graded_edges_use_each_cells_own_area",
+      "test_in_plane_axes_are_the_non_normal_axes_in_increasing_order"}),
+):
+    CASES.append(Case(name=_name, why=_why, edits=[(FARFIELD, _old, _new)],
+                      expect_failing=set(_fails), test_file=FARFIELD_TEST_FILE))
+
 
 def run_case(case: Case) -> bool:
     saved = case.snapshot()
