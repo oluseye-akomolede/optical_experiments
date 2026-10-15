@@ -58,8 +58,19 @@ Not verified, and not used as fact here:
 - `openspec/specs/time-domain/`: six ADDED requirements (the recorded drive, the delivered
   power, the normalisation, the in-plane dipole scored against its mirror law, the broadband
   drive inside its own record, and the flux box with its refusal inside the absorber).
+- `tests/test_fdtd_bench.py`: the bench's spec-path assertion follows the archived change to
+  the live spec. (The lead's review nit on step 1: the file moved with the change and was
+  missing from this list.)
 - `tests/test_fdtd_purcell.py`: the measurement, the ladder, and the tier-1 controls.
-  `scripts/paper1_nanowire.py` (the geometry builder) is step 2 and still pending in tasks.md.
+- `scripts/paper1_nanowire.py` (step 2): the paper's stack as a scene this product's own
+  layout builds -- a gold slab, the SiO2 buffer, a hexagonal InP prism, a dipole on or off
+  the axis -- with the grid, the estimate and the record's resolution printed before anything
+  runs, and two measurement arms (CW, and one pulse through `purcell_spectrum`). It is a
+  bench script: it reads `fdtd.py`, `fdtd_grid.py` and `fdtd_layout.py` and edits none of
+  them, so it adds no requirement to the spec. Its scenarios stay in `tasks.md`, by this
+  change's own rule, until the lead's Orin run passes.
+- `tests/test_paper1_nanowire.py` (step 2): the tiny scene's 13 controls, two of them seen
+  red on purpose, and the refusals the Jetson arm shares with the tier-1 arm.
 
 ## Impact
 

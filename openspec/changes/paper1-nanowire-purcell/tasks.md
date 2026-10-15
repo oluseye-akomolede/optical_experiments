@@ -95,27 +95,138 @@ The lead's four steps (queue row, 2026-10-15). One commit each, local only; the 
       21 for a 20-def file: a count is a claim, and that one was one short; the third sitting
       re-counted 22 defs and 22 collected, and the whole tier-1 suite — 1379 passed, 14
       skipped — ran green on this tree in 653.57 s). The file's own last run on the committed
-      tree: `22 passed in 148.25s`. The two shas the third sitting handed over are
+      tree: `22 passed in 148.25s`; on this branch rebased onto main `9a1bc55` the same file
+      reads `22 passed in 148.21s`, so the step-2 work below sits on a file that is green on
+      the tree it rides. The two shas the third sitting handed over are
       `bc833b1` (the solver and its fixtures) and `eb00ea1` (this delta and this file); the
       1.48524 above was written 1.48525 in `eb00ea1` and is corrected here rather than in the
       sha the lead has already read.
 
 ## 2. Bench: the paper's geometry
 
-- [ ] `scripts/paper1_nanowire.py`: the stack the lead described (nanowire, bottom oxide,
-      top oxide, mirror), a point dipole on or off the cavity axis, `--tiny` for tier 1, the
-      full ladder (mesh, offset) for the Orin.
-- [ ] Reports peak `F`, its wavelength, the band's FWHM against the record's own resolution,
-      and the shape next to the paper's table.
-- [ ] `estimate_run` before it runs, so a grid that cannot fit the Orin's memory is refused
-      rather than discovered.
-- [ ] Test: `tests/test_fdtd_purcell.py` runs `--tiny` and checks its own verdict.
-- [ ] Bench scenarios stay here, not in the spec, until the lead's Orin run passes.
+- [x] `scripts/paper1_nanowire.py`: the stack (a gold slab, the SiO2 buffer, a hexagonal InP
+      prism), a point dipole on or off the axis, `--tiny` for tier 1, `--estimate` for the
+      ladder, and the two measurement arms (CW, and pulse through `purcell_spectrum`). Every
+      dimension is an argument -- the fetched paper's design does not match its own abstract,
+      so nothing about it is asserted -- and `--hex` says what `--diameter` measures across.
+- [x] The scene is the product's own machinery, not a second layout: `fdtd_layout.plan` /
+      `layout` (the 16-cell open pad, the thin-layer rule, the Rakić gold's skin-depth
+      refinement) and `fdtd.estimate_run` against the caps the web form enforces. The run
+      prints that estimate before it starts and refuses over a cap; `refusals` is one function
+      for both entry points, so the tier-1 scene cannot be one the Jetson arm would refuse.
+- [x] The grid and the ladder, measured (`--estimate --spectrum --xp numpy`; the seconds are
+      `fdtd_rate.py`'s cupy rates, which is why `main` warns when `--xp numpy` is asked for):
+
+      dx(nm)  pad(nm)      cells    steps        s    GiB   nm/bin  verdict
+       20.0     400    2,005,680   11,550    568.2   0.24    27.66  fits
+       20.0     600    2,723,560   11,550    771.6   0.34    27.66  fits
+       15.0     400    2,879,392   11,550    815.7   0.35    27.66  fits
+       15.0     600    4,120,956   11,550   1167.5   0.51    27.66  fits
+       12.0     400    3,973,800   11,550   1125.8   0.48    27.66  fits
+       12.0     600    5,994,352   11,550   1698.2   0.73    27.66  fits
+       10.0     400    5,532,780   11,550   1567.4   0.66    27.66  fits
+       10.0     600    8,530,460        --       --     --       --  refused: over 8,000,000 cells
+
+      Every rung's `steps` is 11,550 and every rung's `nm/bin` is 27.66: the timestep is the
+      OXIDE's thin-layer cells, so `--dx` buys cells and seconds and never steps, and the
+      record's resolution is the step count's rather than the cell size's. The last rung is
+      the product's own cell cap refusing it (the message's own count: 8,530,460 cells against
+      a limit of 8,000,000).
+- [x] The resolution is printed, not implied: **27.66 nm per bin against the paper's 4 nm
+      mode**. Resolving that mode takes 225 periods of record, i.e. 79,856 steps where
+      `fdtd.MAX_STEPS` is 20,000 -- four times the product's own cap. Every run this envelope
+      allows therefore measures the enhancement averaged over about 28 nm, and the run says so
+      in its own output. This is the step-2 finding for the lead: the tier-2 envelope cannot
+      resolve the paper's peak, only its neighbourhood.
+- [x] The frame trap, measured and then made a control: `lay["nodes"]` are in the *owner*
+      frame -- the origin at the parts' bounding-box min corner, as the live layout
+      requirement and `fdtd_layout`'s module docstring both say -- so the pad is a negative-z
+      overhang and the buffer sits at `z_oxide`, not at `pad + z_oxide`. The first spelling
+      added the pad, looked 320 nm higher, and reported the tiny buffer as "40 nm over 2 cells
+      of 20.00 nm" where the thin rule gives it cells of its own. Probe: `z[0] = -320 nm`,
+      `z[-1] = 500 nm`, gold voxels 0..47.5 nm, `z_oxide` 40..80 nm, pad 16 cells. The tiny
+      arm now reads the gold's voxel edges against the gold part's own bounds, so the same
+      shift cannot pass quietly. At the ONE command's rung the same line reads `the SiO2 is
+      12 nm over 4 cells of 3.00 nm` -- the paper's own buffer, resolved rather than asserted.
+- [x] A record the hard-started CW drive has not settled, measured in one log
+      (`/tmp/p1probe/settle.log`, the tiny vacuum scene at 900 nm):
+
+      periods/tail   F            steps   note
+      8 / 4          4.60760      1,068   the trap
+      8 / 8          170.07210    1,068   same record, tail widened
+      16 / 8         1.00104      2,136   settled (2x -- but not because of the ratio)
+      32 / 8         1.00186      4,271   settled
+
+      The settling is in PERIODS, not in the tail's share of the record: 8/4 and 16/8 are the
+      same ratio and only the second is settled. So `report` warns below `SETTLED_PERIODS =
+      16`, and the script's own default is 32. (The first spelling of the guard tested the
+      ratio and the tier-1 fixture that runs 8/4 -- a 2x record -- went red, which is how the
+      mistake was caught.)
+- [x] `--tiny`: 13 controls, every one of them a claim that can go red (two of them are seen
+      red on purpose in the tier-1 file): the prism mesh closed and its volume the hexagon's,
+      the product's own clock the tier-2 timeout, the buffer keeping cells of its own and
+      inside the thin rule's cap and finer than the coarse cell, the product's own
+      `check_axis`, the gold a region and at the part's own z and clear of the absorber, the
+      source in InP and clear of both the facet and the absorber, and F = 1 in vacuum through
+      the script's own path (band arm when `--spectrum`). The scene is deliberately small --
+      20 nm cells, a 100 nm wire -- and exercises the same code path, not the same physics.
+- [x] `tests/test_paper1_nanowire.py`: 8 tests, `8 passed in 184.44s` (task `bvvw9vj3u`, exit 0;
+      tier 1, `nice -n 19`, one worker, `(ulimit -v 4194304; ...)`). The run is on this branch
+      rebased onto main `9a1bc55` and on exactly the two files committed below -- the commit
+      adds the change docs only, not a line of the script or the test: the 13-control
+      verdict with its count pinned, the band arm through the same path, the facet control seen
+      red (`--qd-below 25`), the prism control seen red (a mesh with a face removed), the three
+      refusals/warnings -- a record shorter than its tail, a record over `fdtd.MAX_STEPS`
+      (4,000 periods, through the same `refusals` the Jetson arm uses), and a record the drive
+      has not settled -- and the ladder saying so when every rung is over a cap instead of
+      reading the last rung it tried.
+- [x] Bench scenarios stay here, not in the spec, until the lead's Orin run passes. Step 2
+      changes nothing in the product: `fdtd.py`, `fdtd_grid.py` and `fdtd_layout.py` are read,
+      not edited, and the script lives in `scripts/`.
+- [ ] The dielectric as a function: still the deferred item below. Step 2's source sits in
+      InP with a facet ~2 cells away, so the scalar `eps_r` the arm passes is the same
+      approximation the delta describes; nothing here claims otherwise.
 
 ## 3. The Orin command
 
-- [ ] The exact command line(s), listed for the lead, with the expected size and runtime from
-      `estimate_run`, and the output to compare against the paper's table.
+- [ ] The ONE tier-2 run for step 2, with its own `estimate_run` block printed before it
+      starts (5,532,780 cells, 11,550 steps, 1,567.4 s, 0.66 GiB, 27.66 nm per bin; its margin
+      under the 1,800 s timeout is 13 per cent). That estimate is `cells * steps /
+      (RATE_SAFETY * rate)`, i.e. the step loop alone: `RATE_SAFETY = 0.9` makes it err long
+      there, while the voxeliser and the frame recording are not in it at all. This is that
+      block from the real path at this exact rung (a local build-and-estimate probe, no solve;
+      every line below is the probe's own output):
+
+          args      --spectrum --dx 10 --mirror-pad 400
+          grid      165 x 166 x 202  = 5,532,780 cells
+          spacings  x, y 10.000 nm uniform;  z 3.000 nm finest, 10.000 nm coarsest
+          z-axis    the product's own check_axis says: no problems
+          thin      185 z cells below the coarse cell, finest 3.000 nm; the SiO2 is 12 nm over 4 cells of 3.00 nm
+          stack     gold 150 nm = 5.5 skin depths (skin depth 27.2 nm at 333.1 THz), SiO2 12 nm, InP 1375 nm on a 1220 nm mirror; the wire is 420 nm across corners
+          timestep  8.458600e-18 s  (354.9 steps per optical period)
+          record    11,550 steps = 32.5 periods, 1567.4 s estimated on the Jetson (dispersive rates)
+          memory    0.66 GiB estimated  (metals ['Au'], no pec, open boundary)
+          resolves  27.66 nm per bin at 900 nm; the paper's mode is 4 nm and would need 79,856 steps (the cap is 20,000)
+          caps      OK
+
+      The copy and the run:
+
+      rsync -a --relative scripts/paper1_nanowire.py dockerfiles/maxwell_solver/ \
+          jetson:~/mse-bench/paper1/
+      ssh jetson 'cd ~/mse-bench/paper1 && ulimit -v 5000000; nice -n 10 timeout 30m \
+          ~/mse-worker/venv/bin/python scripts/paper1_nanowire.py --xp cupy --spectrum \
+          --dx 10 --mirror-pad 400'
+
+      Two things the lead should weigh before it starts. (1) The bench's python is
+      `~/mse-worker/venv/bin/python` (the Orin's cupy lives there; `~/mse-bench/venv` has
+      none), and the copy must keep the repo's paths -- the script resolves its imports
+      relative to its own file. (2) The Orin is not free: another rig's realtime demo is
+      holding 2.8 GB of ~7 GB, and the estimate's 0.66 GiB is on top of the CUDA runtime. If
+      the bench stays busy, the dx 12 rung (3,973,800 cells, 1,125.8 s, 0.48 GiB, 22 ppw in
+      InP) buys margin at a coarser mesh.
+- [ ] The output to read: the printed grid and estimate, `measured F = ... at ... nm`, the
+      spectrum's peak and its FWHM against the 27.66 nm bin, and whether the shape is the
+      paper's table's. Step 3's ladder (`--height` over the paper's H) is one command per rung.
 
 ## Deferred by the lead, recorded here so it is not dropped
 
