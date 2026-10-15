@@ -293,7 +293,7 @@ def test_the_unresolved_outcome_is_reported_with_its_bound(capsys):
         return {"f": 3.331e14, "f_err": 1.0e12, "tau": 9.7e-14, "tau_err": 3.0e-14,
                 "q": 97.0, "q_err": 30.0, "resolved": False, "at_edge": False,
                 "rms": 1.0e-6, "peak": 1.0e-2, "n": 5_000, "window": 9.7e-14,
-                "dof": 4_995}
+                "dof": 4_995, "f_edge": False}
 
     m.fit_decay = stub
     try:
@@ -305,6 +305,21 @@ def test_the_unresolved_outcome_is_reported_with_its_bound(capsys):
     assert "unresolved" in out, out
     assert "Q >" in out, out                         # the bound is what it reports
     assert "Q         " not in out, out              # and not a Q it did not measure
+    assert "AT THE EDGE" not in out, out             # a fit inside its window says so
+
+    # The same arm, one flag apart: a fit sitting on its window's edge must not
+    # print an f that reads like a measured line. This is the case the window
+    # exists for -- it is what a mode outside the drive's band looks like.
+    def edge_stub(values, dt, start, **kwargs):
+        return {**stub(values, dt, start, **kwargs), "f_edge": True}
+
+    m.fit_decay = edge_stub
+    try:
+        m.ringdown(args, lay, request, measured)
+    finally:
+        m.fit_decay = real
+    edge = capsys.readouterr().out
+    assert "AT THE EDGE" in edge, edge
 
 
 if __name__ == "__main__":       # pragma: no cover

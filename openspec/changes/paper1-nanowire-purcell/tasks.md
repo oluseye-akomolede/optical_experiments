@@ -286,6 +286,17 @@ linewidth is not.
       The first spelling of the fit stopped on its own scan grid -- 0.4% to 2.6% off, a hundred
       times its own error -- and the fix is a coordinate descent (golden-section per axis)
       rather than a fixed number of linspace rounds.
+- [x] The fit's **frequency window follows the drive's band**, not a fixed +-5 per cent of the
+      drive's centre: a 200 nm band around 1000 nm reaches -9 and +11 per cent, so a mode out there
+      was being fitted at the search's own edge and printed as a line. `band=(lo_hz, hi_hz)` is an
+      optional argument (omitted, the window is the old one, so nothing else moved), a transposed
+      band is refused rather than silently swapped, and `f_edge` travels in the fit's dict while
+      the arm prints `AT THE EDGE` when it lands on one. Found while preparing the lead's pulse
+      run, whose whole point is to read f off a tail. Tier 1 fixture
+      `the fit searches the band it is given, not a fixed +-5 per cent`: a synthetic tail 10 per
+      cent below the drive comes back at 299.79 THz against 299.79 sought through the band window,
+      while the fixed window stops at 313.70 (0.943 of the drive) and flags itself -- the two
+      readings differ, so the control cannot pass by both windows agreeing.
 - [ ] **What the fit's error is not.** It is the model's, not the geometry's: a tail holding
       two decays still fits one of them, and a fast CPML transient fits as well as a cavity
       mode. The arm prints that caveat in its own output, and `--vacuum` is the same arm on the

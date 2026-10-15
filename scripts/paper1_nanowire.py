@@ -403,7 +403,8 @@ def _golden(f, lo: float, hi: float, iterations: int = 40) -> float:
     return 0.5 * (a + b)
 
 
-def fit_decay(values, dt: float, start: int, *, frequency: float) -> dict:
+def fit_decay(values, dt: float, start: int, *, frequency: float,
+              band=None) -> dict:
     """(f, tau, Q) from one record's tail, or the bound that says it cannot.
 
     The model is a single decaying sinusoid over a constant: a_dip(t) =
@@ -421,6 +422,15 @@ def fit_decay(values, dt: float, start: int, *, frequency: float) -> dict:
     rather than measuring it. The error is the model's, not the geometry's --
     the arm says so beside the number, because a tail holding two decays still
     fits one of them.
+
+    ``band`` is the frequency window the scan may search, as (lo_hz, hi_hz) --
+    the band the drive actually excites, when the caller knows it. Omitted, the
+    window is the drive's own centre +-5 per cent, which is narrower than a
+    pulse's own band: a 200 nm band around 1000 nm reaches -9 and +11 per cent
+    in frequency, so a fit that may only look +-5 per cent cannot see a mode at
+    1080 nm the same drive put energy into. ``f_edge`` is set when the fit lands
+    on the window's own edge -- that edge is the window talking, and a caller
+    that prints ``f`` without it is printing its own search range as a line.
     """
     values = np.asarray(values, dtype=np.float64).reshape(-1)
     if start < 0 or start + 3 > values.size:
@@ -430,6 +440,13 @@ def fit_decay(values, dt: float, start: int, *, frequency: float) -> dict:
     t = np.arange(n) * dt
     window = n * dt
     w0 = 2.0 * math.pi * frequency
+    if band is None:
+        lo_w, hi_w = 0.95 * w0, 1.05 * w0
+    else:
+        if not band[0] < band[1]:
+            raise ValueError(f"a band of {band} is not (lo_hz, hi_hz)")
+        lo_w = 2.0 * math.pi * float(band[0])
+        hi_w = 2.0 * math.pi * float(band[1])
 
     def rss_at(tau, omega):
         env = np.exp(-t / tau)
@@ -440,7 +457,8 @@ def fit_decay(values, dt: float, start: int, *, frequency: float) -> dict:
         return float(resid @ resid), coef
 
     taus = np.logspace(math.log10(window / 100.0), math.log10(window * TAU_EDGE), 31)
-    omegas = w0 * (1.0 + np.linspace(-0.05, 0.05, 21))
+    omegas = np.linspace(lo_w, hi_w, 21)
+    edge_w = (hi_w - lo_w) / (omegas.size - 1)
     rss, tau, omega, coef = _decay_scan(t, y, taus, omegas)
     at_edge = math.isclose(tau, float(taus[-1]), rel_tol=1e-9)
     # The scan's grid is coarse (a quarter of an octave in tau), far too coarse
@@ -458,6 +476,7 @@ def fit_decay(values, dt: float, start: int, *, frequency: float) -> dict:
         if sweep == 0:                 # the scan's step is used up: tighten
             step_tau, step_w = step_tau * 0.05, step_w * 0.05
     rss, coef = rss_at(tau, omega)
+    f_edge = bool(omega <= omegas[0] + edge_w or omega >= omegas[-1] - edge_w)
 
     def model(p):
         a, b, c, tau, om = p
@@ -487,7 +506,8 @@ def fit_decay(values, dt: float, start: int, *, frequency: float) -> dict:
     return {"f": f, "f_err": f_err, "tau": tau, "tau_err": tau_err,
             "q": q, "q_err": q_err, "samples": n, "window": window,
             "rms": math.sqrt(rss / n), "peak": float(np.max(np.abs(y))),
-            "at_edge": at_edge, "resolved": bool(tau > 3.0 * tau_err and not at_edge)}
+            "at_edge": at_edge, "f_edge": f_edge,
+            "resolved": bool(tau > 3.0 * tau_err and not at_edge)}
 
 
 def ringdown(args, lay, request, measured):
@@ -519,11 +539,16 @@ def ringdown(args, lay, request, measured):
               f" at 5 sigma and under {DRIVE_FLOOR:g} of its peak past"
               f" {pulse_end_sigma():.1f}")
         return None, 2
-    fit = fit_decay(sim["source_field"], dt, start, frequency=f0)
+    half = float(request["bandwidth"])
+    fit = fit_decay(sim["source_field"], dt, start, frequency=f0,
+                    band=(f0 - half, f0 + half))
+    mark = (f"; AT THE EDGE of that band, so this f is the search's own edge and"
+            f" the mode is outside it") if fit["f_edge"] else ""
     print(f"fit       f = {fit['f'] / 1e12:.4f} THz +- {fit['f_err'] / 1e12:.2g}"
-          f" (the drive is {f0 / 1e12:.2f}), tau = {fit['tau'] / 1e-15:.3f} fs"
-          f" +- {fit['tau_err'] / 1e-15:.2g}, rms {fit['rms']:.3e} against a"
-          f" {fit['peak']:.3e} peak")
+          f" (the drive is {f0 / 1e12:.2f}, searched over"
+          f" {C / (f0 + half) / NM:.0f}-{C / (f0 - half) / NM:.0f} nm){mark},"
+          f" tau = {fit['tau'] / 1e-15:.3f} fs +- {fit['tau_err'] / 1e-15:.2g},"
+          f" rms {fit['rms']:.3e} against a {fit['peak']:.3e} peak")
     print(f"caveat    tau's error is the fit's own, not the geometry's: a tail"
           f" holding two decays still fits one of them. --vacuum is the same arm"
           f" on the transient this scene has with no cavity at all")
@@ -789,6 +814,26 @@ def tiny(args) -> int:
                f" ({cut * dt / sigma:.2f} sigma against {want / sigma:.2f}) and a"
                f" span of 8 plus a tail of 8 leaves {tail:.1f} periods of it",
                abs(cut * dt - want) < 0.25 * sigma and tail >= MIN_TAIL_PERIODS))
+
+    # The fit's frequency window has to follow the band the drive excited. This
+    # fixture is that case and only that case: a tail carrying a mode 10 per
+    # cent BELOW the drive's centre, which a +-15 per cent band reaches and the
+    # narrow default cannot. The narrow reading is asserted to FAIL on it, so
+    # the control cannot pass by both windows agreeing.
+    f_c = float(request["frequency_hz"])
+    t_syn = np.arange(max(400, int(12.0 / (dt * f_c)))) * dt
+    f_off = 0.90 * f_c
+    syn = np.exp(-t_syn / (6.0 / f_off)) * np.cos(2.0 * math.pi * f_off * t_syn)
+    wide = fit_decay(syn, dt, 0, frequency=f_c, band=(0.85 * f_c, 1.15 * f_c))
+    narrow = fit_decay(syn, dt, 0, frequency=f_c)
+    ok.append((f"the fit searches the band it is given, not a fixed +-5 per cent"
+               f" ({wide['f'] / 1e12:.2f} THz against {f_off / 1e12:.2f} sought,"
+               f" where the narrow window stops at {narrow['f'] / 1e12:.2f} and"
+               f" flags itself at {narrow['f_edge']})",
+               abs(wide["f"] - f_off) < 0.01 * f_off
+               and not wide["f_edge"]
+               and abs(narrow["f"] - f_off) > 0.03 * f_off
+               and narrow["f_edge"] is True))
 
     as_tail = argparse.Namespace(**{**base, "profile": "pulse", "ringdown": True,
                                     "spectrum": True, "tail_periods": 20.0})
