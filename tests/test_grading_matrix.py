@@ -1414,6 +1414,73 @@ def test_a_shared_bound_with_no_paired_row_is_not_a_bound():
 
 
 # --------------------------------------------------------------------------
+# step 1, 2026-10-15: the bound supports the verdict, it does not replace it
+# --------------------------------------------------------------------------
+
+
+def test_a_bound_that_disagrees_makes_the_case_too_close_to_call():
+    """The wire from the case's own table to the verdict (lead's step 1).
+
+    A graded mesh whose worst error is smaller than the uniform one's reads PASS
+    from the two numbers alone. Here the SIGNED per-multiplet errors sit on
+    opposite sides of zero, so the reference's own error -- which moves both
+    sides by the same d -- puts the two meshes on opposite sides depending on
+    its sign. The ends disagree, the bound supports NEITHER, and a case two
+    readings place on opposite sides is not a PASS.
+    """
+    g, u, c = 0.0002, 0.0005, 0.0010
+    rows = _signed_rows((-g, +u))
+    support = GM.shared_support_for(rows, c)
+    assert support == ["NEITHER", "NEITHER"], support
+    verdict, detail = GM.criterion(g, u, None, shared_support=support)
+    assert verdict == "TOO CLOSE TO CALL"
+    assert "too close to call" in detail and "ends disagree" in detail
+    # and the same two numbers with no bound in hand read exactly as before:
+    # this is what the case said before the wire, not a weaker criterion
+    assert GM.criterion(g, u, None)[0] == "PASS"
+
+
+def test_a_bound_that_backs_the_verdict_leaves_it_alone():
+    """The three-region numbers of step 2f item 1: both ends say PASS."""
+    u, g, c = 0.00274, 0.00221, 0.00089
+    support = GM.shared_support_for(_signed_rows((g, u)), c)
+    assert support == ["PASS", "PASS"], support
+    verdict, detail = GM.criterion(g, u, None, shared_support=support)
+    assert verdict == "PASS"
+    assert "too close" not in detail and "not decidable" not in detail
+
+
+def test_the_other_side_is_a_disagreement_too():
+    """A bound that supports PASS does not carry a FAIL, and says so."""
+    verdict, detail = GM.with_shared_support(
+        "FAIL", "graded 0.900% vs uniform 0.100%", ["PASS"])
+    assert verdict == "TOO CLOSE TO CALL"
+    assert "the bound supports a PASS" in detail
+    assert "the one-sided rule reads FAIL" in detail
+
+
+def test_an_undecidable_bound_leaves_the_verdict_and_names_what_it_rests_on():
+    """No paired signed error is not a bound, so it overturns nothing."""
+    verdict, detail = GM.with_shared_support("PASS", "graded 0.001% vs uniform 0.002%",
+                                             [None, None])
+    assert verdict == "PASS"
+    assert "not decidable here" in detail and "one-sided rule alone" in detail
+
+
+def test_no_bound_in_hand_is_not_a_disagreement():
+    """A run with no signed table, or an analytic reference, has no bound.
+
+    ``None`` means the caller had nothing to compare against: the verdict stands
+    and nothing is added to it. Marking these too close to call would report a
+    missing instrument as a finding.
+    """
+    assert GM.shared_support_for([], 0.001) is None
+    assert GM.shared_support_for(_signed_rows((0.001, 0.002)), None) is None
+    verdict, detail = GM.criterion(0.001, 0.002, None, shared_support=None)
+    assert verdict == "PASS" and detail == GM.criterion(0.001, 0.002, None)[1]
+
+
+# --------------------------------------------------------------------------
 # step 2f item 2: the GRADED side gets its own rotation band
 # --------------------------------------------------------------------------
 

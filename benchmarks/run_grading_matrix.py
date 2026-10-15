@@ -119,6 +119,19 @@ MATRIX_INCOMPLETE = 4
 MATRIX_SAME_MESH = 5
 MATRIX_UNRELIABLE = 6
 MATRIX_NO_VERDICT = 7
+#: Step 1 of the lead's 2026-10-15 message: the one-sided rule reads a PASS or a
+#: FAIL and the case's own bound does not back it. Its own code, for the reason
+#: above -- a caller must not read it as an answer.
+MATRIX_TOO_CLOSE = 8
+
+#: One code per verdict, in one place: a verdict this table does not name is a
+#: ``KeyError`` at the end of a run, and a new verdict added to ``criterion``
+#: without a code here is exactly the kind of silent gap the tests below pin.
+MATRIX_EXIT = {
+    "PASS": MATRIX_OK, "FAIL": MATRIX_FAIL, "UNMEASURED": MATRIX_INCOMPLETE,
+    "SAME MESH": MATRIX_SAME_MESH, "UNRELIABLE": MATRIX_UNRELIABLE,
+    "NO VERDICT": MATRIX_NO_VERDICT, "TOO CLOSE TO CALL": MATRIX_TOO_CLOSE,
+}
 
 #: The tier-2 budget: one solve at a time on the Orin, under the 5 GB limit and
 #: 30 minutes. The element mark is empirical -- the n3 uniform reference at
@@ -1201,7 +1214,7 @@ def reliability(errors, n_multiplets, rows, selflad=None, reference_kind=None,
 
 def criterion(graded_worst, uniform_worst, unmeasured_reason, *,
               same_plan=False, tol=0.0, sides_over_mark=(),
-              reference_convergence=None):
+              reference_convergence=None, shared_support=None):
     """The owner's bar as one pure function of the two numbers and their limits.
 
     Returns ``(verdict, detail)``. A verdict is one of:
@@ -1226,6 +1239,21 @@ def criterion(graded_worst, uniform_worst, unmeasured_reason, *,
         otherwise, and PASS needs ``graded <= uniform + tol`` where ``tol`` is
         the solver's own measured residual: two meshes whose scores differ by
         less than the solver's noise have not been shown to differ.
+    ``TOO CLOSE TO CALL``
+        the one-sided rule above reads PASS or FAIL, but the shared-reference
+        bound does not back it -- step 1 of the lead's 2026-10-15 message, and
+        the reason ``shared_support`` is an input.
+
+    ``shared_support`` is the list of :func:`shared_verdict_supported` answers
+    over the case's own bound scalings (raw, Richardson), or ``None`` when the
+    case has no bound to offer (no signed per-multiplet table, or an analytic
+    reference with no convergence to give away). ``None`` leaves the verdict
+    exactly as it was, which is what a caller with no bound in hand gets. An
+    entry that is not the verdict -- the opposite side, or the bound's own
+    ``"NEITHER"`` -- means the two readings disagree about which mesh is worse,
+    and a comparison that two instruments place on opposite sides is not a
+    PASS or a FAIL. A ``None`` entry is not a disagreement: it is an end with no
+    paired signed error, and an end that is not a bound says nothing either way.
     """
     if unmeasured_reason:
         return "UNMEASURED", unmeasured_reason
@@ -1250,10 +1278,47 @@ def criterion(graded_worst, uniform_worst, unmeasured_reason, *,
     ratio = (graded_worst / uniform_worst) if uniform_worst else float("inf")
     within_tol = bool(tol) and gap <= tol
     verdict = "PASS" if graded_worst <= uniform_worst + tol else "FAIL"
-    return verdict, (f"graded {graded_worst * 100:.3f}% vs uniform "
-                     f"{uniform_worst * 100:.3f}% ({ratio:.2f}x the uniform mesh)"
-                     + (f"; within the solver's measured residual {tol:.2e} "
-                        "-- NOT measurably worse" if within_tol else ""))
+    detail = (f"graded {graded_worst * 100:.3f}% vs uniform "
+              f"{uniform_worst * 100:.3f}% ({ratio:.2f}x the uniform mesh)"
+              + (f"; within the solver's measured residual {tol:.2e} "
+                 "-- NOT measurably worse" if within_tol else ""))
+    return with_shared_support(verdict, detail, shared_support)
+
+
+def with_shared_support(verdict, detail, shared_support):
+    """A PASS/FAIL the shared-reference bound does not back is not one.
+
+    Step 1 of the lead's 2026-10-15 message. ``criterion`` decides which mesh is
+    worse from the two worst errors alone; the shared bound asks the same
+    question with the reference's own error moving BOTH sides, and where the two
+    readings disagree the case has no answer to give. Each answer is named in
+    the detail, so the log says which side the bound supported rather than only
+    that something disagreed.
+
+    ``shared_support is None`` is a caller with no bound in hand: the verdict
+    stands, unchanged and unremarked. A list whose every entry is ``None`` is a
+    bound that is present and undecidable -- an end with no paired signed error
+    is not a bound -- so the verdict stands and the detail says what it rests on.
+    """
+    if shared_support is None:
+        return verdict, detail
+    disagree = [s for s in shared_support if s is not None and s != verdict]
+    if disagree:
+        named = "; ".join(
+            {"PASS": "the bound supports a PASS", "FAIL": "the bound supports a "
+             "FAIL"}.get(s, "the bound's two ends disagree, so the reference's "
+                            "own error can decide this case")
+            for s in dict.fromkeys(disagree))
+        return "TOO CLOSE TO CALL", (
+            f"{detail}; the one-sided rule reads {verdict} but the "
+            f"shared-reference bound does not back it ({named}) -- the two "
+            "readings disagree, so this case is too close to call")
+    if not [s for s in shared_support if s is not None]:
+        return verdict, (detail + "; the shared-reference bound is not "
+                         "decidable here (an end with no paired signed error is "
+                         "not a bound), so this verdict rests on the one-sided "
+                         "rule alone")
+    return verdict, detail
 
 
 def favourable_bound(uniform_worst, graded_worst, reference_convergence,
@@ -1436,6 +1501,21 @@ def shared_verdict_supported(row):
     if all(m < 0.0 for m in margins):
         return "FAIL"
     return "NEITHER"
+
+
+def shared_support_for(rows, convergence, richardson: float = 1.0):
+    """``shared_verdict_supported`` for every scaling of a case's bound.
+
+    ``criterion``'s supporting condition, in one place so the runner and any
+    caller that wants the same reading compute it the same way. ``None`` when
+    the case has no bound to give: no signed per-multiplet table (a run without
+    per-mode matching), or no convergence to shift by (an analytic reference is
+    exact, so its own error is zero and there is nothing to move both sides).
+    """
+    if not rows or convergence is None:
+        return None
+    return [shared_verdict_supported(row)
+            for row in shared_reference_bounds(rows, convergence, richardson)]
 
 
 #: Richardson scale for the bench's own refinement pair, from the order of the
@@ -1761,11 +1841,21 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
     # than "one of the two worst errors is missing".
     reason = (missing_side_reason("the GRADED mesh", graded, reference)
               or missing_side_reason("the UNIFORM mesh", uniform, reference))
+    # Step 1 of the lead's 2026-10-15 message: the one-sided rule above is kept
+    # only where the case's own shared-reference bound agrees with it. The bound
+    # is the same object the report prints below, read from the same signed
+    # per-multiplet table, so the verdict line and the bound line can no longer
+    # say opposite things about the same case. A case with no signed table (or
+    # an analytic reference) has no bound to offer and is judged exactly as
+    # before.
     verdict, detail = criterion(graded.get("worst_rel_error"),
                                 uniform.get("worst_rel_error"), reason,
                                 same_plan=same_mesh,
                                 tol=tol, sides_over_mark=over,
-                                reference_convergence=meta.get("reference_convergence"))
+                                reference_convergence=meta.get("reference_convergence"),
+                                shared_support=shared_support_for(
+                                    rows, meta.get("reference_convergence"),
+                                    richardson_scale(factors)))
     # A verdict that cannot be trusted is not a verdict. It is kept as the
     # provisional reading and NOT reported as PASS: the case is UNRELIABLE.
     n_targets = reference_multiplets_in_reach(reference, n_modes)
@@ -1784,7 +1874,12 @@ def run_case(case, *, grid, backend, work: Path, verbose, bands=False,
                              reference_kind=case["reference"],
                              tolerance=_band_tol)
     out["reliability"] = unreliable
-    if unreliable and verdict in ("PASS", "FAIL"):
+    # TOO CLOSE TO CALL is a criterion verdict and is in this arm on purpose: an
+    # untrustworthy case must not report the bound's refusal as the finding
+    # either, and the verdict it quotes carries the bound's reading inside it.
+    # The reliability finding is the stronger of the two -- it is about the
+    # case's own measurement -- so it is the one that leaves.
+    if unreliable and verdict in ("PASS", "FAIL", "TOO CLOSE TO CALL"):
         out["provisional_verdict"] = verdict
         verdict, detail = ("UNRELIABLE",
                            f"the comparison reads {verdict} ({detail}) but the "
@@ -2283,9 +2378,12 @@ def main(argv=None) -> int:
                              f"supports a {_sup}" if _worse else
                              " -- the ends disagree, so the reference's own error "
                              "can decide this case")
-                    if _worse and result["verdict"] != _sup:
-                        _tail += (f" (the verdict above is {result['verdict']}, "
-                                  "from the one-sided rule)")
+                    if result["verdict"] == "TOO CLOSE TO CALL":
+                        # This bound is the one criterion() was given, so its
+                        # disagreement IS the verdict above: the case is too
+                        # close to call, and the line says which way each
+                        # reading went rather than leaving the two at odds.
+                        _tail += " (which is why the verdict above is too close to call)"
                 print(f"[matrix] shared-reference bound{_scale}: the reference's "
                       f"own convergence {fb['reference_convergence'] * 100:.3f}% "
                       "moves BOTH sides, so " + _ends
@@ -2360,10 +2458,7 @@ def main(argv=None) -> int:
               f"({_band * 100:.3f}%)"
               + (" (within mesh noise)"
                  if abs(_d) <= _band else " (outside mesh noise)"))
-    return {"PASS": MATRIX_OK, "FAIL": MATRIX_FAIL,
-            "UNMEASURED": MATRIX_INCOMPLETE, "SAME MESH": MATRIX_SAME_MESH,
-            "UNRELIABLE": MATRIX_UNRELIABLE,
-            "NO VERDICT": MATRIX_NO_VERDICT}[result["verdict"]]
+    return MATRIX_EXIT[result["verdict"]]
 
 
 if __name__ == "__main__":
