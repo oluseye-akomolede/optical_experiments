@@ -75,7 +75,14 @@ Both go through one pipeline, in this order:
    ch. 3), noise variance from the residual's window periodogram (the mean
    of its lower 80%, unbiased to 1% and 9% scatter at 159 bins), times
    `error_sigma` (default 3). Only the in-window modes are returned; the
-   nuisance poles stay in the model and in the Fisher matrix.
+   nuisance poles stay in the model and in the Fisher matrix. The matrix is
+   scaled to unit diagonal before it is inverted, and a mode lying along an
+   eigen-direction below `1 / FISHER_CONDITION_LIMIT` (1e-12) of the
+   largest eigenvalue gets NaN bars (`error.f`, `error.Q`,
+   `error.amplitude`) instead of a number: a duplicated pole, which the
+   pseudo-inverse used to give exactly half the single-mode bars, or two
+   equal modes closer than about 0.02 Fourier bins at 40 dB. The other
+   modes of the call keep their bars.
 
 ## Measurements
 
@@ -267,6 +274,7 @@ python tests/check_discriminating.py resonances-bars-too-narrow
 python tests/check_discriminating.py resonances-accept-everything
 python tests/check_discriminating.py resonances-pencil-shift-swapped
 python tests/check_discriminating.py resonances-real-half-amplitude
+python tests/check_discriminating.py resonances-fisher-unguarded
 python tests/check_discriminating.py resonances-nyquist-unchecked
 ```
 
@@ -281,6 +289,7 @@ python tests/check_discriminating.py resonances-nyquist-unchecked
 | accept-everything | no significance test | the FDM pure-noise tests (2), the sweep (2), raw agreement (2), three-mode FDM (2) |
 | pencil-shift-swapped | `V1, V2` swapped | raw agreement (2), Q = 1e5 complex pencil, real path pencil, three-mode (3) |
 | real-half-amplitude | `polish`: `d = d[:K]` | real path (2), Q = 1e5 real (2) |
+| fisher-unguarded | `cramer_rao`: `np.linalg.pinv(F)`, every parameter determined | duplicate poles (2), near-duplicate pair (2), weak nuisance (2); the separated-modes test stays green by design |
 | nyquist-unchecked | `_check_window` without the `f_max > nyq` arm | the bad-inputs test |
 
 Every case was run on 2026-10-15 and reported `OK - exactly the expected

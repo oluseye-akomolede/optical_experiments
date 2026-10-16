@@ -103,6 +103,14 @@ NUMERICAL LIMITS (measured in ``tests/test_resonances.py`` and
   computed from the true noise). At 0 dB per-sample SNR on a real record
   the likelihood is no longer single-peaked and one seed in 40 was 5.4
   sigma off: do not read the bars as bounds below about 10 dB.
+* Undetermined bars: a mode the record does not determine (a duplicated
+  pole, or two equal modes closer than about 0.02 Fourier bins, where the
+  condition number of the Fisher matrix scaled to unit diagonal passes
+  ``FISHER_CONDITION_LIMIT``) gets NaN bars rather than a pseudo-inverse's,
+  which for a duplicated pole are exactly half the single-mode bars; the
+  other modes of the same call keep theirs, and a nuisance mode at 1e-6 of
+  the others' amplitude (where ``matrix_rank`` of the raw matrix already
+  drops by four) costs nobody theirs and gets its own at 1/|a|.
 * Resolution: two equal modes at 40 dB with gamma T = 0.5 are both found
   down to 0.2 Fourier bins (1/T) apart, with the worst Q error growing
   from 1e-3 at 2 bins to 7e-2 at 0.2 bins and the bars with it; at 0.1
@@ -546,6 +554,24 @@ def _noise_variance(residual, dt, f_min, f_max, real, n_modes):
     return float(kept.mean() / 0.5981 / N * n_bins / dof)
 
 
+#: Eigenvalues of the Fisher matrix, scaled to unit diagonal, below this
+#: fraction of its largest are directions in parameter space the record does
+#: not determine, and ``cramer_rao`` reports NaN bars for the modes that lie
+#: along them instead of a number. The scaling (each parameter divided by
+#: the square root of its own diagonal entry) makes the test invariant to
+#: the units and the amplitude of every mode; ``np.linalg.matrix_rank`` on
+#: the raw matrix is not, and its verdict on the same coincident pair flips
+#: with the amplitude of an unrelated third mode (measured: 15/16 with a
+#: nuisance mode at 1e-4, 12/16 at 1e-6, the scaled condition number 6e4
+#: both times). 1e12 is where the inverse's own round-off, about the
+#: condition number times 2e-16, reaches 1e-4 relative in a variance, three
+#: figures in a bar; past it the bars slide towards round-off and, at the
+#: pseudo-inverse's truncation (1e-15 of the largest eigenvalue), a
+#: duplicated pole quietly gets exactly half the bars it should. Two equal
+#: modes a tenth of a Fourier bin apart sit at 5e7, a hundredth at 5e13.
+FISHER_CONDITION_LIMIT = 1e12
+
+
 def _jacobian(modes, dt, n, real):
     """Columns d(model)/d(ln|a|, arg a, f T, gamma T) per mode; real for a real record."""
     t = np.arange(n) * dt
@@ -558,6 +584,52 @@ def _jacobian(modes, dt, n, real):
     return (Jm.real if real else Jm), T
 
 
+def _fisher(modes, dt, n, sigma2, real):
+    """The Fisher matrix in ``(ln|a|, arg a, f T, gamma T)`` per mode, and T."""
+    Jm, T = _jacobian(modes, dt, n, real)
+    if real:
+        F = (Jm.T @ Jm) / sigma2
+    else:
+        F = 2 * (Jm.conj().T @ Jm).real / sigma2
+    return F, T
+
+
+def _fisher_inverse(F):
+    """``(cov, determined)``: the inverse of ``F`` over the directions the
+    record determines, and per parameter whether it lies in them alone.
+
+    ``F`` is scaled to unit diagonal (a parameter with a zero diagonal has
+    no information at all and is undetermined outright); eigenvalues of the
+    scaled matrix below ``1 / FISHER_CONDITION_LIMIT`` of the largest are
+    the directions the record does not determine, and the inverse is built
+    from the others. A parameter counts as determined when the dropped
+    directions, had they sat exactly at the limit, would have moved its
+    variance by less than the inverse's own round-off (the limit times
+    machine epsilon, relative): a coincident pair's null vector has only
+    round-off on an unrelated mode, so that mode keeps its bars, while a
+    mode that leans on the pair's undetermined combination does not.
+    """
+    P = F.shape[0]
+    d = np.diag(F)
+    has = d > 0
+    s = np.zeros(P)
+    s[has] = 1 / np.sqrt(d[has])
+    C = (s[:, None] * F * s[None, :])[np.ix_(has, has)]
+    cov = np.zeros((P, P))
+    determined = np.zeros(P, bool)
+    if has.any() and np.all(np.isfinite(C)):
+        lam, V = np.linalg.eigh(C)                  # ascending; lam[-1] >= 1 (trace = size)
+        lost = lam < lam[-1] / FISHER_CONDITION_LIMIT
+        kept = V[:, ~lost]
+        Ci = (kept / lam[~lost]) @ kept.T
+        var = np.diag(Ci)
+        share = (V[:, lost] ** 2).sum(axis=1)
+        # share * LIMIT / lam_max <= LIMIT * eps * var, the two LIMITs cancelled
+        determined[has] = share <= np.finfo(float).eps * lam[-1] * var
+        cov[np.ix_(has, has)] = (s[has, None] * Ci) * s[None, has]
+    return cov, determined
+
+
 def cramer_rao(modes, dt: float, n: int, sigma2: float, *, real: bool):
     """Cramér-Rao standard deviations of ``(f, gamma, ln|a|, arg a)`` per mode.
 
@@ -565,20 +637,23 @@ def cramer_rao(modes, dt: float, n: int, sigma2: float, *, real: bool):
     variance per sample (``E|w|^2`` for complex noise). Returns an array of
     shape ``(len(modes), 4)`` with the standard deviations, from the inverse
     of the Fisher matrix of the full multi-mode model (Kay 1993, eq. 3.31),
-    computed with the dimensionless time t/T so that the inversion is well
-    scaled.
+    computed with the dimensionless time t/T and then scaled to unit
+    diagonal so that the inversion is well scaled.
+
+    A mode the record does not determine (two coincident poles, or a pair
+    so close that the scaled Fisher matrix's condition number is above
+    ``FISHER_CONDITION_LIMIT``) gets NaN in all four columns rather than a
+    pseudo-inverse's bars, which for a duplicated pole are exactly half the
+    true single-mode bars; the other modes of the same call keep theirs.
     """
     K = len(modes)
     if K == 0:
         return np.zeros((0, 4))
-    Jm, T = _jacobian(modes, dt, n, real)
-    if real:
-        F = (Jm.T @ Jm) / sigma2
-    else:
-        F = 2 * (Jm.conj().T @ Jm).real / sigma2
-    cov = np.linalg.pinv(F, hermitian=True)
+    F, T = _fisher(modes, dt, n, sigma2, real)
+    cov, determined = _fisher_inverse(F)
     var = np.clip(np.diag(cov), 0, None).reshape(K, 4)
     std = np.sqrt(var)
+    std[~determined.reshape(K, 4).all(axis=1)] = np.nan   # the whole mode, Q needs f and gamma
     std[:, 2] /= T         # f = (f T) / T
     std[:, 3] /= T         # gamma
     return std[:, [2, 3, 0, 1]]
