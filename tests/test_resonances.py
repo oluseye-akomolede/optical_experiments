@@ -307,6 +307,148 @@ def test_real_path_equals_complex_path(method):
 
 
 # --------------------------------------------------------------------------
+# 7. bars the record does not determine
+# --------------------------------------------------------------------------
+
+Q_BARS = 1e4
+GAMMA_BARS = math.pi * F0 / Q_BARS
+N_BARS = int(0.5 / GAMMA_BARS / DT)        # gamma T = 0.5, the sweep's record
+T_BARS = (N_BARS - 1) * DT
+SIGMA2_BARS = 1e-4                          # 40 dB per-sample SNR at |a| = 1
+FAR = (F0 + 0.15, math.pi * (F0 + 0.15) / 5e3, 20.0)   # TRIO's distant mode as (f, gamma, a)
+TRIO_MODES = [(f, math.pi * f / q, a) for f, q, a in TRIO]
+
+
+def fisher(modes, real):
+    """The Fisher matrix as ``cramer_rao`` builds it, from the Jacobian alone."""
+    Jm, T = R._jacobian(modes, DT, N_BARS, real)
+    return (Jm.T @ Jm if real else 2 * (Jm.conj().T @ Jm).real) / SIGMA2_BARS, T
+
+
+def pinv_bars(modes, real):
+    """``cramer_rao`` as it stood before the guard: the pseudo-inverse of F."""
+    F, T = fisher(modes, real)
+    std = np.sqrt(np.clip(np.diag(np.linalg.pinv(F, hermitian=True)), 0, None))
+    std = std.reshape(len(modes), 4)
+    std[:, 2:] /= T
+    return std[:, [2, 3, 0, 1]]
+
+
+def scaled_condition(modes, real):
+    """Condition number of F scaled to unit diagonal, the measure the guard
+    reads, recomputed here so the test does not take the guard's word for it."""
+    F, _ = fisher(modes, real)
+    s = 1 / np.sqrt(np.diag(F))
+    lam = np.linalg.eigvalsh(s[:, None] * F * s[None, :])
+    return lam[-1] / abs(lam[0])
+
+
+def bars(modes, real):
+    return R.cramer_rao(modes, DT, N_BARS, SIGMA2_BARS, real=real)
+
+
+@pytest.mark.parametrize("real", [False, True])
+def test_duplicate_poles_get_no_bars(real):
+    """Two identical modes make the Fisher matrix singular and their bars
+    are NaN: the pseudo-inverse used to give each of them exactly half the
+    single-mode bars (its two identical rows split one variance four ways)
+    and nothing said so. The single mode's own bars are finite, so the test
+    cannot pass by NaN-ing everything, and an unrelated third mode in the
+    same call keeps the bars it has without the pair.
+
+    Mutation (``resonances-fisher-unguarded``): in ``cramer_rao`` replace
+    ``_fisher_inverse(F)`` by ``np.linalg.pinv(F, hermitian=True)`` with
+    every parameter determined: the duplicates come back with finite bars
+    at half the single mode's and the ``isnan`` assertion fails.
+    """
+    mode = (F0, GAMMA_BARS, 0.7 - 0.2j)
+    single = bars([mode], real)
+    assert single.shape == (1, 4) and np.all(np.isfinite(single)) and np.all(single > 0)
+    dup = bars([mode, mode], real)
+    assert dup.shape == (2, 4)
+    assert np.all(np.isnan(dup)), \
+        f"duplicate poles were given bars {dup.tolist()} against single-mode bars {single[0].tolist()}"
+    # what the pseudo-inverse says about the same pair: half the bars
+    assert pinv_bars([mode, mode], real) == pytest.approx(np.vstack([single, single]) / 2, rel=1e-9)
+    # a resolved mode beside the pair keeps its own bars
+    trio = bars([mode, mode, FAR], real)
+    assert np.all(np.isnan(trio[:2])) and np.all(np.isfinite(trio[2]))
+    assert trio[2] == pytest.approx(bars([mode, FAR], real)[1], rel=1e-12)
+
+
+@pytest.mark.parametrize("real", [False, True])
+def test_separated_modes_keep_the_plain_inverse_bars(real):
+    """Two modes 159 Fourier bins apart, and two one bin apart, get finite
+    bars equal to the plain inverse of the Fisher matrix (the formula before
+    the guard) to 1e-12 relative; the three-mode ``TRIO`` (pair 0.32 bins
+    apart, scaled condition number 3e6) to 1e-6, where the two inversions'
+    own round-off parts them. Stays green under the mutation above: it pins
+    what the guard must not change.
+    """
+    cases = [([(F0, GAMMA_BARS, 0.7 - 0.2j), (F0 + 0.1, 1.3 * GAMMA_BARS, 0.3j)], 1e-12),
+             ([(F0, GAMMA_BARS, 1.0), (F0 + 1 / T_BARS, GAMMA_BARS, 1.0)], 1e-12),
+             (TRIO_MODES, 1e-6)]
+    for modes, tol in cases:
+        assert scaled_condition(modes, real) < R.FISHER_CONDITION_LIMIT
+        std = bars(modes, real)
+        assert std.shape == (len(modes), 4) and np.all(np.isfinite(std))
+        assert std == pytest.approx(pinv_bars(modes, real), rel=tol), modes
+
+
+@pytest.mark.parametrize("real", [False, True])
+def test_near_duplicate_pair_across_the_condition_limit(real):
+    """Two equal modes 0.02 Fourier bins apart put the scaled Fisher
+    matrix's condition number at 0.8 of ``FISHER_CONDITION_LIMIT``: their
+    bars are finite, thousands of times the single-mode bars (the pair is
+    barely resolved), and agree with the plain inverse to 2e-3. At 0.015
+    bins the condition number is 4.4 times the limit and both get NaN, where
+    the plain inverse still prints a number. The condition number is
+    recomputed here from the Jacobian.
+
+    Mutation (``resonances-fisher-unguarded``): the 0.015-bin pair keeps its
+    pseudo-inverse bars and the ``isnan`` assertion fails.
+    """
+    single = bars([(F0, GAMMA_BARS, 1.0)], real)[0]
+    for bins, over in ((0.02, False), (0.015, True)):
+        pair = [(F0, GAMMA_BARS, 1.0), (F0 + bins / T_BARS, GAMMA_BARS, 1.0)]
+        ratio = scaled_condition(pair, real) / R.FISHER_CONDITION_LIMIT
+        assert (ratio > 1) == over and 0.1 < ratio < 10, (bins, ratio)
+        std = bars(pair, real)
+        old = pinv_bars(pair, real)
+        assert np.all(np.isfinite(old))
+        if over:
+            assert np.all(np.isnan(std)), (bins, ratio, std.tolist())
+        else:
+            assert np.all(np.isfinite(std)) and np.all(std > 1e3 * single), (bins, std.tolist())
+            assert std == pytest.approx(old, rel=2e-3)
+
+
+@pytest.mark.parametrize("real", [False, True])
+def test_weak_nuisance_mode_costs_nobody_their_bars(real):
+    """``TRIO`` plus a nuisance mode of amplitude 1e-6 far outside: the raw
+    Fisher matrix's ``matrix_rank`` falls below 16 (the nuisance's block is
+    1e-12 of the others, under the rank tolerance) while the scaled
+    condition number stays at 3e6, so every bar is finite, the three modes'
+    bars are within 1e-3 of their values without the nuisance, and the
+    nuisance's own bars are 100 times those of the same mode at amplitude
+    1e-4 (bars scale as 1/|a|). The pseudo-inverse of the raw matrix gave
+    the 1e-6 mode bars of 1e-7 and below, a million times too small.
+
+    Mutation (``resonances-fisher-unguarded``): the 1/|a| scaling fails.
+    """
+    base = bars(TRIO_MODES, real)
+    weak = TRIO_MODES + [(F0 + 0.3, 0.01, 1e-4)]
+    weaker = TRIO_MODES + [(F0 + 0.3, 0.01, 1e-6)]
+    assert np.linalg.matrix_rank(fisher(weaker, real)[0]) < 16
+    assert scaled_condition(weaker, real) == pytest.approx(scaled_condition(TRIO_MODES, real), rel=1e-3)
+    std_weak, std_weaker = bars(weak, real), bars(weaker, real)
+    assert np.all(np.isfinite(std_weak)) and np.all(np.isfinite(std_weaker))
+    assert std_weaker[:3] == pytest.approx(base, rel=1e-3)
+    assert std_weaker[3] == pytest.approx(100 * std_weak[3], rel=1e-6), \
+        f"bars at |a| = 1e-6 {std_weaker[3].tolist()} against |a| = 1e-4 {std_weak[3].tolist()}"
+
+
+# --------------------------------------------------------------------------
 # contracts
 # --------------------------------------------------------------------------
 

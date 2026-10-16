@@ -748,6 +748,25 @@ CASES.append(Case(
 ))
 
 CASES.append(Case(
+    name="resonances-fisher-unguarded",
+    why="the pseudo-inverse of a singular Fisher matrix gives a duplicated pole half the bars and says nothing",
+    edits=[(
+        RESONANCES,
+        "    cov, determined = _fisher_inverse(F)",
+        "    cov, determined = np.linalg.pinv(F, hermitian=True), np.ones(4 * K, bool)",
+    )],
+    expect_failing={
+        "test_duplicate_poles_get_no_bars[False]",
+        "test_duplicate_poles_get_no_bars[True]",
+        "test_near_duplicate_pair_across_the_condition_limit[False]",
+        "test_near_duplicate_pair_across_the_condition_limit[True]",
+        "test_weak_nuisance_mode_costs_nobody_their_bars[False]",
+        "test_weak_nuisance_mode_costs_nobody_their_bars[True]",
+    },
+    test_file=RESONANCES_TEST_FILE,
+))
+
+CASES.append(Case(
     name="resonances-nyquist-unchecked",
     why="a window above Nyquist must be refused, not aliased",
     edits=[(
