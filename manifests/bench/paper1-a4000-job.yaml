@@ -69,11 +69,13 @@ spec:
         nvidia.com/gpu.product: NVIDIA-RTX-A4000
       containers:
         - name: bench
-          # The tag is the revision the image was built FROM: d101aa8 is the commit that
-          # introduced Dockerfile.bench-cuda at exactly these contents, and the image was
-          # built from that tree and smoke-tested. Push it under this tag and the reference
-          # here is the revision, verifiable by rebuilding d101aa8.
-          image: harbor.arcadia-ecs.local/mode-search-engine/paper1-bench-cuda:d101aa8
+          # The tag is the revision the image was built FROM: 69654be carries
+          # Dockerfile.bench-cuda unchanged and adds the --max-cells flag the args below pass,
+          # and the image was built from that tree and smoke-tested there. Push it under this
+          # tag and the reference here is the revision, verifiable by rebuilding 69654be.
+          # The superseded tag was d101aa8, which predates --max-cells and would refuse these
+          # args with "unrecognized arguments".
+          image: harbor.arcadia-ecs.local/mode-search-engine/paper1-bench-cuda:69654be
           args:
             - --hex
             - paper
