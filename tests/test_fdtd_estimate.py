@@ -131,6 +131,36 @@ def test_each_limit_admits_its_value_and_refuses_one_over(key, limit, lever,
     assert lever in text and shown in text and str(info.value) == text
 
 
+def test_the_two_ceilings_a_bench_may_raise_default_to_the_products_own():
+    """The step and time ceilings are arguments, and their default is the cap.
+
+    The paper-1 bench script passes them: the owner's 2026-10-16 decision let one
+    flagged bench record run past both (39,650 steps and 47 minutes, priced on the
+    Jetson). Every other caller -- ``worker/td_solve.py``, the web app -- passes
+    nothing, which is what this pins: the default IS ``MAX_STEPS`` /
+    ``MAX_SECONDS``, read at call time, so a caller that says nothing meets the
+    product's ceiling and a test that moves the constant moves the limit with it.
+    """
+    over = _estimate(steps=fdtd.MAX_STEPS + 1, seconds=fdtd.MAX_SECONDS + 1.0)
+    with pytest.raises(fdtd.EstimateError) as info:
+        fdtd.check_limits(over)
+    assert [name for name, *_ in info.value.exceeded] == ["steps", "time"]
+
+    # The same estimate with the two ceilings raised to exactly what it needs:
+    # nothing is left to refuse.
+    raised = {"max_steps": over["steps"], "max_seconds": over["seconds"]}
+    fdtd.check_limits(over, **raised)
+
+    # One step and one second over the raised pair, and the limit each refusal
+    # reports is the raised one -- not the product's own, which the log line would
+    # then name instead of the ceiling that actually applied.
+    with pytest.raises(fdtd.EstimateError) as info:
+        fdtd.check_limits(_estimate(steps=over["steps"] + 1,
+                                    seconds=over["seconds"] + 1.0), **raised)
+    reported = [(name, got) for name, _, got, _ in info.value.exceeded]
+    assert reported == [("steps", over["steps"]), ("time", over["seconds"])]
+
+
 def test_the_refusal_names_the_value_that_broke_each_limit():
     with pytest.raises(fdtd.EstimateError) as info:
         fdtd.check_limits(_estimate(cells=9_261_000, steps=24_000,

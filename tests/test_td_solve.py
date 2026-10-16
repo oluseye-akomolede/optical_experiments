@@ -247,6 +247,30 @@ def test_a_layout_refusal_reaches_the_owner_as_a_verdict():
                           xp=np, free_bytes=PLENTY)
 
 
+def test_a_job_past_the_product_step_cap_is_refused(monkeypatch):
+    """A k8s Job meets the product's own ceiling, not the bench's.
+
+    The bench flags (``--max-steps`` / ``--max-seconds``) live on the bench
+    script's parser, so this worker -- the path a Job and the web app take -- is
+    where the product's cap has to keep biting: 1e-7 s at this fixture's 1 mm
+    cells is tens of thousands of steps, and the refusal names the ceiling. The
+    spy is the other half of the claim, and the half a message match cannot make:
+    the ceiling the worker applies is the default, because nothing on this path
+    passes one.
+    """
+    seen = []
+    real = FDTD.check_limits
+
+    def spy(est, **kw):
+        seen.append(kw)
+        return real(est, **kw)
+
+    monkeypatch.setattr(FDTD, "check_limits", spy)
+    with pytest.raises(td_solve.TDSolveError, match="over the limit of 20,000"):
+        td_solve.solve_td(_job(duration_s=1e-7), _Store(), xp=np, free_bytes=PLENTY)
+    assert seen == [{}], seen
+
+
 @pytest.mark.parametrize("changes, needle", [
     ({"movie_start_s": 1e-10, "movie_end_s": 5e-11}, "at or before its start"),
     ({"movie_end_s": 1e-9}, "outside the run"),

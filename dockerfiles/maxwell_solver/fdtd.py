@@ -2068,9 +2068,24 @@ def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
     }
 
 
-def check_limits(estimate: dict) -> None:
+def check_limits(estimate: dict, *, max_steps=None, max_seconds=None) -> None:
     """Raise ``EstimateError`` naming every limit ``estimate`` exceeds, the
-    value that exceeded it, and the form setting that reduces it."""
+    value that exceeded it, and the form setting that reduces it.
+
+    ``max_steps`` and ``max_seconds`` are the two limits this call applies, and
+    each defaults to the product's own (``MAX_STEPS``, ``MAX_SECONDS``) when it
+    is None. One caller ever passes them: the paper-1 bench script, whose
+    ``--max-steps`` / ``--max-seconds`` raise a bench record's ceiling past what
+    the product allows (a settled nanowire record needs more than 20,000 steps,
+    and more than 30 minutes of Jetson, to stop rising). Nothing else can:
+    there is no environment variable and no module global to set, and no product
+    entry point passes them -- ``worker/td_solve.py`` and the web app call this
+    with the defaults -- so a raised ceiling stays on the bench path alone.
+    """
+    if max_steps is None:
+        max_steps = MAX_STEPS      # read here, not bound at import: a test that
+    if max_seconds is None:        # moves the constant still moves the limit
+        max_seconds = MAX_SECONDS
     e = estimate
     finest = f"{e['finest'] * 1e9:.3g} nm"
     exceeded = []
@@ -2078,10 +2093,10 @@ def check_limits(estimate: dict) -> None:
         exceeded.append(("cells", e["cells"], MAX_CELLS,
             f"The grid has {e['cells']:,} cells, over the limit of "
             f"{MAX_CELLS:,}. Increase dx to use fewer, larger cells."))
-    if e["steps"] > MAX_STEPS:
-        exceeded.append(("steps", e["steps"], MAX_STEPS,
+    if e["steps"] > max_steps:
+        exceeded.append(("steps", e["steps"], max_steps,
             f"The run needs {e['steps']:,} time steps, over the limit of "
-            f"{MAX_STEPS:,} (dt is {e['dt']:.3g} s, set by the finest cell, "
+            f"{max_steps:,} (dt is {e['dt']:.3g} s, set by the finest cell, "
             f"{finest}). Shorten the duration, or increase dx."))
     if e["bytes"] > MAX_BYTES:
         frames = e.get("frames") or 0
@@ -2092,11 +2107,11 @@ def check_limits(estimate: dict) -> None:
             f"absorbing layer's storage across the whole grid)."
             + (f" Or record fewer than the {frames:,} movie frames asked for."
                if frames > MAX_FRAMES else "")))
-    if e["seconds"] > MAX_SECONDS:
-        exceeded.append(("time", e["seconds"], MAX_SECONDS,
+    if e["seconds"] > max_seconds:
+        exceeded.append(("time", e["seconds"], max_seconds,
             f"The run would take about {e['seconds'] / 60:.0f} minutes, over "
-            f"the limit of {MAX_SECONDS // 60} minutes. Shorten the duration, "
-            f"or increase dx."))
+            f"the limit of {int(max_seconds) // 60} minutes. Shorten the "
+            f"duration, or increase dx."))
     if exceeded:
         raise EstimateError(exceeded)
 

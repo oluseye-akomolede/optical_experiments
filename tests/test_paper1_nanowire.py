@@ -18,6 +18,12 @@ than its tail, a record over ``fdtd.MAX_STEPS``, and a record too short for the
 hard-started CW drive to have settled (8 periods is F = 4.61 in vacuum, and the
 run says so).
 
+The two per-run ceilings are covered both ways as well: the product's own refuse
+a long record, and the bench flags that raise them (``--max-steps`` and
+``--max-seconds``, the ceilings only a flagged bench run may raise) are read by
+the ladder and the run path through one function and refused if they would lower
+a ceiling instead.
+
 The estimate ladder is covered at the tiny dims too -- there it only builds plans
 and estimates, never voxelises or solves, so it stays tier 1 -- which is how a
 ladder with every rung refused is seen to report that rather than read the last
@@ -36,6 +42,7 @@ physics.
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import math
 import re
@@ -168,7 +175,7 @@ def test_the_record_shorter_than_its_window_is_refused():
 def test_a_run_over_the_step_cap_is_refused():
     """The product's own cap, through the same refusal the Jetson arm answers.
 
-    4000 periods is 995,162 steps at the tiny scene's 6.29 nm finest cell, over
+    4000 periods is 1,013,479 steps at the tiny scene's 6.22 nm finest cell, over
     ``fdtd.MAX_STEPS``. The point of running it here is that ``tiny`` and
     ``main`` share one refusal function, so a scene the tier-1 arm accepts is a
     scene the Jetson arm would accept.
@@ -177,6 +184,90 @@ def test_a_run_over_the_step_cap_is_refused():
     assert done.returncode == 2, done.stdout + done.stderr
     assert "refused" in done.stdout
     assert "over the limit of 20,000" in done.stdout
+
+
+LONG = ["--tiny", "--periods", "500"]           # 126,685 steps at 6.22 nm
+RAISED = ["--max-steps", "200000", "--max-seconds", "7200"]
+
+
+def test_the_same_long_record_is_refused_without_a_flag_and_accepted_with_one():
+    """One record, both verdicts: the product's ceilings, then the bench's.
+
+    500 periods on the tiny scene is 126,685 steps at its 6.22 nm finest cell --
+    over ``fdtd.MAX_STEPS`` before any solve starts. Without a flag the run path
+    refuses it, and ``run_limits`` is the product's own two constants; with the
+    flags, the same call accepts it. This is the pair the owner's 2026-10-16
+    decision turns on: only a flagged bench run may go longer, and the flag is
+    what the ladder and the run path both read.
+    """
+    m = _load()
+    plain = m.parse_args(list(LONG))
+    assert m.run_limits(plain) == {"max_steps": m.fdtd.MAX_STEPS,
+                                   "max_seconds": m.fdtd.MAX_SECONDS}
+    lay, request, geom = m.solve_scene(plain)
+    measured = m.filled(plain, lay, request)
+    assert measured["exceeded"], measured
+    assert "over the limit of 20,000" in measured["exceeded"], measured["exceeded"]
+
+    args = m.parse_args(LONG + RAISED)
+    assert m.run_limits(args) == {"max_steps": 200_000, "max_seconds": 7200.0}
+    lay, request, geom = m.solve_scene(args)
+    measured = m.filled(args, lay, request)
+    assert measured["exceeded"] is None, measured["exceeded"]
+
+
+def test_the_run_path_hands_its_raised_ceiling_to_the_cap_check(monkeypatch):
+    """The raised ceiling reaches ``fdtd.check_limits``, not just this module.
+
+    ``filled`` builds the estimate and the verdict; the limit that verdict is
+    measured against has to be the one handed over, or a run priced against the
+    bench ceiling would be refused by the product's own at the last step.
+    """
+    m = _load()
+    calls = []
+    real = m.fdtd.check_limits
+    monkeypatch.setattr(m.fdtd, "check_limits",
+                        lambda est, **kw: (calls.append(kw), real(est, **kw))[1])
+    args = m.parse_args(LONG + RAISED)
+    lay, request, geom = m.solve_scene(args)
+    m.filled(args, lay, request)
+    assert calls == [{"max_steps": 200_000, "max_seconds": 7200.0}], calls
+
+
+def test_no_cap_call_site_escapes_the_bench_ceiling():
+    """Every ``check_limits`` call in the bench script hands one over.
+
+    The estimator and the run path must read the SAME ceiling, so a bare
+    ``fdtd.check_limits(est)`` -- a second call site quietly taking the product's
+    own cap while a rung or a run was priced against the raised one -- is the
+    failure this looks for, and the ladder's ``run_limits(sub)`` is the one the
+    spy test above cannot reach without sweeping scenes. The product half, where a
+    bare call is correct, is ``test_td_solve``.
+    """
+    src = SCRIPT.read_text()
+    calls = re.findall(r"fdtd\.check_limits\([^)]*\)", src)
+    assert len(calls) == 2, calls
+    assert all("**" in c for c in calls), calls
+
+
+def test_a_flag_that_would_lower_a_cap_is_refused_before_any_scene(capsys):
+    """The flags raise a ceiling; a value under the product's own is an error.
+
+    Two ways, because the parser is not the only way to reach ``run_limits``:
+    argparse refuses the flag at the command line, and the ``max()`` inside
+    ``run_limits`` makes a namespace that never met the parser read the product's
+    own ceiling rather than a lowered one.
+    """
+    m = _load()
+    for flag, value in (("--max-steps", "1000"), ("--max-seconds", "60")):
+        with pytest.raises(SystemExit) as info:
+            m.parse_args(["--tiny", flag, value])
+        assert info.value.code == 2
+        err = capsys.readouterr().err
+        assert "may only raise a cap" in err, err
+    lowered = argparse.Namespace(max_steps=1000, max_seconds=60.0)
+    assert m.run_limits(lowered) == {"max_steps": m.fdtd.MAX_STEPS,
+                                     "max_seconds": m.fdtd.MAX_SECONDS}
 
 
 def test_a_record_that_is_not_settled_is_flagged():
@@ -405,8 +496,9 @@ def test_a_positive_error_below_its_own_parameter_is_the_pinv_too():
     The clamp this arm was written against caught a non-positive diagonal. Run A
     (2026-10-16, the corners wire at 898.3 nm, tau at the fit grid's top) came
     back with both errors positive and neither one a number -- 4.1e-65 THz
-    beside a 333.7 THz centre, 6.3e-14 fs beside a 2033 fs decay, eighteen
-    orders below their own values. A `<= 0` test passes both, and the
+    beside a 333.7 THz centre, 6.3e-14 fs beside a 2033 fs decay, tens of
+    orders below their own values (67 decades for the frequency, 16.5 for the
+    decay). A `<= 0` test passes both, and the
     three-sigma test then reads the pinv's noise as a resolved mode.
 
     Two fixtures, because the floor has to drop one shape and keep the other. A
@@ -467,7 +559,8 @@ def test_the_settling_line_reads_the_record_before_its_end(capsys):
 
     try:
         # tau of 300 fs against a 50.9-period record: at two thirds the envelope
-        # is 0.31 of its value at the end, so a reading that says "settled" here
+        # is 0.73 of its value at the end (0.3125 against 0.4299; 0.53 in
+        # power), so a reading that says "settled" here
         # would be wrong by construction rather than by tolerance.
         out = run({"drive": drive,
                    "source_field": (1.0 - np.exp(-t / 3.0e-13)) * drive})

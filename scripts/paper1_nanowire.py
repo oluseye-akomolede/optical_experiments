@@ -274,6 +274,32 @@ def steps_for_4nm(dt: float, wavelength_nm: float) -> int:
     return int(math.ceil(periods / (C / (wavelength_nm * NM) * dt)))
 
 
+def run_limits(args) -> dict:
+    """The two per-run ceilings this bench run is measured against.
+
+    The product's own unless the bench flags raised them. ``--max-steps`` and
+    ``--max-seconds`` exist for the one case the owner approved on 2026-10-16: a
+    settled CW record at 993 nm is 39,650 steps and about 47 minutes, past both
+    of the product's caps, and only a bench run may go longer.
+
+    One function because the estimator (``ladder``) and the run path (``filled``)
+    must read the SAME ceiling: a priced rung that disagreed with the run it
+    priced would be a second opinion rather than an estimate.
+
+    The flags live on this script's own parser and are read only here, so the web
+    app and the k8s Job path -- which call ``fdtd.check_limits`` with no ceiling
+    argument -- cannot reach a raised one. ``max()`` and not the flag alone, so a
+    ceiling below the product's is unreachable even from a hand-built namespace:
+    a bench run wanting a shorter record lowers ``--periods`` instead.
+    """
+    steps = getattr(args, "max_steps", None)
+    seconds = getattr(args, "max_seconds", None)
+    return {"max_steps": (fdtd.MAX_STEPS if steps is None
+                          else max(fdtd.MAX_STEPS, int(steps))),
+            "max_seconds": (fdtd.MAX_SECONDS if seconds is None
+                            else max(fdtd.MAX_SECONDS, float(seconds)))}
+
+
 def filled(args, lay, request):
     """The layout's estimate, the caps' verdict, and the record's own reach."""
     est = fdtd.estimate_run(lay["nodes"], duration=request["duration_s"],
@@ -286,7 +312,7 @@ def filled(args, lay, request):
                             pec=lay["pec"])
     exceeded = None
     try:
-        fdtd.check_limits(est)
+        fdtd.check_limits(est, **run_limits(args))
     except fdtd.EstimateError as exc:
         exceeded = str(exc)
     dlambda = (args.wavelength * NM) ** 2 / (C * est["steps"] * est["dt"]) / NM
@@ -313,10 +339,14 @@ def refusals(args, measured, lay=None, geom=None) -> str:
     function on purpose: the tier-1 arm cannot pass a scene that the Jetson arm
     would refuse, which is what the ``--tiny --periods 4000`` test pins.
 
-    The tier-2 clock needs no check of its own here: the product's caps carry
-    it (``fdtd.MAX_SECONDS`` is the same 30 minutes), so a run over the timeout
-    is already ``measured["exceeded"]``. That equality is itself a control --
-    see ``tiny``, which fails if someone moves one clock without the other.
+    The tier-2 clock needs no check of its own here: with no bench ceiling
+    raised, the product's caps carry it (``fdtd.MAX_SECONDS`` is the same 30
+    minutes), so a run over the timeout is already ``measured["exceeded"]``. That
+    equality is itself a control -- see ``tiny``, which fails if someone moves one
+    clock without the other. ``--max-seconds`` is what breaks it, deliberately:
+    a flagged bench run is longer than the launcher's own clock (r19 ran 30.9
+    minutes under a 45-minute one), so for that run the launcher's ``MSE_CLOCK``
+    and not this line is what bounds the wall time.
 
     With a layout in hand it also refuses a source that is not at the depth
     that was asked for. The z line is pinned (``fdtd_layout.plan``'s
@@ -552,17 +582,21 @@ def fit_decay(values, dt: float, start: int, *, frequency: float,
         three of its own errors" test there is. A *positive* diagonal can be the
         pinv's just as surely -- Run A (2026-10-16, 898.3 nm, tau at the fit
         grid's top) printed 4.1e-65 THz against a 333.7 THz centre and 6.3e-14
-        fs against a 2033 fs decay, both positive and both eighteen orders below
-        their own value, which is not a number any record of finite samples
-        fixes.
+        fs against a 2033 fs decay, both positive and both tens of orders below
+        their own value (67 for the frequency, 16.5 for the decay), which is not a
+        number any record of finite samples fixes.
 
         The test is the error beside its own parameter, not the rank of
         ``jac.T @ jac``: measured (2026-10-16) ``matrix_rank`` calls that matrix
-        rank 1 at its default tolerance for *every* fixture tried, including the
-        noisy tail whose tau error is a real 6.5e-6 of tau. A rank verdict there
+        rank 1 at its default tolerance for *every* fixture tried, the flat tail
+        whose other four singular values are exactly 0 included, and the noisy
+        tail whose tau error is a real 6.5e-6 of tau. A rank verdict there
         would throw away a measurement the record does make; the size of the
-        error separates the two, 6.5e-6 kept against 7.4e-66 dropped, with this
-        floor three decades clear of both.
+        error separates the two, 6.5e-6 kept against ~1e-65 dropped, with this
+        floor three decades below the kept error and fifty-five above the
+        dropped one. That last digit is pinv noise -- 4.6237e-65 on the
+        reviewer's VM, 7.4e-66 on an earlier run here -- so it is quoted as an
+        order of magnitude, which is all the record fixes.
         """
         diag = float(cov[k, k])
         if diag <= 0.0:
@@ -797,11 +831,16 @@ def report(args, lay, request, geom, measured):
           f"  (metals {sorted(lay['metals']) or 'none'},"
           f" {'pec' if lay['pec'] is not None else 'no pec'},"
           f" {request['boundary']} boundary)")
+    lim = run_limits(args)
+    raised = (lim["max_steps"] > fdtd.MAX_STEPS
+              or lim["max_seconds"] > fdtd.MAX_SECONDS)
     print(f"resolves  {measured['dlambda_nm']:.2f} nm per bin at"
           f" {args.wavelength:.0f} nm; the paper's mode is {PAPER_FWHM_NM:.0f} nm"
           f" and would need {steps_for_4nm(est['dt'], args.wavelength):,} steps"
-          f" (the cap is {fdtd.MAX_STEPS:,})")
-    print(f"caps      {measured['exceeded'] or 'OK'}")
+          f" (the cap is {lim['max_steps']:,})")
+    print(f"caps      {measured['exceeded'] or 'OK'}"
+          + (f" (bench ceiling: {lim['max_steps']:,} steps,"
+             f" {lim['max_seconds'] / 60:.0f} min)" if raised else ""))
     if (args.profile == "cw"
             and est["steps"] * est["dt"] * f0 < args.window_periods):
         print(f"refused: the record is"
@@ -1234,22 +1273,27 @@ def ladder(args) -> int:
         sub = argparse.Namespace(**args.__dict__)
         sub.dx, sub.mirror_pad = dx, pad
         asked_row = extra and (dx, pad) == asked
+        lim = run_limits(sub)        # the run path reads this same function
         try:
             plan, request, geom = planned_scene(sub)
             est = fdtd_layout.estimate(plan, request, record_frames=False)
             steps = steps_for(sub, request, est["dt"])
             request["duration_s"] = steps * est["dt"]
             est = fdtd_layout.estimate(plan, request, record_frames=False)
-            fdtd.check_limits(est)
+            fdtd.check_limits(est, **lim)
         except fdtd.FDTDError as exc:
             print(f"{dx:5.1f} {pad:6.0f}   refused"
                   f"{' (as asked)' if asked_row else ''}: {str(exc)[:64]}")
             continue
         dlam = (sub.wavelength * NM) ** 2 / (C * est["steps"] * est["dt"]) / NM
+        raised = (lim["max_steps"] > fdtd.MAX_STEPS
+                  or lim["max_seconds"] > fdtd.MAX_SECONDS)
         print(f"{dx:5.1f} {pad:6.0f} {est['cells']:12,} {est['steps']:8,}"
               f" {est['seconds']:8.1f} {est['bytes'] / 2 ** 30:6.2f}"
               f" {dlam:6.2f}  fits ("
-              + ("as asked" if asked_row else "the caps carry the tier-2 clock")
+              + ("as asked" if asked_row
+                 else ("the bench ceiling, not the tier-2 clock" if raised
+                       else "the caps carry the tier-2 clock"))
               + ")")
         if finest is None or dx < finest[0].dx:     # the finest spacing that fits
             finest = (sub, est)
@@ -1261,7 +1305,7 @@ def ladder(args) -> int:
     print(f"\nresolving the paper's {PAPER_FWHM_NM:.0f} nm mode needs"
           f" {sub.wavelength / PAPER_FWHM_NM:.0f} periods of record, i.e."
           f" {steps_for_4nm(est['dt'], sub.wavelength):,} steps at dx"
-          f" {sub.dx:.1f} nm; the product's cap is {fdtd.MAX_STEPS:,}"
+          f" {sub.dx:.1f} nm; the cap is {run_limits(sub)['max_steps']:,}"
           + ("  -- the tail arm does not wait for that: it reads the decay and"
              " reports the error it gets" if sub.ringdown else ""))
     return 0
@@ -1299,6 +1343,32 @@ def parse_args(argv=None):
         xp = np
     args.xp = xp                     # the bench idiom: xp is the module itself
     return args
+
+
+def _raised_cap(flag, product_name, unit, kind):
+    """``type=`` for the bench flags that raise one of the product's caps.
+
+    A value below the product's own is refused here, at the parser and before any
+    scene is built: these flags raise a ceiling and never lower one (a shorter
+    record is a smaller ``--periods``). The product's own is read from ``fdtd``
+    when the flag is parsed, not when this factory is called, so a test that moves
+    the constant moves the floor too -- the same late binding ``run_limits`` and
+    ``fdtd.check_limits`` use. ``run_limits`` clamps with ``max()`` as well, so a
+    namespace that never met this parser cannot lower a ceiling either.
+    """
+    def parse(text):
+        product = getattr(fdtd, product_name)
+        try:
+            value = kind(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{flag} wants {unit}, got {text!r}")
+        if value < product:
+            raise argparse.ArgumentTypeError(
+                f"{flag} {value:,} is below the product's own {product:,}, and the"
+                f" flag may only raise a cap: a shorter record is a smaller"
+                f" --periods")
+        return value
+    return parse
 
 
 def PARSER_ARGUMENTS(p) -> None:
@@ -1343,6 +1413,17 @@ def PARSER_ARGUMENTS(p) -> None:
     p.add_argument("--periods", type=float, default=32.0, help="CW record, periods")
     p.add_argument("--window-periods", type=float, default=8.0,
                    help="the CW reading's tail window, in drive periods")
+    p.add_argument("--max-steps", default=None, metavar="N",
+                   type=_raised_cap("--max-steps", "MAX_STEPS",
+                                    "a whole number of steps", int),
+                   help="raise the product's step cap for this bench run; only"
+                        " this bench script has the flag, so the web app and the"
+                        " k8s jobs cannot reach a raised ceiling")
+    p.add_argument("--max-seconds", default=None, metavar="S",
+                   type=_raised_cap("--max-seconds", "MAX_SECONDS",
+                                    "seconds", float),
+                   help="raise the product's run-time cap, in seconds (distinct"
+                        " from the launcher's own MSE_CLOCK)")
     p.add_argument("--axis", default="x", help="the dipole's component")
     p.add_argument("--profile", choices=("cw", "pulse"), default="cw")
     p.add_argument("--xp", choices=("numpy", "cupy"), default="numpy")

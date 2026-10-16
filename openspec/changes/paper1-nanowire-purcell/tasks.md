@@ -629,21 +629,32 @@ linewidth is not.
 - [x] **The lead's other criterion -- the pinv dropping a direction -- is not usable here, and
       the measurement is why.** `np.linalg.matrix_rank(jac.T @ jac)` at its default tolerance is
       **1** for the noiseless decay, **1** for the noisy decay, **1** for the decay-free
-      sinusoid and **1** for the plateaued decay, and **2** for the constant tail (whose
-      smallest singular value is exactly 0) -- five fixtures, all at `dt = 5.0e-18`,
-      `n = 6000`. So it calls a tail whose `tau_err` is a real 6.5e-6 of `tau` rank 1, exactly
-      as it calls a tail with no decay in it. The reason is scale: one singular value of
-      `jac.T @ jac` carries the parameterization's units at 2.344e30 (5.865e27 plateau,
-      2.367e8 constant), the rest sit at 6.0e3, 2.5e3 and 2.4e2, and the degenerate direction
-      at 2.3e-26, so the default tolerance `sv_max * 5 * eps` = 2.60e15 swallows the four
-      directions that carry a measurement. A rank verdict would report a measurement the
-      record does make as undetermined. The separating quantity is the error beside its own
-      parameter -- 6.5e-6 kept, 7.4e-66 (that same tail's `f_err`) dropped -- with three
-      decades clear of the floor on either side. Reported back to the lead as the answer to "or
-      the pinv drops a direction", with the numbers.
+      sinusoid, **1** for the plateaued decay and **1** for the constant tail (whose other
+      four singular values are exactly 0, so the default tolerance `6000 * 5 * eps` =
+      6.66e-12 sits above zero and the rank is blind to it) -- five fixtures, all at
+      `dt = 5.0e-18`, `n = 6000`. So it calls a tail whose `tau_err` is a real 6.5e-6 of
+      `tau` rank 1, exactly as it calls a tail with no decay in it. The reason is scale:
+      one singular value of `jac.T @ jac` carries the parameterization's units at 2.344e30
+      (5.865e27 plateau), the rest sit at 9.6e3, 6.0e3 and 2.4e2, and the degenerate
+      direction at 2.3e-26, so the default tolerance `sv_max * 5 * eps` = 2.60e15 swallows
+      the four directions that carry a measurement. A rank verdict would report a
+      measurement the record does make as undetermined. The separating quantity is the
+      error beside its own parameter -- 6.5e-6 kept, ~1e-65 (that same tail's `f_err`)
+      dropped -- with the floor three decades below the kept error and fifty-five above
+      the dropped one. Reported back to the lead as the answer to "or the pinv drops a
+      direction", with the numbers.
       *(The first draft of this entry said "rank 1 for every fixture" and put 2.4e2 at the top
       of the spectrum; the spectra printed above are the correction, made the same session by
-      re-reading the matrix the pinv actually receives.)*
+      re-reading the matrix the pinv actually receives. A second pass on 2026-10-16, after the
+      reviewer's nit, fixed two more numbers: the constant tail's `matrix_rank` is **1**, not 2
+      -- 6,000 and four zeros at this sampling, 5,474 and four zeros at r17's -- so there is no
+      fixture the rank does separate, and the constant-tail singular value is `n`, not 2.367e8,
+      which did not reproduce on any fixture tried. A third pass, on the reviewer's
+      re-measurement of the quiet fixture's spectrum (2.344e30, 9.551e3, 5.993e3, 2.442e2,
+      2.277e-26), replaced the 2.5e3 that no fixture showed with 9.6e3, and cut the noisy
+      tail's `f_err`/`f` back to ~1e-65: it is pinv noise, 4.6237e-65 on their VM and 7.4e-66
+      on an earlier run of this rig's, so the digit is not a number the record fixes and the
+      order of magnitude is all the sentence claims.)*
 - [x] **The control can fail.** `test_a_positive_error_below_its_own_parameter_is_the_pinv_too`
       calls the real `fit_decay` on a noiseless 1e-14 s decay at the fitter's own control frame
       (`dt = 5.0e-18`, 6,000 samples, 3.331e14 Hz) and requires all three errors `None` and
@@ -658,12 +669,117 @@ linewidth is not.
       (`070e4fd4292bb14cdaaffc28eeb3520c`, both before and after).
 - [x] **The test carries its own control**, so the floor cannot be met by `return None`: the
       same tail with 1e-4 of noise, in the same call, keeps its `tau_err` (6.5e-6 of `tau`,
-      `resolved` true) and drops its `f_err` (7.4e-66 of `f`). One call, both directions.
+      `resolved` true) and drops its `f_err` (~1e-65 of `f`). One call, both directions.
 - [x] **Spec delta.** The `An error the covariance does not determine...` requirement now names
       both shapes, sets `ERR_FLOOR = 1e-9`, says in the requirement itself that the rank of
       `J^T J` is not the criterion and why, and carries two new scenarios (the positive
       machine-zero fit with its red numbers, and the rank measurement across all five tails).
       `openspec validate paper1-nanowire-purcell` is valid.
+
+## The bench ceilings a flagged record may raise (the owner's 2026-10-16 decision, step 1)
+
+- [x] **What was asked.** Based on main `7d6b6c4`: let a bench run raise the 20,000-step cap
+      explicitly -- a flag or argument on the bench script path only, the default unchanged
+      everywhere, with a test proving the product path still refuses 20,001 steps, and the
+      estimator and the run path reading the SAME limit.
+- [x] **Why the time cap joined it, said out loud as the deviation it is.** The lead's letter
+      named the step cap alone. The record the owner allowed is refused by the second cap as
+      well: priced on this revision (`--hex paper --wavelength 993 --dx 20 --mirror-pad 600
+      --periods 100`) it is 2,903,040 cells, 39,650 steps, 2,823.3 s -- 47 minutes, 61.6
+      minutes at the measured 1.31x -- and `--estimate` refuses with both `over the limit of
+      20,000` and `over the limit of 30 minutes`. A step cap a bench may raise beside a time
+      cap it may not would leave the approved run unlaunchable, so both ceilings became
+      arguments behind the same flag family. Offered to the lead to split them if only the
+      step cap is wanted.
+- [x] **The two ceilings are arguments, and the product's own is their default.**
+      `fdtd.check_limits(estimate, *, max_steps=None, max_seconds=None)` resolves each at call
+      time from `MAX_STEPS` / `MAX_SECONDS` (read there, not bound at import, so a test that
+      moves the constant moves the limit), reports the ceiling that applied in each refusal,
+      and names in its docstring the one caller that passes them.
+      `tests/test_fdtd_estimate.py::test_the_two_ceilings_a_bench_may_raise_default_to_the
+      _products_own`.
+- [x] **The product path passes none.** `worker/td_solve.py:220` calls `fdtd.check_limits(est)`
+      bare, and `test_a_job_past_the_product_step_cap_is_refused` spies on the solver's own
+      method, requires the product's `TDSolveError` to say `over the limit of 20,000`, and
+      asserts the recorded call list is `[{}]` -- the lead's "prove the product path still
+      refuses 20,001 steps", at the call site rather than at a copy.
+- [x] **One function, read by the estimator and the run path.** `run_limits(args)` in the bench
+      script returns the pair the flags name or the product's own, clamped with `max()` against
+      the product's constants so nothing can lower one. `filled` (estimator) and the run arm
+      both call `fdtd.check_limits(est, **run_limits(...))`, and the new
+      `test_no_cap_call_site_escapes_the_bench_ceiling` finds both call sites in the source and
+      requires each to hand a ceiling over. The run arm's log names the ceiling it ran under
+      (`caps  OK (bench ceiling: 200,000 steps, 120 min)`, `resolves ... (the cap is 200,000)`),
+      so a raised record cannot read as a product run, and the ladder's `fits` suffix says
+      which of the two clocks is binding.
+- [x] **Only raising is a flag.** `--max-steps` / `--max-seconds` go through one `type=`
+      factory that refuses a value under the product's own with `may only raise a cap` (argparse
+      exit 2), and the `max()` clamp covers a namespace that never met the parser:
+      `test_a_flag_that_would_lower_a_cap_is_refused_before_any_scene`.
+- [x] **Both verdicts on one record.** `test_the_same_long_record_is_refused_without_a_flag_and
+      _accepted_with_one`: 500 periods on the tiny scene is 126,685 steps at its 6.22 nm finest
+      cell, the plain call's `measured["exceeded"]` holds `over the limit of 20,000`, the
+      flagged call's is `None`, with the real `check_limits` under the monkeypatch.
+- [x] **Measured on the rung itself, both ways** (2026-10-16, VM, `--estimate` only, final
+      revision): the flagged `--max-steps 200000 --max-seconds 7200 --hex paper --wavelength
+      993 --dx 20 --mirror-pad 600 --periods 100` prices 20.0/600 at 2,903,040 cells, 39,650
+      steps, 2,823.3 s, 9.93 nm per bin, every rung that fits reading `fits (the bench ceiling,
+      not the tier-2 clock)` with 10.0/600 still refused on cells (9,166,668 > 8,000,000), and
+      the 4 nm line names the applied cap (`the cap is 200,000`) instead of the product's; the
+      same command unflagged is refused on every rung, the 39,650-step ones by the step cap and
+      10.0/600 by the cells, ending `every rung above was refused`; the plain ladder at the
+      default ceilings is unchanged (`fits (the caps carry the tier-2 clock)`); and
+      `--max-steps 1000` is refused at the parser with `may only raise a cap` (argparse exit 2,
+      asserted in the test) while `--max-seconds abc` is refused as not a number.
+- [x] **Tests, the affected ones, tier 1, all green** (`.venv-mse/bin/python -m pytest`,
+      `nice -n 19`, `(ulimit -v 4194304; ...)`, 2026-10-16): `tests/test_fdtd_estimate.py` 19
+      passed in 0.41 s; `tests/test_td_solve.py -k "cap or limit"` 2 passed, 78 deselected in
+      0.73 s; `tests/test_paper1_nanowire.py -k "cap or ceiling or flag or long_record or
+      settling"` 8 passed, 18 deselected in 86.22 s, on the committed revision and
+      re-run after every edit to the script. `openspec validate paper1-nanowire-purcell` valid.
+- [x] **Both paths exercised on a real run** (2026-10-16, VM, tier 1, `--tiny --periods 100`):
+      flagged, the log reads `resolves  9.00 nm per bin at 900 nm; ... (the cap is 200,000)`
+      and `caps      OK (bench ceiling: 200,000 steps, 120 min)`, then goes on to
+      `measured  F = 1.0011 at 900 nm` and `settling  F = 0.9737 at two thirds of the record
+      against 1.0011 at its end, +2.8% between them` (a lossy tiny cell; nothing to do with the
+      nanowire), exit 0; unflagged, the same scene is `refused: The run needs 25,337 time steps,
+      over the limit of 20,000 (dt is 1.18e-17 s, set by the finest cell, 6.22 nm)`. Measuring
+      that pair also corrected two stale numbers in the bench tests: the tiny scene's finest cell
+      is 6.22 nm, not 6.29, so 4000 periods is 1,013,479 steps and not the 995,162 that stood in
+      the pre-existing comment (that test asserts only the refusal, so the wrong figure was
+      invisible), and 500 periods is 126,685, not 124,395.
+- [x] **Spec delta.** New requirement `A record past the product's step and time ceilings SHALL
+      need a bench flag, and the product's own entry points SHALL NOT be able to raise either`,
+      with three scenarios -- the product path's default with no ceiling passed, one record
+      refused without a flag and accepted with one, and a lowering flag refused -- plus an
+      amended estimate scenario saying which rung the cell cap catches first.
+- [x] **The reviewer's nits on the accepted shas are fixed in this commit too**, doc, spec and
+      comments only: the noisy tail's `f_err`/`f` is quoted as ~1e-65 (4.6237e-65 measured
+      twice on the reviewer's VM, 7.4e-66 on this rig -- pinv noise, so only the order of
+      magnitude is the claim), Run A's two errors are 67 and 16.5 decades below their own
+      values, the 2m docstring's ratio is 0.73 (0.53 in power), the quiet fixture's spectrum
+      reads 9.6e3 where a 2.5e3 stood that no fixture showed, and the constant tail's
+      `matrix_rank` is 1 with its singular value at `n` -- the `2` and the `2.367e8` did not
+      reproduce. No behaviour changes in any of them.
+- [x] **The three rebased shas were ACCEPTed before this commit** (row
+      `qitem-20261016152611-34d46fbd`, transition 16321, 15:47Z): cacc6df (2l), 602173a (2m),
+      0d3b72b (2n), accepted by identity with ad5e495 / d89e5ba / b8ad1a4 -- the four reviewed
+      files are byte-identical across the rebase and `git patch-id --stable` matches -- and the
+      reviewer's gate was 22 passed in 1112 s at the pre-rebase tip, transferred to the rebased
+      one on that identity. Their five nits are the bullet above.
+- [x] **The bench launcher's two gaps are closed**, in the untracked launcher on the Jetson
+      (`~/mse-bench/paper1/run_cw.sh`, md5 `c6814c6f005a64ec340273379b3c5f5e`; it is not in
+      this repo and never was -- it is machinery, not a product artifact): it now refuses
+      `MSE_CLOCK` below 1 (a non-numeric value too, same exit 2) where `timeout 0` used to wait
+      forever, and its `--xp` guard accepts every spelling argparse's prefix abbreviation
+      accepts -- `--x cupy`, `--xp=cupy` -- where the first version matched `--xp cupy` alone.
+      Every launch now writes `logs/<label>.launch.log` (label, clock and where it came from,
+      python, the product script's md5, UTC launch time, args), which is the provenance r19's
+      0-byte file did not have: the bench tree is not a git checkout, so that line and the md5
+      beside it are what pins a result to a revision. Exercised on the bench, one at a time,
+      `--estimate --tiny` only: clock 0 exit 2, clock abc exit 2, `--xp numpy` exit 9,
+      `--xp cupy` / `--x cupy` / `--xp=cupy` all exit 0 with the launch log written and the
+      product md5 recorded.
 
 ## Deferred by the lead, recorded here so it is not dropped
 
