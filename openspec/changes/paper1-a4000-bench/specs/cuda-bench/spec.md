@@ -62,18 +62,20 @@ today, and this change SHALL NOT raise it.
   manifest: ResourceQuota admission is exempt from dry-run, so dry-run green is not a pass
 
 #### Scenario: the memory limit is derived from the priced grid
-- **WHEN** the priced dx-10 record (9,166,668 cells) is compared with the memory limit
-- **THEN** the table's own storage per cell (~131 bytes, from its printed GiB against cells)
-  puts the record at ~1.12 GiB = 1,146.9 MiB: 14.0 % of the 8Gi request (8,192 MiB, so the
-  request is 7.1× the estimate) and 7.0 % of the card's 16,376 MiB
+- **WHEN** the priced dx-10 record with the boundary held (14,048,300 cells) is compared with
+  the memory limit
+- **THEN** the estimator's own storage for it is 1,754,244,508 bytes = 1,673.0 MiB = 1.63 GiB:
+  20.4 % of the 8Gi request (8,192 MiB, so the request is 4.9x the estimate) and 10.2 % of the
+  card's 16,376 MiB -- both denominators named, because "15 % of the card" was wrong
 
 #### Scenario: the args are the launcher and they name cupy
 - **WHEN** the Job's `args` are read
 - **THEN** they carry the priced record in full (`--wavelength`, `--dx`, `--mirror-pad`,
-  `--periods`, `--xp cupy`) plus the three raised bench ceilings `--max-cells`, `--max-steps`
-  and `--max-seconds`, because on the cluster there is no `run_cw.sh`: the manifest is the
-  launcher, and the script's default `--xp numpy` would run at about a third of the table's
-  rate with nothing to refuse it
+  `--periods`, `--xp cupy`, and the open boundary held at r20's own distance through `--pad-nm`
+  and `--pml-nm`) plus the three raised bench ceilings `--max-cells`, `--max-steps` and
+  `--max-seconds`, because on the cluster there is no `run_cw.sh`: the manifest is the launcher,
+  and the script's default `--xp numpy` would run at about a third of the table's rate with
+  nothing to refuse it
 
 ### Requirement: The Job's wall bound SHALL be its own activeDeadlineSeconds, derived from the same estimator's seconds
 
@@ -84,8 +86,8 @@ started, so the deadline is the only live timer on the cluster.
 
 #### Scenario: the deadline follows the record's own pricing
 - **WHEN** the CW record's deadline is checked against its pricing
-- **THEN** `1.5 × 11,696 s (the table's 8,914.8 s at the Orin's measured factor 1.312) + 300 s
-  setup = 17,844 s`, rounded up to the next half hour, is the 18,000 s in the file, and the
+- **THEN** `1.5 × 17,925 s (the table's 13,662.4 s at the Orin's measured factor 1.312) + 300 s
+  setup = 27,188 s`, rounded up to the next half hour, is the 28,800 s in the file, and the
   file states this arithmetic
 
 #### Scenario: the run's own rate is visible before the deadline
@@ -108,8 +110,8 @@ its partial log as the only measurement there is.
 
 #### Scenario: the args are refused without the cell ceiling and admitted with it
 - **WHEN** the manifest's dx-10 args are run against the shipped code
-- **THEN** they are refused with the cell limit (`The grid has 9,166,668 cells, over the limit
-  of 8,000,000`) before the scene is built, and with the file's own `--max-cells 10000000` the
+- **THEN** they are refused with the cell limit (`The grid has 14,048,300 cells, over the limit
+  of 8,000,000`) before the scene is built, and with the file's own `--max-cells 15000000` the
   same args are admitted -- which is the resolution `tasks.md` records: the owner's decision
-  was the third bench ceiling (`--max-cells`), not the dx-12/pad-600 rung whose deadline the
-  file also carries as the alternative
+  was the third bench ceiling (`--max-cells`), not a coarser rung, because at the held boundary
+  the dx-12 rung is 8,952,300 cells and still over the cap

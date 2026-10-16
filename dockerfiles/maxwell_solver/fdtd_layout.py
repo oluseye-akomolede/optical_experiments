@@ -158,7 +158,7 @@ def _refuse_conductor_nodes(names, parts, table, scene, nodes, lo, length_scale,
 
 
 def plan(names, parts, request, *, length_scale: float, materials=None,
-         n_index=None) -> dict:
+         n_index=None, pad_cells=None, pml_cells=None) -> dict:
     """``layout`` without the voxeliser: the grid, source placement and probes.
 
     Cheap enough for the web form (no per-node point-in-mesh test), so the
@@ -172,6 +172,19 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
     ``request["pin_source_z"]`` (default off) puts a point source's own z on
     the z axis as a node, so the source sits where it was asked to rather than
     at the nearest node ``_locate`` finds.
+
+    The open boundary's own geometry is ``pad_cells`` and ``pml_cells``, and
+    passing them is the ONLY way to it: both default to this module's
+    ``OPEN_PAD_CELLS`` and ``fdtd.DEFAULT_PML_CELLS`` read at call time, and
+    ``request`` is not consulted for either. The web form and the worker build
+    their own request and call this with neither, so the product's boundary is
+    the product's. The bench script is the one caller that passes them
+    (``--pad-nm``/``--pml-nm``): the pad is a cell COUNT, so at ``--dx`` 10 the
+    product's own 16-cell pad is 160 nm against the 320 nm r20 ran with, and a
+    dx-10 record priced without them would move the boundary's distance at the
+    same time as the resolution, leaving the two indistinguishable. A
+    ``pml_cells`` that is not inside ``pad_cells`` is refused by the caller
+    (``scripts/paper1_nanowire.py``'s own guard), not here.
     """
     boundary = request["boundary"]
     if boundary not in BOUNDARIES:
@@ -205,7 +218,8 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
             plo, phi = _bounds([parts[p]], length_scale)
             olo, ohi = np.minimum(olo, plo - t), np.maximum(ohi, phi + t)
     size, off = ohi - olo, lo - olo
-    pad = OPEN_PAD_CELLS * dx if boundary == "open" else 0.0
+    pad_cells = OPEN_PAD_CELLS if pad_cells is None else int(pad_cells)
+    pad = pad_cells * dx if boundary == "open" else 0.0
     f_top = band_top(request["profile"], request["frequency_hz"],
                      request["bandwidth"])
 
@@ -274,7 +288,8 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
     nodes = tuple(n - pad - off[a]                         # owner frame
                   for a, n in enumerate(grid["nodes"]))
 
-    pml = fdtd.DEFAULT_PML_CELLS if boundary == "open" else 0
+    pml = ((fdtd.DEFAULT_PML_CELLS if pml_cells is None else int(pml_cells))
+           if boundary == "open" else 0)
     box = None
     if plane:
         faces = [(_node_index(n, float(-o)), _node_index(n, float(s - o)))
@@ -295,7 +310,9 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
             "spacings": grid["spacings"], "shape": grid["shape"], "box": box,
             "cell": cell, "probes": probes, "origin_m": lo,
             "band_top_hz": f_top, "part_bounds": part_bounds,
-            "boundary": boundary, "coatings": coats, "coat_bounds": coat_bounds}
+            "boundary": boundary, "coatings": coats, "coat_bounds": coat_bounds,
+            "pad_cells": pad_cells if boundary == "open" else 0,
+            "pml_cells": pml}
 
 
 def _finder(names, parts, table, coatings, boundary, length_scale, nodes):
@@ -471,18 +488,21 @@ def refuse_conductor_points(planned, parts, *, length_scale: float) -> None:
 
 
 def layout(names, parts, request, *, length_scale: float, materials=None,
-           n_index=None) -> dict:
+           n_index=None, pad_cells=None, pml_cells=None) -> dict:
     """The grid, voxelised scene, source placement and probes for a td job.
 
     ``request`` is ``td_solve.request_from``'s dict. Returns ``nodes`` (owner
     frame, metres), ``spacings``, ``shape``, ``eps``, ``pec``, ``metals``,
     ``box`` (TF/SF node-index corners, plane wave only), ``cell`` (point
     source node), ``probes`` ([(i, j, k, component)]), ``origin_m`` (the
-    bounding box's minimum corner in mesh-frame metres) and ``caveats``
+    bounding box's minimum corner in mesh-frame metres), ``pad_cells`` and
+    ``pml_cells`` (the open boundary's own geometry, as planned -- see
+    ``plan``, which is the only place either is read) and ``caveats``
     (strings for the result, e.g. a non-box part's thin-feature caveat).
     """
     planned = plan(names, parts, request, length_scale=length_scale,
-                   materials=materials, n_index=n_index)
+                   materials=materials, n_index=n_index, pad_cells=pad_cells,
+                   pml_cells=pml_cells)
     names, table, nodes = planned["names"], planned["table"], planned["nodes"]
     lo, cell, probes = planned["origin_m"], planned["cell"], planned["probes"]
     coatings = request.get("coatings")
@@ -504,4 +524,5 @@ def layout(names, parts, request, *, length_scale: float, materials=None,
     return {"caveats": caveats, "nodes": nodes, "spacings": planned["spacings"],
             "shape": planned["shape"], "eps": scene["eps"], "pec": scene["pec"],
             "metals": scene["metals"], "box": planned["box"], "cell": cell,
-            "probes": probes, "origin_m": lo, "band_top_hz": planned["band_top_hz"]}
+            "probes": probes, "origin_m": lo, "band_top_hz": planned["band_top_hz"],
+            "pad_cells": planned["pad_cells"], "pml_cells": planned["pml_cells"]}

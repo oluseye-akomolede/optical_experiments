@@ -188,6 +188,47 @@ def band_hz(args) -> float:
     return (lo - hi) / 2.0
 
 
+def _nm_cells(nm, dx) -> int:
+    """A bench boundary distance in nm as whole cells at this run's ``dx``."""
+    return int(round(float(nm) / float(dx)))
+
+
+def boundary_cells(args) -> dict:
+    """This run's open boundary as cell counts: ``pad_cells``, ``pml_cells``.
+
+    ``--pad-nm`` and ``--pml-nm`` name the boundary's DISTANCE in nanometres,
+    which is the physical parameter here: ``fdtd_layout.OPEN_PAD_CELLS`` is a
+    cell COUNT, so the product's own pad is 320 nm at dx 20 -- the run r20
+    measured F = 4.38 on -- and 160 nm at dx 10, and the absorber with it. A
+    dx-10 record run on those defaults would change the open boundary's
+    distance at the same time as the wire's resolution, and a difference from
+    r20 could then be either one (this scene's own record: 200 nm against 400
+    nm of pad moved F by 16%). These two flags hold the distance, so dx is the
+    only thing a dx-10 record changes.
+
+    A distance that is not a whole number of cells is rounded to the nearest
+    one and the run reports the distance it really held (``report``'s
+    ``boundary`` line), so a log never claims a boundary the grid did not have.
+    Below one cell is refused in ``arm_conflicts``: a pad of no cells is no
+    boundary at all.
+
+    ``--pml-nm`` and ``--pml`` set the same absorber. The nm flag is the answer
+    when both are given; ``arm_conflicts`` refuses a run that names two
+    different ones, so the rule is unreachable from the parser. Defaults are
+    the product's own, read here at call time.
+    """
+    pad_nm = getattr(args, "pad_nm", None)
+    pml_nm = getattr(args, "pml_nm", None)
+    pml = getattr(args, "pml", None)
+    if pml_nm is None:
+        pml_cells = fdtd.DEFAULT_PML_CELLS if pml is None else int(pml)
+    else:
+        pml_cells = _nm_cells(pml_nm, args.dx)
+    return {"pad_cells": (fdtd_layout.OPEN_PAD_CELLS if pad_nm is None
+                          else _nm_cells(pad_nm, args.dx)),
+            "pml_cells": pml_cells}
+
+
 def scene(args):
     """The three parts, their materials, and the request the layout reads.
 
@@ -231,8 +272,14 @@ def scene(args):
     }
     request["frequency_hz"] = C / (args.wavelength * NM)
     request["bandwidth"] = band_hz(args)
+    cells = boundary_cells(args)
     geom = {"z_top": z_top, "z_oxide": (z_gold1, z_ox1), "radius": radius,
-            "half": half, "pad_cells": fdtd_layout.OPEN_PAD_CELLS}
+            "half": half,
+            # the open boundary the layout is built with: the cells, and the
+            # distance they are (rounded to the nearest cell, so a log can name
+            # the boundary it held rather than the one it asked for)
+            "pad_cells": cells["pad_cells"], "pad_nm": cells["pad_cells"] * args.dx,
+            "pml_cells": cells["pml_cells"], "pml_nm": cells["pml_cells"] * args.dx}
     return names, parts, materials, request, geom
 
 
@@ -240,7 +287,8 @@ def planned_scene(args):
     """The product's own plan, and its cheap estimate (no voxeliser)."""
     names, parts, materials, request, geom = scene(args)
     plan = fdtd_layout.plan(names, parts, request, length_scale=1.0,
-                            materials=materials)
+                            materials=materials, pad_cells=geom["pad_cells"],
+                            pml_cells=geom["pml_cells"])
     return plan, request, geom
 
 
@@ -248,7 +296,8 @@ def solve_scene(args):
     """The product's own layout: grid, voxelised scene, source node, probes."""
     names, parts, materials, request, geom = scene(args)
     lay = fdtd_layout.layout(names, parts, request, length_scale=1.0,
-                             materials=materials)
+                             materials=materials, pad_cells=geom["pad_cells"],
+                             pml_cells=geom["pml_cells"])
     return lay, request, geom
 
 
@@ -282,11 +331,14 @@ def run_limits(args) -> dict:
     settled CW record at 993 nm is 39,650 steps and about 47 minutes, past both
     of the product's caps, and only a bench run may go longer. ``--max-cells``
     is the same permission for the third cap, which the same dx-10 nm record
-    needs: it holds 9,166,668 cells, over the 8 M cap by 14.6%, because the
-    grid's fine layers (a coating's thickness / ``MIN_CELLS``, a metal's skin
-    depth / ``CELLS_PER_SKIN``) do not scale with ``--dx`` while the rest of the
-    axis does. The lead's word, 2026-10-16: the knob is per-run and on the bench
-    path only, and the product's own 8,000,000 stays exactly what it is.
+    needs: with the open boundary held at r20's own distance it holds 14,048,300
+    cells, over the 8 M cap by 75.6%, because the grid's fine layers (a coating's
+    thickness / ``MIN_CELLS``, a metal's skin depth / ``CELLS_PER_SKIN``) do not
+    scale with ``--dx`` while the rest of the axis does — and the pad is a cell
+    COUNT (``OPEN_PAD_CELLS``), so on the product's own pad the same record is
+    also 320 nm smaller per axis than the run it is compared to. The lead's word,
+    2026-10-16: the knob is per-run and on the bench path only, and the product's
+    own 8,000,000 stays exactly what it is.
 
     One function because the estimator (``ladder``) and the run path (``filled``)
     must read the SAME ceiling: a priced rung that disagreed with the run it
@@ -418,6 +470,25 @@ def arm_conflicts(args) -> str:
         return ("refused: --save-tail writes the pulse record the tail arm fits,"
                 " so on a non-ring-down (CW or band) run the flag is silently"
                 " ignored and the caller believes a record was written")
+    pad_nm = getattr(args, "pad_nm", None)
+    pml_nm = getattr(args, "pml_nm", None)
+    for flag, nm in (("--pad-nm", pad_nm), ("--pml-nm", pml_nm)):
+        if nm is not None and nm < args.dx:
+            return (f"refused: {flag} {nm:g} nm is under one cell at dx"
+                    f" {args.dx:g} nm, so this run would have no boundary there"
+                    f" at all")
+    if pml_nm is not None and args.pml is not None \
+            and _nm_cells(pml_nm, args.dx) != int(args.pml):
+        return (f"refused: --pml {args.pml} cells and --pml-nm {pml_nm:g} nm name"
+                f" different absorbers at dx {args.dx:g} nm"
+                f" ({_nm_cells(pml_nm, args.dx)} cells); name one")
+    cells = boundary_cells(args)
+    if cells["pml_cells"] >= cells["pad_cells"]:
+        return (f"refused: the {cells['pml_cells']}-cell absorber is not inside"
+                f" the {cells['pad_cells']}-cell pad"
+                f" ({cells['pml_cells'] * args.dx:.0f} nm in"
+                f" {cells['pad_cells'] * args.dx:.0f} nm), so the parts would be"
+                f" in the absorber")
     return ""
 
 
@@ -784,14 +855,22 @@ def _oxide_cell_nm(z, geom) -> float:
 
 def report(args, lay, request, geom, measured):
     est = measured["est"]
-    if args.pml >= geom["pad_cells"]:
-        print(f"refused: --pml {args.pml} is not inside the layout's "
-              f"{geom['pad_cells']}-cell pad; the parts would be in the absorber")
-        return 2
     z = np.asarray(lay["nodes"][2])
     problems = fdtd_grid.check_axis(z, args.dx * NM)
     print(f"grid      {est['shape'][0]} x {est['shape'][1]} x {est['shape'][2]}"
           f"  = {est['cells']:,} cells")
+    # The open boundary is the run's own two settings, in the cells the grid was
+    # built with AND the distance those cells are. A cell count is not a
+    # distance: the product's own pad is 160 nm at dx 10 against r20's 320, so a
+    # dx-10 record's boundary has to be readable off its own log.
+    asked_nm = " ".join(
+        f"--{name} {getattr(args, name.replace('-', '_'), None):.0f}"
+        for name in ("pad-nm", "pml-nm")
+        if getattr(args, name.replace("-", "_"), None) is not None)
+    print(f"boundary  open: pad {geom['pad_cells']} cells = {geom['pad_nm']:.0f} nm,"
+          f" absorber {geom['pml_cells']} cells = {geom['pml_nm']:.0f} nm,"
+          f" {geom['pad_nm'] - geom['pml_nm']:.0f} nm of open space"
+          f" ({asked_nm or 'both at the product defaults'})")
     print(f"spacings  x, y {args.dx:.3f} nm uniform;  z {est['finest'] / NM:.3f} nm"
           f" finest, {np.diff(z).max() / NM:.3f} nm coarsest"
           f"  (the spec's neighbour ratio is <= {fdtd_grid.MAX_RATIO})")
@@ -894,7 +973,7 @@ def _run(args, lay, request, measured):
     sim = fdtd.simulate(lay["eps"], source, measured["est"]["steps"],
                         lay["probes"], spacings=lay["spacings"],
                         boundary=request["boundary"], pec=lay["pec"],
-                        pml_cells=args.pml, ade_terms=terms, xp=args.xp,
+                        pml_cells=lay["pml_cells"], ade_terms=terms, xp=args.xp,
                         record_drive=True, record_source_field=True)
     wall = time.monotonic() - started
     estimate = measured["est"]["seconds"]
@@ -1279,6 +1358,12 @@ def ladder(args) -> int:
     extra = asked not in rungs          # the caller's own rung, if it is not one
     if extra:
         rungs.append(asked)
+    held = boundary_cells(args)
+    print(f"boundary  held at {held['pad_cells'] * args.dx:.0f} nm of pad and"
+          f" {held['pml_cells'] * args.dx:.0f} nm of absorber at dx"
+          f" {args.dx:.1f}; each rung's cell counts follow its own dx"
+          f" ({held['pad_cells']}/{held['pml_cells']} cells at dx"
+          f" {args.dx:.1f})\n")
     finest = None
     for dx, pad in rungs:
         sub = argparse.Namespace(**args.__dict__)
@@ -1394,9 +1479,20 @@ def PARSER_ARGUMENTS(p) -> None:
     p.add_argument("--dx", type=float, default=10.0, help="x-y cell, nm")
     p.add_argument("--mirror-pad", type=float, default=600.0,
                    help="gold beyond the wire's circumradius, nm")
-    p.add_argument("--pml", type=int, default=fdtd.DEFAULT_PML_CELLS,
-                   help=f"absorber cells (the layout's pad is"
-                        f" {fdtd_layout.OPEN_PAD_CELLS})")
+    p.add_argument("--pml", type=int, default=None, metavar="N",
+                   help=f"absorber cells (default {fdtd.DEFAULT_PML_CELLS}); the"
+                        f" layout's own pad is"
+                        f" {fdtd_layout.OPEN_PAD_CELLS} cells")
+    p.add_argument("--pad-nm", type=float, default=None, metavar="NM",
+                   help="open boundary's pad as a DISTANCE: the layout is padded"
+                        f" by this and not by its own"
+                        f" {fdtd_layout.OPEN_PAD_CELLS} cells, so a dx-10 record"
+                        f" can hold r20's boundary (rounded to the nearest cell"
+                        f" at this dx, and the run reports the distance it"
+                        f" held)")
+    p.add_argument("--pml-nm", type=float, default=None, metavar="NM",
+                   help="absorber as a DISTANCE (same rounding and reporting as"
+                        " --pad-nm); the answer when both it and --pml are given")
     p.add_argument("--hex", choices=("paper", "corners", "flats"),
                    default="paper",
                    help="what --diameter measures: paper (the paper's relation,"

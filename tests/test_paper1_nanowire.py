@@ -19,10 +19,21 @@ hard-started CW drive to have settled (8 periods is F = 4.61 in vacuum, and the
 run says so).
 
 The three per-run ceilings are covered both ways as well: the product's own refuse
-a long record, and the bench flags that raise them (``--max-steps`` and
-``--max-seconds``, the ceilings only a flagged bench run may raise) are read by
-the ladder and the run path through one function and refused if they would lower
-a ceiling instead.
+a long record, and the bench flags that raise them (``--max-steps``,
+``--max-seconds`` and ``--max-cells``, the ceilings only a flagged bench run may
+raise) are read by the ladder and the run path through one function and refused
+if they would lower a ceiling instead.
+
+The open boundary is covered as a distance (``--pad-nm``/``--pml-nm``), because
+``fdtd_layout.OPEN_PAD_CELLS`` is a cell count: 16 cells is 320 nm at dx 20 --
+what r20 ran -- and 160 nm at dx 10, so a dx-10 record on the product's own pad
+would move the boundary and the resolution at once. The knob's own control is
+the coarse rung: at dx 20 the same pair is the product's own 16/10 cells and the
+same box, which is what makes the dx-10 record comparable to r20. The tiny run
+then holds a named boundary end to end -- the layout builds with it and the
+absorber reaches the solver -- and the refusals that keep the distance honest
+(a pad under one cell, ``--pml`` and ``--pml-nm`` disagreeing, an absorber as
+thick as the pad) are read both directly and through the script's own entry.
 
 The estimate ladder is covered at the tiny dims too -- there it only builds plans
 and estimates, never voxelises or solves, so it stays tier 1 -- which is how a
@@ -224,20 +235,23 @@ def test_the_cell_ceiling_is_the_third_thing_the_bench_flags_can_raise(capsys):
     The ladder is the cheap half of the product's own layout -- ``planned_scene``
     is documented as "the product's own plan, and its cheap estimate (no
     voxeliser)" -- so this exercises the whole path the manifest's args take,
-    without voxelising 9 M cells, which is not tier-1 work. The same scene is
-    2,903,040 cells at dx 20 nm and 9,166,668 at dx 10 nm, over
-    ``fdtd.MAX_CELLS`` by 14.6 %: only the three pad layers take ``--dx``, while
-    the oxide's ``thickness / MIN_CELLS`` and the gold's ``depth /
-    CELLS_PER_SKIN`` are the same six capped requests at either dx.
+    without voxelising 14 M cells, which is not tier-1 work. The manifest's
+    record holds the open boundary at r20's own distance (``--pad-nm 320
+    --pml-nm 200``, the product's own 16/10 cells at dx 20): that is what makes
+    the dx-10 record r20's own box at a finer dx -- 14,048,300 cells against
+    r20's 2,903,040, over ``fdtd.MAX_CELLS`` by 75.6 % -- because only the three
+    pad layers take ``--dx`` while the oxide's ``thickness / MIN_CELLS`` and the
+    gold's ``depth / CELLS_PER_SKIN`` are the same capped requests at either dx.
     """
     m = _load()
     record = ["--estimate", "--hex", "paper", "--wavelength", "993", "--dx",
-              "10", "--mirror-pad", "600", "--periods", "100"]
-    # Without a bench flag every rung is over the step cap, so not one is priced
+              "10", "--mirror-pad", "600", "--periods", "100",
+              "--pad-nm", "320", "--pml-nm", "200"]
+    # Without a bench flag every rung is over the cell cap, so not one is priced
     # and the table says so rather than printing a number it could not reach.
     assert m.ladder(m.parse_args(list(record))) == 2
     out = capsys.readouterr().out
-    assert ("refused: The grid has 9,166,668 cells, over the limit of 8,000,000"
+    assert ("refused: The grid has 14,048,300 cells, over the limit of 8,000,000"
             in out), out
     assert "every rung above was refused" in out, out
 
@@ -246,18 +260,215 @@ def test_the_cell_ceiling_is_the_third_thing_the_bench_flags_can_raise(capsys):
     # GiB. The table's row for dx 10.0 / pad 600, read by its own first two
     # columns -- this rung is one of the table's own, so it carries no "(as asked)"
     # marker and a substring search over the whole table could match another row.
-    assert m.ladder(m.parse_args(record + ["--max-cells", "10000000",
+    assert m.ladder(m.parse_args(record + ["--max-cells", "15000000",
                                            "--max-steps", "200000",
-                                           "--max-seconds", "10800"])) == 0
+                                           "--max-seconds", "18000"])) == 0
     row = None
     for line in capsys.readouterr().out.splitlines():
         cells = line.split()
         if len(cells) >= 5 and cells[0] == "10.0" and cells[1] == "600":
             row = line
     assert row, "the dx-10/pad-600 row is missing from the table"
-    assert "9,166,668" in row and "39,650" in row, row
-    assert "8914.8" in row and "1.12" in row, row
+    assert "14,048,300" in row and "39,650" in row, row
+    assert "13662.4" in row and "1.63" in row, row
     assert "fits" in row and "refused" not in row, row
+
+
+def _extents_nm(plan):
+    """The planned box in nm per axis: the nodes' own span in the owner frame."""
+    return [round((float(max(axis)) - float(min(axis))) / 1e-9, 1)
+            for axis in plan["nodes"]]
+
+
+def test_the_held_boundary_is_the_product_s_own_at_r20_s_dx():
+    """``--pad-nm 320 --pml-nm 200`` at dx 20 IS the product's own 16/10 cells.
+
+    That is the whole reason the flags exist: the same pair holds r20's box at dx
+    10, so a difference from r20 is the resolution and not the boundary. If the
+    knob moved the coarse grid at all, the dx-10 record it is meant to make
+    comparable to r20 would be a different box, and nothing in the log would say
+    so. Both plans are the product's own, so nothing is voxelised here.
+    """
+    m = _load()
+    base = ["--hex", "paper", "--wavelength", "993", "--mirror-pad", "600",
+            "--periods", "100"]
+    plain = m.parse_args(base + ["--dx", "20"])
+    held = m.parse_args(base + ["--dx", "20", "--pad-nm", "320", "--pml-nm", "200"])
+    a, _, geom_a = m.planned_scene(plain)
+    b, _, geom_b = m.planned_scene(held)
+    assert (geom_b["pad_cells"], geom_b["pml_cells"]) == (m.fdtd_layout.OPEN_PAD_CELLS,
+                                                          m.fdtd.DEFAULT_PML_CELLS)
+    assert (geom_a["pad_cells"], geom_a["pml_cells"]) == (geom_b["pad_cells"],
+                                                          geom_b["pml_cells"])
+    assert a["shape"] == b["shape"], (a["shape"], b["shape"])
+    assert math.prod(a["shape"]) == math.prod(b["shape"]) == 2_903_040
+    assert _extents_nm(a) == _extents_nm(b) == [2318.8, 2318.8, 2177.0]
+
+
+def test_the_dx_10_record_holds_r20_s_box_and_only_the_resolution_moves():
+    """Held at dx 10: r20's own box, 4.84x the cells, the same steps and the same dt.
+
+    The count is what decides the bench ceiling, and the steps are what decide the
+    record's own cost: a uniform grid halved per axis would be 8x the cells and,
+    at a halved dt, 2x the steps. Neither is what happens, and the reason is in
+    the plan -- the capped layers keep their own spacing, so they take up node
+    count per axis without refining (244/144 = 1.694, 245/144 = 1.701,
+    235/140 = 1.679, which is the 4.839x cells), while ``dt`` is set by the
+    oxide's own 3.000 nm and does not move at all.
+    """
+    m = _load()
+    base = ["--hex", "paper", "--wavelength", "993", "--mirror-pad", "600",
+            "--periods", "100"]
+    coarse, _, _ = m.planned_scene(m.parse_args(base + ["--dx", "20"]))
+    fine, _, geom = m.planned_scene(m.parse_args(
+        base + ["--dx", "10", "--pad-nm", "320", "--pml-nm", "200"]))
+    assert (geom["pad_cells"], geom["pml_cells"]) == (32, 20)
+    assert (geom["pad_nm"], geom["pml_nm"]) == (320.0, 200.0)
+    assert fine["shape"] == (244, 245, 235), fine["shape"]
+    assert math.prod(fine["shape"]) == 14_048_300
+    assert _extents_nm(fine) == _extents_nm(coarse)
+    # the same dt, because the finest spacing is the oxide's own 3.000 nm at either
+    # dx -- read off the plans rather than retyped
+    assert float(min(fine["spacings"][2])) == float(min(coarse["spacings"][2]))
+
+
+def test_the_boundary_distance_is_rounded_to_the_nearest_cell(capsys):
+    """A rung whose dx does not divide 320 nm cannot hold it exactly, and says what it held.
+
+    dx 15 nm is the nearest rung that fits the product's own 8 M cells with the
+    box held; 320/15 and 200/15 are not whole cells, so the plan holds 21 and 13
+    (315 nm and 195 nm) and reports those. Rounded up instead, the same rung
+    would hold 22/14 -- 330/210 nm -- and the two are different boundaries, which
+    is why the rounding is pinned rather than assumed.
+    """
+    m = _load()
+    args = m.parse_args(["--hex", "paper", "--wavelength", "993", "--mirror-pad",
+                         "600", "--dx", "15", "--pad-nm", "320", "--pml-nm", "200"])
+    cells = m.boundary_cells(args)
+    assert (cells["pad_cells"], cells["pml_cells"]) == (21, 13)
+    plan, _, geom = m.planned_scene(args)
+    assert (geom["pad_nm"], geom["pml_nm"]) == (315.0, 195.0)
+    assert _extents_nm(plan) != [2318.8, 2318.8, 2177.0], _extents_nm(plan)
+    # and the nearest-fitting rung really is under the product's own ceiling: this
+    # is the rung the manifest's comment offers as the alternative
+    assert math.prod(plan["shape"]) == 5_234_775
+    out = _ladder_rows(m, ["--dx", "12", "--pad-nm", "320", "--pml-nm", "200"])
+    assert out["12.0"][0] == 8_952_300, out
+
+
+def _ladder_rows(m, extra):
+    """The ladder's own table over one record: ``{"dx": [cells, seconds]}`` for pad 600."""
+    import contextlib
+    import io
+    held = io.StringIO()
+    record = ["--estimate", "--hex", "paper", "--wavelength", "993",
+              "--mirror-pad", "600", "--periods", "100", "--max-cells", "15000000",
+              "--max-steps", "200000", "--max-seconds", "18000"] + list(extra)
+    with contextlib.redirect_stdout(held):
+        assert m.ladder(m.parse_args(record)) == 0
+    rows = {}
+    for line in held.getvalue().splitlines():
+        cells = line.split()
+        if len(cells) >= 5 and cells[1] == "600" and cells[0].replace(".", "").isdigit():
+            rows[cells[0]] = [int(cells[2].replace(",", "")), float(cells[4])]
+    return rows
+
+
+def test_the_three_boundary_refusals(capsys):
+    """A pad under one cell, two absorbers that disagree, and an absorber outside the pad.
+
+    Every one of them is argument-level, so it fires before a scene exists: a
+    pad of no cells is no boundary at all, ``--pml`` and ``--pml-nm`` naming
+    different absorbers would leave the run guessing which the log meant, and an
+    absorber as thick as the pad puts the scene inside it.
+    """
+    m = _load()
+    base = ["--hex", "paper", "--dx", "10"]
+    thin = m.parse_args(base + ["--pad-nm", "8"])
+    assert "under one cell at dx 10 nm" in m.arm_conflicts(thin), m.arm_conflicts(thin)
+    two = m.parse_args(base + ["--pml", "20", "--pml-nm", "100"])
+    assert "different absorbers at dx 10 nm (10 cells)" in m.arm_conflicts(two)
+    deep = m.parse_args(base + ["--pad-nm", "100"])
+    assert ("the 10-cell absorber is not inside the 10-cell pad (100 nm in 100 nm)"
+            in m.arm_conflicts(deep)), m.arm_conflicts(deep)
+    # reached through the script's own entry, each is an exit 2 and no scene is
+    # built: `--tiny` would print its controls if the run had got that far. The
+    # tiny arm's own dx is 20 nm and its own absorber 6 cells (120 nm), which is
+    # why the nm flags below are the ones they are: the pair that disagrees with
+    # its absorber is refused, and a pad that cannot hold that absorber is too.
+    for extra in (["--pad-nm", "10"], ["--pml-nm", "20"],
+                  ["--pad-nm", "100", "--pml-nm", "120"]):
+        done = run("--tiny", *extra)
+        assert done.returncode == 2, (extra, done.stdout, done.stderr)
+        assert "refused:" in done.stdout + done.stderr, (extra, done.stdout, done.stderr)
+        assert "tiny: all controls hold" not in done.stdout, extra
+
+
+def test_a_tiny_run_holds_the_boundary_it_names():
+    """The run path's own boundary line, and the controls still holding at it.
+
+    The tiny scene runs at dx 20 nm with a 6-cell (120 nm) absorber of its own,
+    so naming 200/120 nm is 10 and 6 cells: the same absorber in the same
+    distance, a smaller pad. What this pins is the pair of readings a log has to
+    carry for a dx-10 record to be comparable to r20 at all -- the cells the grid
+    was built with and the distance they are -- and that the run really built
+    with them: `solve_scene` hands the pair to the layout and the absorber to the
+    solver, so the controls' own verdict at this boundary is what says the
+    reading is not just a printout. A cell count is not a distance: 16 cells is
+    320 nm at dx 20 and 160 nm at dx 10.
+    """
+    done = run("--tiny", "--pad-nm", "200", "--pml-nm", "120")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert ("boundary  open: pad 10 cells = 200 nm, absorber 6 cells = 120 nm,"
+            " 80 nm of open space (--pad-nm 200 --pml-nm 120)" in done.stdout), done.stdout
+    assert "tiny: all controls hold" in done.stdout, done.stdout
+
+
+def test_no_product_path_names_the_bench_boundary():
+    """The boundary flags are the bench script's own, and its two builders pass them.
+
+    ``plan`` reads ``pad_cells``/``pml_cells`` only from its own caller, so the
+    product's boundary stays the product's. The two files that plan a product run
+    are the worker and the web form, and the bench script's two scene builders --
+    the ones a run, the tiny arm and the estimator's ladder all go through -- hand
+    over both, so the box a record is priced in is the box it is built in. The
+    tiny arm's three emitter-z probes call the planner with neither on purpose:
+    they are asking where the emitter lands, not what the boundary is.
+    """
+    for product in (ROOT / "worker" / "td_solve.py", ROOT / "web" / "td_form.py"):
+        text = product.read_text()
+        assert "pad_cells" not in text, product
+        assert "pml_cells" not in text, product
+    src = SCRIPT.read_text()
+    for builder in ("fdtd_layout.plan(names, parts, request, length_scale=1.0,",
+                    "fdtd_layout.layout(names, parts, request, length_scale=1.0,"):
+        assert builder in src, builder
+        window = src[src.index(builder):][:400]
+        assert 'pad_cells=geom["pad_cells"]' in window, window
+        assert 'pml_cells=geom["pml_cells"]' in window, window
+
+
+def test_the_estimator_and_the_run_hold_the_same_boundary():
+    """A record must be priced in the box it is run in, at the real dx.
+
+    ``plan`` is what the ladder prices (node counts); ``layout`` is what a run
+    builds (the nodes). They are handed the same pair of counts from the same
+    args, and the two geoms have to come out equal -- otherwise the record's
+    price would be for one boundary and its run for another, and the run's own
+    log would be the only place that could show it.
+
+    This is the tiny arm on purpose: `solve_scene` voxelises, so the dx-10 record
+    (14,048,300 cells) is the Jetson's or the Job's work, not tier 1's.
+    """
+    m = _load()
+    args = m.parse_args(["--tiny", "--pad-nm", "200", "--pml-nm", "120"])
+    plan, _, geoms_plan = m.planned_scene(args)
+    lay, _, geoms_run = m.solve_scene(args)
+    assert geoms_plan == geoms_run
+    assert (geoms_run["pad_cells"], geoms_run["pml_cells"]) == (10, 6)
+    assert (lay["pad_cells"], lay["pml_cells"]) == (10, 6)
+    assert (plan["pad_cells"], plan["pml_cells"]) == (10, 6)
+
 
 
 def test_the_run_path_hands_its_raised_ceiling_to_the_cap_check(monkeypatch):

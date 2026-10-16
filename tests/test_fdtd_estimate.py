@@ -164,30 +164,31 @@ def test_the_two_ceilings_a_bench_may_raise_default_to_the_products_own():
 def test_a_bench_may_raise_the_cell_ceiling_and_the_default_is_the_products_own():
     """``max_cells`` is the third ceiling, and its default is still 8 M.
 
-    The dx-10 nm record of the paper's own scene holds 9,166,668 cells, over the
-    product's cap by 14.6%. A caller that says nothing -- ``worker/td_solve.py``,
+    The record this change prices -- the paper's own scene at dx 10 nm with the
+    open boundary held where r20's run held it -- is 14,048,300 cells, over the
+    product's cap by 75.6%. A caller that says nothing -- ``worker/td_solve.py``,
     the web app -- still meets 8,000,000 exactly: the control here is the
     product's own default, and one cell over it is refused. The ceiling is read
     at call time, so a test that moves the constant moves the limit too.
     """
-    e = _estimate(cells=9_166_668)
+    e = _estimate(cells=14_048_300)
     with pytest.raises(fdtd.EstimateError) as info:
         fdtd.check_limits(e)
     (name, value, got_limit, text), = info.value.exceeded
-    assert (name, value, got_limit) == ("cells", 9_166_668, fdtd.MAX_CELLS)
+    assert (name, value, got_limit) == ("cells", 14_048_300, fdtd.MAX_CELLS)
     assert "8,000,000" in text and "Increase dx" in text
 
     # At exactly what it needs, and above it: both admitted.
-    fdtd.check_limits(e, max_cells=9_166_668)
-    fdtd.check_limits(e, max_cells=10_000_000)
+    fdtd.check_limits(e, max_cells=14_048_300)
+    fdtd.check_limits(e, max_cells=15_000_000)
 
     # One cell over the raised ceiling, and the refusal names the raised ceiling
     # rather than the product's own -- which the log line would then call in force.
     with pytest.raises(fdtd.EstimateError) as info:
-        fdtd.check_limits(_estimate(cells=9_166_669), max_cells=9_166_668)
+        fdtd.check_limits(_estimate(cells=14_048_301), max_cells=14_048_300)
     (name, value, got_limit, text), = info.value.exceeded
-    assert (name, value, got_limit) == ("cells", 9_166_669, 9_166_668)
-    assert "9,166,668" in text and "8,000,000" not in text
+    assert (name, value, got_limit) == ("cells", 14_048_301, 14_048_300)
+    assert "14,048,300" in text and "8,000,000" not in text
 
 
 def test_the_refusal_names_the_value_that_broke_each_limit():

@@ -18,31 +18,45 @@ and the Jetson bench is one GPU behind a flock'd lock whose only wall bound is t
   the wall bound as the Job's own `activeDeadlineSeconds` and the result surviving in the pod
   log for 7 days.
 - A new capability spec, `openspec/specs/cuda-bench`.
+- `--max-cells`, `--pad-nm` and `--pml-nm` on `scripts/paper1_nanowire.py`: the bench path's own
+  third ceiling, and the open boundary named as a distance instead of a cell count. Both are
+  bench-only — the web form and the worker build their own request and call the planner with
+  neither, so the product's own boundary and its own 8,000,000 cells are untouched.
 
 ## Pricing (the product's own estimator, nothing run)
 
-`scripts/paper1_nanowire.py --estimate`, the CW check (993 nm, 100 periods) and the ring-down
-locator (1000 nm ± 100 nm, 30 tail periods). Both asked rungs — dx 10 nm with the Orin's own
-pad of 600 nm — are **9,166,668 cells: over `fdtd.MAX_CELLS = 8,000,000` by 1,166,668
-(14.6 %)**, so neither can be launched as things stand, with or without the bench flags: the
-two bench knobs raise steps and seconds only (`fdtd.check_limits(max_steps, max_seconds)` in
-`dockerfiles/maxwell_solver/fdtd.py`; the cell branch reads the module constant inline).
+`scripts/paper1_nanowire.py --estimate`, both records at dx 10 nm with the open boundary held
+at r20's own distance: 320 nm of pad and 200 nm of absorber, which is the product's own 16/10
+cells at dx 20 and reproduces r20's grid exactly — the same 2318.8 × 2318.8 × 2177.0 nm box.
 
-The tables and the derived Orin-rate seconds are in `tasks.md`. The nearest rung that fits
-today is dx 12 nm at the same 600 nm pad: 6,397,264 cells, 39,650 steps, 0.79 GiB, 6,221.5 s
-at the table's own rate.
+Holding the boundary is what attached the number to a run. `fdtd_layout.OPEN_PAD_CELLS` is a
+cell COUNT, so the product's pad is 320 nm at dx 20 and 160 nm at dx 10: a dx-10 record on the
+defaults moves the boundary at the same time as the grid, and no difference from r20 could then
+be attributed to either one (this scene's own record: 200 nm against 400 nm of pad moved F by
+16 %). Held, the CW check is **14,048,300 cells, 39,650 steps, 1.63 GiB, 13,662.4 s** at the
+estimator's own rate, i.e. 17,925 s (4 h 58 m) at the Orin's measured factor 1.312; the
+ring-down locator is the same grid with a shorter record — 21,918 steps (its own 1000 nm
+centre), 7,552.4 s = 9,909 s (2 h 45 m).
+
+14,048,300 cells is over `fdtd.MAX_CELLS = 8,000,000` by 6,048,300 (75.6 %), so the record needs
+a third bench ceiling — `--max-cells`, which the lead authorised on 2026-10-16 and this change
+adds — rather than the rung the first pricing offered: at the held boundary dx 12 nm is
+8,952,300 cells and still over the cap, and the nearest rung that fits is dx 15 nm (5,234,775
+cells, 5,091.0 s = 6,679 s on the Orin).
+
+The tables and the derived Orin-rate seconds are in `tasks.md`.
 
 ## What this change does not do
 
-- It does not raise the product's cell ceiling. A third bench knob (`--max-cells`, threaded
-  like the other two, with the product path still bare) is **proposed** in `tasks.md` and left
-  for the lead's word: it is a reviewed code change, not a silent one.
+- It does not raise the product's cell ceiling. `--max-cells` is a third bench knob, threaded
+  exactly like `--max-steps` and `--max-seconds`: read only from this script's own parser, with
+  `fdtd.MAX_CELLS` and every product caller's bare `fdtd.check_limits(...)` unchanged.
 - It runs nothing on the cluster and pushes nothing: the Job is a manifest, and the image is
   built and smoke-tested on the VM only.
 - It touches no product code, no DAG, no web app and no database.
 
 ## Impact
 
-Two new files. The Job occupies the namespace's single Job slot under the `mse-power-cap`
-ResourceQuota (1 Job) for up to its deadline, so it is launched when no owner upload is
-solving.
+Two new files, plus the three bench flags above. The Job occupies the namespace's single Job
+slot under the `mse-power-cap` ResourceQuota (1 Job) for up to its deadline, so it is launched
+when no owner upload is solving.
