@@ -70,13 +70,18 @@ def test_the_tiny_scene_holds_every_control():
     assert done.returncode == 0, done.stdout + done.stderr
     assert "tiny: all controls hold" in done.stdout
     assert "FAIL" not in done.stdout
-    # 18 controls: a scene that quietly loses one still has to be caught here. The
+    # 19 controls: a scene that quietly loses one still has to be caught here. The
     # three past 15 are the fit's window following the drive's band (2e), the saved
     # tail re-fitting to the line it came from (2f), and an unwritable tail path
-    # raising the one exception the arm catches (2h).
-    assert done.stdout.count("\n  ok   ") == 18, done.stdout
+    # raising the one exception the arm catches (2h); the fourth is --save-tail
+    # refused on the arms that have no tail to write (2i).
+    assert done.stdout.count("\n  ok   ") == 19, done.stdout
     # and the settled record the small scene runs must not warn about itself
     assert "warning: the record is" not in done.stdout
+    # the step loop reports itself, so a run the bench kills leaves more than its
+    # plan behind: the step it reached, the seconds, and the rate it was given
+    assert re.search(r"^progress  step 1,000 of [\d,]+,\s+[\d.]+ s,"
+                     r"\s+[\d.]+ Mcell-steps/s$", done.stdout, re.M), done.stdout
 
 
 def test_the_tiny_scene_reads_one_across_the_band_in_vacuum():
@@ -323,6 +328,63 @@ def test_the_unresolved_outcome_is_reported_with_its_bound(capsys):
         m.fit_decay = real
     edge = capsys.readouterr().out
     assert "AT THE EDGE" in edge, edge
+
+
+def test_the_progress_line_survives_a_killed_run(tmp_path):
+    """Why the line exists: rung 6 hit the bench's cap and left only its plan.
+
+    The child here runs 3,000 steps with stdout on a file -- so the interpreter
+    block-buffers it, which is what the tier-2 runner does -- and leaves through
+    its own check hook with ``os._exit``: no flush, no atexit, nothing. That is
+    the kill the bench delivered, minus the 30 minutes. The lines for steps 1,000
+    and 2,000 have to be in the file anyway, which they are only if the loop
+    flushed them itself.
+    """
+    program = tmp_path / "progress_probe.py"
+    program.write_text(
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(ROOT / 'dockerfiles' / 'maxwell_solver')!r})\n"
+        "import numpy as np, fdtd\n"
+        "def stop(step):\n"
+        "    if step >= 2048:\n"
+        "        os._exit(9)\n"
+        "eps = np.ones((12, 11, 11), np.float32)\n"
+        "src = fdtd.Source((6, 5, 5), frequency=3e14, bandwidth=1e14,"
+        " component='z')\n"
+        "fdtd.simulate(eps, src, 3000, probes=[(7, 5, 5, 'z')],\n"
+        "              spacings=(20e-9,) * 3, boundary='metal', check=stop)\n")
+    log = tmp_path / "run.log"
+    with log.open("w") as handle:
+        done = subprocess.run([sys.executable, str(program)], stdout=handle,
+                              stderr=subprocess.STDOUT, cwd=ROOT, timeout=300)
+    assert done.returncode == 9, done.returncode
+    text = log.read_text()
+    # the two lines the run had reached, with the rate it was actually given --
+    # 1452 cells over the loop's own seconds, so the number is the machine's
+    lines = re.findall(r"^progress  step ([\d,]+) of 3,000,\s+([\d.]+) s,"
+                       r"\s+([\d.]+) Mcell-steps/s$", text, re.M)
+    assert [step for step, _, _ in lines] == ["1,000", "2,000"], text
+    for step, seconds, rate in lines:
+        cells = 12 * 11 * 11
+        assert abs(float(rate) - cells * int(step.replace(",", ""))
+                   / float(seconds) / 1e6) < 0.1, lines
+
+
+def test_save_tail_without_the_tail_arm_is_refused(tmp_path):
+    """2i: the flag is read in the ringdown arm and nowhere else, and it is not inert.
+
+    Both arms that have no tail to save are asked through the command line the
+    bench uses, and the tail arm is asked to keep its write -- a refusal that
+    also refused the armed run would be worse than the silence it replaces.
+    """
+    for extra in ([], ["--spectrum"]):
+        done = run("--tiny", *extra, "--save-tail", str(tmp_path / "tail"))
+        assert done.returncode == 2, done.stdout + done.stderr
+        assert "refused" in done.stdout and "--save-tail" in done.stdout, done.stdout
+    saved = tmp_path / "tail-ok"
+    done = run("--tiny", "--ringdown", "--save-tail", str(saved))
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (saved.parent / (saved.name + ".npz")).exists(), done.stdout
 
 
 if __name__ == "__main__":       # pragma: no cover

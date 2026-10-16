@@ -61,6 +61,7 @@ reports exactly zero energy from a run that is behaving perfectly.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -103,6 +104,16 @@ DEFAULT_PML_CELLS = 10
 
 #: How often ``simulate`` calls its ``check`` hook, in steps.
 CHECK_EVERY = 64
+
+
+#: How often the step loop reports itself -- step, elapsed and the rate the
+#: machine is actually giving -- in steps. A tier-2 run has a wall-clock cap,
+#: and the run that hits it is exactly the run whose output matters: without
+#: these lines a killed run leaves its plan and nothing else, so neither where
+#: it stopped nor the rate that stopped it can be recovered afterwards. The
+#: line is flushed as it is printed, so it survives the kill (a redirected
+#: stdout is block-buffered, and a buffer dies with the process).
+PROGRESS_EVERY = 1000
 
 #: The field movie's caps (proposal: at most 64 samples per axis, at most 60
 #: frames by default and 120 at most). A frame is then at most 1 MiB of float32.
@@ -2639,7 +2650,15 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             Ex[:, :, -1] = 0.0
             Ey[:, :, -1] = 0.0
 
+    progress_start = time.perf_counter()
+    n_cells = int(np.prod(shape))
     for step in range(n_steps):
+        if step and step % PROGRESS_EVERY == 0:
+            progress_seconds = time.perf_counter() - progress_start
+            print(f"progress  step {step:,} of {n_steps:,},"
+                  f" {progress_seconds:,.1f} s,"
+                  f" {n_cells * step / progress_seconds / 1e6:,.1f}"
+                  f" Mcell-steps/s", flush=True)
         if check is not None and step % CHECK_EVERY == 0:
             check(step)
         t = step * dt
@@ -2773,6 +2792,11 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                            out=peak[component])
         if flux_array is not None:
             flux_array[step] = _flux_step(field, flux_terms, xp)
+
+    progress_seconds = time.perf_counter() - progress_start
+    print(f"progress  step {n_steps:,} of {n_steps:,}, {progress_seconds:,.1f} s,"
+          f" {n_cells * n_steps / progress_seconds / 1e6:,.1f} Mcell-steps/s"
+          f"  (done)", flush=True)
 
     if peak is not None:
         peak = {c: _host_result(values, xp) for c, values in peak.items()}

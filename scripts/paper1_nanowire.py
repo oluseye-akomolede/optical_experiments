@@ -339,6 +339,10 @@ def arm_conflicts(args) -> str:
         return (f"refused: --ringdown needs a drive-free tail of at least"
                 f" {MIN_TAIL_PERIODS:g} periods to fit a decay to, got"
                 f" {args.tail_periods:g}")
+    if args.save_tail and not args.ringdown:
+        return ("refused: --save-tail writes the pulse record the tail arm fits,"
+                " so on a non-ring-down (CW or band) run the flag is silently"
+                " ignored and the caller believes a record was written")
     return ""
 
 
@@ -933,6 +937,28 @@ def tiny(args) -> int:
                f" alone is clean",
                bool(arm_conflicts(as_band)) is False
                and bool(arm_conflicts(as_tail)) is True))
+
+    # --save-tail is read in the tail arm and nowhere else, so on any other run
+    # it would be inert: no record written, no warning, exit 0. The refusal is
+    # asked of the same function the launch asks, on both of the arms that have
+    # no tail to save, and the tail arm is asked to keep its write.
+    as_cw_save = argparse.Namespace(**{**base, "profile": "cw", "ringdown": False,
+                                       "spectrum": False, "tail_periods": 0.0,
+                                       "save_tail": "logs/tail"})
+    as_band_save = argparse.Namespace(**{**base, "profile": "pulse",
+                                         "ringdown": False, "spectrum": True,
+                                         "tail_periods": 0.0,
+                                         "save_tail": "logs/tail"})
+    as_tail_save = argparse.Namespace(**{**base, "profile": "pulse",
+                                         "ringdown": True, "spectrum": False,
+                                         "tail_periods": 20.0,
+                                         "save_tail": "logs/tail"})
+    ok.append(("--save-tail without the tail arm is refused"
+               f" ({arm_conflicts(as_cw_save)[:40] or 'NOTHING'}), on the CW and"
+               " the band arm alike, and the tail arm keeps its write",
+               "--save-tail" in arm_conflicts(as_cw_save)
+               and "--save-tail" in arm_conflicts(as_band_save)
+               and arm_conflicts(as_tail_save) == ""))
 
     z = np.asarray(lay["nodes"][2])
     oxide = _oxide_slice(z, geom)
