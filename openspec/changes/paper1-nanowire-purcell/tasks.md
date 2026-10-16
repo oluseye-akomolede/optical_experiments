@@ -429,6 +429,12 @@ linewidth is not.
       estimate here as 1.30x optimistic. **Rung 8** -- CW, paper, dx 20, pad 600, at the
       fitted 986.7 nm: 144 x 144 x 138 = 2,861,568 cells, dt 8.357141e-18 s, 12,603 steps =
       32.0 periods, 884.6 s estimated, **1,165.6 s wall = 1.32x**, **F = 3.2419**.
+      **Rung 9** -- the same point 10 nm down-band, CW at 976.7 nm, same mesh class:
+      144 x 144 x 138 = 2,861,568 cells, dt 8.362267e-18 s, 12,468 steps = 32.0 periods,
+      875.1 s estimated, **1,152.4 s wall = 1.32x**, **F = 1.6687**, and no NvMap line at all
+      (rung 8's log had 18). The two points are 10 nm apart in wavelength and a factor 1.94
+      apart in F, which is one sharp line rather than a broad one -- but both are *40 nm* runs
+      (see 3d) and neither stands beside the paper's 17.
 - [ ] The two-point pad sweep is a rule applied, not a convergence proved: run 3b (pad 600,
       CW at 900 nm, about 16 min) is the run that would prove it. It is held back rather than
       spent, because the CW point at the fitted wavelength (also pad 600) may already supply
@@ -475,6 +481,52 @@ linewidth is not.
       why the flag has to be stated, not inherited, in the arm namespaces the controls
       build: a live `--save-tail` made the band arm read dirty and the run failed its own
       controls (measured: exit 1 as committed at 3a183d9, exit 0 after the fix).
+
+## 3d. The emitter's depth is geometry, not resolution (2j)
+
+- [x] **The mesh was moving the emitter, and nothing said so.** The source is snapped to the
+      nearest node (`fdtd_grid._locate`), so the depth below the facet is a property of the
+      node list, not of `--qd-below`. Read off the runs' own `dipole` lines: **rung 8**, dx 20,
+      asked 30 nm -- node (71, 71, 119) at z 1497.01 nm, **39.99 nm** below the facet at
+      1537.00 nm (so its F = 3.2419 is a *40 nm* run and does not stand beside the paper's 17);
+      **rung 7**, dx 30, the same request -- 29.89 nm. The same 10.10 nm shift sits in rungs
+      1 and 2 (dx 20, pad 400, also 39.99), so every 900 nm reading in section 3b is a 40 nm
+      one. Two depths are two geometries: a dipole 10 nm further into a 1375 nm wire with a
+      facet 40 nm above it is a different Purcell factor, and the difference between two dx
+      values had been read as resolution.
+- [x] **The fix** (this step's own sha). `fdtd_layout.plan` takes `request["pin_source_z"]`
+      (default false) and, when it is set for a point source, adds the source's own z to the
+      z axis' lines before `build_grid`, so the axis' own node is the depth asked for. The
+      in-plane axes are left alone on purpose: x and y are uniform at `dx` for every part
+      here, so a line there would grade an axis that is not graded today (the dipole is also
+      9.89 nm and 9.87 nm off the wire's axis at dx 20, which is the same class of defect and
+      is **not** fixed here -- on a uniform axis it costs a graded axis, not a node, and that
+      is a second decision). `paper1_nanowire.py` sets the key on the one request all three
+      arms share, so the pulse, band and CW arms are pinned alike.
+- [x] **The refusal is the load-bearing half.** `build_grid` drops a line that lands outside
+      the extent or within `LINE_SNAP` of an edge, and the source is then snapped anyway with
+      nothing printed -- a silent geometry change, which is worse than a failed run. So
+      `refusals` now takes the plan and refuses when the realised depth is more than 1 nm from
+      `--qd-below`, naming the realised depth, the request and the difference; it is the same
+      function at both entry points (`--tiny` and the bench run), so tier 1 cannot pass a
+      scene the bench would refuse. The realised depth has one reader, `emitter_depth_nm`,
+      used by both the `dipole` line and the refusal, so the two cannot drift.
+- [x] **Controls** (tier 1, `--tiny`: 19 controls at 2i, **21 at 2j** -- the count is that
+      revision's own assertion, `done.stdout.count("\n  ok   ")`). One plans two scenes at
+      dx 20 and dx 30 **with and without the pin**: the control's own (`--qd-below 60`, where
+      the un-pinned depth is **57.11 nm at both dx**, read off the pre-pin run's own `dipole`
+      line in `tiny_2i.log` as well as off the plan) and the paper's, built by the parser's
+      own defaults rather than by a retyped copy (`--qd-below 30`: 39.99 nm at dx 20, 29.89 at
+      dx 30). The un-pinned column is not decoration -- an equality against the pinned plan
+      alone would pass with the pin inert on any mesh whose nodes land on the request, and the
+      paper's dx-30 mesh is 0.11 nm off, i.e. it would pass by luck. The assertion is that each
+      scene has at least one dx past the 1 nm tolerance, and the message marks which readings
+      are. The second control drives `refusals` with a plan whose depth is out of tolerance
+      (the control's own scene, un-pinned) requiring the refusal to name the realised depth,
+      the request and the difference, and with the run's own plan, requiring that call to pass.
+      `test_the_tiny_scene_holds_every_control` also now pins the printed depth at the 0.01 nm
+      the line prints (`< 0.005`, where it was only within one finest cell before): the
+      predicate that let the defect through is the one that would have let the fix through.
 
 ## Deferred by the lead, recorded here so it is not dropped
 

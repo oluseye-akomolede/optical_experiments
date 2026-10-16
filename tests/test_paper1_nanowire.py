@@ -70,12 +70,14 @@ def test_the_tiny_scene_holds_every_control():
     assert done.returncode == 0, done.stdout + done.stderr
     assert "tiny: all controls hold" in done.stdout
     assert "FAIL" not in done.stdout
-    # 19 controls: a scene that quietly loses one still has to be caught here. The
+    # 21 controls: a scene that quietly loses one still has to be caught here. The
     # three past 15 are the fit's window following the drive's band (2e), the saved
     # tail re-fitting to the line it came from (2f), and an unwritable tail path
     # raising the one exception the arm catches (2h); the fourth is --save-tail
-    # refused on the arms that have no tail to write (2i).
-    assert done.stdout.count("\n  ok   ") == 19, done.stdout
+    # refused on the arms that have no tail to write (2i); the last two are the
+    # emitter's own z being a node at two dx values, and the refusal that fires
+    # when a mesh does not put it there (2j).
+    assert done.stdout.count("\n  ok   ") == 21, done.stdout
     # and the settled record the small scene runs must not warn about itself
     assert "warning: the record is" not in done.stdout
     # the step loop reports itself, so a run the bench kills leaves more than its
@@ -102,21 +104,26 @@ def test_the_tiny_scene_reads_one_across_the_band_in_vacuum():
     # the reading and its own prediction, both on the record of the run
     assert re.search(r"^run\s+\d+\.\d s wall\s+\(\d+\.\d\d x the"
                      r" \d+\.\d s estimate\)$", done.stdout, re.M), done.stdout
-    # the dipole line says where the node is and what was asked for it, so the
-    # gap between them is a quantisation and must be inside one finest cell
+    # the dipole line says where the node is and what was asked for it
     dipole = re.search(r"^dipole\s+node \((\d+), (\d+), (\d+)\): z\s+([\d.]+) nm,"
                        r"\s+([\d.]+) nm below the top facet at ([\d.]+) nm"
                        r"\s+\(--qd-below (\S+) asked\); in plane\s+([+\-][\d.]+),"
                        r"\s+([+\-][\d.]+) nm off the wire's axis, (\w)-polarised$",
                        done.stdout, re.M)
     assert dipole, done.stdout
-    finest = float(re.search(r"z ([\d.]+) nm finest", done.stdout).group(1))
     node_z, depth, top = (float(dipole.group(4)), float(dipole.group(5)),
                           float(dipole.group(6)))
     # the line's own arithmetic: the printed depth is the two printed z values
     assert abs((top - node_z) - depth) < 1e-9, done.stdout
-    # and the node it picked is within one finest cell of the depth asked for
-    assert abs(depth - float(dipole.group(7))) <= finest, done.stdout
+    # 2j pins the source's own z as a grid node, so the printed depth is not
+    # merely inside a cell of the request, as it was while this read only
+    # "within one finest cell". At the 2i revision this same line read 57.11 nm
+    # against the 60 nm asked (node (31, 31, 34), its own log): 2.89 nm, inside
+    # that grid's 6.218 nm finest cell, so the weak rule passed it -- and 2.89 nm
+    # outside the 0.005 below, so this one fails it. Group(7) is the
+    # `--qd-below` field the line itself prints, so the two numbers compared
+    # are the line's own rather than a 60 retyped here.
+    assert abs(depth - float(dipole.group(7))) < 0.005, done.stdout
 
 
 def test_every_rung_over_the_cap_is_reported_not_skipped():

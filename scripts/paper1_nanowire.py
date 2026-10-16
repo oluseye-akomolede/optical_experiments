@@ -126,6 +126,7 @@ MIN_TAIL_PERIODS = 6.0  # a decay needs at least this many periods to be fitted
 TAU_EDGE = 20.0         # the fit's own tau grid reaches this far in windows
 UNRESOLVED = 3          # measured, but the record's tail leaves Q unpinned
 DEFAULT_TAIL_PERIODS = 20.0   # asked for only by --ringdown
+QD_DEPTH_TOL_NM = 1.0   # how far the emitter's realised depth may sit from --qd-below
 
 
 def paper_clock(args, request):
@@ -222,6 +223,10 @@ def scene(args):
         "bandwidth": None, "polarisation": args.axis,
         "samples": None, "sample_duration_s": None,
         "duration_s": 1e-15, "coatings": None,
+        # --qd-below is the paper's geometry, so the emitter's own z is pinned
+        # as a grid node (see ``fdtd_layout.plan``) and the realised depth is
+        # refused, not reported, when the mesh cannot put it there.
+        "pin_source_z": True,
     }
     request["frequency_hz"] = C / (args.wavelength * NM)
     request["bandwidth"] = band_hz(args)
@@ -288,7 +293,19 @@ def filled(args, lay, request):
             "dlambda_nm": dlambda}
 
 
-def refusals(args, measured) -> str:
+def emitter_depth_nm(lay, geom) -> float:
+    """How far below the top facet the source node really sits, in nm.
+
+    One function because two readers ask it: the report prints this depth, and
+    ``refusals`` measures the run against it. Read off the layout's own node
+    list and source cell, so neither reader can retype the expression and drift
+    from the plan they are describing.
+    """
+    z = np.asarray(lay["nodes"][2])
+    return float((geom["z_top"] - z[int(lay["cell"][2])]) / NM)
+
+
+def refusals(args, measured, lay=None, geom=None) -> str:
     """The refusal both entry points owe before anything runs.
 
     Returns the refusal line, or "" when the run may go ahead. It is one
@@ -299,9 +316,27 @@ def refusals(args, measured) -> str:
     it (``fdtd.MAX_SECONDS`` is the same 30 minutes), so a run over the timeout
     is already ``measured["exceeded"]``. That equality is itself a control --
     see ``tiny``, which fails if someone moves one clock without the other.
+
+    With a layout in hand it also refuses a source that is not at the depth
+    that was asked for. The z line is pinned (``fdtd_layout.plan``'s
+    ``pin_source_z``), but ``graded_axis`` drops a line that lands out of range
+    or within ``LINE_SNAP`` of the extent's edges, and then the source is
+    silently snapped to the nearest node: a run of a different geometry than
+    the one asked for, which is worse than a refusal because nothing downstream
+    can see it. Measured on this scene before the pin: 39.99 nm at dx 20 and
+    29.89 nm at dx 30 for a requested 30.
     """
     if measured["exceeded"]:
         return f"refused: {measured['exceeded']}"
+    if lay is not None and geom is not None:
+        depth = emitter_depth_nm(lay, geom)
+        out = abs(depth - float(args.qd_below))
+        if out > QD_DEPTH_TOL_NM:
+            return (f"refused: the emitter sits {depth:.2f} nm below the top facet"
+                    f" where --qd-below {args.qd_below:g} was asked, {out:.2f} nm"
+                    f" out (tolerance {QD_DEPTH_TOL_NM:g} nm): the source is"
+                    f" snapped to the nearest grid node, so this run is a"
+                    f" different geometry and not a coarser one")
     return ""
 
 
@@ -681,7 +716,7 @@ def report(args, lay, request, geom, measured):
     cell = lay["cell"]
     x, y = np.asarray(lay["nodes"][0]), np.asarray(lay["nodes"][1])
     print(f"dipole    node ({cell[0]}, {cell[1]}, {cell[2]}): z"
-          f" {z[cell[2]] / NM:.2f} nm, {(geom['z_top'] - z[cell[2]]) / NM:.2f} nm"
+          f" {z[cell[2]] / NM:.2f} nm, {emitter_depth_nm(lay, geom):.2f} nm"
           f" below the top facet at {geom['z_top'] / NM:.2f} nm"
           f" (--qd-below {args.qd_below:g} asked); in plane"
           f" {(x[cell[0]] - geom['half']) / NM:+.2f},"
@@ -847,7 +882,7 @@ def tiny(args) -> int:
     code = report(real, lay, request, geom, measured)      # the run's own block
     if code:                                    # the pml guard, not a cap
         return code
-    why = refusals(real, measured)
+    why = refusals(real, measured, lay, geom)
     if why:
         print(why)
         return 2
@@ -1006,6 +1041,75 @@ def tiny(args) -> int:
                f" {real.pml * real.dx:.0f} nm)",
                float(z[cell[2]] - z[0]) > real.pml * real.dx * NM
                and float(z[-1] - z[cell[2]]) > real.pml * real.dx * NM))
+
+    # --qd-below is the paper's geometry, and the source is snapped to the
+    # nearest node unless its own z is a node, so a mesh change MOVES it. The
+    # control plans two scenes -- this control's own, and the paper's as its
+    # parser's own defaults build it rather than as a retyped copy -- at two dx
+    # values, with and without the pin. Both columns are the point: an equality
+    # against the pinned plan alone passes with the pin inert on any mesh whose
+    # nodes happen to land on the request, and the depth the bench runs actually
+    # got is the un-pinned one -- 39.99 nm at dx 20 and 29.89 at dx 30 for the
+    # paper's 30, read off rung 8's own `dipole` line, which is how this was
+    # found. One pitch is one dx, so the two dx values are the control.
+    rows = []
+    for label, ns in (("tiny", argparse.Namespace(**base)),
+                      ("paper", parse_args([]))):
+        for dx_nm in (20.0, 30.0):
+            sub = argparse.Namespace(**{**ns.__dict__, "dx": dx_nm})
+            names_s, parts_s, materials_s, req_s, geom_s = scene(sub)
+            rows.append((f"{label} dx {dx_nm:g}", float(sub.qd_below),
+                         emitter_depth_nm(fdtd_layout.plan(
+                             names_s, parts_s, req_s, length_scale=1.0,
+                             materials=materials_s), geom_s),
+                         emitter_depth_nm(fdtd_layout.plan(
+                             names_s, parts_s,
+                             {k: v for k, v in req_s.items()
+                              if k != "pin_source_z"},
+                             length_scale=1.0, materials=materials_s), geom_s)))
+    slides = {}
+    for lab, want, _, snap in rows:
+        slides.setdefault(lab.split()[0], []).append(abs(snap - want))
+
+    # Built by a helper, not inline: the bench's python is 3.10, where an
+    # f-string cannot contain the quote it is itself written in -- an inline
+    # `{"*" if ...}` in this same double-quoted f-string is a SyntaxError there
+    # (PEP 701 lifted that in 3.12, which is what this VM runs), and the first
+    # version of this control was committed that way and died on the bench
+    # before a single step. Tier 1 runs the VM's python, so it cannot see it.
+    def label(lab, want, snap):
+        over = "*" if abs(snap - want) > QD_DEPTH_TOL_NM else ""
+        return f"{lab} {snap:.2f}{over}"
+
+    ok.append((f"the emitter's own z is a node at both dx, so every mesh puts"
+               f" it at --qd-below"
+               f" ({', '.join(f'{lab} {pin:.2f}' for lab, _, pin, _ in rows)} nm)"
+               f" where the nearest-node snap gives"
+               f" ({', '.join(label(lab, want, snap) for lab, want, _, snap in rows)}"
+               f" nm; * is more than the {QD_DEPTH_TOL_NM:g} nm the refusal allows)",
+               all(abs(pin - want) <= 1e-6 for _, want, pin, _ in rows)
+               and all(any(off > QD_DEPTH_TOL_NM for off in v)
+                       for v in slides.values())))
+
+    # The pin can be dropped -- a line out of range, or within LINE_SNAP of an
+    # extent edge -- and then the source is snapped to the nearest node with
+    # nothing said. So the refusal is asked of the same function the launch
+    # calls, with a plan whose depth IS out of tolerance (the un-pinned plan
+    # this scene produces) and with the run's own plan: the first has to be
+    # refused, naming the depth it realised, and the second has to pass.
+    names_s, parts_s, materials_s, req_s, geom_s = scene(
+        argparse.Namespace(**{**base, "dx": 20.0}))
+    off = refusals(argparse.Namespace(**{**base, "dx": 20.0}),
+                   {"exceeded": None},
+                   fdtd_layout.plan(names_s, parts_s,
+                                    {k: v for k, v in req_s.items()
+                                     if k != "pin_source_z"},
+                                    length_scale=1.0, materials=materials_s),
+                   geom_s)
+    ok.append((f"a mesh that does not put the emitter at --qd-below is refused"
+               f" ({off[:70] or 'NOTHING'})",
+               f"{float(base['qd_below']):g}" in off and "nm out" in off
+               and refusals(real, measured, lay, geom) == ""))
 
     vac = argparse.Namespace(**{**base, "vacuum": True})
     lay_v, request_v, geom_v = solve_scene(vac)
@@ -1191,7 +1295,7 @@ def main(argv=None) -> int:
     code = report(args, lay, request, geom, measured)
     if code:
         return code
-    why = refusals(args, measured)
+    why = refusals(args, measured, lay, geom)
     if why:
         print(why)
         return 2
