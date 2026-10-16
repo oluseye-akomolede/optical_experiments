@@ -338,9 +338,19 @@ contradict.
   `/tmp/mse-price-numpy.log`'s header describes the same cupy attempt in earlier wording; that
   file is deliberately left byte for byte as it was, so the 3-against-8 header counts above stay
   true.
-- Not observed, and not claimed: the `caps` line's `(bench ceiling: …, …, N cells)` clause
-  prints only on a real run (`paper1_nanowire.py:930`), and no real run is affordable here — the
-  reviewer said the same. It is read from the source and asserted by tier-1, no more.
+- Corrected, and this revision's own capture is what corrected it. This bullet said the `caps`
+  line's `(bench ceiling: …, …, N cells)` clause "prints only on a real run" (`:930`) and was
+  therefore unobserved here. Both halves are wrong. The clause is gated on `raised` — the run's
+  limits were raised above the product's (`paper1_nanowire.py:923-925`) — not on a solve
+  completing, and it prints on any path that reaches `report()` (`:930-933`). It is observed
+  three bullets above: `/tmp/mse-runarm-cupy-verbatim.log:18` and `/tmp/mse-runarm-cupy.log:20`
+  both read `caps      OK (bench ceiling: 200,000 steps, 300 min, 15,000,000 cells)`. The `OK`
+  is estimator-side (`measured["exceeded"]`, `:374-378`, measured against `run_limits(args)`), so
+  no solve can change it; what no capture here shows is a path that reaches `report()` and then
+  finishes its solve — both captures die at `measure()`'s `_run` call (`:991`). The other half,
+  "no real run is affordable here", is the reviewer's own correction: no *completed* run is
+  affordable here. Fourth instance in this change of a claim whose evidence moved after it was
+  written, which is why it is worth the lines.
 - Tier-1 for this revision: the two files hold 54 tests and all 54 pass, in two complementary
   selections (`-k "ceiling or boundary or holds or nearest or estimator or prices or hand"` →
   17 passed / 37 deselected; its exact negation → 37 passed / 17 deselected), so the union is the
