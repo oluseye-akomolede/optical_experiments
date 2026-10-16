@@ -394,27 +394,50 @@ contradict.
   in this image's build log it prints `headers ok at /usr/local/cuda/include -- cupy 14.2.0`, and
   the same body re-run against the **built** image prints the same line. The build's other proof,
   from before, still prints `closure ok, cupy 14.2.0`.
-- **Size change** (the lead asked for it stated): the image is now 4,864,242,905 bytes against
-  f856bbf's 4,742,903,335 — **+121 MB**, docker's `4.74 GB → 4.86 GB`. The two alternatives the
-  row named: a whole `-devel` base (measured locally at 11,471,517,149 bytes, against the
-  `-runtime` base's 3,933,593,520) would put the image near **12.4 GB**; the `cupy-cuda12x[ctk]`
-  extra would install a second, version-drifting copy of the toolkit through pip. Borrowing the
-  two trees costs the 88.8 MB the JIT actually needs.
-- **Smoke of the BUILT image**, `docker run --rm --cpus=2 --memory=2g`, no GPU on this host:
+- **Size change** (the lead asked for it stated): the tagged image is 4,864,242,354 bytes
+  (`.Id` `sha256:d40e87780f62…`) against f856bbf's 4,742,903,335 — **+121 MB**, docker's
+  `4.74 GB → 4.86 GB`. The two alternatives the row named: a whole `-devel` base (measured
+  locally at 11,471,517,149 bytes, against the `-runtime` base's 3,933,593,520) would put the
+  image near **12.4 GB**; the `cupy-cuda12x[ctk]` extra would install a second, version-drifting
+  copy of the toolkit through pip. Borrowing the two trees costs the 88.8 MB the JIT needs.
+- **Two images, one recipe** — the probe image (built first, `.Id` `sha256:3fd8d7dbbc3e…`,
+  4,864,242,905 bytes) and the tagged rebuild (`.Id` `sha256:d40e87780f62…`, 4,864,242,354) are
+  **not** byte-identical, and no rebuild from a network install can be: the shared build cache no
+  longer held the earlier layers, so the rebuild re-ran **every** step (the pip layer took 77.3 s
+  re-downloading its pinned wheels — `numpy==2.2.6`, `scipy==1.15.3`, `trimesh==5.1.0`,
+  `cupy-cuda12x==14.2.0`, so new mtimes and wheel metadata in the tar, hence new layer digests).
+  What is identical, measured: the instruction list (`docker history --no-trunc`'s per-layer
+  sizes match line for line), every pinned version, the runtime `Env`/`User`/`Entrypoint`, and
+  the seven copied source files (md5 for md5, checked in the *tagged* image, in the probe image,
+  and against the worktree). The delivered tag is the image the committed Dockerfile built, and
+  the checks below were re-run on it; the probe's pricing numbers are properties of the source,
+  which is the same seven files.
+- **Smoke of the BUILT images** (`docker run --rm --cpus=2 --memory=2g`, no GPU on this host) — run
+  on **both**, because as the bullet above says the tag's bytes are not the probe's:
   `--entrypoint python3` → `python 3.12.3 numpy 2.2.6 scipy 1.15.3 trimesh 5.1.0 cupy 14.2.0
-  uid 10001`; `--help` lists `--max-cells`, `--max-steps`, `--pad-nm`, `--pml-nm`,
-  `--tail-periods`; `--tiny --xp numpy` → `boundary  open: pad 16 cells = 320 nm, absorber 6 cells
-  = 120 nm, 200 nm of open space (both at the product defaults)` and `tiny: all controls hold`.
-- **The seven payload files are the same bytes as f856bbf's image**, md5 for md5 (md5sum run in
-  both containers), and `git diff --name-only f856bbf` lists nothing under the `COPY` lines — so
-  this image's solver is f856bbf's solver and only the recipe and the borrowed base files differ.
+  uid 10001`, `cuda-pathfinder 1.8.3`; the header check re-run with its verbatim body → `headers ok
+  at /usr/local/cuda/include -- cupy 14.2.0`, exit 0; `--help` lists `--max-cells`, `--max-steps`,
+  `--pad-nm`, `--pml-nm`, `--tail-periods`, `--xp`, `--estimate`, `--tiny`; `--tiny --xp numpy` →
+  `boundary  open: pad 16 cells = 320 nm, absorber 6 cells = 120 nm, 200 nm of open space (both at
+  the product defaults)` and `tiny: all controls hold`. **The seven payload files are the same
+  bytes in the tagged image, in the probe image and in the worktree** — the `md5sum` of the seven,
+  concatenated, is `f8e0405a51f81b531c4406e7765fb609` in all three — so the two images differ in
+  their recipe layers, not in the solver, and `git diff --name-only f856bbf` lists nothing under
+  the `COPY` lines.
 - **The tag**: `dockerfiles/maxwell_solver/Dockerfile.bench-cuda` changes the recipe, so the image
-  is rebuilt and retagged to the sha of the commit that carries it, and the commit after that one
-  points `manifests/bench/paper1-a4000-job.yaml` at that tag (the sha is on the row and in the
-  handoff to the reviewer). The superseded `:f856bbf` **tag** is
-  removed from the local store as the row asks; the image itself is left untagged under its ID
-  `sha256:7b12e059a9ab…` (4.74 GB) until the lead has pushed and verified the new tag, so the red
-  stays reproducible here; it goes when the lead says so.
+  is rebuilt and retagged to the sha of the commit that carries it —
+  `harbor.arcadia-ecs.local/mode-search-engine/paper1-bench-cuda:37f8d32` — and the commit after
+  that one points `manifests/bench/paper1-a4000-job.yaml` at that tag. The superseded image goes
+  from the local store entirely, tag and all, as the row asks, and the probe image
+  `paper1-bench-cuda:headertest` (`sha256:3fd8d7dbbc3e…`) with it. Reproducing the red needs
+  neither: the output is kept at `/tmp/mse-headerfix-red.log` (the check's verbatim body against
+  the old id `sha256:7b12e059a9ab…`, size 4,742,903,335, `AssertionError: cuda-pathfinder found no
+  CUDA header directory`, `rc=1`), and the old image rebuilds from git in one command —
+  `git show f856bbf:dockerfiles/maxwell_solver/Dockerfile.bench-cuda > /tmp/old.Dockerfile &&
+  docker build -f /tmp/old.Dockerfile -t paper1-bench-cuda:f856bbf .` — because that Dockerfile and
+  the seven sources it copies are both in the history. The independent half of the same claim is
+  one stock pull: `docker run --rm --entrypoint sh nvidia/cuda:12.6.3-runtime-ubuntu24.04 -c 'ls -A
+  /usr/local/cuda/include'` shows only `nvToolsExt.h`.
 - **What is NOT proven by the builder**: no GPU kernel has run against this image — this host has
   no GPU, so a kernel Job is not available to this seat. The build check turns on the headers
   alone by construction. The end-to-end proof is the lead's own one-minute kernel smoke on

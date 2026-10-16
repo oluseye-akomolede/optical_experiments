@@ -93,11 +93,14 @@ spec:
         nvidia.com/gpu.product: NVIDIA-RTX-A4000
       containers:
         - name: bench
-          # The tag is the revision the image was built FROM: it carries Dockerfile.bench-cuda
-          # unchanged and adds --max-cells, --pad-nm and --pml-nm, the flags the args below
-          # pass, and the image was built from that tree and smoke-tested there. Push it under
-          # this tag and the reference is the revision, verifiable by rebuilding it.
-          image: harbor.arcadia-ecs.local/mode-search-engine/paper1-bench-cuda:f856bbf
+          # The tag is the revision the image was built FROM: this one carries the header fix
+          # in Dockerfile.bench-cuda (the same release's -devel stage copied onto the -runtime
+          # base: nvrtc has no headers there) plus the --max-cells / --pad-nm / --pml-nm flags
+          # the args below pass. The image was built from that tree and smoke-tested there, and
+          # the tag's revision is verifiable by rebuilding it. The superseded tag, :f856bbf, is
+          # NOT merely older: its image died on the locator's FIRST GPU kernel, in cupy's JIT,
+          # because of exactly those missing headers (tasks.md, "The header fix").
+          image: harbor.arcadia-ecs.local/mode-search-engine/paper1-bench-cuda:37f8d32
           args:
             - --hex
             - paper
