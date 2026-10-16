@@ -50,3 +50,17 @@ Tier 1 only: every test is a closed-form synthetic record, a few seconds,
       green on the rebased branch; no image smoke test (nothing in an image
       changes); no e2e job
 - [x] `openspec validate resonance-extraction --strict`
+
+## 4. Archive prep: the NaN requirement (2026-10-16, row 5dd42c5e)
+
+- [x] "Error bars SHALL bound the error" is scoped to the modes and
+      parameters the record determines, and names the requirement
+      `cramer-rao-singular-fisher` adds to this capability for the rest.
+      Unscoped, the two merged as a contradiction (reviewer N3, row
+      30a2e1a6): a bar cannot both bound an error and be NaN. Spec text
+      only -- the bars the code produces are the ones the two requirements
+      now agree on.
+- [x] `openspec validate --all` 17 passed, and a dry archive of this change
+      then `cramer-rao-singular-fisher` in a scratch worktree leaves
+      `openspec/specs/resonance-extraction/spec.md` holding both
+      requirements with no contradiction between them.

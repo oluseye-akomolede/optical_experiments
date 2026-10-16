@@ -50,7 +50,12 @@ n, real=True)` SHALL rebuild the fit. Source:
 `error` SHALL carry `error_sigma` (default 3) standard deviations of the
 Cramér-Rao bound on `f`, `Q` and `|amplitude|` for the full multi-mode
 model, at the maximum-likelihood fit (`polish=True`), with the noise
-variance read from the window periodogram of the residual. Source:
+variance read from the window periodogram of the residual. The bound SHALL
+hold for every mode and parameter the record determines; where a parameter
+lies along a direction the record does not determine there is no bound to
+report, this requirement states none for it, and what is reported instead
+is the NaN bar of "A bar the record does not determine SHALL be NaN, never
+a number". Source:
 `cramer_rao`, `polish`, `_noise_variance` in
 `dockerfiles/maxwell_solver/resonances.py`.
 
