@@ -399,6 +399,44 @@ def test_a_degenerate_covariance_is_reported_not_rounded_to_zero(capsys):
     assert "three-sigma floor" in out and "Q >" not in out, out
 
 
+def test_a_positive_error_below_its_own_parameter_is_the_pinv_too():
+    """The other shape of the same thing: a positive diagonal, and no error.
+
+    The clamp this arm was written against caught a non-positive diagonal. Run A
+    (2026-10-16, the corners wire at 898.3 nm, tau at the fit grid's top) came
+    back with both errors positive and neither one a number -- 4.1e-65 THz
+    beside a 333.7 THz centre, 6.3e-14 fs beside a 2033 fs decay, eighteen
+    orders below their own values. A `<= 0` test passes both, and the
+    three-sigma test then reads the pinv's noise as a resolved mode.
+
+    Two fixtures, because the floor has to drop one shape and keep the other. A
+    noiseless decaying sinusoid reproduces it: the residual is at the machine's
+    own floor, so sigma2 is, and the normal matrix is ill-conditioned enough
+    that the pinv answers with noise. Beside it stands the record the fitter is
+    *supposed* to measure, and the two are separated by the size of the error
+    next to its own parameter -- 6.5e-6 for the good tau against 1e-9, three
+    decades of daylight. Without that control the fix could be `return None`
+    and this test would not notice.
+    """
+    m = _load()
+    f0, dt, n = 3.331e14, 5.0e-18, 6000
+    t = np.arange(n) * dt
+    quiet = 1.0 + np.exp(-t / 1.0e-14) * np.cos(2.0 * np.pi * f0 * t)
+    fit = m.fit_decay(quiet, dt, 0, frequency=f0)
+    assert fit["f_err"] is None and fit["tau_err"] is None, fit
+    assert fit["q_err"] is None and not fit["resolved"], fit
+    assert m._err(fit["f_err"], 1e12) == m.UNDETERMINED
+
+    # The control: the same tail with 1e-4 of noise, which is the fixture the
+    # fitter is expected to resolve. One call keeps a tau error and drops an f
+    # error, which is the whole distinction the floor is meant to draw.
+    rng = np.random.default_rng(7)
+    got = m.fit_decay(quiet + 1.0e-4 * rng.standard_normal(n), dt, 0, frequency=f0)
+    assert got["tau_err"] is not None and got["tau_err"] / got["tau"] > 1.0e-7, got
+    assert got["resolved"], got
+    assert got["f_err"] is None, got
+
+
 def test_the_settling_line_reads_the_record_before_its_end(capsys):
     """The CW arm reads one record twice: at two thirds, and at its end.
 

@@ -614,6 +614,57 @@ linewidth is not.
       every field, so none of them reads a `None` that is not the point. The arm's readers
       outside the repo read the printed log.
 
+## 3h. The same degeneracy in its other shape: a *positive* error (the lead's item 2, 2026-10-16)
+
+- [x] **The lead's reading, measured.** Run A's fit (r18, 2026-10-16, the corners wire at
+      898.3 nm, tau at the fit grid's top) printed both errors **positive**: `f_err =
+      4.1e-65` THz beside a 333.7157 THz centre and `tau_err = 6.3e-14` fs beside a 2033.077 fs
+      decay. `<= 0` passes both, and the three-sigma test then reads the pinv's noise as a
+      resolved mode; only `at_edge` kept that run out of a false verdict.
+- [x] **The fix** (this step's own sha). `ERR_FLOOR = 1e-9`, beside `TAU_EDGE`: a parameter's
+      error is `None` when it is below that fraction of the parameter's own value, in one
+      `_sigma(k, value)` that also holds the non-positive-diagonal rule. A parameter whose value
+      is exactly zero keeps its error -- the comparison is against its own size, which is not a
+      scale to divide by.
+- [x] **The lead's other criterion -- the pinv dropping a direction -- is not usable here, and
+      the measurement is why.** `np.linalg.matrix_rank(jac.T @ jac)` at its default tolerance is
+      **1** for the noiseless decay, **1** for the noisy decay, **1** for the decay-free
+      sinusoid and **1** for the plateaued decay, and **2** for the constant tail (whose
+      smallest singular value is exactly 0) -- five fixtures, all at `dt = 5.0e-18`,
+      `n = 6000`. So it calls a tail whose `tau_err` is a real 6.5e-6 of `tau` rank 1, exactly
+      as it calls a tail with no decay in it. The reason is scale: one singular value of
+      `jac.T @ jac` carries the parameterization's units at 2.344e30 (5.865e27 plateau,
+      2.367e8 constant), the rest sit at 6.0e3, 2.5e3 and 2.4e2, and the degenerate direction
+      at 2.3e-26, so the default tolerance `sv_max * 5 * eps` = 2.60e15 swallows the four
+      directions that carry a measurement. A rank verdict would report a measurement the
+      record does make as undetermined. The separating quantity is the error beside its own
+      parameter -- 6.5e-6 kept, 7.4e-66 (that same tail's `f_err`) dropped -- with three
+      decades clear of the floor on either side. Reported back to the lead as the answer to "or
+      the pinv drops a direction", with the numbers.
+      *(The first draft of this entry said "rank 1 for every fixture" and put 2.4e2 at the top
+      of the spectrum; the spectra printed above are the correction, made the same session by
+      re-reading the matrix the pinv actually receives.)*
+- [x] **The control can fail.** `test_a_positive_error_below_its_own_parameter_is_the_pinv_too`
+      calls the real `fit_decay` on a noiseless 1e-14 s decay at the fitter's own control frame
+      (`dt = 5.0e-18`, 6,000 samples, 3.331e14 Hz) and requires all three errors `None` and
+      `resolved` false. At HEAD the red is the gate's own assertion, with the numbers in it:
+      `AssertionError: {... 'f_err': 4.325810895698449e-58, 'tau': 1.0000000001270973e-14,
+      'tau_err': 1.147398143717868e-26 ...}` / `assert (4.325810895698449e-58 is None)`,
+      1 failed, 21 deselected in 1.29 s. The damage that shape does is in the same dict: at HEAD
+      that noiseless tail came back `'resolved': True` with `q_err = 1.2007114395802098e-11`, a
+      Q the record does not determine printed as resolved to eleven digits. Green with the fix:
+      **22 passed in 1157.51 s** over the whole file. The product file was restored to its
+      committed bytes after the red and the restore was read back by md5
+      (`070e4fd4292bb14cdaaffc28eeb3520c`, both before and after).
+- [x] **The test carries its own control**, so the floor cannot be met by `return None`: the
+      same tail with 1e-4 of noise, in the same call, keeps its `tau_err` (6.5e-6 of `tau`,
+      `resolved` true) and drops its `f_err` (7.4e-66 of `f`). One call, both directions.
+- [x] **Spec delta.** The `An error the covariance does not determine...` requirement now names
+      both shapes, sets `ERR_FLOOR = 1e-9`, says in the requirement itself that the rank of
+      `J^T J` is not the criterion and why, and carries two new scenarios (the positive
+      machine-zero fit with its red numbers, and the rank measurement across all five tails).
+      `openspec validate paper1-nanowire-purcell` is valid.
+
 ## Deferred by the lead, recorded here so it is not dropped
 
 - [ ] **The dielectric as a function, not a constant** (the lead's step-1 item (7), called a

@@ -124,6 +124,7 @@ PAPER_FWHM_NM = 4.0
 DRIVE_FLOOR = 1e-4      # of the drive's own peak: where the pulse is over
 MIN_TAIL_PERIODS = 6.0  # a decay needs at least this many periods to be fitted
 TAU_EDGE = 20.0         # the fit's own tau grid reaches this far in windows
+ERR_FLOOR = 1e-9        # of its own value: below this an error is the pinv's
 UNRESOLVED = 3          # measured, but the record's tail leaves Q unpinned
 DEFAULT_TAIL_PERIODS = 20.0   # asked for only by --ringdown
 QD_DEPTH_TOL_NM = 1.0   # how far the emitter's realised depth may sit from --qd-below
@@ -538,13 +539,41 @@ def fit_decay(values, dt: float, start: int, *, frequency: float,
     rss = float(resid @ resid)
     sigma2 = rss / max(n - 5, 1)
     cov = sigma2 * np.linalg.pinv(jac.T @ jac)
-    # A diagonal that is not positive is a direction the data do not determine,
-    # and the clamp this replaced called it zero: a flat tail -- the cavity never
-    # rose -- then reported f +- 0 at the three-sigma test's own pass, because a
-    # zero error passes every "more than three of its own errors" test there is.
-    tau_err = None if cov[3, 3] <= 0.0 else math.sqrt(cov[3, 3])
-    f_err = None if cov[4, 4] <= 0.0 else math.sqrt(cov[4, 4]) / (2.0 * math.pi)
     f = omega / (2.0 * math.pi)
+
+    def _sigma(k, value):
+        """Parameter ``k``'s own error, or None where the record does not fix it.
+
+        A direction the record does not determine shows up in the covariance as
+        an error that is not one, in either of two shapes. A non-positive
+        diagonal is the pinv having dropped the direction, and the clamp this
+        replaced called it zero: a flat tail -- the cavity never rose -- then
+        reported f +- 0 and a resolved Q, because zero passes every "more than
+        three of its own errors" test there is. A *positive* diagonal can be the
+        pinv's just as surely -- Run A (2026-10-16, 898.3 nm, tau at the fit
+        grid's top) printed 4.1e-65 THz against a 333.7 THz centre and 6.3e-14
+        fs against a 2033 fs decay, both positive and both eighteen orders below
+        their own value, which is not a number any record of finite samples
+        fixes.
+
+        The test is the error beside its own parameter, not the rank of
+        ``jac.T @ jac``: measured (2026-10-16) ``matrix_rank`` calls that matrix
+        rank 1 at its default tolerance for *every* fixture tried, including the
+        noisy tail whose tau error is a real 6.5e-6 of tau. A rank verdict there
+        would throw away a measurement the record does make; the size of the
+        error separates the two, 6.5e-6 kept against 7.4e-66 dropped, with this
+        floor three decades clear of both.
+        """
+        diag = float(cov[k, k])
+        if diag <= 0.0:
+            return None
+        err = math.sqrt(diag)
+        # An exactly-zero parameter keeps whatever error it has: the comparison
+        # is against its own size, which is not a scale to divide by.
+        return None if err < abs(value) * ERR_FLOOR else err
+
+    tau_err = _sigma(3, tau)
+    f_err = _sigma(4, f)
     q = math.pi * f * tau
     q_err = (math.pi * math.hypot(tau * f_err, f * tau_err)
              if f_err is not None and tau_err is not None else None)
@@ -562,7 +591,8 @@ def _err(value, scale: float) -> str:
     """The ``+-`` half of a fitted error: a number, or why there is not one.
 
     ``fit_decay`` returns None for an error whose covariance diagonal is not
-    positive, which is a direction the record does not determine. Formatting
+    positive, or which is orders of magnitude below its own parameter -- both
+    are a direction the record does not determine. Formatting
     that as ``0`` is what this arm used to print, and it is the wrong number to
     print: a flat tail -- the cavity never rose -- passed the three-sigma test
     on a zero error and reported a centre and a Q with no error bars at all.
