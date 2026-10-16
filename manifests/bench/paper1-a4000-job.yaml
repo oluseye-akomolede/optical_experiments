@@ -1,6 +1,14 @@
 # Paper 1's dx-10 grid check on an A4000: one bounded Job, and the pod log IS the result.
 #
-# Runbook (the lead, after review and with the namespace's GPU quota at 1):
+# BLOCKED TODAY -- the GPU quota is a live obstacle, not a met precondition. The namespace's
+# ResourceQuota mse-power-cap carries requests.nvidia.com/gpu hard=0, used=0, so a 1-GPU pod is
+# refused: "exceeded quota: mse-power-cap, requested: requests.nvidia.com/gpu=1, used: 0,
+# limited: 0". Raising it 0 -> 1 is the OWNER's decision; the lead applies it. Nobody on this
+# rig raises a quota. And a trap for whoever checks: `kubectl apply --dry-run=server` answers
+# "created (server dry run)" for this file even while the quota refuses it, because
+# ResourceQuota admission is exempt from dry-run -- dry-run green is NOT admissibility.
+#
+# Runbook (the lead, after the owner raises the namespace's GPU quota 0 -> 1):
 #
 #   kubectl -n mode-search-engine delete job paper1-bench-dx10-cw993 --ignore-not-found
 #   kubectl -n mode-search-engine apply -f manifests/bench/paper1-a4000-job.yaml
@@ -79,11 +87,16 @@ spec:
             - "100"          # r20's record: 100.0 periods = 39,650 steps at this dt
             - --window-periods
             - "8"            # the script's own default, named so the F reading is unambiguous
-            # The two bench ceilings. Both are needed and both are on the command line, where
-            # a reviewer reads them: the product's defaults (20,000 steps, 1,800 s) refuse this
-            # record, and only this script's own flags can raise them (4b9d9fc). --max-seconds
-            # is a pricing verdict: 8,914.8 s at the estimator's rate, so 10,800 s leaves room
-            # without inventing a timer the product does not have.
+            # The three bench ceilings. All are needed and all are on the command line, where
+            # a reviewer reads them: the product's defaults (8,000,000 cells, 20,000 steps,
+            # 1,800 s) refuse this record, and only this script's own flags can raise them
+            # (4b9d9fc for the first two, the cell one after the lead's 2026-10-16 decision).
+            # --max-seconds is a pricing verdict: 8,914.8 s at the estimator's rate, so
+            # 10,800 s leaves room without inventing a timer the product does not have.
+            # --max-cells is the smallest round million over the priced 9,166,668 (cells are
+            # counted in nodes, so the 1.14x headroom also absorbs the +1 node per axis).
+            - --max-cells
+            - "10000000"
             - --max-steps
             - "200000"
             - --max-seconds
@@ -104,7 +117,9 @@ spec:
             # requests == limits, all three. Memory: the priced grid is ~1.12 GiB by the
             # estimator's own storage per cell (~131 bytes: its printed GiB against cells; the
             # same table prints 0.36 GiB for r20's 2,903,040 cells at 9,166,668/2,903,040 =
-            # 3.16x the cells). 8Gi is 7x that estimate, and 15% of the card's 16376 MiB.
+            # 3.16x the cells). 1.12 GiB is 1,146.9 MiB, which is 14.0% of this request
+            # (8,192 MiB, so the request is 7.1x the estimate) and 7.0% of the card's
+            # 16,376 MiB -- both denominators named, because "15% of the card" was wrong.
             requests: {cpu: "2", memory: 8Gi, nvidia.com/gpu: 1}
             limits: {cpu: "2", memory: 8Gi, nvidia.com/gpu: 1}
           securityContext:

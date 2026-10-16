@@ -275,12 +275,18 @@ def steps_for_4nm(dt: float, wavelength_nm: float) -> int:
 
 
 def run_limits(args) -> dict:
-    """The two per-run ceilings this bench run is measured against.
+    """The three per-run ceilings this bench run is measured against.
 
     The product's own unless the bench flags raised them. ``--max-steps`` and
     ``--max-seconds`` exist for the one case the owner approved on 2026-10-16: a
     settled CW record at 993 nm is 39,650 steps and about 47 minutes, past both
-    of the product's caps, and only a bench run may go longer.
+    of the product's caps, and only a bench run may go longer. ``--max-cells``
+    is the same permission for the third cap, which the same dx-10 nm record
+    needs: it holds 9,166,668 cells, over the 8 M cap by 14.6%, because the
+    grid's fine layers (a coating's thickness / ``MIN_CELLS``, a metal's skin
+    depth / ``CELLS_PER_SKIN``) do not scale with ``--dx`` while the rest of the
+    axis does. The lead's word, 2026-10-16: the knob is per-run and on the bench
+    path only, and the product's own 8,000,000 stays exactly what it is.
 
     One function because the estimator (``ladder``) and the run path (``filled``)
     must read the SAME ceiling: a priced rung that disagreed with the run it
@@ -292,9 +298,12 @@ def run_limits(args) -> dict:
     ceiling below the product's is unreachable even from a hand-built namespace:
     a bench run wanting a shorter record lowers ``--periods`` instead.
     """
+    cells = getattr(args, "max_cells", None)
     steps = getattr(args, "max_steps", None)
     seconds = getattr(args, "max_seconds", None)
-    return {"max_steps": (fdtd.MAX_STEPS if steps is None
+    return {"max_cells": (fdtd.MAX_CELLS if cells is None
+                          else max(fdtd.MAX_CELLS, int(cells))),
+            "max_steps": (fdtd.MAX_STEPS if steps is None
                           else max(fdtd.MAX_STEPS, int(steps))),
             "max_seconds": (fdtd.MAX_SECONDS if seconds is None
                             else max(fdtd.MAX_SECONDS, float(seconds)))}
@@ -832,7 +841,8 @@ def report(args, lay, request, geom, measured):
           f" {'pec' if lay['pec'] is not None else 'no pec'},"
           f" {request['boundary']} boundary)")
     lim = run_limits(args)
-    raised = (lim["max_steps"] > fdtd.MAX_STEPS
+    raised = (lim["max_cells"] > fdtd.MAX_CELLS
+              or lim["max_steps"] > fdtd.MAX_STEPS
               or lim["max_seconds"] > fdtd.MAX_SECONDS)
     print(f"resolves  {measured['dlambda_nm']:.2f} nm per bin at"
           f" {args.wavelength:.0f} nm; the paper's mode is {PAPER_FWHM_NM:.0f} nm"
@@ -840,7 +850,8 @@ def report(args, lay, request, geom, measured):
           f" (the cap is {lim['max_steps']:,})")
     print(f"caps      {measured['exceeded'] or 'OK'}"
           + (f" (bench ceiling: {lim['max_steps']:,} steps,"
-             f" {lim['max_seconds'] / 60:.0f} min)" if raised else ""))
+             f" {lim['max_seconds'] / 60:.0f} min,"
+             f" {lim['max_cells']:,} cells)" if raised else ""))
     if (args.profile == "cw"
             and est["steps"] * est["dt"] * f0 < args.window_periods):
         print(f"refused: the record is"
@@ -1286,7 +1297,8 @@ def ladder(args) -> int:
                   f"{' (as asked)' if asked_row else ''}: {str(exc)[:64]}")
             continue
         dlam = (sub.wavelength * NM) ** 2 / (C * est["steps"] * est["dt"]) / NM
-        raised = (lim["max_steps"] > fdtd.MAX_STEPS
+        raised = (lim["max_cells"] > fdtd.MAX_CELLS
+                  or lim["max_steps"] > fdtd.MAX_STEPS
                   or lim["max_seconds"] > fdtd.MAX_SECONDS)
         print(f"{dx:5.1f} {pad:6.0f} {est['cells']:12,} {est['steps']:8,}"
               f" {est['seconds']:8.1f} {est['bytes'] / 2 ** 30:6.2f}"
@@ -1413,6 +1425,12 @@ def PARSER_ARGUMENTS(p) -> None:
     p.add_argument("--periods", type=float, default=32.0, help="CW record, periods")
     p.add_argument("--window-periods", type=float, default=8.0,
                    help="the CW reading's tail window, in drive periods")
+    p.add_argument("--max-cells", default=None, metavar="N",
+                   type=_raised_cap("--max-cells", "MAX_CELLS",
+                                    "a whole number of cells", int),
+                   help="raise the product's cell cap for this bench run; only"
+                        " this bench script has the flag, so the web app and the"
+                        " k8s jobs cannot reach a raised ceiling")
     p.add_argument("--max-steps", default=None, metavar="N",
                    type=_raised_cap("--max-steps", "MAX_STEPS",
                                     "a whole number of steps", int),

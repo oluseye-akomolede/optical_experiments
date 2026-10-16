@@ -46,19 +46,32 @@ an A4000 reading is comparable with the Orin's.
 SHALL set `requests` equal to `limits` for `nvidia.com/gpu`, `cpu` and `memory`, and SHALL set
 the container's BLAS/OpenMP thread counts to its own CPU limit (a container CPU limit does not
 change `os.cpu_count()`, so an unset thread count starts one thread per host core and is
-throttled). Which node carries the Job SHALL be left to the quota and the card's own
+throttled). Which node carries the Job SHALL be left to the scheduler and the card's own
 allocatable, and the file SHALL say where a host pin would go.
+
+This requirement SHALL NOT be read as admissibility. The namespace's quota admits no GPU
+today, and this change SHALL NOT raise it.
+
+#### Scenario: the GPU quota is a live obstacle, not a met precondition
+- **WHEN** the namespace's ResourceQuota `mse-power-cap` is read
+- **THEN** `requests.nvidia.com/gpu` is hard 0 / used 0, and a 1-GPU pod is refused
+  (`exceeded quota: mse-power-cap, requested: requests.nvidia.com/gpu=1, used: 0, limited: 0`)
+- **AND** raising it 0 → 1 SHALL be the owner's decision and the lead's apply, never this
+  change's own act
+- **AND** `kubectl apply --dry-run=server` SHALL NOT be read as admissibility for this
+  manifest: ResourceQuota admission is exempt from dry-run, so dry-run green is not a pass
 
 #### Scenario: the memory limit is derived from the priced grid
 - **WHEN** the priced dx-10 record (9,166,668 cells) is compared with the memory limit
 - **THEN** the table's own storage per cell (~131 bytes, from its printed GiB against cells)
-  puts the record at ~1.12 GiB, 7× inside the 8Gi limit and 15 % of the card's 16376 MiB
+  puts the record at ~1.12 GiB = 1,146.9 MiB: 14.0 % of the 8Gi request (8,192 MiB, so the
+  request is 7.1× the estimate) and 7.0 % of the card's 16,376 MiB
 
 #### Scenario: the args are the launcher and they name cupy
 - **WHEN** the Job's `args` are read
 - **THEN** they carry the priced record in full (`--wavelength`, `--dx`, `--mirror-pad`,
-  `--periods`, `--xp cupy`) plus the two raised bench ceilings `--max-steps` and
-  `--max-seconds`, because on the cluster there is no `run_cw.sh`: the manifest is the
+  `--periods`, `--xp cupy`) plus the three raised bench ceilings `--max-cells`, `--max-steps`
+  and `--max-seconds`, because on the cluster there is no `run_cw.sh`: the manifest is the
   launcher, and the script's default `--xp numpy` would run at about a third of the table's
   rate with nothing to refuse it
 
@@ -93,9 +106,10 @@ its partial log as the only measurement there is.
 - **THEN** the pod is not deleted while the queue row that launched it is still open, so the
   progress lines up to the kill can be read
 
-#### Scenario: the args are refused before the scene is built while the cell cap stands
+#### Scenario: the args are refused without the cell ceiling and admitted with it
 - **WHEN** the manifest's dx-10 args are run against the shipped code
-- **THEN** the script refuses with the cell limit (`The grid has 9,166,668 cells, over the
-  limit of 8,000,000`) before building anything, which is the open item in the change's
-  `tasks.md`: the third bench ceiling, or the dx-12/pad-600 rung whose deadline the file also
-  carries
+- **THEN** they are refused with the cell limit (`The grid has 9,166,668 cells, over the limit
+  of 8,000,000`) before the scene is built, and with the file's own `--max-cells 10000000` the
+  same args are admitted -- which is the resolution `tasks.md` records: the owner's decision
+  was the third bench ceiling (`--max-cells`), not the dx-12/pad-600 rung whose deadline the
+  file also carries as the alternative

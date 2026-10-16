@@ -2068,31 +2068,39 @@ def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
     }
 
 
-def check_limits(estimate: dict, *, max_steps=None, max_seconds=None) -> None:
+def check_limits(estimate: dict, *, max_steps=None, max_seconds=None,
+                 max_cells=None) -> None:
     """Raise ``EstimateError`` naming every limit ``estimate`` exceeds, the
     value that exceeded it, and the form setting that reduces it.
 
-    ``max_steps`` and ``max_seconds`` are the two limits this call applies, and
-    each defaults to the product's own (``MAX_STEPS``, ``MAX_SECONDS``) when it
-    is None. One caller ever passes them: the paper-1 bench script, whose
-    ``--max-steps`` / ``--max-seconds`` raise a bench record's ceiling past what
-    the product allows (a settled nanowire record needs more than 20,000 steps,
-    and more than 30 minutes of Jetson, to stop rising). Nothing else can:
-    there is no environment variable and no module global to set, and no product
-    entry point passes them -- ``worker/td_solve.py`` and the web app call this
-    with the defaults -- so a raised ceiling stays on the bench path alone.
+    ``max_cells``, ``max_steps`` and ``max_seconds`` are the three limits this
+    call applies, and each defaults to the product's own (``MAX_CELLS``,
+    ``MAX_STEPS``, ``MAX_SECONDS``) when it is None. One caller ever passes
+    them: the paper-1 bench script, whose ``--max-cells`` / ``--max-steps`` /
+    ``--max-seconds`` raise a bench record's ceiling past what the product
+    allows (a settled nanowire record needs more than 20,000 steps, and more
+    than 30 minutes of Jetson, to stop rising; a dx-10 nm record of the same
+    scene needs 9,166,668 cells, over the 8 M cell cap by 14.6%, because the
+    grid's fine layers do not scale with ``--dx``). Nothing else can: there is
+    no environment variable and no module global to set, and no product entry
+    point passes them -- ``worker/td_solve.py`` and the web app call this with
+    the defaults -- so a raised ceiling stays on the bench path alone.
     """
+    # each read here, not bound at import: a test that moves a constant still
+    # moves the limit that constant names
+    if max_cells is None:
+        max_cells = MAX_CELLS
     if max_steps is None:
-        max_steps = MAX_STEPS      # read here, not bound at import: a test that
-    if max_seconds is None:        # moves the constant still moves the limit
+        max_steps = MAX_STEPS
+    if max_seconds is None:
         max_seconds = MAX_SECONDS
     e = estimate
     finest = f"{e['finest'] * 1e9:.3g} nm"
     exceeded = []
-    if e["cells"] > MAX_CELLS:
-        exceeded.append(("cells", e["cells"], MAX_CELLS,
+    if e["cells"] > max_cells:
+        exceeded.append(("cells", e["cells"], max_cells,
             f"The grid has {e['cells']:,} cells, over the limit of "
-            f"{MAX_CELLS:,}. Increase dx to use fewer, larger cells."))
+            f"{max_cells:,}. Increase dx to use fewer, larger cells."))
     if e["steps"] > max_steps:
         exceeded.append(("steps", e["steps"], max_steps,
             f"The run needs {e['steps']:,} time steps, over the limit of "

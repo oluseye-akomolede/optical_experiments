@@ -18,7 +18,7 @@ than its tail, a record over ``fdtd.MAX_STEPS``, and a record too short for the
 hard-started CW drive to have settled (8 periods is F = 4.61 in vacuum, and the
 run says so).
 
-The two per-run ceilings are covered both ways as well: the product's own refuse
+The three per-run ceilings are covered both ways as well: the product's own refuse
 a long record, and the bench flags that raise them (``--max-steps`` and
 ``--max-seconds``, the ceilings only a flagged bench run may raise) are read by
 the ladder and the run path through one function and refused if they would lower
@@ -195,14 +195,15 @@ def test_the_same_long_record_is_refused_without_a_flag_and_accepted_with_one():
 
     500 periods on the tiny scene is 126,685 steps at its 6.22 nm finest cell --
     over ``fdtd.MAX_STEPS`` before any solve starts. Without a flag the run path
-    refuses it, and ``run_limits`` is the product's own two constants; with the
+    refuses it, and ``run_limits`` is the product's own three constants; with the
     flags, the same call accepts it. This is the pair the owner's 2026-10-16
     decision turns on: only a flagged bench run may go longer, and the flag is
     what the ladder and the run path both read.
     """
     m = _load()
     plain = m.parse_args(list(LONG))
-    assert m.run_limits(plain) == {"max_steps": m.fdtd.MAX_STEPS,
+    assert m.run_limits(plain) == {"max_cells": m.fdtd.MAX_CELLS,
+                                   "max_steps": m.fdtd.MAX_STEPS,
                                    "max_seconds": m.fdtd.MAX_SECONDS}
     lay, request, geom = m.solve_scene(plain)
     measured = m.filled(plain, lay, request)
@@ -210,10 +211,53 @@ def test_the_same_long_record_is_refused_without_a_flag_and_accepted_with_one():
     assert "over the limit of 20,000" in measured["exceeded"], measured["exceeded"]
 
     args = m.parse_args(LONG + RAISED)
-    assert m.run_limits(args) == {"max_steps": 200_000, "max_seconds": 7200.0}
+    assert m.run_limits(args) == {"max_cells": m.fdtd.MAX_CELLS,
+                                  "max_steps": 200_000, "max_seconds": 7200.0}
     lay, request, geom = m.solve_scene(args)
     measured = m.filled(args, lay, request)
     assert measured["exceeded"] is None, measured["exceeded"]
+
+
+def test_the_cell_ceiling_is_the_third_thing_the_bench_flags_can_raise(capsys):
+    """The product's own pricing arm on the manifest's own record: refused on cells, then priced.
+
+    The ladder is the cheap half of the product's own layout -- ``planned_scene``
+    is documented as "the product's own plan, and its cheap estimate (no
+    voxeliser)" -- so this exercises the whole path the manifest's args take,
+    without voxelising 9 M cells, which is not tier-1 work. The same scene is
+    2,903,040 cells at dx 20 nm and 9,166,668 at dx 10 nm, over
+    ``fdtd.MAX_CELLS`` by 14.6 %: only the three pad layers take ``--dx``, while
+    the oxide's ``thickness / MIN_CELLS`` and the gold's ``depth /
+    CELLS_PER_SKIN`` are the same six capped requests at either dx.
+    """
+    m = _load()
+    record = ["--estimate", "--hex", "paper", "--wavelength", "993", "--dx",
+              "10", "--mirror-pad", "600", "--periods", "100"]
+    # Without a bench flag every rung is over the step cap, so not one is priced
+    # and the table says so rather than printing a number it could not reach.
+    assert m.ladder(m.parse_args(list(record))) == 2
+    out = capsys.readouterr().out
+    assert ("refused: The grid has 9,166,668 cells, over the limit of 8,000,000"
+            in out), out
+    assert "every rung above was refused" in out, out
+
+    # With the three flags the manifest passes, the same rung is priced, and the
+    # price is the one tasks.md quotes: cells, steps, the estimator's seconds and
+    # GiB. The table's row for dx 10.0 / pad 600, read by its own first two
+    # columns -- this rung is one of the table's own, so it carries no "(as asked)"
+    # marker and a substring search over the whole table could match another row.
+    assert m.ladder(m.parse_args(record + ["--max-cells", "10000000",
+                                           "--max-steps", "200000",
+                                           "--max-seconds", "10800"])) == 0
+    row = None
+    for line in capsys.readouterr().out.splitlines():
+        cells = line.split()
+        if len(cells) >= 5 and cells[0] == "10.0" and cells[1] == "600":
+            row = line
+    assert row, "the dx-10/pad-600 row is missing from the table"
+    assert "9,166,668" in row and "39,650" in row, row
+    assert "8914.8" in row and "1.12" in row, row
+    assert "fits" in row and "refused" not in row, row
 
 
 def test_the_run_path_hands_its_raised_ceiling_to_the_cap_check(monkeypatch):
@@ -231,7 +275,8 @@ def test_the_run_path_hands_its_raised_ceiling_to_the_cap_check(monkeypatch):
     args = m.parse_args(LONG + RAISED)
     lay, request, geom = m.solve_scene(args)
     m.filled(args, lay, request)
-    assert calls == [{"max_steps": 200_000, "max_seconds": 7200.0}], calls
+    assert calls == [{"max_cells": m.fdtd.MAX_CELLS,
+                      "max_steps": 200_000, "max_seconds": 7200.0}], calls
 
 
 def test_no_cap_call_site_escapes_the_bench_ceiling():
@@ -259,14 +304,17 @@ def test_a_flag_that_would_lower_a_cap_is_refused_before_any_scene(capsys):
     own ceiling rather than a lowered one.
     """
     m = _load()
-    for flag, value in (("--max-steps", "1000"), ("--max-seconds", "60")):
+    for flag, value in (("--max-cells", "1000000"), ("--max-steps", "1000"),
+                        ("--max-seconds", "60")):
         with pytest.raises(SystemExit) as info:
             m.parse_args(["--tiny", flag, value])
         assert info.value.code == 2
         err = capsys.readouterr().err
         assert "may only raise a cap" in err, err
-    lowered = argparse.Namespace(max_steps=1000, max_seconds=60.0)
-    assert m.run_limits(lowered) == {"max_steps": m.fdtd.MAX_STEPS,
+    lowered = argparse.Namespace(max_cells=1_000_000, max_steps=1000,
+                                 max_seconds=60.0)
+    assert m.run_limits(lowered) == {"max_cells": m.fdtd.MAX_CELLS,
+                                     "max_steps": m.fdtd.MAX_STEPS,
                                      "max_seconds": m.fdtd.MAX_SECONDS}
 
 
