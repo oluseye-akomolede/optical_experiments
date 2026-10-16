@@ -298,14 +298,20 @@ contradict.
   under `boundary  held at 320 nm of pad and 200 nm of absorber at dx 10.0; each rung's cell
   counts follow its own dx (32/20 cells at dx 10.0)` (`/tmp/mse-price-numpy.log`; the reviewer's
   own ladder run reproduces the same table, which is the independent half).
-- The pricing arm's BACKEND, named because it is not the manifest's. That run needed `--xp numpy`,
-  and `--xp cupy` — which the manifest carries — cannot reach the table on any GPU-less host.
-  Measured on this revision's image: with `--xp cupy` the same command prints
-  `boundary  open: pad 32 cells = 320 nm, absorber 20 cells = 200 nm, 120 nm of open space
-  (--pad-nm 320 --pml-nm 200)` and `memory    1.63 GiB estimated`, then raises
-  `cudaErrorInsufficientDriver` at cupy's first allocation. That is a property of this host (no
-  driver), not of the image: cupy's path is exercised where it can run, on the A4000 — the lead's
-  kernel smoke and this Job itself. Do not read the numpy table above as a cupy measurement.
+- The pricing arm's BACKEND, measured both ways. This bullet replaces an earlier draft that set
+  a *run* against an *estimate* and blamed the backend; the arm was the difference, and the
+  reviewer caught it. Both backends price the identical table on this GPU-less host: `--xp cupy
+  --estimate` with the manifest's argument values exits 0, and `diff
+  /tmp/mse-price-cupy.log /tmp/mse-price-numpy.log` reports one blank line and nothing else. cupy
+  is touched by `import cupy as xp` alone (`scripts/paper1_nanowire.py:1437-1438`), and an import
+  needs no driver. What cannot start here is the RUN arm: the manifest's own argv carries no
+  `--estimate`, so running it verbatim executes the CW solve, which prints `boundary  open: pad 32
+  cells = 320 nm, absorber 20 cells = 200 nm, 120 nm of open space (--pad-nm 320 --pml-nm 200)`
+  and `memory    1.63 GiB estimated` — both from `report()`, which the run path calls
+  (`scripts/paper1_nanowire.py:870`, `:918`, `:1089`), not from the pricing arm, whose boundary
+  line is `ladder()`'s `held at` (`:1362`) — and then raises `cudaErrorInsufficientDriver` at
+  cupy's first allocation. That is this host's missing driver, not the image; the Job's cupy
+  *kernel* path is exercised where it can run, on the A4000 (the lead's kernel smoke).
 - Not observed, and not claimed: the `caps` line's `(bench ceiling: …, …, N cells)` clause
   prints only on a real run (`paper1_nanowire.py:930`), and no real run is affordable here — the
   reviewer said the same. It is read from the source and asserted by tier-1, no more.
@@ -332,7 +338,7 @@ contradict.
 - **The mechanism, read from the source and then measured**: `check_limits` appends a clause for
   every ceiling the record exceeds and raises them together (`fdtd.py:2095-2124`: cells, steps,
   memory, time), while `ladder` prints only `str(exc)[:64]` (`paper1_nanowire.py:1381-1382` —
-  64 characters, not the 32 the reviewer's note first said). So a row shows whichever limit *leads*
+  64 characters, not the 32 their chat message first said). So a row shows whichever limit *leads*
   the message. Measured with no bench flag at this revision: all eight rungs refused — dx 20, dx 15
   and dx 12-at-pad-400 lead with `The run needs 39,650 time steps, over the limit of 20,000`;
   dx 12-at-pad-600 and dx 10 at both pads lead with `The grid has 14,048,300 cells, over the limit
@@ -407,7 +413,7 @@ contradict.
 - **Size change** (the lead asked for it stated): the tagged image is 4,864,242,354 bytes
   (`.Id` `sha256:d40e87780f62…`) against f856bbf's 4,742,903,335 — **+121 MB**, docker's
   `4.74 GB → 4.86 GB`. The two alternatives the row named: a whole `-devel` base (measured
-  locally at 11,471,517,149 bytes, against the `-runtime` base's 3,933,593,520) would put the
+  locally at 11,471,517,149 bytes, against the `-runtime` base's 3,933,595,642) would put the
   image near **12.4 GB**; the `cupy-cuda12x[ctk]` extra would install a second, version-drifting
   copy of the toolkit through pip. Borrowing the two trees costs the 88.8 MB the JIT needs.
 - **Two images, one recipe** — the probe image (built first, `.Id` `sha256:3fd8d7dbbc3e…`,
@@ -439,7 +445,8 @@ contradict.
   `harbor.arcadia-ecs.local/mode-search-engine/paper1-bench-cuda:37f8d32` — and the commit after
   that one points `manifests/bench/paper1-a4000-job.yaml` at that tag. The superseded image goes
   from the local store entirely, tag and all, as the row asks, and the probe image
-  `paper1-bench-cuda:headertest` (`sha256:3fd8d7dbbc3e…`) with it. Reproducing the red needs
+  `paper1-bench-cuda:headertest` (`sha256:3fd8d7dbbc3e…`) with it — `docker images` on this host
+  lists one `paper1-bench-cuda` line, the tag. Reproducing the red needs
   neither: the output is kept at `/tmp/mse-headerfix-red.log` (the check's verbatim body against
   the old id `sha256:7b12e059a9ab…`, size 4,742,903,335, `AssertionError: cuda-pathfinder found no
   CUDA header directory`, `rc=1`), and the old image rebuilds from git in one command —

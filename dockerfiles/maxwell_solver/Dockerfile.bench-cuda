@@ -18,12 +18,14 @@
 # image borrows the headers from the SAME 12.6.3 release's -devel variant, in a named stage
 # used for nothing else: include/ (192 entries, 29,991,150 bytes) and nvvm/ (58,791,564
 # bytes, whose libdevice.10.bc is nvrtc's device library). Those two trees measure 88,782,714
-# bytes in the built image and the same bytes in the -devel image (du -sb, run in both). Against
-# this base's
-# 3,933,593,520 bytes the -devel base is 11,471,517,149, so taking the whole base instead
-# would land the image near 12.4 GB -- nvcc, static libraries and lint tools this bench never
-# calls -- for the 88.8 MB of files it needs. As built: 4,864,242,905 bytes against f856bbf's
-# 4,742,903,335, +121 MB, docker's 4.74 GB -> 4.86 GB.
+# bytes in the built image and the same bytes in the -devel image (du -sb, run in both). Both
+# bases are quoted the same way, each tag's own `.Size` from `docker image inspect`: this base
+# 3,933,595,642, the -devel base 11,471,517,149, so taking the whole base instead would land the
+# image near 12.4 GB -- nvcc, static libraries and lint tools this bench never calls -- for the
+# 88.8 MB of files it needs. As built (the delivered tag): 4,864,242,354 bytes against f856bbf's
+# 4,742,903,335, +121 MB, docker's 4.74 GB -> 4.86 GB. The probe image built minutes earlier,
+# before the tag, is 4,864,242,905: a build-cache miss re-ran the pip layer, so tag and probe are
+# the same recipe in different bytes (see the smoke bullet in tasks.md).
 #
 # THE CHECK. The build asks the question cupy's JIT asks, with no GPU present:
 # cuda.pathfinder.find_nvidia_header_directory('cudart'), and the header file under it.

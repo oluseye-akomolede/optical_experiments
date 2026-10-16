@@ -55,7 +55,7 @@ against happened on the cluster's first GPU kernel, not at `import`.
   `nvvm/`, 58,791,564 bytes, for nvrtc's own `libdevice.10.bc`), so the A4000 image stays on
   12.6.3 runtime libraries and comes out at 4,864,242,354 bytes against `f856bbf`'s
   4,742,903,335 (about +121 MB), rather than the near 12.4 GB a whole `-devel` base
-  (11,471,517,149 bytes, against this base's 3,933,593,520) would make it
+  (11,471,517,149 bytes, against this base's 3,933,595,642) would make it
 
 #### Scenario: the check fails on the image that failed on the cluster
 - **WHEN** the build's own check -- `cuda.pathfinder.find_nvidia_header_directory('cudart')`,
