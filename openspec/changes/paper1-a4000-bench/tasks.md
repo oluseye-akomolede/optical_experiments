@@ -292,10 +292,20 @@ contradict.
   `--help` lists `--pml`, `--pad-nm`, `--pml-nm` and `--max-cells`; `--tiny --pad-nm 200
   --pml-nm 120 --xp numpy` → the boundary line `boundary  open: pad 10 cells = 200 nm, absorber
   6 cells = 120 nm, 80 nm of open space (--pad-nm 200 --pml-nm 120)` and `tiny: all controls
-  hold`; and the pricing arm with THIS manifest's own args reproduces the table's held dx-10 row
-  and its boundary line — `10.0 600 14,048,300 39,650 13662.4 1.63 9.93 fits (the bench ceiling,
-  not the tier-2 clock)`, under `boundary  held at 320 nm of pad and 200 nm of absorber at dx
-  10.0; each rung's cell counts follow its own dx (32/20 cells at dx 10.0)`.
+  hold`; and the pricing arm with THIS manifest's own argument VALUES reproduces the table's held
+  dx-10 row and its boundary line, rc=0, all eight rungs in that one call — `10.0    600
+  14,048,300   39,650  13662.4   1.63   9.93  fits (the bench ceiling, not the tier-2 clock)`,
+  under `boundary  held at 320 nm of pad and 200 nm of absorber at dx 10.0; each rung's cell
+  counts follow its own dx (32/20 cells at dx 10.0)` (`/tmp/mse-price-numpy.log`; the reviewer's
+  own ladder run reproduces the same table, which is the independent half).
+- The pricing arm's BACKEND, named because it is not the manifest's. That run needed `--xp numpy`,
+  and `--xp cupy` — which the manifest carries — cannot reach the table on any GPU-less host.
+  Measured on this revision's image: with `--xp cupy` the same command prints
+  `boundary  open: pad 32 cells = 320 nm, absorber 20 cells = 200 nm, 120 nm of open space
+  (--pad-nm 320 --pml-nm 200)` and `memory    1.63 GiB estimated`, then raises
+  `cudaErrorInsufficientDriver` at cupy's first allocation. That is a property of this host (no
+  driver), not of the image: cupy's path is exercised where it can run, on the A4000 — the lead's
+  kernel smoke and this Job itself. Do not read the numpy table above as a cupy measurement.
 - Not observed, and not claimed: the `caps` line's `(bench ceiling: …, …, N cells)` clause
   prints only on a real run (`paper1_nanowire.py:930`), and no real run is affordable here — the
   reviewer said the same. It is read from the source and asserted by tier-1, no more.
