@@ -301,17 +301,43 @@ contradict.
 - The pricing arm's BACKEND, measured both ways. This bullet replaces an earlier draft that set
   a *run* against an *estimate* and blamed the backend; the arm was the difference, and the
   reviewer caught it. Both backends price the identical table on this GPU-less host: `--xp cupy
-  --estimate` with the manifest's argument values exits 0, and `diff
-  /tmp/mse-price-cupy.log /tmp/mse-price-numpy.log` reports one blank line and nothing else. cupy
-  is touched by `import cupy as xp` alone (`scripts/paper1_nanowire.py:1437-1438`), and an import
-  needs no driver. What cannot start here is the RUN arm: the manifest's own argv carries no
-  `--estimate`, so running it verbatim executes the CW solve, which prints `boundary  open: pad 32
-  cells = 320 nm, absorber 20 cells = 200 nm, 120 nm of open space (--pad-nm 320 --pml-nm 200)`
-  and `memory    1.63 GiB estimated` — both from `report()`, which the run path calls
-  (`scripts/paper1_nanowire.py:870`, `:918`, `:1089`), not from the pricing arm, whose boundary
-  line is `ladder()`'s `held at` (`:1362`) — and then raises `cudaErrorInsufficientDriver` at
-  cupy's first allocation. That is this host's missing driver, not the image; the Job's cupy
-  *kernel* path is exercised where it can run, on the A4000 (the lead's kernel smoke).
+  --estimate` with the manifest's argument values exits 0, and the two logs' estimate OUTPUT is
+  identical — comment-stripped, the diff is one blank line and nothing else. Precisely:
+  `diff <(grep -v '^#' /tmp/mse-price-cupy.log) <(grep -v '^#' /tmp/mse-price-numpy.log)` gives
+  one blank line; `diff /tmp/mse-price-cupy.log /tmp/mse-price-numpy.log | grep -c '^[<>]'` gives
+  11, because each log carries its own `#` header, 3 lines against 8. The output is identical;
+  the files are not. An earlier draft of this bullet and 1d2904b's message said the log was
+  "byte-identical to the numpy run's (diff reports one blank line)", which the un-stripped diff
+  refutes — the reviewer's R3 caught that. cupy is touched by `import cupy as xp` alone
+  (`scripts/paper1_nanowire.py:1437-1438`), and an import needs no driver.
+  What cannot start here is the RUN arm: the manifest's own argv carries no `--estimate`, so
+  running it verbatim executes the CW solve. Captured against the delivered tag
+  (`/tmp/mse-runarm-cupy-verbatim.log` — the manifest's argv character for character, its image
+  ID and clock in the header, `docker run --rm --cpus=2 --memory=2g`): `report()` prints its
+  whole block, in order `grid` / `boundary` / `spacings` / `z-axis` / `thin` / `stack` /
+  `dipole` / `timestep` / `record` / `memory` / `resolves` / `caps` / `source`, the two lines
+  this bullet had quoted reading
+  `boundary  open: pad 32 cells = 320 nm, absorber 20 cells = 200 nm, 120 nm of open space
+  (--pad-nm 320 --pml-nm 200)` and
+  `memory    1.63 GiB estimated  (metals ['Au'], no pec, open boundary)` (the earlier edit had
+  dropped that parenthetical). The run then dies at its first cupy device call —
+  `cupy_backends.cuda.api.runtime.CUDARuntimeError: cudaErrorInsufficientDriver: CUDA driver
+  version is insufficient for CUDA runtime version` at `fdtd.py:2241  eps = xp.asarray(eps_r,
+  dtype=f32)`, reached from `_run` (`paper1_nanowire.py:973`) via `measure` (`:991`) in `main()`
+  (`:1583`). So the block above is `report()`'s (`scripts/paper1_nanowire.py:870`, `:918`), whose
+  call this arm's `main()` makes at `:1568` (`:1554-1568`; an earlier draft cited `:1089`, which
+  is `tiny()`'s call at `:1052`, not this arm's) — not the pricing arm's, whose boundary line is
+  `ladder()`'s `held at` (`:1362`). The failure is this host's missing driver, not the image; the
+  Job's cupy *kernel* path is exercised where it can run, on the A4000 (the lead's kernel smoke).
+  `/tmp/mse-runarm-cupy.log` is the same argv with `--dx 40` and nothing else, which completes in
+  ~30 s and exits rc=1 with the same block-then-exception order; the failure precedes any
+  stepping, so dx does not enter it. One caveat, stated rather than smoothed over: the verbatim
+  capture's own rc is 124 — its `timeout 900` bound killed the client, so that file carries the
+  block and the traceback but no completed exit; the dx-40 run is the one whose exit was actually
+  observed (rc=1), which is why the exception, not the bound, is read as the failure.
+  `/tmp/mse-price-numpy.log`'s header describes the same cupy attempt in earlier wording; that
+  file is deliberately left byte for byte as it was, so the 3-against-8 header counts above stay
+  true.
 - Not observed, and not claimed: the `caps` line's `(bench ceiling: …, …, N cells)` clause
   prints only on a real run (`paper1_nanowire.py:930`), and no real run is affordable here — the
   reviewer said the same. It is read from the source and asserted by tier-1, no more.
