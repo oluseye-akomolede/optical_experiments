@@ -162,7 +162,9 @@ The lead's four steps (queue row, 2026-10-15). One commit each, local only; the 
       16`, and the script's own default is 32. (The first spelling of the guard tested the
       ratio and the tier-1 fixture that runs 8/4 -- a 2x record -- went red, which is how the
       mistake was caught.)
-- [x] `--tiny`: 15 controls, every one of them a claim that can go red (two of them are seen
+- [x] `--tiny`: 15 controls at `5712be5` (that is that revision's own printed stdout, measured
+      by running it, not counted off the source; the count grows with the steps -- see 3c-3e
+      for each one), every one of them a claim that can go red (two of them are seen
       red on purpose in the tier-1 file): the prism mesh closed and its volume the hexagon's,
       the product's own clock the tier-2 timeout, the buffer keeping cells of its own and
       inside the thin rule's cap and finer than the coarse cell, the product's own
@@ -460,9 +462,17 @@ linewidth is not.
       reads back the argument the writer was handed -- including `np.savez`'s own `.npz`,
       which is why the arm prints the name it actually wrote. Control: a synthetic tail saved
       and read back re-fits to the line fitted in memory, bit for bit (`again["f"] ==
-      wide["f"]`), off 2,972 samples on disk. 15 controls hold at this commit, 18 at step 2h,
-      19 after 2i's own (`--save-tail` refused) -- each count being that revision's own
-      assertion, `done.stdout.count("\n  ok   ")`, read off `git show <rev>:tests/...`:
+      wide["f"]`), off 2,972 samples on disk. The "15" in that sentence is the *test's*
+      assertion, not what the scene printed, and running each revision is what separates the
+      two: `12b674f` prints **16** ok lines against the constant 15, and step 2f's `f91d46c`
+      prints **17** against the same 15 -- so that control was red as committed at both (at
+      `12b674f`, measured: `1 failed in 49.07s`, the assert at `tests/test_paper1_nanowire.py:74`;
+      at `f91d46c` the same assert compares 17 with 15 and cannot pass). `5712be5` (step 2d, 15
+      printed and 15 asserted) is the last revision where the two agreed before the drift, and
+      step 2h is the revision that catches the constant up (18/18), then 19 at 2i and 21 at 2j.
+      Each figure is that revision's own constant from
+      `git show <rev>:tests/test_paper1_nanowire.py`, set against
+      `done.stdout.count("\n  ok   ")` over that same revision's `--tiny` stdout:
       `tiny: all controls hold`, exit 0.
 - [x] **A failed tail write could take the run's number with it** (2h). The write stood among
       the arm's own statements, so a path a run cannot write (a file where a directory
@@ -498,11 +508,19 @@ linewidth is not.
       (default false) and, when it is set for a point source, adds the source's own z to the
       z axis' lines before `build_grid`, so the axis' own node is the depth asked for. The
       in-plane axes are left alone on purpose: x and y are uniform at `dx` for every part
-      here, so a line there would grade an axis that is not graded today (the dipole is also
-      9.89 nm and 9.87 nm off the wire's axis at dx 20, which is the same class of defect and
-      is **not** fixed here -- on a uniform axis it costs a graded axis, not a node, and that
-      is a second decision). `paper1_nanowire.py` sets the key on the one request all three
-      arms share, so the pulse, band and CW arms are pinned alike.
+      here, and the same class of defect lives there -- an index is not the axis. Read off
+      the runs' own `dipole` lines, in-plane offsets as `x, y` in nm: rung 1 `+0.00, -9.57`;
+      rungs 2 and 3 `-0.00, +9.87`; rung 6 `-0.00, -9.87`; rung 7 `+0.00, -0.00`; rungs 8 and
+      9 `-9.89, -9.87`; the s1 band arm `-0.00, -9.87`. So at **dx 20** x reads -9.89 in
+      rungs 8 and 9 but -0.00 in rung 6 and in the s1 band arm, and y reads both -9.87 and
+      +9.87. That offset is the nearest node's distance from the axis, and which side it
+      falls on is the run's own node list, not a `dx` signature: rung 6's x axis has 143
+      nodes and rung 9's has 144 (`grid 143 x 144 x 138` against `144 x 144 x 138` in the two
+      logs), so the *same* index 71 lands on a different physical x and one run reads 0.00
+      where the other reads -9.89. A line on a uniform axis would buy one node and cost a
+      graded axis, which is a second decision, so it is **not** fixed here. `paper1_nanowire.py`
+      sets the key on the one request all three arms share, so the pulse, band and CW arms
+      are pinned alike.
 - [x] **The refusal is the load-bearing half.** `build_grid` drops a line that lands outside
       the extent or within `LINE_SNAP` of an edge, and the source is then snapped anyway with
       nothing printed -- a silent geometry change, which is worse than a failed run. So
