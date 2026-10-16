@@ -40,6 +40,38 @@ an A4000 reading is comparable with the Orin's.
 - **THEN** `python3 -c "import cupy; print(cupy.__version__)"` prints the pinned version, so
   the image's risk (a wheel that cannot be installed or imported) is settled off the cluster
 
+### Requirement: The image SHALL carry the CUDA Toolkit headers its own JIT needs, and the build SHALL prove the JIT can find them with no GPU
+
+cupy JIT-compiles every kernel the bench runs, and nvrtc cannot compile without the CUDA
+Toolkit headers, which the `-runtime` base does not ship. The image SHALL therefore carry the
+headers of its own pinned release, and the Dockerfile SHALL fail its build when the JIT's own
+lookup for them comes back empty -- a check that needs no GPU, because the failure it guards
+against happened on the cluster's first GPU kernel, not at `import`.
+
+#### Scenario: the headers do not change the base or its pin
+- **WHEN** the image's header source is read
+- **THEN** the headers come from the same `12.6.3` release's `-devel` variant, borrowed in a
+  build stage that is never the target (`include/`, 192 entries, 29,991,150 bytes, plus
+  `nvvm/`, 58,791,564 bytes, for nvrtc's own `libdevice.10.bc`), so the A4000 image stays on
+  12.6.3 runtime libraries and comes out at 4,864,242,905 bytes against `f856bbf`'s
+  4,742,903,335, rather than the near 12.4 GB a whole `-devel` base
+  (11,471,517,149 bytes, against this base's 3,933,593,520) would make it
+
+#### Scenario: the check fails on the image that failed on the cluster
+- **WHEN** the build's own check -- `cuda.pathfinder.find_nvidia_header_directory('cudart')`,
+  plus the `cuda_fp16.h` file under the directory it answers -- is run against `f856bbf`
+- **THEN** it answers `None` and the check fails, which is a red that
+  `cupy.cuda.get_cuda_path()` cannot give: on that same image the call returns a non-empty,
+  existing path (`/usr/local/cuda-12.6/targets/x86_64-linux`) and it is the headers inside it
+  that are missing, so a check on the path alone is a false green
+
+#### Scenario: no GPU is needed to run the check
+- **WHEN** the check runs on the GPU-less building host
+- **THEN** it turns on the headers alone; `cupy.cuda.compiler.compile_using_nvrtc()` SHALL NOT
+  be used as the check, because it wants a driver context and raises
+  `cudaErrorInsufficientDriver` without one, so a GPU kernel Job on a worker remains the
+  end-to-end proof
+
 ### Requirement: The A4000 Job SHALL be pinned to one GPU of one product and SHALL request exactly what it limits
 
 `manifests/bench/paper1-a4000-job.yaml` SHALL select the GPU product and ask for one GPU,

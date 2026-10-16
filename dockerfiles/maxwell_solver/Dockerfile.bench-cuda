@@ -8,7 +8,39 @@
 # BASE, pinned at or below what the target nodes report: the A4000 nodes carry
 # nvidia.com/cuda.runtime-version.full=12.7 with driver 565.57.01, so 12.6.3 is the newest
 # tag at or under it. The -runtime variant has the math libraries (cuBLAS/cuFFT/cuSPARSE)
-# the solver needs; the -devel toolchain is not, since nothing is compiled here.
+# the solver needs -- but not the CUDA Toolkit HEADERS, and the one thing on this path that
+# does compile is cupy's own JIT (see THE HEADERS).
+#
+# THE HEADERS. cupy JIT-compiles every kernel it runs, and nvrtc needs the Toolkit headers to
+# do it: the -runtime variant's include dir carries only nvToolsExt.h. f856bbf reached the
+# cluster without them and the FIRST GPU kernel died there -- fdtd.py:2244, `xp.all(eps > 0)`,
+# 2026-10-16 21:15Z, after the run had already priced its grid and printed `caps OK`. So this
+# image borrows the headers from the SAME 12.6.3 release's -devel variant, in a named stage
+# used for nothing else: include/ (192 entries, 29,991,150 bytes) and nvvm/ (58,791,564
+# bytes, whose libdevice.10.bc is nvrtc's device library). Those two trees measure 88,782,714
+# bytes in the built image and the same bytes in the -devel image (du -sb, run in both). Against
+# this base's
+# 3,933,593,520 bytes the -devel base is 11,471,517,149, so taking the whole base instead
+# would land the image near 12.4 GB -- nvcc, static libraries and lint tools this bench never
+# calls -- for the 88.8 MB of files it needs. As built: 4,864,242,905 bytes against f856bbf's
+# 4,742,903,335, +121 MB, docker's 4.74 GB -> 4.86 GB.
+#
+# THE CHECK. The build asks the question cupy's JIT asks, with no GPU present:
+# cuda.pathfinder.find_nvidia_header_directory('cudart'), and the header file under it.
+# Measured both ways: on f856bbf it answers None and the check FAILS (the build-time proof
+# this change adds); on this image it answers /usr/local/cuda/include. Two candidate checks
+# would NOT have caught it, both measured, so neither is used: `import cupy` (needs neither a
+# GPU nor headers -- it was green on f856bbf, which is how a broken image passed its build),
+# and cupy.cuda.get_cuda_path() (returns a non-empty path even on f856bbf,
+# /usr/local/cuda-12.6/targets/x86_64-linux, because the symlink and the directory exist and
+# only the headers inside do not -- a check on it would be a false green).
+# cupy.cuda.compiler.compile_using_nvrtc() cannot be a build-time check at all: it wants a
+# driver context and raised cudaErrorInsufficientDriver on this GPU-less building host. The
+# end-to-end proof stays a GPU kernel Job on a worker, which no build step can replace.
+#
+# NOT borrowed: lib64/libcudadevrt.a. cupy reads it only when the compile options ask for
+# relocatable device code (compiler.py:243, `_is_cudadevrt_needed`), and nothing on this path
+# passes one: no RawKernel or RawModule in the script or in the six modules it imports.
 #
 # FILES: exactly the import closure of the bench script, derived from the script rather than
 # listed by hand. From the repo root:
@@ -43,9 +75,14 @@
 # SMOKE, with no GPU on the building host (docker run ignores nice/ulimit, so the container is
 # bounded on its own -- every local docker run needs both):
 #   docker run --rm --cpus=2 --memory=2g --entrypoint python3 IMG -c "import cupy; print(cupy.__version__)"
+#   docker run --rm --cpus=2 --memory=2g --entrypoint python3 IMG -c "import os, cupy; from cuda.pathfinder \
+#     import find_nvidia_header_directory as f; d=f('cudart'); print(d, os.path.exists(os.path.join(d,'cuda_fp16.h')))"
 #   docker run --rm --cpus=2 --memory=2g IMG --help
 #   docker run --rm --cpus=2 --memory=2g IMG --tiny --xp numpy
 
+# The borrowed headers (THE HEADERS): a stage that is never the target, copied from and never
+# run. Its only job is to hold the -devel variant's /usr/local/cuda-12.6 trees.
+FROM nvidia/cuda:12.6.3-devel-ubuntu24.04 AS ctk
 FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
 
 ENV PYTHONUNBUFFERED=1 \
@@ -85,12 +122,26 @@ COPY dockerfiles/maxwell_solver/fdtd_voxel.py dockerfiles/maxwell_solver/fdtd_vo
 COPY dockerfiles/maxwell_solver/mse_common.py dockerfiles/maxwell_solver/mse_common.py
 COPY dockerfiles/maxwell_solver/mse_geometry.py dockerfiles/maxwell_solver/mse_geometry.py
 
+# THE HEADERS (see above), at their real multiarch path rather than through /usr/local/cuda,
+# which is a symlink chain through /etc/alternatives in both variants.
+COPY --from=ctk /usr/local/cuda-12.6/targets/x86_64-linux/include/ /usr/local/cuda-12.6/targets/x86_64-linux/include/
+COPY --from=ctk /usr/local/cuda-12.6/nvvm/ /usr/local/cuda-12.6/nvvm/
+
 # Build-time proof of the closure and the layout: every module the script imports at run time
 # must load from the copied tree, and cupy must import with no GPU present. A missing COPY
 # fails the build here rather than on a cluster node five hours in.
 RUN python3 -c "import sys; sys.path[:0] = ['scripts', 'dockerfiles/maxwell_solver']; \
         import paper1_nanowire, fdtd, fdtd_grid, fdtd_layout, fdtd_voxel, mse_common, mse_geometry; \
         import cupy; print('closure ok, cupy', cupy.__version__)"
+
+# THE HEADERS CHECK (see above): the question the first GPU kernel asked and lost, asked here
+# with no GPU, so a headerless image fails AT THE BUILD rather than on a cluster node.
+RUN python3 -c "import os, cupy; \
+        from cuda.pathfinder import find_nvidia_header_directory as find; \
+        d = find('cudart'); \
+        assert d, 'cuda-pathfinder found no CUDA header directory'; \
+        assert os.path.exists(os.path.join(d, 'cuda_fp16.h')), d; \
+        print('headers ok at', d, '-- cupy', cupy.__version__)"
 
 # Non-root, and its own home for cupy's kernel cache. The Job names this uid explicitly, so
 # the kubelet does not have to inspect the image to verify runAsNonRoot.

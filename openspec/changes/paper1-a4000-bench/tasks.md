@@ -360,3 +360,62 @@ contradict.
   (0:18:38)`, exit 0. The count is unmoved from the pre-correction 54 for a reason worth stating:
   the new assertions went inside an existing test, so they add coverage without adding a line to
   the count.
+
+## The header fix (row `975ea38f`): the first GPU kernel, and a build check that fails without the headers
+
+- **What failed**, as reported by the lead from worker2 (2026-10-16 21:15:19Z, the locator Job):
+  the run priced its grid and printed `caps OK`, and then the **first GPU kernel** died inside
+  `_run` at `fdtd.py:2244`, `xp.all(eps > 0)` — a cupy JIT compile (`cupy_launch`), not the
+  estimator. `CUDA_PATH` on the Pod did not help, because on that image the directory the
+  variable would name is not there.
+- **Not quoted**: the `RuntimeError: Failed to find CUDA headers…` line as the row renders it is
+  the worker's text, and it is not in the image's own bytes — `grep -ra 'CUDA headers' /opt/venv`
+  and over the CUDA trees finds only an unrelated CCCL comment. The mechanism below is therefore
+  attributed by measurement **on the failed image** (`paper1-bench-cuda:f856bbf`, local `.Id`
+  `sha256:7b12e059a9ab…`, 4,742,903,335 bytes), not by that string.
+- **The measurement, with no GPU**: `cuda.pathfinder.find_nvidia_header_directory('cudart')`
+  (cuda-pathfinder 1.8.3, already in the venv) answers **None** on f856bbf — that is the question
+  cupy's JIT asks. The `-runtime` base's include dir carries only `nvToolsExt.h`; `libnvrtc.so.12`
+  is present, so nvrtc is there and its inputs are not. Two candidate checks were measured and
+  rejected: `import cupy` needs neither a GPU nor headers (green on f856bbf — which is how this
+  image passed its own build), and `cupy.cuda.get_cuda_path()` returns a non-empty **existing**
+  path (`/usr/local/cuda-12.6/targets/x86_64-linux`) — a false green, since it is the headers
+  inside that path that are missing. `compile_using_nvrtc()` raised `cudaErrorInsufficientDriver`
+  on this GPU-less host, so it cannot be a build-time check at all.
+- **The fix**: a named stage `FROM nvidia/cuda:12.6.3-devel-ubuntu24.04 AS ctk`, never the target,
+  plus two `COPY --from=ctk` lines at the trees' real multiarch paths
+  (`targets/x86_64-linux/include/`, `nvvm/`). `du -sb` inside the built image and inside the
+  `-devel` image returns the **same** 29,991,150 and 58,791,564 bytes — 88.8 MB of the source's
+  bytes, not a re-derivation. `libcudadevrt.a` is deliberately **not** copied: cupy reads it only
+  when compile options ask for relocatable device code (`compiler.py:243`), and there is no
+  `RawKernel` or `RawModule` anywhere in the script or the six modules it imports.
+- **The check, red and green, run with the Dockerfile's own verbatim body and no GPU**: on
+  f856bbf it fails with `AssertionError: cuda-pathfinder found no CUDA header directory` (exit 1);
+  in this image's build log it prints `headers ok at /usr/local/cuda/include -- cupy 14.2.0`, and
+  the same body re-run against the **built** image prints the same line. The build's other proof,
+  from before, still prints `closure ok, cupy 14.2.0`.
+- **Size change** (the lead asked for it stated): the image is now 4,864,242,905 bytes against
+  f856bbf's 4,742,903,335 — **+121 MB**, docker's `4.74 GB → 4.86 GB`. The two alternatives the
+  row named: a whole `-devel` base (measured locally at 11,471,517,149 bytes, against the
+  `-runtime` base's 3,933,593,520) would put the image near **12.4 GB**; the `cupy-cuda12x[ctk]`
+  extra would install a second, version-drifting copy of the toolkit through pip. Borrowing the
+  two trees costs the 88.8 MB the JIT actually needs.
+- **Smoke of the BUILT image**, `docker run --rm --cpus=2 --memory=2g`, no GPU on this host:
+  `--entrypoint python3` → `python 3.12.3 numpy 2.2.6 scipy 1.15.3 trimesh 5.1.0 cupy 14.2.0
+  uid 10001`; `--help` lists `--max-cells`, `--max-steps`, `--pad-nm`, `--pml-nm`,
+  `--tail-periods`; `--tiny --xp numpy` → `boundary  open: pad 16 cells = 320 nm, absorber 6 cells
+  = 120 nm, 200 nm of open space (both at the product defaults)` and `tiny: all controls hold`.
+- **The seven payload files are the same bytes as f856bbf's image**, md5 for md5 (md5sum run in
+  both containers), and `git diff --name-only f856bbf` lists nothing under the `COPY` lines — so
+  this image's solver is f856bbf's solver and only the recipe and the borrowed base files differ.
+- **The tag**: `dockerfiles/maxwell_solver/Dockerfile.bench-cuda` changes the recipe, so the image
+  is rebuilt and retagged to the sha of the commit that carries it, and the commit after that one
+  points `manifests/bench/paper1-a4000-job.yaml` at that tag (the sha is on the row and in the
+  handoff to the reviewer). The superseded `:f856bbf` **tag** is
+  removed from the local store as the row asks; the image itself is left untagged under its ID
+  `sha256:7b12e059a9ab…` (4.74 GB) until the lead has pushed and verified the new tag, so the red
+  stays reproducible here; it goes when the lead says so.
+- **What is NOT proven by the builder**: no GPU kernel has run against this image — this host has
+  no GPU, so a kernel Job is not available to this seat. The build check turns on the headers
+  alone by construction. The end-to-end proof is the lead's own one-minute kernel smoke on
+  worker2 before the locator relaunches, which the row already schedules.
