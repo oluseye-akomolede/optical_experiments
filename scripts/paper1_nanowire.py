@@ -576,11 +576,6 @@ def ringdown(args, lay, request, measured):
               f" at 5 sigma and under {DRIVE_FLOOR:g} of its peak past"
               f" {pulse_end_sigma():.1f}")
         return None, 2
-    if args.save_tail:
-        wrote = save_record(args.save_tail, sim["source_field"], dt, start, request)
-        print(f"tail      {np.size(sim['source_field']):,} samples and the dt they"
-              f" were taken with in {wrote}: load_record plus fit_decay re-fits this"
-              f" tail without another run")
     half = float(request["bandwidth"])
     fit = fit_decay(sim["source_field"], dt, start, frequency=f0,
                     band=(f0 - half, f0 + half))
@@ -594,6 +589,22 @@ def ringdown(args, lay, request, measured):
     print(f"caveat    tau's error is the fit's own, not the geometry's: a tail"
           f" holding two decays still fits one of them. --vacuum is the same arm"
           f" on the transient this scene has with no cavity at all")
+    if args.save_tail:
+        # After the fit is printed, not before: the write is a convenience and the
+        # fit is the measurement, so a write that fails must not be able to take the
+        # number down with it -- and the only exception a path can raise here is an
+        # OSError, which is caught rather than left to end the run.
+        try:
+            wrote = save_record(args.save_tail, sim["source_field"], dt, start,
+                                request)
+        except OSError as exc:
+            print(f"warning   the tail was not written ({type(exc).__name__}:"
+                  f" {exc}): the fit above is this run's own, and a second model on"
+                  f" this record now needs another run")
+        else:
+            print(f"tail      {np.size(sim['source_field']):,} samples and the dt they"
+                  f" were taken with in {wrote}: load_record plus fit_decay re-fits"
+                  f" this tail without another run")
     if fit["resolved"]:
         print(f"Q         {fit['q']:.4g} +- {fit['q_err']:.2g}, a line of"
               f" {args.wavelength / fit['q']:.2f} nm against the paper's"
@@ -897,6 +908,21 @@ def tiny(args) -> int:
                saved == tmp + "/tail.npz"
                and back["values"].size == syn.size
                and again["f"] == wide["f"] and again["tau"] == wide["tau"]))
+
+    # The arm catches OSError around the write, so the control has to ask the real
+    # raise site for its type: a path that cannot be written must produce the one
+    # exception the arm catches, and not one that would escape the catch and end the
+    # run after the fit had already been computed.
+    with tempfile.TemporaryDirectory() as tmp:
+        blocker = Path(tmp) / "not-a-directory"
+        blocker.write_text("x")
+        try:
+            save_record(str(blocker / "tail"), syn, dt, 0, req_syn)
+            raised = None
+        except OSError as exc:
+            raised = type(exc).__name__
+    ok.append((f"a tail that cannot be written raises what the arm catches"
+               f" ({raised or 'nothing'} is an OSError)", raised is not None))
 
     as_tail = argparse.Namespace(**{**base, "profile": "pulse", "ringdown": True,
                                     "spectrum": True, "tail_periods": 20.0})

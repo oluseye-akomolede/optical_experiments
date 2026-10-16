@@ -70,8 +70,11 @@ def test_the_tiny_scene_holds_every_control():
     assert done.returncode == 0, done.stdout + done.stderr
     assert "tiny: all controls hold" in done.stdout
     assert "FAIL" not in done.stdout
-    # 15 controls: a scene that quietly loses one still has to be caught here
-    assert done.stdout.count("\n  ok   ") == 15, done.stdout
+    # 18 controls: a scene that quietly loses one still has to be caught here. The
+    # three past 15 are the fit's window following the drive's band (2e), the saved
+    # tail re-fitting to the line it came from (2f), and an unwritable tail path
+    # raising the one exception the arm catches (2h).
+    assert done.stdout.count("\n  ok   ") == 18, done.stdout
     # and the settled record the small scene runs must not warn about itself
     assert "warning: the record is" not in done.stdout
 
