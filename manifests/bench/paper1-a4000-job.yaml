@@ -81,10 +81,10 @@ spec:
       restartPolicy: Never
       imagePullSecrets:
         - name: mse-harbor-pull
-      # Product only, no host: the namespace's GPU quota and the card's own allocatable decide
-      # which node. Add `kubernetes.io/hostname: sigma-workerN` only if the lead wants one that
-      # is known idle at launch time.
+      # Pinned to sigma-worker2 by the owner (2026-10-16 18:46Z): sigma-worker1's two A4000s
+      # belong to the hcm team. The product selector stays so a relabelled node cannot match.
       nodeSelector:
+        kubernetes.io/hostname: sigma-worker2
         nvidia.com/gpu.product: NVIDIA-RTX-A4000
       containers:
         - name: bench
