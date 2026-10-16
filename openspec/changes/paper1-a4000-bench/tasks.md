@@ -108,5 +108,18 @@ the alternative is dx 12 nm/pad 600 (6,397,264 cells) — the same pad, a coarse
 
 ## Evidence for the row
 
-- shas: (filled after each commit) — image build log, the three smoke outputs, `openspec
-  validate paper1-a4000-bench`, and the affected tier-1 counts.
+- Image commit **d101aa8** (Dockerfile + this file + the spec delta); manifest commit follows it.
+  The image tag is d101aa8: the revision the image was built from.
+- Built on the VM: `DOCKER_CONFIG=~/.docker-mse`, `nice -n 19`, exit 0, 12/12 steps, image
+  `4.74 GB`. The build-time closure check printed `#15 1.331 closure ok, cupy 14.2.0`, so the
+  CUDA wheel is importable without a GPU.
+- Smoke-tested on the VM, no GPU, `docker run --rm --cpus=2 --memory=2g`, all exit 0:
+  - `--entrypoint python3 -c "import cupy, numpy, scipy, trimesh; ..."` →
+    `cupy 14.2.0 numpy 2.2.6 scipy 1.15.3 trimesh 5.1.0`, `uid 10001`
+  - `--help` → the script's own usage line
+  - `--tiny --xp numpy` → `tiny: all controls hold`
+- `openspec validate paper1-a4000-bench` → valid.
+- `mse-harbor-pull` confirmed present in ns `mode-search-engine` and is what the live `mse-web`
+  deployment uses to pull `harbor.arcadia-ecs.local/mode-search-engine/mse-web:1cca12b` — the
+  manifest's pull secret and registry path are the ones a working consumer already uses.
+- Pushed by nobody yet: the builder does not push; the image is tagged locally for the lead.
