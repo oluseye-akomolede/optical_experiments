@@ -19,27 +19,46 @@
 # killed by the deadline leaves only what it printed.
 #
 # WHAT THIS RUN IS. The dx-10 grid check the owner asked for (18:43Z), priced from the product's
-# own estimator at 993 nm, 100 periods, pad 600 nm: 9,166,668 cells, 39,650 steps, 9.93 nm per
-# bin, ~1.12 GiB. The Orin's measured rate (r19, r20: 1.31x the estimator) would put it at
-# 11,696 s; an A4000 is expected to be faster, and the Job's own progress lines say by how much
-# within minutes.
+# own estimator at 993 nm, 100 periods, mirror-pad 600 nm and the open boundary HELD at the
+# distance r20's own run held (320 nm of pad, 200 nm of absorber): 14,048,300 cells, 39,650
+# steps, 9.93 nm per bin, 1.63 GiB, 13,662.4 s at the estimator's rate = 17,925 s (4 h 58 m) at
+# the Orin's measured factor 1.312 (r19 1.3116, r20 1.3119). An A4000 is expected to be faster,
+# and the Job's own progress lines say by how much within minutes.
 #
-# KNOWN OBSTACLE, for the lead: those args are REFUSED by the shipped code -- 9,166,668 cells
-# is over fdtd.MAX_CELLS = 8,000,000, and the two bench knobs raise steps and seconds only. The
-# alternatives, both priced in openspec/changes/paper1-a4000-bench/tasks.md:
-#   (a) dx 12 nm, pad 600 nm -- fits today (6,397,264 cells, 0.79 GiB, 39,650 steps, 6,221.5 s
-#       at the estimator's rate = 8,163 s on the Orin). Same manifest, `--dx "12"`, and
-#       activeDeadlineSeconds 12600 instead of 18000.
-#   (b) the ring-down locator first (--ringdown --band-half 100 --tail-periods 30) to find where
-#       a finer grid puts the resonance: also over the cell cap at pad 600, 4,928.0 s at the
-#       estimator's rate = 6,465 s on the Orin, activeDeadlineSeconds 10800.
+# WHY THE BOUNDARY IS IN THE ARGS. fdtd_layout.OPEN_PAD_CELLS is a cell COUNT, so the product's
+# own pad is 320 nm at dx 20 -- which is what r20 ran -- and 160 nm at dx 10. On the defaults
+# this record would move the open boundary and the wire's resolution at once, and no difference
+# from r20 could then be attributed to either one (this scene's own record: 200 nm against
+# 400 nm of pad moved F by 16%). Held at 320/200 nm, the box is r20's own 2318.8 x 2318.8 x
+# 2177.0 nm, so dx is the only thing this record changes. --pad-nm/--pml-nm are in the script
+# from the revision this tag names; without them the args are `unrecognized arguments`.
+#
+# THE THREE CEILINGS ARE NOT OPTIONAL. The product's own defaults (8,000,000 cells, 20,000
+# steps, 1,800 s) refuse this record on all three counts -- 14,048,300 cells, 39,650 steps,
+# 13,662 s -- and only this script's own flags raise them (4b9d9fc for the first two, --max-cells
+# on the lead's 2026-10-16 decision). The product's callers are unchanged: the web form and the
+# worker call fdtd.check_limits bare. The ceilings are pricing verdicts, not timers -- nothing
+# but activeDeadlineSeconds stops a run that has started.
+#
+# THE ALTERNATIVES, priced the same way (boundary held, mirror-pad 600 nm); the tables are in
+# openspec/changes/paper1-a4000-bench/tasks.md:
+#   (a) THE LOCATOR FIRST, the lead's order: the ring-down locator, the same grid with a shorter
+#       record -- 21,918 steps at its own 1000 nm centre, 7,552.4 s = 9,909 s (2 h 45 m) on the
+#       Orin, so activeDeadlineSeconds 16200, with `--ringdown --band-half 100 --tail-periods 30`
+#       in place of `--wavelength 993`, --periods and --window-periods and
+#       --max-cells/--max-steps/--max-seconds unchanged. It says where a finer grid puts the
+#       resonance before the 5-hour record is spent on 993 nm.
+#   (b) THE COARSER RUNG IF THIS ONE IS KILLED AND THE CARD IS THE PROBLEM: dx 15 nm is the
+#       nearest rung that fits the product's own 8,000,000 cells with the boundary and the mirror
+#       pad held -- 5,234,775 cells, 5,091.0 s = 6,679 s on the Orin, activeDeadlineSeconds
+#       10800. dx 12 nm is NOT a way out: 8,952,300 cells, still over the cap.
 #
 # activeDeadlineSeconds, derived (not a rate the estimator cannot give): the record's own
-# seconds 8,914.8 s x 1.312 (the Orin's measured factor over the estimator, r19 1.3116,
-# r20 1.3119) = 11,696 s, x 1.5 margin = 17,544 s, + 300 s for the scene and the first frames
-# = 17,844 s, rounded up to the next half hour = 18,000 s. This Job is the launcher: there is
-# no run_cw.sh here and no MSE_CLOCK, and `--max-seconds` below is a pricing verdict, not a
-# timer -- a run that has started is stopped by this deadline and by nothing else.
+# seconds 13,662.4 s x 1.312 (the Orin's measured factor over the estimator) = 17,925 s, x 1.5
+# margin = 26,888 s, + 300 s for the scene and the first frames = 27,188 s, rounded up to the
+# next half hour = 28,800 s. This Job is the launcher: there is no run_cw.sh here and no
+# MSE_CLOCK, and `--max-seconds` below is a pricing verdict, not a timer -- a run that has
+# started is stopped by this deadline and by nothing else.
 #
 apiVersion: batch/v1
 kind: Job
@@ -51,7 +70,7 @@ metadata:
     paper1-arm: cw993-dx10
 spec:
   backoffLimit: 0                    # a failed run is a result (the log), not a retry
-  activeDeadlineSeconds: 18000       # 5 h: see the derivation above
+  activeDeadlineSeconds: 28800       # 8 h: see the derivation above
   ttlSecondsAfterFinished: 604800    # 7 days: the log of a 5-hour run must outlive the queue
   template:
     metadata:
@@ -69,40 +88,40 @@ spec:
         nvidia.com/gpu.product: NVIDIA-RTX-A4000
       containers:
         - name: bench
-          # The tag is the revision the image was built FROM: 69654be carries
-          # Dockerfile.bench-cuda unchanged and adds the --max-cells flag the args below pass,
-          # and the image was built from that tree and smoke-tested there. Push it under this
-          # tag and the reference here is the revision, verifiable by rebuilding 69654be.
-          # The superseded tag was d101aa8, which predates --max-cells and would refuse these
-          # args with "unrecognized arguments".
-          image: harbor.arcadia-ecs.local/mode-search-engine/paper1-bench-cuda:69654be
+          # The tag is the revision the image was built FROM: it carries Dockerfile.bench-cuda
+          # unchanged and adds --max-cells, --pad-nm and --pml-nm, the flags the args below
+          # pass, and the image was built from that tree and smoke-tested there. Push it under
+          # this tag and the reference is the revision, verifiable by rebuilding it.
+          image: harbor.arcadia-ecs.local/mode-search-engine/paper1-bench-cuda:f856bbf
           args:
             - --hex
             - paper
             - --wavelength
-            - "993"          # where the dx-20 run found the mode; the locator variant (b)
+            - "993"          # where the dx-20 run found the mode; the locator variant (a)
             - --dx           # says whether a finer grid moves it
             - "10"
             - --mirror-pad
-            - "600"          # the Orin's own pad, unchanged, so this is a grid check only
+            - "600"          # r20's own gold pad, unchanged, so this is a grid check only
+            - --pad-nm       # and r20's own open boundary, held as a DISTANCE (see WHY THE
+            - "320"          # BOUNDARY IS IN THE ARGS): 32 pad cells at this dx
+            - --pml-nm       # 20 absorber cells inside them, 120 nm of open space around the
+            - "200"          # parts -- the same nm r20 ran, in twice as many cells
             - --periods
             - "100"          # r20's record: 100.0 periods = 39,650 steps at this dt
             - --window-periods
             - "8"            # the script's own default, named so the F reading is unambiguous
             # The three bench ceilings. All are needed and all are on the command line, where
             # a reviewer reads them: the product's defaults (8,000,000 cells, 20,000 steps,
-            # 1,800 s) refuse this record, and only this script's own flags can raise them
-            # (4b9d9fc for the first two, the cell one after the lead's 2026-10-16 decision).
-            # --max-seconds is a pricing verdict: 8,914.8 s at the estimator's rate, so
-            # 10,800 s leaves room without inventing a timer the product does not have.
-            # --max-cells is the smallest round million over the priced 9,166,668 (cells are
-            # counted in nodes, so the 1.14x headroom also absorbs the +1 node per axis).
+            # 1,800 s) refuse this record, and only this script's own flags can raise them.
+            # --max-seconds is a pricing verdict: 13,662.4 s at the estimator's rate, so
+            # 18,000 s is 1.32x that without inventing a timer the product does not have.
+            # --max-cells is the smallest round million over the priced 14,048,300.
             - --max-cells
-            - "10000000"
+            - "15000000"
             - --max-steps
             - "200000"
             - --max-seconds
-            - "10800"
+            - "18000"
             - --xp
             - cupy           # the script defaults to numpy, about 3x slower than the
                              # estimator's rate; nothing else on this path would catch that
@@ -116,12 +135,11 @@ spec:
             - {name: OPENBLAS_NUM_THREADS, value: "2"}
             - {name: NUMEXPR_NUM_THREADS, value: "2"}
           resources:
-            # requests == limits, all three. Memory: the priced grid is ~1.12 GiB by the
-            # estimator's own storage per cell (~131 bytes: its printed GiB against cells; the
-            # same table prints 0.36 GiB for r20's 2,903,040 cells at 9,166,668/2,903,040 =
-            # 3.16x the cells). 1.12 GiB is 1,146.9 MiB, which is 14.0% of this request
-            # (8,192 MiB, so the request is 7.1x the estimate) and 7.0% of the card's
-            # 16,376 MiB -- both denominators named, because "15% of the card" was wrong.
+            # requests == limits, all three. Memory: the priced grid is 1.63 GiB by the
+            # estimator's own storage for it (1,754,244,508 bytes = 1,673.0 MiB), which is
+            # 20.4% of this request (8,192 MiB, so the request is 4.9x the estimate) and 10.2%
+            # of the card's 16,376 MiB -- both denominators named, because "15% of the card"
+            # was wrong. CPU 2 and the four thread counts above are one setting.
             requests: {cpu: "2", memory: 8Gi, nvidia.com/gpu: 1}
             limits: {cpu: "2", memory: 8Gi, nvidia.com/gpu: 1}
           securityContext:

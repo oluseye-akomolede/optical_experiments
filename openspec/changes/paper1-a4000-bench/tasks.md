@@ -269,15 +269,39 @@ contradict.
 
 ## Evidence for the row
 
-- Commits: the code commit (script, layout, tests, specs, this file, the proposal) carries the
-  image's tag; a second commit lands the manifest that names it.
-- Built on the VM: `DOCKER_CONFIG=~/.docker-mse`, `nice -n 19`, exit 0, 12/12 steps, image
-  `4.74 GB`. The build-time closure check printed `closure ok, cupy 14.2.0`, so the CUDA wheel
-  is importable without a GPU.
+- Commits: `f856bbf` is the code commit (script, layout, tests, specs, this file, the proposal)
+  and it is the revision the image is built from, so it carries the image's tag; the commit after
+  it lands the manifest that names `…/paper1-bench-cuda:f856bbf`.
+- Built on the VM from that revision: `DOCKER_CONFIG=~/.docker-mse`, exit 0, 12/12 steps,
+  `sha256:94c9507399a3b6f5a5d154826cae198dfe2ebfa6c74dae14f73d6edc892c5df2`, 4.74 GB. The
+  build-time closure check printed `closure ok, cupy 14.2.0`, so the CUDA wheel is importable
+  without a GPU.
+- The image's seven python files are the revision's bytes, checked rather than assumed: each
+  file's md5 inside the container equals `git show f856bbf:<path> | md5sum` for all seven
+  (`paper1_nanowire.py` `468d3006…`, `fdtd.py` `d233b759…`, `fdtd_grid.py` `130a6791…`,
+  `fdtd_layout.py` `7e328cf6…`, `fdtd_voxel.py` `4be5b67e…`, `mse_common.py` `a1a34af3…`,
+  `mse_geometry.py` `2d5a3463…`).
 - Smoke-tested on the VM, no GPU, `docker run --rm --cpus=2 --memory=2g`, all exit 0:
-  `cupy 14.2.0 numpy 2.2.6 scipy 1.15.3 trimesh 5.1.0` as uid 10001; `--help`; `--tiny --xp
-  numpy` → `tiny: all controls hold`; and the pricing arm in the image reproduces the table's
-  own dx-10 row, with the boundary line and the raised cell ceiling in the caps line.
+  `--entrypoint python3` → `cupy 14.2.0 numpy 2.2.6 scipy 1.15.3 trimesh 5.1.0 uid 10001`;
+  `--help` lists `--pml`, `--pad-nm`, `--pml-nm` and `--max-cells`; `--tiny --pad-nm 200
+  --pml-nm 120 --xp numpy` → the boundary line `boundary  open: pad 10 cells = 200 nm, absorber
+  6 cells = 120 nm, 80 nm of open space (--pad-nm 200 --pml-nm 120)` and `tiny: all controls
+  hold`; and the pricing arm with THIS manifest's own args reproduces the table's held dx-10 row
+  and its boundary line — `10.0 600 14,048,300 39,650 13662.4 1.63 9.93 fits (the bench ceiling,
+  not the tier-2 clock)`, under `boundary  held at 320 nm of pad and 200 nm of absorber at dx
+  10.0; each rung's cell counts follow its own dx (32/20 cells at dx 10.0)`.
+- Not observed, and not claimed: the `caps` line's `(bench ceiling: …, …, N cells)` clause
+  prints only on a real run (`paper1_nanowire.py:930`), and no real run is affordable here — the
+  reviewer said the same. It is read from the source and asserted by tier-1, no more.
+- Tier-1 for this revision: the two files hold 54 tests and all 54 pass, in two complementary
+  selections (`-k "ceiling or boundary or holds or nearest or estimator or prices or hand"` →
+  17 passed / 37 deselected; its exact negation → 37 passed / 17 deselected), so the union is the
+  whole pair rather than two overlapping hunks.
+- The reviewer's two stale spots, both closed here and re-checked by grep at this revision:
+  `manifests/bench/paper1-a4000-job.yaml`'s obstacle block now says the cell shortfall is resolved
+  by this file's own `--max-cells` and the GPU quota is the only live obstacle (its one `refused`
+  is the quota text); `proposal.md` no longer calls `--max-cells` proposed nor says the record
+  cannot be launched.
 - `openspec validate paper1-a4000-bench` → valid.
 - `mse-harbor-pull` confirmed present in ns `mode-search-engine` and is what the live `mse-web`
   deployment uses to pull `harbor.arcadia-ecs.local/mode-search-engine/mse-web:1cca12b` — the
