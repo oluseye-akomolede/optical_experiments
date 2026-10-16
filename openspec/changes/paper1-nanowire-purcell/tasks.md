@@ -202,7 +202,7 @@ The lead's four steps (queue row, 2026-10-15). One commit each, local only; the 
       block from the real path at this exact rung (a local build-and-estimate probe, no solve;
       every line below is the probe's own output):
 
-          args      --spectrum --dx 10 --mirror-pad 400
+          args      --spectrum --hex corners --dx 10 --mirror-pad 400
           grid      165 x 166 x 202  = 5,532,780 cells
           spacings  x, y 10.000 nm uniform;  z 3.000 nm finest, 10.000 nm coarsest
           z-axis    the product's own check_axis says: no problems
@@ -386,7 +386,7 @@ linewidth is not.
 ## 3b. The tier-2 runs on the Orin (the lead's approval, 2026-10-15), one rung at a time
 
 - [x] **Run 1** `--wavelength 900 --hex corners --dx 20 --mirror-pad 400`, the comparison
-      point for the old reading: grid 121 x 123 x 139 = 2,037,477 cells, 11,426 steps = 32.0
+      point for the old reading: grid 121 x 122 x 138 = 2,037,156 cells, 11,426 steps = 32.0
       periods, **F = 3.2295 at 900 nm**, 727.6 s wall against a 570.9 s estimate (**1.27x**).
 - [x] **Run 2** the paper's own reading (`--hex paper`: 478.8 nm across corners, 414.7 nm
       across flats): 123 x 124 x 138 = 2,104,776 cells, 11,426 steps, **F = 0.1971 at
@@ -398,9 +398,37 @@ linewidth is not.
 - [x] **The pad decision the lead's rule makes** (2026-10-15: "If either pad moves F by more
       than 10%, use the larger pad for the pulse run and say so"). Pad 200 reads 0.2288 and
       pad 400 reads 0.1971: 16.1 per cent apart, over the line, so **the pulse run takes the
-      larger pad, 600 nm**. Priced there: 2,841,696 cells, 17,948 steps, 1,251.0 s estimated
-      -- about 1,550 s, 26 min, at the measured 1.24x, inside the 1,800 s clock. dx 15 at pad
-      600 and every dx 12 or finer rung are refused at that pad.
+      larger pad, 600 nm**. Priced there at 900 nm, dx 20, each row naming its arm -- "CW" is
+      the point arm, "pulse" is `--ringdown --tail-periods 20`:
+
+          arm    geometry  cells       steps    s est    nm per bin at 900 nm
+          CW     paper     2,841,696   11,426     796.4  28.12
+          pulse  paper     2,821,104   18,649   1,290.4  17.13
+          CW     corners   2,763,036   11,426     774.4  28.12
+          pulse  corners   2,723,560   18,649   1,245.8  17.13
+
+      The arm is not a detail, and a row is only the row it names: the same rung priced as
+      `--spectrum` reads 11,550 steps at 2,821,104 cells (paper) or 2,723,560 (corners), and
+      `--band-half` moves the record too (dx 20 pad 400 at 900 nm: band-half 70 -> 11,550
+      steps, band-half 100 -> 8,176, band-half 30 refused). dx 15 at pad 600 and every dx 12
+      or finer rung are refused at that pad.
+
+- [x] **The rungs that were run**, each read from its own log in
+      `~/mse-bench/paper1/logs` (machines: the Orin bench, `/home/sigmastrain/mse-worker/venv`).
+      **Rung 6** -- pulse, paper, dx 20, pad 600, drive 1000 nm with band 1000 +- 100:
+      143 x 144 x 138 = 2,841,696 cells, dt 8.402479e-18 s, 17,948 steps = 45.2 periods,
+      1,251.0 s estimated, tail 7,896 steps = 19.9 periods. **Killed at the 1,800 s cap**
+      (exit 124, log ending at its `source` line) -- see the rate below.
+      **Rung 7** -- the same arm at dx 30: 123 x 123 x 118 = 1,785,222 cells, the same 17,948
+      steps, 785.9 s estimated, and it finished in **1,019.8 s wall = 1.30x**, at
+      **31.4 Mcell-steps/s** (its own `progress` lines). That rate is what killed rung 6:
+      2,841,696 cells x 17,948 steps / 31.4e6 = **1,624 s of stepping alone** against the
+      1,800 s clock, so under 3 min of headroom for setup and recording -- and the kill says
+      that is less than they take. The estimator prices those same cells and steps at
+      1,251.0 s, i.e. it assumes **1.30x** more than this bench gives; treat every tier-2
+      estimate here as 1.30x optimistic. **Rung 8** -- CW, paper, dx 20, pad 600, at the
+      fitted 986.7 nm: 144 x 144 x 138 = 2,861,568 cells, dt 8.357141e-18 s, 12,603 steps =
+      32.0 periods, 884.6 s estimated, **1,165.6 s wall = 1.32x**, **F = 3.2419**.
 - [ ] The two-point pad sweep is a rule applied, not a convergence proved: run 3b (pad 600,
       CW at 900 nm, about 16 min) is the run that would prove it. It is held back rather than
       spent, because the CW point at the fitted wavelength (also pad 600) may already supply
@@ -426,8 +454,27 @@ linewidth is not.
       reads back the argument the writer was handed -- including `np.savez`'s own `.npz`,
       which is why the arm prints the name it actually wrote. Control: a synthetic tail saved
       and read back re-fits to the line fitted in memory, bit for bit (`again["f"] ==
-      wide["f"]`), off 2,972 samples on disk. 17 controls hold: `tiny: all controls hold`,
-      exit 0.
+      wide["f"]`), off 2,972 samples on disk. 15 controls hold at this commit, 18 at step 2h,
+      19 after 2i's own (`--save-tail` refused) -- each count being that revision's own
+      assertion, `done.stdout.count("\n  ok   ")`, read off `git show <rev>:tests/...`:
+      `tiny: all controls hold`, exit 0.
+- [x] **A failed tail write could take the run's number with it** (2h). The write stood among
+      the arm's own statements, so a path a run cannot write (a file where a directory
+      belongs) raised `NotADirectoryError` out of the arm after the fit had been printed:
+      the number the run was spent for died with the save. The write is now a `try` of its
+      own, after the fit, and the `OSError` a path raises is caught and reported as a
+      `warning` line naming the exception's type -- so the run keeps its fit and its `Q` and
+      still returns 0. Two controls, each holding one half: `tiny`'s own asks the real raise
+      site for the type of what it raises (`save_record` on a path whose parent is a regular
+      file), and a tier-1 fixture drives the same command the bench uses,
+      `--tiny --ringdown --save-tail <a file, not a directory>/tail`, asserting the child's
+      exit status, the `fit` and `Q` lines, the `warning` naming `NotADirectoryError`, and
+      the absence of the write's own success line -- so a fix that drops the number instead
+      of the file cannot pass, and a check that cannot fail would be seen for one. The same
+      flag on a run that never rings down is refused outright (`arm_conflicts`), which is
+      why the flag has to be stated, not inherited, in the arm namespaces the controls
+      build: a live `--save-tail` made the band arm read dirty and the run failed its own
+      controls (measured: exit 1 as committed at 3a183d9, exit 0 after the fix).
 
 ## Deferred by the lead, recorded here so it is not dropped
 

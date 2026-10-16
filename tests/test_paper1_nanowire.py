@@ -387,5 +387,33 @@ def test_save_tail_without_the_tail_arm_is_refused(tmp_path):
     assert (saved.parent / (saved.name + ".npz")).exists(), done.stdout
 
 
+def test_a_tail_that_cannot_be_written_still_leaves_the_number(tmp_path):
+    """2h, driven end to end: the record is a convenience, the fit is the number.
+
+    ``tiny``'s own control asks the raise site for the type of what it raises,
+    which is how the arm's ``except OSError`` is kept honest -- but it never puts
+    a failing path through the arm, so it cannot see whether the arm survives one.
+    The child here is the same command the bench runs, with the path pointing
+    where no file can be written (a file where a directory belongs), and the
+    asserts are the run's own: exit 0, the fit and Q printed, the warning naming
+    the exception, and no record left at the path. A fix that dropped the number
+    instead of the file fails on the first two.
+    """
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x\n")
+    target = blocker / "tail"
+    done = run("--tiny", "--ringdown", "--save-tail", str(target))
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "fit       f =" in done.stdout, done.stdout
+    assert "\nQ         " in done.stdout or "unresolved:" in done.stdout, done.stdout
+    assert re.search(r"^warning   the tail was not written \(NotADirectoryError:",
+                     done.stdout, re.M), done.stdout
+    # the write's own line is what says the record is on disk (rung 7's log has it:
+    # "17,948 samples and the dt they were taken with in logs/r7_tail.npz"), so a run
+    # whose path could not be written must not be printing it -- an assertion that can
+    # fail, which `not Path(...).exists()` here could not: the path's parent is a file
+    assert "samples and the dt they were taken with in" not in done.stdout, done.stdout
+
+
 if __name__ == "__main__":       # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

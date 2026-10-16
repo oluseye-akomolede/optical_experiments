@@ -300,3 +300,34 @@ one wants `delivered_power` rather than this.
   `F = 1.5882` where the image-dipole law says 1.1629 (`+36.6` per cent) for a dipole seven
   cells above it — the geometry whose delivered power is `+2.8` per cent — and
   `F = 346.4668` against 1.8945 for one two cells above it.
+
+### Requirement: The tail arm's saved record SHALL be a convenience beside its fit, and a record it cannot write SHALL NOT cost it the number
+
+`scripts/paper1_nanowire.py --ringdown --save-tail PATH` SHALL write the arm's own record
+with the `dt` it was taken with, its start step, and the drive's frequency and band, so a
+second decay model can be fitted to that tail without spending the bench again. The write
+SHALL sit in a `try` of its own, attempted after the fit has been printed, catching the
+`OSError` a path raises and reporting it as one `warning` line that names the exception's
+type in the place of the write's own "… samples and the dt they were taken with in …" line.
+A run whose tail cannot be written SHALL keep its `fit` line and the arm's own verdict for
+that tail on stdout and SHALL exit 0: the fit is the measurement and the file is the
+convenience, so a path must not be able to end a run whose number is already computed. The
+failure SHALL be reported and never swallowed — a reader has to be able to tell a record
+that is on disk from one that is not. On a run whose arm never rings down, `--save-tail`
+SHALL be refused before the run rather than accepted and ignored, since a flag read in one
+arm and inert in the others promises a file on every arm.
+
+#### Scenario: a tail that cannot be written is reported and the run still answers
+- **WHEN** `--tiny --ringdown --save-tail <a path under a file, where no directory belongs>`
+  is run, so the write raises before a record can exist
+- **THEN** the run exits 0 with its `fit` line and its own verdict for that tail (`Q         `
+  where the tail resolves a decay, `unresolved:` where it does not), and a `warning` line
+  naming `NotADirectoryError` where the write's success line would have been
+- **AND** `tiny`'s own control SHALL ask the real raise site for its type, so the exception
+  the arm catches is the one a path actually produces: `save_record` on a path whose parent
+  is a regular file raises `NotADirectoryError`, an `OSError`
+- **AND** the same command without `--ringdown` SHALL be refused with `--save-tail` in the
+  message, which is why the arm namespaces the controls build SHALL state `save_tail`
+  themselves and not inherit the caller's: a live `--save-tail` leaking into them made the
+  band arm read dirty and the run failed its own controls (measured: exit 1 before the arm
+  namespaces were fixed, exit 0 after).

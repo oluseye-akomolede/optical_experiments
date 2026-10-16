@@ -928,10 +928,18 @@ def tiny(args) -> int:
     ok.append((f"a tail that cannot be written raises what the arm catches"
                f" ({raised or 'nothing'} is an OSError)", raised is not None))
 
+    # save_tail is STATED here, not inherited: a control that asks arm_conflicts
+    # about an arm has to name every key that function reads, or the caller's own
+    # flags leak into the arm the control is describing. It did: --tiny --ringdown
+    # --save-tail <path> made --save-tail itself the reason the band arm read
+    # dirty, so the run failed its own control (found by driving the flag end to
+    # end, which is what the flag's own scenario asks for).
     as_tail = argparse.Namespace(**{**base, "profile": "pulse", "ringdown": True,
-                                    "spectrum": True, "tail_periods": 20.0})
+                                    "spectrum": True, "tail_periods": 20.0,
+                                    "save_tail": None})
     as_band = argparse.Namespace(**{**base, "profile": "pulse", "ringdown": False,
-                                    "spectrum": True, "tail_periods": 0.0})
+                                    "spectrum": True, "tail_periods": 0.0,
+                                    "save_tail": None})
     ok.append(("the band arm and the tail arm refuse to share one record"
                f" ({arm_conflicts(as_tail)[:40] or 'NOTHING'}), and the band arm"
                f" alone is clean",
