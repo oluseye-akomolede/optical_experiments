@@ -576,6 +576,44 @@ linewidth is not.
       and the control is green again in 2.49 s. Counts: **19 pytest controls** (18 passing plus
       this one, `tests/test_paper1_nanowire.py`), `--tiny`'s own **21**.
 
+## 3f. An error the covariance does not determine printed as zero (the lead's fix, 2026-10-16)
+
+- [x] **Run B's own fit line is the evidence.** r17 (`--wavelength 993 --ringdown
+      --band-half 140 --tail-periods 14`, 12,456 steps, 1,159.4 s, exit 0) printed
+      `f = 314.5642 THz +- 0` beside `tau = 102.5 +- 9.4 fs`. The lead's reading is the right
+      one and my first correction to it was wrong: the site formats `f_err / 1e12` with `:.2g`,
+      and `:.2g` is significant figures, not decimals -- `{4e-4:.2g}` prints `0.0004`, measured,
+      so `+- 0` can only mean `f_err` is **exactly 0.0**. The clamp at 2i's `fit_decay` was
+      `sqrt(max(cov[4, 4], 0.0))`: the tail had no optimum away from `a = b = 0`, so the omega
+      column of the Jacobian vanished, `pinv` returned a non-positive diagonal for it, and the
+      clamp printed the direction the record does not determine as the number 0.0. A zero error
+      passes every three-sigma test there is, and `q_err = pi * hypot(tau * f_err, f * tau_err)`
+      then carried the tau term alone: r17's `Q = 101.3 +- 9.3` understated its own error, where
+      `tau = 102.5 +- 9.4 fs` was never affected.
+- [x] **The fix** (this step's own sha). The clamp is gone: `tau_err` and `f_err` are `None`
+      when their own diagonal is not positive, `q_err` is `None` when either term is, and
+      `resolved` requires `tau_err is not None`. A module-level `_err(value, scale)` prints a
+      number, or `undetermined (degenerate covariance)` where there is not one, and all four
+      reporting sites read it -- the arm's `fit` and `Q` lines, the `unresolved:` branch (which
+      now says it cannot form a three-sigma floor rather than forming one from `None`) and
+      `tiny`'s own homogeneous-scene line, which would have raised on `None`.
+- [x] **The control can fail, and was made to.** `test_a_degenerate_covariance_is_reported_not_rounded_to_zero`
+      calls the real `fit_decay` on a constant tail at **r17's own sampling** (`dt = 8.431110137e-18`
+      s, 5,474 samples) and requires all three errors `None`, `resolved` false, and the two sites
+      to print the word. The fixture is the shape because the first one written was not: at the
+      stub's borrowed `dt = 5.0e-18` a constant tail left `tau_err = 1.99e-39` -- positive, and
+      absurd, so the assertion failed on the fix rather than on the bug (a sweep at r17's own dt
+      gives both errors `None` for every n in {4000, 5474, 6000, 8000, 12000}). At HEAD the same
+      fixture returns `f_err: 0.0, tau_err: 0.0` and the red is the gate's own assertion
+      (`0.0 is None`, `tests/test_paper1_nanowire.py:355`); with the fix it is green in 482.61 s
+      (`1 passed, 19 deselected`). The product file was restored to its committed bytes after
+      the red (`git diff --stat` unchanged).
+- [x] **Nothing else reads those fields.** `grep -rn "tau_err\|f_err\|q_err"` over the repo is
+      the fit, the returned dict and the four report sites above, plus the tier-1 tests that
+      stub the dict -- three existing stubs and this control, all of which carry a number for
+      every field, so none of them reads a `None` that is not the point. The arm's readers
+      outside the repo read the printed log.
+
 ## Deferred by the lead, recorded here so it is not dropped
 
 - [ ] **The dielectric as a function, not a constant** (the lead's step-1 item (7), called a

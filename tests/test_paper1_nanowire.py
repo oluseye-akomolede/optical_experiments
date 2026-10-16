@@ -337,6 +337,61 @@ def test_the_unresolved_outcome_is_reported_with_its_bound(capsys):
     assert "AT THE EDGE" in edge, edge
 
 
+def test_a_degenerate_covariance_is_reported_not_rounded_to_zero(capsys):
+    """A constant tail: the covariance's tau and omega columns both vanish.
+
+    fit_decay is called for real here -- the fixture is the diagnosis, not a
+    stub. With no signal the optimum sits at a = b = 0, and that kills both the
+    tau and the omega Jacobian column, so cov[3,3] and cov[4,4] are not
+    positive. The clamp this was written against called them 0.0, and a zero
+    error passes every "more than three of its own errors" test there is: a
+    record with nothing in it reported a resolved Q with no error bar at all.
+    """
+    m = _load()
+    # r17's own record: dt 8.431110137e-18 s and a 5,474-sample tail, so this
+    # fixture is the shape the arm actually printed "+- 0" for on 2026-10-16.
+    f0, dt, n = 3.019e14, 8.431110137e-18, 5474
+    fit = m.fit_decay(np.full(n, 1e-9), dt, 0, frequency=f0)
+    assert fit["tau_err"] is None and fit["f_err"] is None, fit
+    assert fit["q_err"] is None, fit
+    assert not fit["resolved"], fit                  # a zero error must not pass
+    assert m._err(None, 1e-15) == m.UNDETERMINED
+    assert m._err(1.0e-16, 1e-15) == "0.1"           # a real error still prints
+
+    # And the arm prints the word where the number would have gone. An error is
+    # not reachable on demand from a scene, so the fit is stubbed here -- but a
+    # good tau with a degenerate omega is the shape r17's tail actually had.
+    args = m.parse_args(["--tiny", "--ringdown"])
+    lay, request, geom = m.solve_scene(args)
+    measured = m.filled(args, lay, request)
+    real = m.fit_decay
+    bad_f = {"f": 3.331e14, "f_err": None, "tau": 9.7e-14, "tau_err": 3.0e-14,
+             "q": 97.0, "q_err": None, "resolved": True, "at_edge": False,
+             "rms": 1.0e-6, "peak": 1.0e-2, "n": 5_000, "window": 9.7e-14,
+             "dof": 4_995, "f_edge": False}
+    m.fit_decay = lambda *a, **k: bad_f
+    try:
+        _, code = m.ringdown(args, lay, request, measured)
+    finally:
+        m.fit_decay = real
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert out.count(m.UNDETERMINED) == 2, out       # the f error and the Q error
+    assert "+- 0," not in out and "+- 0 " not in out, out
+
+    # A tau error that is undetermined answers in the unresolved branch, and it
+    # must not print a three-sigma floor it cannot form.
+    m.fit_decay = lambda *a, **k: {**bad_f, "tau_err": None, "resolved": False}
+    try:
+        _, code = m.ringdown(args, lay, request, measured)
+    finally:
+        m.fit_decay = real
+    out = capsys.readouterr().out
+    assert code == m.UNRESOLVED == 3, out
+    assert m.UNDETERMINED in out, out
+    assert "three-sigma floor" in out and "Q >" not in out, out
+
+
 def test_the_progress_line_survives_a_killed_run(tmp_path):
     """Why the line exists: rung 6 hit the bench's cap and left only its plan.
 

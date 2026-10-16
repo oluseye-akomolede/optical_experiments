@@ -538,16 +538,36 @@ def fit_decay(values, dt: float, start: int, *, frequency: float,
     rss = float(resid @ resid)
     sigma2 = rss / max(n - 5, 1)
     cov = sigma2 * np.linalg.pinv(jac.T @ jac)
-    tau_err = math.sqrt(max(cov[3, 3], 0.0))
-    f_err = math.sqrt(max(cov[4, 4], 0.0)) / (2.0 * math.pi)
+    # A diagonal that is not positive is a direction the data do not determine,
+    # and the clamp this replaced called it zero: a flat tail -- the cavity never
+    # rose -- then reported f +- 0 at the three-sigma test's own pass, because a
+    # zero error passes every "more than three of its own errors" test there is.
+    tau_err = None if cov[3, 3] <= 0.0 else math.sqrt(cov[3, 3])
+    f_err = None if cov[4, 4] <= 0.0 else math.sqrt(cov[4, 4]) / (2.0 * math.pi)
     f = omega / (2.0 * math.pi)
     q = math.pi * f * tau
-    q_err = math.pi * math.hypot(tau * f_err, f * tau_err)
+    q_err = (math.pi * math.hypot(tau * f_err, f * tau_err)
+             if f_err is not None and tau_err is not None else None)
     return {"f": f, "f_err": f_err, "tau": tau, "tau_err": tau_err,
             "q": q, "q_err": q_err, "samples": n, "window": window,
             "rms": math.sqrt(rss / n), "peak": float(np.max(np.abs(y))),
             "at_edge": at_edge, "f_edge": f_edge,
-            "resolved": bool(tau > 3.0 * tau_err and not at_edge)}
+            "resolved": bool(tau_err is not None and tau > 3.0 * tau_err and not at_edge)}
+
+
+UNDETERMINED = "undetermined (degenerate covariance)"
+
+
+def _err(value, scale: float) -> str:
+    """The ``+-`` half of a fitted error: a number, or why there is not one.
+
+    ``fit_decay`` returns None for an error whose covariance diagonal is not
+    positive, which is a direction the record does not determine. Formatting
+    that as ``0`` is what this arm used to print, and it is the wrong number to
+    print: a flat tail -- the cavity never rose -- passed the three-sigma test
+    on a zero error and reported a centre and a Q with no error bars at all.
+    """
+    return UNDETERMINED if value is None else f"{value / scale:.2g}"
 
 
 def _npz_path(path) -> str:
@@ -620,10 +640,10 @@ def ringdown(args, lay, request, measured):
                     band=(f0 - half, f0 + half))
     mark = (f"; AT THE EDGE of that band, so this f is the search's own edge and"
             f" the mode is outside it") if fit["f_edge"] else ""
-    print(f"fit       f = {fit['f'] / 1e12:.4f} THz +- {fit['f_err'] / 1e12:.2g}"
+    print(f"fit       f = {fit['f'] / 1e12:.4f} THz +- {_err(fit['f_err'], 1e12)}"
           f" (the drive is {f0 / 1e12:.2f}, searched over"
           f" {C / (f0 + half) / NM:.0f}-{C / (f0 - half) / NM:.0f} nm){mark},"
-          f" tau = {fit['tau'] / 1e-15:.3f} fs +- {fit['tau_err'] / 1e-15:.2g},"
+          f" tau = {fit['tau'] / 1e-15:.3f} fs +- {_err(fit['tau_err'], 1e-15)},"
           f" rms {fit['rms']:.3e} against a {fit['peak']:.3e} peak")
     print(f"caveat    tau's error is the fit's own, not the geometry's: a tail"
           f" holding two decays still fits one of them. --vacuum is the same arm"
@@ -645,11 +665,17 @@ def ringdown(args, lay, request, measured):
                   f" were taken with in {wrote}: load_record plus fit_decay re-fits"
                   f" this tail without another run")
     if fit["resolved"]:
-        print(f"Q         {fit['q']:.4g} +- {fit['q_err']:.2g}, a line of"
+        print(f"Q         {fit['q']:.4g} +- {_err(fit['q_err'], 1.0)}, a line of"
               f" {args.wavelength / fit['q']:.2f} nm against the paper's"
               f" {PAPER_FWHM_NM:.0f} nm -- read from the decay, not from this"
               f" record's {measured['dlambda_nm']:.2f} nm bins")
         return fit, 0
+    if fit["tau_err"] is None:
+        print(f"unresolved: tau's own error is {UNDETERMINED}, so there is no"
+              f" three-sigma floor to bound Q with: the covariance's tau direction"
+              f" is one this record does not determine, not one it determines"
+              f" badly")
+        return fit, UNRESOLVED
     floor = max(fit["tau"] - 3.0 * fit["tau_err"], 0.0)
     tail = ("tau ran to the top of the fit's own grid"
             if fit["at_edge"] else "tau is not three of its own errors")
@@ -1118,7 +1144,7 @@ def tiny(args) -> int:
         fit, code = ringdown(vac, lay_v, request_v, measured_v)
         ok.append((f"the tail arm runs on a homogeneous scene and answers either"
                    f" way (tau {fit['tau'] / 1e-15:.3f} fs +-"
-                   f" {fit['tau_err'] / 1e-15:.2g},"
+                   f" {_err(fit['tau_err'], 1e-15)},"
                    f" {'pinned' if not code else 'unresolved'})"
                    if fit is not None else
                    "the tail arm answers on a homogeneous scene (it refused this"
