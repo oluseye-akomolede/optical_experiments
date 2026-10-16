@@ -300,3 +300,50 @@ one wants `delivered_power` rather than this.
   `F = 1.5882` where the image-dipole law says 1.1629 (`+36.6` per cent) for a dipole seven
   cells above it — the geometry whose delivered power is `+2.8` per cent — and
   `F = 346.4668` against 1.8945 for one two cells above it.
+
+### Requirement: The tail arm's saved record SHALL be a convenience beside its fit, and a record it cannot write SHALL NOT cost it the number
+
+`scripts/paper1_nanowire.py --ringdown --save-tail PATH` SHALL write the arm's own record
+with the `dt` it was taken with, its start step, and the drive's frequency and band, so a
+second decay model can be fitted to that tail without spending the bench again. The write
+SHALL sit in a `try` of its own, attempted after the fit has been printed, catching the
+`OSError` a path raises and reporting it as one `warning` line that names the exception's
+type in the place of the write's own "… samples and the dt they were taken with in …" line.
+A run whose tail cannot be written SHALL keep its `fit` line and the arm's own verdict for
+that tail on stdout and SHALL exit 0: the fit is the measurement and the file is the
+convenience, so a path must not be able to end a run whose number is already computed. The
+failure SHALL be reported and never swallowed — a reader has to be able to tell a record
+that is on disk from one that is not. On a run whose arm never rings down, `--save-tail`
+SHALL be refused before the run rather than accepted and ignored, since a flag read in one
+arm and inert in the others promises a file on every arm.
+
+#### Scenario: a tail that cannot be written is reported and the run still answers
+- **WHEN** `--tiny --ringdown --save-tail <a path under a file, where no directory belongs>`
+  is run, so the write raises before a record can exist
+- **THEN** the run exits 0 with its `fit` line and its own verdict for that tail (`Q         `
+  where the tail resolves a decay, `unresolved:` where it does not), and a `warning` line
+  naming `NotADirectoryError` where the write's success line would have been
+- **AND** `tiny`'s own control SHALL ask the real raise site for its type, so the exception
+  the arm catches is the one a path actually produces: `save_record` on a path whose parent
+  is a regular file raises `NotADirectoryError`, an `OSError`
+- **AND** the same command without `--ringdown` SHALL be refused with `--save-tail` in the
+  message, which is why the arm namespaces the controls build SHALL state `save_tail`
+  themselves and not inherit the caller's: a live `--save-tail` leaking into them made the
+  band arm read dirty and the run failed its own controls (measured: exit 1 before the arm
+  namespaces were fixed, exit 0 after).
+
+### Requirement: A point source SHALL sit at the depth it was asked for, and a mesh that cannot put it there SHALL be refused before the run
+
+The scene this change measures puts its dipole a fixed distance below the top facet (`--qd-below`), and that distance is the paper's geometry: a mesh that moves it is a different measurement. So `fdtd_layout.plan` SHALL accept a request key `pin_source_z` (default false) and, when it is set and the source is a point source, add the source's own z as a line of the z axis, so `build_grid` snaps the source to the node it was asked for rather than to the nearest node the axis happens to have. The in-plane coordinates SHALL NOT be pinned: they are uniform at `dx` for every part of this scene, so a line there would grade an axis that is not graded today. `scripts/paper1_nanowire.py` SHALL set the key on every arm (the pulse, the band and the CW arms share one request) and SHALL print the realised depth, read from the plan's own nodes and source cell.
+
+Because `graded_axis` drops a line that lands outside the extent or within `LINE_SNAP` of an edge, the pin alone SHALL NOT be taken as proof: with a plan in hand, `refusals` SHALL compare the realised depth with `--qd-below` and refuse the run when the two are more than 1 nm apart, naming the realised depth, the requested depth and the difference, before any stepping. Both entry points SHALL be refused by that same function, so the tier-1 arm cannot pass a scene the bench run would refuse.
+
+#### Scenario: the emitter sits where the paper's geometry puts it, at every dx
+- **WHEN** two scenes — the tier-1 control's own, and the paper's as its parser's defaults build it rather than as a retyped copy — are each planned at `--dx 20` and at `--dx 30`, with and without `pin_source_z`
+- **THEN** every pinned plan's realised depth is the `--qd-below` it asked for, to the 0.01 nm its own line prints (60 nm in the control's scene, 30 nm in the paper's), where the un-pinned snap gives 57.11 nm at both dx in the control's scene and, in the paper's, 39.99 nm at dx 20 and 29.89 nm at dx 30 for the same request — so the meshes used to put one dipole at two depths 10.10 nm apart (rung 8's own `dipole` line at dx 20, rung 7's at dx 30). At least one dx in each scene SHALL be past the 1 nm tolerance, which is the defect the pin exists for
+- **AND** the control SHALL read the un-pinned plan too, in both directions, because an equality against the pinned plan alone passes on any mesh whose nodes happen to land on the request (the paper's dx-30 mesh is 0.11 nm off, i.e. it would pass by luck)
+
+#### Scenario: a mesh that does not put the emitter at the depth asked is refused
+- **WHEN** `refusals` is given the run's own arguments and a plan whose source node sits 57.11 nm below the top facet against `--qd-below 60` (the control's scene, un-pinned)
+- **THEN** it returns a refusal naming the realised depth, the request and the difference, and the run's own plan passes the same call, so the refusal is asked of the function the launch calls rather than of a copy of it
+- **AND** the tier-1 test SHALL pin the printed depth at the 0.01 nm the line prints (`< 0.005`), where it read only "within one finest cell" before: at the 2i revision this scene's own un-pinned `dipole` line read 57.11 nm against the 60 nm asked (node (31, 31, 34)), 2.89 nm out -- inside that grid's 6.218 nm finest cell, so the weak rule passed it, and outside the 0.005 this one allows, so the predicate that let the defect through is the one that would have let the fix through. At 2j the same line reads 60.00 nm and passes, where the pin adds two cells to the z axis (62 x 62 x 54 = 207,576 before, 62 x 62 x 56 = 215,264 after, the coarsest z cell 20.000 nm down to 19.066)

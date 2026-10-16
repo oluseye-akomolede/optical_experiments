@@ -23,6 +23,12 @@ and estimates, never voxelises or solves, so it stays tier 1 -- which is how a
 ladder with every rung refused is seen to report that rather than read the last
 rung it happened to try.
 
+The tail arm -- a pulse record whose drive is over partway through, fitted to one
+decaying sinusoid -- is covered three ways: the fit itself against synthetic
+tails with a known tau (and against one with no decay at all, so a fit that
+invents a decay is caught), the window it cuts at read against the product's own
+pulse envelope, and the refusals a band arm and a too-short span owe it.
+
 The tiny scene is deliberately small -- 20 nm cells, a 100 nm wire -- so it runs
 in tier 1. It exercises the same code path the Jetson run does, not the same
 physics.
@@ -31,10 +37,13 @@ physics.
 from __future__ import annotations
 
 import importlib.util
+import math
+import re
 import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import trimesh
 
@@ -61,10 +70,20 @@ def test_the_tiny_scene_holds_every_control():
     assert done.returncode == 0, done.stdout + done.stderr
     assert "tiny: all controls hold" in done.stdout
     assert "FAIL" not in done.stdout
-    # 13 controls: a scene that quietly loses one still has to be caught here
-    assert done.stdout.count("\n  ok   ") == 13, done.stdout
+    # 21 controls: a scene that quietly loses one still has to be caught here. The
+    # three past 15 are the fit's window following the drive's band (2e), the saved
+    # tail re-fitting to the line it came from (2f), and an unwritable tail path
+    # raising the one exception the arm catches (2h); the fourth is --save-tail
+    # refused on the arms that have no tail to write (2i); the last two are the
+    # emitter's own z being a node at two dx values, and the refusal that fires
+    # when a mesh does not put it there (2j).
+    assert done.stdout.count("\n  ok   ") == 21, done.stdout
     # and the settled record the small scene runs must not warn about itself
     assert "warning: the record is" not in done.stdout
+    # the step loop reports itself, so a run the bench kills leaves more than its
+    # plan behind: the step it reached, the seconds, and the rate it was given
+    assert re.search(r"^progress  step 1,000 of [\d,]+,\s+[\d.]+ s,"
+                     r"\s+[\d.]+ Mcell-steps/s$", done.stdout, re.M), done.stdout
 
 
 def test_the_tiny_scene_reads_one_across_the_band_in_vacuum():
@@ -72,6 +91,39 @@ def test_the_tiny_scene_reads_one_across_the_band_in_vacuum():
     done = run("--tiny", "--spectrum")
     assert done.returncode == 0, done.stdout + done.stderr
     assert "tiny: all controls hold" in done.stdout
+    # Every bin, not only the peak: the shape string cannot say how far above 1
+    # the band's floor sits, and a peak on the band's edge is itself a reading.
+    bins = re.findall(r"^bin\s+(\d+\.\d) nm\s+F =\s+([\d.]+)$", done.stdout, re.M)
+    assert len(bins) == 6, done.stdout
+    peak = re.search(r"^peak\s+F = ([\d.]+) at ([\d.]+) nm$", done.stdout, re.M)
+    assert peak, done.stdout
+    values = {wavelength: float(value) for wavelength, value in bins}
+    # the peak line is one of the bins, not its own reading of the record
+    assert float(peak.group(2)) in [float(w) for w, _ in bins], done.stdout
+    assert float(peak.group(1)) == max(values.values()), done.stdout
+    # the reading and its own prediction, both on the record of the run
+    assert re.search(r"^run\s+\d+\.\d s wall\s+\(\d+\.\d\d x the"
+                     r" \d+\.\d s estimate\)$", done.stdout, re.M), done.stdout
+    # the dipole line says where the node is and what was asked for it
+    dipole = re.search(r"^dipole\s+node \((\d+), (\d+), (\d+)\): z\s+([\d.]+) nm,"
+                       r"\s+([\d.]+) nm below the top facet at ([\d.]+) nm"
+                       r"\s+\(--qd-below (\S+) asked\); in plane\s+([+\-][\d.]+),"
+                       r"\s+([+\-][\d.]+) nm off the wire's axis, (\w)-polarised$",
+                       done.stdout, re.M)
+    assert dipole, done.stdout
+    node_z, depth, top = (float(dipole.group(4)), float(dipole.group(5)),
+                          float(dipole.group(6)))
+    # the line's own arithmetic: the printed depth is the two printed z values
+    assert abs((top - node_z) - depth) < 1e-9, done.stdout
+    # 2j pins the source's own z as a grid node, so the printed depth is not
+    # merely inside a cell of the request, as it was while this read only
+    # "within one finest cell". At the 2i revision this same line read 57.11 nm
+    # against the 60 nm asked (node (31, 31, 34), its own log): 2.89 nm, inside
+    # that grid's 6.218 nm finest cell, so the weak rule passed it -- and 2.89 nm
+    # outside the 0.005 below, so this one fails it. Group(7) is the
+    # `--qd-below` field the line itself prints, so the two numbers compared
+    # are the line's own rather than a 60 retyped here.
+    assert abs(depth - float(dipole.group(7))) < 0.005, done.stdout
 
 
 def test_every_rung_over_the_cap_is_reported_not_skipped():
@@ -137,6 +189,252 @@ def test_a_record_that_is_not_settled_is_flagged():
     assert "warning: the record is" in done.stdout, done.stdout + done.stderr
     assert "Raise --periods." in done.stdout
     assert "tiny: all controls hold" not in done.stdout
+
+
+def test_the_fitter_recovers_a_decay_and_refuses_to_invent_one():
+    """The fit both ways, on synthetic tails whose tau is known.
+
+    Two fixtures, because one would measure nothing: a decaying sinusoid at a tau
+    the window is long enough to see, and a sinusoid that does not decay at all
+    inside the window. A fit that reports a decay either way fails the second,
+    and a fit that reports none fails the first.
+    """
+    module = _load()
+    f0, dt, n = 3.331e14, 5.0e-18, 6000
+    t = np.arange(n) * dt
+    rng = np.random.default_rng(7)
+    tau = 1.0e-14                                  # 10 fs over a 30 fs window
+    values = 1.0 + np.exp(-t / tau) * np.cos(2.0 * np.pi * f0 * t)
+    values = values + 1e-4 * rng.standard_normal(n)
+    fit = module.fit_decay(values, dt, 0, frequency=f0)
+    assert abs(fit["tau"] - tau) / tau < 0.02, fit
+    assert abs(fit["f"] - f0) / f0 < 0.02, fit
+    assert abs(fit["q"] - math.pi * f0 * tau) / (math.pi * f0 * tau) < 0.05, fit
+    assert fit["resolved"]
+
+    flat = 1.0 + np.cos(2.0 * np.pi * f0 * t)      # no decay this window can see
+    nope = module.fit_decay(flat, dt, 0, frequency=f0)
+    assert not nope["resolved"], nope
+    assert nope["at_edge"], nope
+
+
+def test_the_drive_cut_needs_a_pulse_to_cut():
+    """An all-zero drive has no end, and the cut says so instead of returning 0."""
+    module = _load()
+    with pytest.raises(ValueError):
+        module.drive_done(np.zeros(100))
+
+
+def test_the_tail_arm_reads_the_decay_of_a_drive_free_record():
+    """--tiny --ringdown: the window is the drive's own end, and the arm answers.
+
+    Vacuum has no cavity, so either verdict is a pass here -- what this pins is
+    that the arm reaches one through the script's own path, over a tail of the
+    length the record was asked for, and that ``tiny``'s own control sees it.
+    """
+    done = run("--tiny", "--ringdown")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "tiny: all controls hold" in done.stdout
+    assert "the tail arm runs on a homogeneous scene" in done.stdout
+    assert "tail      the drive is under" in done.stdout
+    found = re.search(r"= ([0-9.]+) periods\n", done.stdout)
+    assert found and float(found.group(1)) >= 6.0, done.stdout
+    assert "\nQ         " in done.stdout or "unresolved:" in done.stdout, done.stdout
+
+
+def test_the_band_arm_refuses_a_tail():
+    """A tail moves the pulse off the centre of its own record: -94 dB."""
+    done = run("--tiny", "--spectrum", "--tail-periods", "10")
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "-94 dB" in done.stdout
+
+
+def test_a_span_that_ends_inside_the_drive_leaves_no_tail():
+    """--pulse-span 5 with the tail's own 8 periods: the record ends first."""
+    done = run("--tiny", "--ringdown", "--pulse-span", "5", "--tail-periods", "8")
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "refused: the drive is over only" in done.stdout, done.stdout
+    assert "FAIL" in done.stdout
+
+
+def test_the_ladder_says_the_tail_arm_does_not_wait_for_the_record():
+    """Both ways: the 4 nm line is a bar the tail arm is not held to, and only when it runs.
+
+    The ladder prices a record long enough to resolve 4 nm; the tail arm reads a decay
+    instead, so the bar has to be marked as not applying to it -- and marked only when
+    it is the arm in play, or the line says it of a CW run the reader is about to make.
+    """
+    plain = run("--tiny", "--estimate")
+    assert "resolving the paper's 4 nm mode needs" in plain.stdout, plain.stdout
+    assert "the tail arm does not wait for that" not in plain.stdout, plain.stdout
+    tail = run("--tiny", "--estimate", "--ringdown")
+    assert "the tail arm does not wait for that" in tail.stdout, tail.stdout
+
+
+def test_the_ladder_prices_the_rung_that_was_asked_for():
+    """--dx 5 is not one of the ladder's own rungs, so it has to be priced on request.
+
+    Left alone, --estimate --dx 5 prints a table of other rungs and says nothing about
+    the one the caller named -- which reads exactly like the asked rung was priced and
+    fitted. Both directions: the marker means something only if a standard run lacks it.
+    """
+    done = run("--estimate", "--dx", "5", "--mirror-pad", "400")
+    row = [line for line in done.stdout.splitlines()
+           if line.strip().startswith("5.0")]
+    assert row, done.stdout + done.stderr
+    assert "as asked" in row[0], done.stdout          # priced, and marked as the ask
+    assert "over the limit of 8,000,000" in row[0], done.stdout
+    plain = run("--estimate", "--dx", "20", "--mirror-pad", "400")
+    assert "as asked" not in plain.stdout, plain.stdout
+
+
+def test_the_unresolved_outcome_is_reported_with_its_bound(capsys):
+    """The lead's second accepted outcome, forced rather than hoped for.
+
+    No scene produces an unresolved tail on demand -- the tiny vacuum tail resolved to
+    Q = 2 when it was run -- so the fit is stubbed and the arm asked directly. Two
+    things this deliberately does not claim: `--tiny` returns its controls' verdict (0,
+    the control line naming the answer the arm gave) rather than the arm's code, and the
+    non-tiny path's pass-through of that code is a tier-2 reading, not a tier-1 one. In
+    process, because a stub cannot reach a subprocess.
+    """
+    m = _load()
+    args = m.parse_args(["--tiny", "--ringdown"])
+    lay, request, geom = m.solve_scene(args)
+    measured = m.filled(args, lay, request)
+    real = m.fit_decay
+
+    def stub(values, dt, start, **kwargs):
+        return {"f": 3.331e14, "f_err": 1.0e12, "tau": 9.7e-14, "tau_err": 3.0e-14,
+                "q": 97.0, "q_err": 30.0, "resolved": False, "at_edge": False,
+                "rms": 1.0e-6, "peak": 1.0e-2, "n": 5_000, "window": 9.7e-14,
+                "dof": 4_995, "f_edge": False}
+
+    m.fit_decay = stub
+    try:
+        _, code = m.ringdown(args, lay, request, measured)
+    finally:
+        m.fit_decay = real
+    out = capsys.readouterr().out
+    assert code == m.UNRESOLVED == 3, out
+    assert "unresolved" in out, out
+    assert "Q >" in out, out                         # the bound is what it reports
+    assert "Q         " not in out, out              # and not a Q it did not measure
+    assert "AT THE EDGE" not in out, out             # a fit inside its window says so
+
+    # The same arm, one flag apart: a fit sitting on its window's edge must not
+    # print an f that reads like a measured line. This is the case the window
+    # exists for -- it is what a mode outside the drive's band looks like.
+    def edge_stub(values, dt, start, **kwargs):
+        return {**stub(values, dt, start, **kwargs), "f_edge": True}
+
+    m.fit_decay = edge_stub
+    try:
+        m.ringdown(args, lay, request, measured)
+    finally:
+        m.fit_decay = real
+    edge = capsys.readouterr().out
+    assert "AT THE EDGE" in edge, edge
+
+
+def test_the_progress_line_survives_a_killed_run(tmp_path):
+    """Why the line exists: rung 6 hit the bench's cap and left only its plan.
+
+    The child here runs 3,000 steps with stdout on a file -- so the interpreter
+    block-buffers it, which is what the tier-2 runner does -- and leaves through
+    its own check hook with ``os._exit``: no flush, no atexit, nothing. That is
+    the kill the bench delivered, minus the 30 minutes. The lines for steps 1,000
+    and 2,000 have to be in the file anyway, which they are only if the loop
+    flushed them itself.
+
+    The box is 8x the one this started on (24x22x22 = 11,616 cells, measured here
+    at 0.7 s and 1.5 s for the two lines) because the check on the number below
+    needs the loop's own seconds to be long enough that the tenth the line prints
+    is a small part of them.
+    """
+    program = tmp_path / "progress_probe.py"
+    program.write_text(
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(ROOT / 'dockerfiles' / 'maxwell_solver')!r})\n"
+        "import numpy as np, fdtd\n"
+        "def stop(step):\n"
+        "    if step >= 2048:\n"
+        "        os._exit(9)\n"
+        "eps = np.ones((24, 22, 22), np.float32)\n"
+        "src = fdtd.Source((12, 11, 11), frequency=3e14, bandwidth=1e14,"
+        " component='z')\n"
+        "fdtd.simulate(eps, src, 3000, probes=[(13, 11, 11, 'z')],\n"
+        "              spacings=(20e-9,) * 3, boundary='metal', check=stop)\n")
+    log = tmp_path / "run.log"
+    with log.open("w") as handle:
+        done = subprocess.run([sys.executable, str(program)], stdout=handle,
+                              stderr=subprocess.STDOUT, cwd=ROOT, timeout=300)
+    assert done.returncode == 9, done.returncode
+    text = log.read_text()
+    # The two lines the run had reached, with the rate the loop was actually
+    # given.  Both numbers on a line are rounded -- the seconds to a tenth, the
+    # rate to a tenth -- so the exact division is not the thing to compare
+    # against: the first draft did that within 0.1 and was red on this box
+    # (0.2 s / 6.4 Mcell-steps/s, whose exact rate is 7.26) while a slow machine
+    # made the same line pass.  A control whose verdict is the machine's speed
+    # proves nothing, so the number is asked to sit in the band the printed
+    # seconds can support: the slowest and the fastest true time that could have
+    # rounded to it, each side widened by the rate's own last digit.
+    lines = re.findall(r"^progress  step ([\d,]+) of 3,000,\s+([\d.]+) s,"
+                       r"\s+([\d.]+) Mcell-steps/s$", text, re.M)
+    assert [step for step, _, _ in lines] == ["1,000", "2,000"], text
+    for step, seconds, rate in lines:
+        cells = 24 * 22 * 22
+        t = float(seconds)
+        assert t > 0.1, lines
+        implied = cells * int(step.replace(",", "")) / 1e6
+        assert (implied / (t + 0.05) - 0.05
+                <= float(rate) <= implied / (t - 0.05) + 0.05), lines
+
+
+def test_save_tail_without_the_tail_arm_is_refused(tmp_path):
+    """2i: the flag is read in the ringdown arm and nowhere else, and it is not inert.
+
+    Both arms that have no tail to save are asked through the command line the
+    bench uses, and the tail arm is asked to keep its write -- a refusal that
+    also refused the armed run would be worse than the silence it replaces.
+    """
+    for extra in ([], ["--spectrum"]):
+        done = run("--tiny", *extra, "--save-tail", str(tmp_path / "tail"))
+        assert done.returncode == 2, done.stdout + done.stderr
+        assert "refused" in done.stdout and "--save-tail" in done.stdout, done.stdout
+    saved = tmp_path / "tail-ok"
+    done = run("--tiny", "--ringdown", "--save-tail", str(saved))
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (saved.parent / (saved.name + ".npz")).exists(), done.stdout
+
+
+def test_a_tail_that_cannot_be_written_still_leaves_the_number(tmp_path):
+    """2h, driven end to end: the record is a convenience, the fit is the number.
+
+    ``tiny``'s own control asks the raise site for the type of what it raises,
+    which is how the arm's ``except OSError`` is kept honest -- but it never puts
+    a failing path through the arm, so it cannot see whether the arm survives one.
+    The child here is the same command the bench runs, with the path pointing
+    where no file can be written (a file where a directory belongs), and the
+    asserts are the run's own: exit 0, the fit and Q printed, the warning naming
+    the exception, and no record left at the path. A fix that dropped the number
+    instead of the file fails on the first two.
+    """
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x\n")
+    target = blocker / "tail"
+    done = run("--tiny", "--ringdown", "--save-tail", str(target))
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "fit       f =" in done.stdout, done.stdout
+    assert "\nQ         " in done.stdout or "unresolved:" in done.stdout, done.stdout
+    assert re.search(r"^warning   the tail was not written \(NotADirectoryError:",
+                     done.stdout, re.M), done.stdout
+    # the write's own line is what says the record is on disk (rung 7's log has it:
+    # "17,948 samples and the dt they were taken with in logs/r7_tail.npz"), so a run
+    # whose path could not be written must not be printing it -- an assertion that can
+    # fail, which `not Path(...).exists()` here could not: the path's parent is a file
+    assert "samples and the dt they were taken with in" not in done.stdout, done.stdout
 
 
 if __name__ == "__main__":       # pragma: no cover

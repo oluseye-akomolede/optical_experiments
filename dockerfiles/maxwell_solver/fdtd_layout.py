@@ -168,6 +168,10 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
     ``origin_m`` and ``band_top_hz`` as ``layout`` does, plus ``names``,
     ``table`` (part name -> material) and ``part_bounds`` (owner-frame
     metres, per part).
+
+    ``request["pin_source_z"]`` (default off) puts a point source's own z on
+    the z axis as a node, so the source sits where it was asked to rather than
+    at the nearest node ``_locate`` finds.
     """
     boundary = request["boundary"]
     if boundary not in BOUNDARIES:
@@ -251,6 +255,21 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
                     layers[axis] += [fdtd_grid.Layer(a, a + SKIN_DEPTHS * depth, fine),
                                      fdtd_grid.Layer(b - SKIN_DEPTHS * depth, b, fine)]
 
+    if request.get("pin_source_z") and not plane:
+        # A point source's own z becomes a node, so it sits at the depth it was
+        # asked for. Without this the source is SNAPPED to the nearest node
+        # (``_locate``), which is a different geometry and not a coarser one: on
+        # this scene's own meshes a dipole asked 30 nm under the top facet
+        # landed 39.99 nm there at dx 20 and 29.89 nm at dx 30, and the two
+        # depths are two different Purcell factors. Opt-in, because pinning an
+        # axis that would otherwise be uniform makes it graded and costs cells;
+        # the line is still dropped by ``graded_axis`` if it is out of range or
+        # within ``LINE_SNAP`` of the extent's edges, so a caller that cares
+        # reads the planned node back -- see ``scripts/paper1_nanowire.py``,
+        # which refuses a run whose realised depth is not the depth it asked
+        # for. The in-plane coordinates are NOT pinned: x and y are uniform at
+        # ``dx`` for every part here, so a line there would grade them.
+        lines[2] = lines[2] + [float(request["position"][2]) - olo[2] + pad]
     grid = fdtd_grid.build_grid(tuple(size + 2 * pad), dx, layers, lines)
     nodes = tuple(n - pad - off[a]                         # owner frame
                   for a, n in enumerate(grid["nodes"]))

@@ -65,12 +65,24 @@ Not verified, and not used as fact here:
 - `scripts/paper1_nanowire.py` (step 2): the paper's stack as a scene this product's own
   layout builds -- a gold slab, the SiO2 buffer, a hexagonal InP prism, a dipole on or off
   the axis -- with the grid, the estimate and the record's resolution printed before anything
-  runs, and two measurement arms (CW, and one pulse through `purcell_spectrum`). It is a
-  bench script: it reads `fdtd.py`, `fdtd_grid.py` and `fdtd_layout.py` and edits none of
-  them, so it adds no requirement to the spec. Its scenarios stay in `tasks.md`, by this
-  change's own rule, until the lead's Orin run passes.
-- `tests/test_paper1_nanowire.py` (step 2): the tiny scene's 13 controls, two of them seen
-  red on purpose, and the refusals the Jetson arm shares with the tier-1 arm.
+  runs, and three measurement arms (CW, one pulse through `purcell_spectrum`, and the same
+  pulse read as a decay: `--ringdown` cuts the record at the drive's own end and fits one
+  decaying sinusoid, reporting Q with the error it gets rather than a linewidth the record's
+  bins cannot resolve). It is a bench script: it reads `fdtd.py`, `fdtd_grid.py` and
+  `fdtd_layout.py` and edits none of them, so it adds no requirement to the spec. Its
+  scenarios stay in `tasks.md`, by this change's own rule, until the lead's Orin run passes.
+- `tests/test_paper1_nanowire.py` (step 2): the tiny scene's 15 controls, two of them seen
+  red on purpose, the fitter checked both ways against synthetic tails (one with a known tau,
+  one with no decay in its window at all), and the refusals the Jetson arm shares with the
+  tier-1 arm.
+- `scripts/paper1_nanowire.py` (step 2b): `--estimate` prices the rung the caller named when
+  it is not one of the ladder's own pairs, marked in the verdict column -- before this it
+  overrode `--dx`/`--mirror-pad` on every row it printed, so `--estimate --dx 5` was silent
+  about dx 5 and read like the asked rung had been priced and fitted. Its "finest fitting
+  rung" is now the minimum-dx fitting rung rather than the last row to fit, which was the
+  same thing only by the luck of the table's order. Measured at dx 5 / pad 400:
+  26,873,280 cells, 3.4x over the cap, so the owner's 2x-finer step-3 run is not reachable
+  at this pad; the reachable convergence pair is dx 20 -> dx 10.
 
 ## Impact
 

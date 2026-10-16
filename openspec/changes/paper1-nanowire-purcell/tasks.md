@@ -162,24 +162,31 @@ The lead's four steps (queue row, 2026-10-15). One commit each, local only; the 
       16`, and the script's own default is 32. (The first spelling of the guard tested the
       ratio and the tier-1 fixture that runs 8/4 -- a 2x record -- went red, which is how the
       mistake was caught.)
-- [x] `--tiny`: 13 controls, every one of them a claim that can go red (two of them are seen
+- [x] `--tiny`: 15 controls at `5712be5` (that is that revision's own printed stdout, measured
+      by running it, not counted off the source; the count grows with the steps -- see 3c-3e
+      for each one), every one of them a claim that can go red (two of them are seen
       red on purpose in the tier-1 file): the prism mesh closed and its volume the hexagon's,
       the product's own clock the tier-2 timeout, the buffer keeping cells of its own and
       inside the thin rule's cap and finer than the coarse cell, the product's own
       `check_axis`, the gold a region and at the part's own z and clear of the absorber, the
-      source in InP and clear of both the facet and the absorber, and F = 1 in vacuum through
-      the script's own path (band arm when `--spectrum`). The scene is deliberately small --
+      source in InP and clear of both the facet and the absorber, F = 1 in vacuum through
+      the script's own path (band arm when `--spectrum`, the tail arm when `--ringdown`),
+      the drive ending where its own envelope's algebra says it does, and the two readings
+      of one record refusing to share it. The scene is deliberately small --
       20 nm cells, a 100 nm wire -- and exercises the same code path, not the same physics.
-- [x] `tests/test_paper1_nanowire.py`: 8 tests, `8 passed in 184.44s` (task `bvvw9vj3u`, exit 0;
-      tier 1, `nice -n 19`, one worker, `(ulimit -v 4194304; ...)`). The run is on this branch
-      rebased onto main `9a1bc55` and on exactly the two files committed below -- the commit
-      adds the change docs only, not a line of the script or the test: the 13-control
-      verdict with its count pinned, the band arm through the same path, the facet control seen
-      red (`--qd-below 25`), the prism control seen red (a mesh with a face removed), the three
-      refusals/warnings -- a record shorter than its tail, a record over `fdtd.MAX_STEPS`
-      (4,000 periods, through the same `refusals` the Jetson arm uses), and a record the drive
-      has not settled -- and the ladder saying so when every rung is over a cap instead of
-      reading the last rung it tried.
+- [x] `tests/test_paper1_nanowire.py`, the step-2 file: 8 tests, `8 passed in 184.44s` (task
+      `bvvw9vj3u`, exit 0; tier 1, `nice -n 19`, one worker, `(ulimit -v 4194304; ...)`). That
+      run is on this branch rebased onto main `9a1bc55` and on exactly the two files committed
+      below -- the commit adds the change docs only, not a line of the script or the test: the
+      tiny scene's controls with their count pinned (13 of them at that commit; 15 after
+      section 3a), the band arm through the same path, the facet
+      control seen red (`--qd-below 25`), the prism control seen red (a mesh with a face
+      removed), the three refusals/warnings -- a record shorter than its tail, a record over
+      `fdtd.MAX_STEPS` (4,000 periods, through the same `refusals` the Jetson arm uses), and a
+      record the drive has not settled -- and the ladder saying so when every rung is over a
+      cap instead of reading the last rung it tried. The file stands at 15 tests after section
+      3a: `14 passed in 308.58s` at step 2a (task `bw74qywga`), and the three ladder tests
+      re-run green after 2b (section 3a's last bullet) before the full file was run again.
 - [x] Bench scenarios stay here, not in the spec, until the lead's Orin run passes. Step 2
       changes nothing in the product: `fdtd.py`, `fdtd_grid.py` and `fdtd_layout.py` are read,
       not edited, and the script lives in `scripts/`.
@@ -197,7 +204,7 @@ The lead's four steps (queue row, 2026-10-15). One commit each, local only; the 
       block from the real path at this exact rung (a local build-and-estimate probe, no solve;
       every line below is the probe's own output):
 
-          args      --spectrum --dx 10 --mirror-pad 400
+          args      --spectrum --hex corners --dx 10 --mirror-pad 400
           grid      165 x 166 x 202  = 5,532,780 cells
           spacings  x, y 10.000 nm uniform;  z 3.000 nm finest, 10.000 nm coarsest
           z-axis    the product's own check_axis says: no problems
@@ -224,9 +231,350 @@ The lead's four steps (queue row, 2026-10-15). One commit each, local only; the 
       holding 2.8 GB of ~7 GB, and the estimate's 0.66 GiB is on top of the CUDA runtime. If
       the bench stays busy, the dx 12 rung (3,973,800 cells, 1,125.8 s, 0.48 GiB, 22 ppw in
       InP) buys margin at a coarser mesh.
-- [ ] The output to read: the printed grid and estimate, `measured F = ... at ... nm`, the
-      spectrum's peak and its FWHM against the 27.66 nm bin, and whether the shape is the
-      paper's table's. Step 3's ladder (`--height` over the paper's H) is one command per rung.
+- [x] **The run came back** (the lead, tier 2, `--spectrum --dx 12 --mirror-pad 400`, not the
+      dx 10 block above): exit 0, 1,458.6 s wall against 1,125.8 s estimated, `peak F = 2.2839
+      at 976.3 nm`, and six pairs of `NvMapMemAlloc ... error 12` at the start. 976.3 nm is
+      not a resonance: it is the band's own top bin (the band is centred at 900 nm in
+      frequency, so its wavelength edges are 836.8 and 976.4 nm), and the shape string came
+      back uniform -- every bin read F ~ 2. The paper's line is 4 nm wide at 900 nm and this
+      record's bins are 27.66 nm wide, which is the wall section 3a names; what it does not
+      answer is where in the band the cavity sits, and that is the CW arm's question
+      (section 4), because a monochromatic drive reads F at exactly its own wavelength
+      instead of averaging it over a bin.
+- [x] **The estimate was 29 per cent short, and structurally so.** `seconds = cells * steps /
+      (RATE_SAFETY * rate)` is the step loop alone -- the voxeliser and the spectrum's own
+      pass are not in it -- and `RATE_SAFETY = 0.9` times the *slowest* recorded dispersive
+      row (45.30 Mcell-steps/s, over two 300-step cupy runs) already errs long. The gap is
+      the machine: 3,973,800 cells x 11,550 steps over 1,458.6 s is 31.5 Mcell-steps/s, 69
+      per cent of that slowest row, and the Orin was holding another rig's realtime demo
+      (5,540 MB of 7,619 MB used, 469 MB free, when the re-run below was launched). The six
+      `NvMapMemAlloc` failures are the same contention seen from the allocator; the arm's own
+      estimate is 0.48 GiB, so nothing in this scene asks for the ~1 GB those errors name.
+      The re-run keeps stderr beside stdout to read the exact lines and the memory at the
+      moment they appear, rather than to guess the allocation from here.
+- [x] What was added instead of a new constant: the arm prints its own ratio, `run 1458.6 s
+      wall  (1.29 x the 1125.8 s estimate)`, so every logged run says whether the table's
+      rate held on that machine. `RATE_SAFETY` is left alone -- one contended run cannot set
+      a constant the next machine has to live with.
+- [ ] The consequence for choosing rungs, measured rather than assumed: at 1.29x, a rung must
+      be estimated under about 1,400 s to survive the 1,800 s tier-2 clock. dx 10 at pad 400
+      (1,567.7 s) is therefore out, and dx 10 at pad 200 (903.2 s, 3,222,828 cells) is in --
+      which matters because the paper's own mesh is "10 nm in all three co-ordinates".
+
+## 3a. The tail arm (the lead's ruling, 2026-10-15)
+
+The step-2 report named the wall: the record's own bins are 27.66 nm wide at dx 10, the paper's
+line is 4 nm, and reaching it by lengthening the record is 79,856 steps against a 20,000 cap.
+The lead's ruling is not to lengthen records past the cap, but to read the *decay*: the drive
+is over partway through a pulse record, and the tail after it is one decaying sinusoid --
+`a_dip(t) = c + exp(-t/tau) (a cos wt + b sin wt)` -- giving Q = pi f tau with a covariance
+error off the model's own residual. If the fit cannot pin Q from the short record, the arm
+reports it as unresolved with the bound it gives. Both outcomes are accepted; a silent
+linewidth is not.
+
+- [x] `--tail-periods` puts whole drive periods of record after the pulse is over, and
+      `--ringdown` reads them. `arm_conflicts` keeps the two readings off one another's
+      records: the band arm needs its drive centred in its own record (its estimator is a
+      cross-spectral density, and the delta records the -94 dB that a mostly-ring-down record
+      costs it), and the tail arm needs the tail the band arm cannot have.
+- [x] The window is a reading of the pulse, not a retyped constant: `pulse_end_sigma()` is
+      `5 + sqrt(-ln floor)` sigma off the product's own envelope, and `drive_done()` finds the
+      same cut in the run's recorded drive. `--estimate`/`report` prints the planned tail
+      before anything runs; the arm prints the measured one.
+- [x] Tier 1, both directions (the fixture is `test_the_fitter_recovers_a_decay_and_refuses_to_invent_one`):
+      synthetic tails with a known tau come back within a few of their own statistical errors
+      (10 fs over a 30 fs window: -0.00002%; 5 fs: -0.0033%; 20 fs: +0.0009%; 0.5 s each), and
+      a sinusoid with no decay in its window returns `resolved = False` with `at_edge = True`.
+      The first spelling of the fit stopped on its own scan grid -- 0.4% to 2.6% off, a hundred
+      times its own error -- and the fix is a coordinate descent (golden-section per axis)
+      rather than a fixed number of linspace rounds.
+- [x] The fit's **frequency window follows the drive's band**, not a fixed +-5 per cent of the
+      drive's centre: a 200 nm band around 1000 nm reaches -9 and +11 per cent, so a mode out there
+      was being fitted at the search's own edge and printed as a line. `band=(lo_hz, hi_hz)` is an
+      optional argument (omitted, the window is the old one, so nothing else moved), a transposed
+      band is refused rather than silently swapped, and `f_edge` travels in the fit's dict while
+      the arm prints `AT THE EDGE` when it lands on one. Found while preparing the lead's pulse
+      run, whose whole point is to read f off a tail. Tier 1 fixture
+      `the fit searches the band it is given, not a fixed +-5 per cent`: a synthetic tail 10 per
+      cent below the drive comes back at 299.79 THz against 299.79 sought through the band window,
+      while the fixed window stops at 313.70 (0.943 of the drive) and flags itself -- the two
+      readings differ, so the control cannot pass by both windows agreeing.
+- [ ] **What the fit's error is not.** It is the model's, not the geometry's: a tail holding
+      two decays still fits one of them, and a fast CPML transient fits as well as a cavity
+      mode. The arm prints that caveat in its own output, and `--vacuum` is the same arm on the
+      same scene with no cavity, so the two taus read side by side say which is which. Neither
+      has been run on the Orin.
+- [x] The estimate path grew with it: `--estimate` overrode `--dx`/`--mirror-pad` on every row
+      it printed, so `--estimate --dx 5` was silent about dx 5 -- which reads like the rung the
+      caller named had been priced and fitted, and is the first command step 3's finer-grid run
+      needs. The caller's own rung is now priced too and marked in the verdict column (a refused
+      one as well, since that is the row a reader most needs marked), and "the finest fitting
+      rung" is the minimum-dx rung that fits rather than the last row in the table that did.
+
+## 4. Step 3's shape (the lead, 2026-10-15)
+
+- [ ] The owner's step 3 as scoped in the row: the Purcell spectrum 850-950 nm at H=1375, a
+      short H sweep (1300/1375/1450) to show the peak moves, and a run at a finer grid to
+      show the peak is converged rather than asserted. The spectrum is the band arm's -- one
+      pulse record covers the octave -- and the sweep is `--height`.
+- [ ] The finer-grid run, measured rather than assumed: the ladder's own rungs stop at dx 10
+      (5,593,868 cells at pad 400, 1,567.7 s), and `--estimate --dx 5` prices 26,873,280
+      cells, 3.4x over the 8,000,000 cap, so dx 5 is not reachable at this pad. The pair
+      that is reachable is dx 20 -> dx 10 (2,037,156 -> 5,593,868 cells). Reaching dx 5
+      means shrinking the mirror pad, which is the scene's own physical geometry (what the
+      mirror and the CPML need), so it is the owner's decision rather than a cost knob to
+      turn quietly.
+- [ ] CW Purcell at 900 nm and a few neighbouring wavelengths (`--wavelength`), the CW arm's
+      own reading of the peak value. Nothing here lengthens a record past the cap to buy
+      linewidth. The rungs, priced with the measured 1.29x in hand: dx 12 pad 400 (1,127.5 s
+      estimated, the rung the lead ran) fits the 1,800 s clock; dx 10 pad 400 (1,567.7 s) does
+      not, and dx 10 pad 200 (903.2 s, 3,222,828 cells) does -- and dx 10 is the paper's own
+      mesh, so the pad's convergence run is what buys the comparable rung.
+- [x] **The reading superseded one the scene had.** `--hex corners` (corner-to-corner = the
+      quoted number) made the flats 363.7 nm, 12 per cent narrow, and was the default until
+      the lead's decision below. It stays runnable, because run 1 is the comparison point for
+      the reading.
+- [x] The dipole's placement is the paper's, in its own words: "The QD emitter placed
+      on-axis at 30 nm below the top." (Figure 2a) and "we placed the QD at the second
+      antinode from the top" -- on a wire whose in-material half wave is 130.8 nm, 30 nm is
+      that second antinode, so the two sentences agree. The scene puts the dipole on the axis
+      30 nm under the top facet, and `report` now prints the node it actually chose and the
+      gap to what was asked (tiny scene: 57.11 nm delivered against 60 asked, inside one
+      finest cell; 3.33 nm off-axis on a 60 nm wire, well inside the paper's own +-100 nm
+      displacement tolerance). The coarse grid misses the ask by more, and the arm says so:
+      on the dx 20 Orin run the line reads "z 1497.01 nm, 39.99 nm below the top facet at
+      1537.00 nm (--qd-below 30 asked); in plane +9.93, -9.57 nm off the wire's axis", i.e.
+      10 nm deep and 13.8 nm off axis, because neither the depth nor the axis is a Yee node.
+      Priced rather than waved through: over 10 nm of depth the in-material field falls by
+      1 - cos(2*pi*3.44*10/900) = 2.9 per cent, and 13.8 nm is inside the central plateau of a
+      210 nm-radius wire, so the two are worth a few per cent of F -- not the factor of eight
+      under investigation, and inside the paper's own displacement scan. A finer z cell at the
+      source is the fix, owed once the rungs are chosen. The paper's crown is not modelled, and the text says
+      which F belongs to which geometry: the ~17 is `for this cavity`, the optimised
+      one, defined by height, width and the 12 nm oxide alone, while the crown enters
+      only as the growth's own deviation -- "It is difficult to achieve a perfectly
+      flat top facet of the NW with the bottom-up growth process" -- whose sweep
+      "provides a Purcell enhancement greater than 10 for crown heights smaller than
+      90 nm". So a plain prism is the right thing to compare with 17, and no crown can
+      explain reading ~2. (The crown figure's caption transposes the labels --
+      "D=1375 nm and H= 420 nm" where the text says height 1375 and width 420 -- the
+      numbers agree, the letters do not; this scene follows the text.)
+- [x] **The 420 nm reading is the paper's own relation, and it is now the default**
+      (the lead, 2026-10-15): 2s = 1.14 D with s the hexagon's side, so the quoted
+      number fixes the corner-to-corner width at 1.14 x 420 = 478.8 nm and the
+      flat-to-flat at 414.6 nm. `--hex paper` is that reading and the default;
+      `--hex corners` (corners = the quoted number) and `--hex flats` (flats = the
+      quoted number) remain, because run 1 below is the comparison point for the
+      reading and has to stay runnable. `report` prints both widths and the flag it
+      used, and the docstring cites the sentence.
+- [ ] The pad is not a cost knob to turn quietly: it is the mirror's own lateral extent, and
+      the paper's mode is a quasi-BIC, whose field is the kind that reaches the mirror's
+      edge. Shrinking it to 200 nm to fit the dx 10 rung inside the clock therefore owes a
+      convergence run (dx 20 at pad 200/400/600) rather than an assumption. The layout's own
+      16-cell pad sits outside the box on every axis, so no `--mirror-pad` value can reach the
+      absorber; what changes with it is how much gold the mode sees.
+- [ ] The gold is Rakić Lorentz-Drude here and Palik's measurements in the paper ("For the
+      Gold mirror, Palik's experimental permittivity data was used"). Both are metals at
+      900 nm; the difference is a named one, to be read out of a run rather than argued.
+- [ ] Q from the ring-down of the short record (section 3a), reported with its error -- or
+      reported as unresolved with the bound it gives. Those are the two accepted outcomes.
+- [ ] NA 0.8 collection waits for the far-field cloud job that is in flight; it is not an arm
+      of this script today, and nothing here claims it.
+- [ ] The 4 nm line, stated honestly: the record's bins resolve 27.66 nm, so the mode's width
+      is not in them. The `--ringdown` arm says so in its own output, and the ladder's 4 nm
+      line says so when `--ringdown` is set, rather than leaving a reader to conclude the mode
+      was resolved.
+
+## 3b. The tier-2 runs on the Orin (the lead's approval, 2026-10-15), one rung at a time
+
+- [x] **Run 1** `--wavelength 900 --hex corners --dx 20 --mirror-pad 400`, the comparison
+      point for the old reading: grid 121 x 122 x 138 = 2,037,156 cells, 11,426 steps = 32.0
+      periods, **F = 3.2295 at 900 nm**, 727.6 s wall against a 570.9 s estimate (**1.27x**).
+- [x] **Run 2** the paper's own reading (`--hex paper`: 478.8 nm across corners, 414.7 nm
+      across flats): 123 x 124 x 138 = 2,104,776 cells, 11,426 steps, **F = 0.1971 at
+      900 nm**, 753.0 s against 589.9 s (**1.28x**). The geometry moved F by 16x -- 3.2295 to
+      0.1971 -- i.e. away from the paper's 17, not toward it.
+- [x] **Run 3** (pad convergence at the smaller pad) `--mirror-pad 200`: 103 x 104 x 138 =
+      1,478,256 cells, 11,426 steps, **F = 0.2288 at 900 nm**, 514.6 s against 414.3 s
+      (**1.24x**, the quiet bench: load 1.66).
+- [x] **The pad decision the lead's rule makes** (2026-10-15: "If either pad moves F by more
+      than 10%, use the larger pad for the pulse run and say so"). Pad 200 reads 0.2288 and
+      pad 400 reads 0.1971: 16.1 per cent apart, over the line, so **the pulse run takes the
+      larger pad, 600 nm**. Priced there at 900 nm, dx 20, each row naming its arm -- "CW" is
+      the point arm, "pulse" is `--ringdown --tail-periods 20`:
+
+          arm    geometry  cells       steps    s est    nm per bin at 900 nm
+          CW     paper     2,841,696   11,426     796.4  28.12
+          pulse  paper     2,821,104   18,649   1,290.4  17.13
+          CW     corners   2,763,036   11,426     774.4  28.12
+          pulse  corners   2,723,560   18,649   1,245.8  17.13
+
+      The arm is not a detail, and a row is only the row it names: the same rung priced as
+      `--spectrum` reads 11,550 steps at 2,821,104 cells (paper) or 2,723,560 (corners), and
+      `--band-half` moves the record too (dx 20 pad 400 at 900 nm: band-half 70 -> 11,550
+      steps, band-half 100 -> 8,176, band-half 30 refused). dx 15 at pad 600 and every dx 12
+      or finer rung are refused at that pad.
+
+- [x] **The rungs that were run**, each read from its own log in
+      `~/mse-bench/paper1/logs` (machines: the Orin bench, `/home/sigmastrain/mse-worker/venv`).
+      **Rung 6** -- pulse, paper, dx 20, pad 600, drive 1000 nm with band 1000 +- 100:
+      143 x 144 x 138 = 2,841,696 cells, dt 8.402479e-18 s, 17,948 steps = 45.2 periods,
+      1,251.0 s estimated, tail 7,896 steps = 19.9 periods. **Killed at the 1,800 s cap**
+      (exit 124, log ending at its `source` line) -- see the rate below.
+      **Rung 7** -- the same arm at dx 30: 123 x 123 x 118 = 1,785,222 cells, the same 17,948
+      steps, 785.9 s estimated, and it finished in **1,019.8 s wall = 1.30x**, at
+      **31.4 Mcell-steps/s** (its own `progress` lines). That rate is what killed rung 6:
+      2,841,696 cells x 17,948 steps / 31.4e6 = **1,624 s of stepping alone** against the
+      1,800 s clock, so under 3 min of headroom for setup and recording -- and the kill says
+      that is less than they take. The estimator prices those same cells and steps at
+      1,251.0 s, i.e. it assumes **1.30x** more than this bench gives; treat every tier-2
+      estimate here as 1.30x optimistic. **Rung 8** -- CW, paper, dx 20, pad 600, at the
+      fitted 986.7 nm: 144 x 144 x 138 = 2,861,568 cells, dt 8.357141e-18 s, 12,603 steps =
+      32.0 periods, 884.6 s estimated, **1,165.6 s wall = 1.32x**, **F = 3.2419**.
+      **Rung 9** -- the same point 10 nm down-band, CW at 976.7 nm, same mesh class:
+      144 x 144 x 138 = 2,861,568 cells, dt 8.362267e-18 s, 12,468 steps = 32.0 periods,
+      875.1 s estimated, **1,152.4 s wall = 1.32x**, **F = 1.6687**, and no NvMap line at all
+      (rung 8's log had 18). The two points are 10 nm apart in wavelength and a factor 1.94
+      apart in F, which is one sharp line rather than a broad one -- but both are *40 nm* runs
+      (see 3d) and neither stands beside the paper's 17.
+- [ ] The two-point pad sweep is a rule applied, not a convergence proved: run 3b (pad 600,
+      CW at 900 nm, about 16 min) is the run that would prove it. It is held back rather than
+      spent, because the CW point at the fitted wavelength (also pad 600) may already supply
+      the same 600-vs-400 comparison for free, and that is known once the pulse run lands.
+      If the fitted wavelength is far from 900 nm, the pad's convergence at 900 nm stays
+      unmeasured and the report says so.
+
+## 3c. The tail arm's two faults, found and fixed in tier 1
+
+- [x] **The fit's window was not the drive's band** (`12b674f`). `fit_decay` searched a fixed
+      +-5 per cent of the drive's frequency, while the priced pulse run's band (900-1100 nm,
+      `--band-half 100`) excites 9-11 per cent either side of the drive. A mode excited
+      between 900 nm and the old window's own edge would have been fitted *at* that edge and
+      printed as a line -- a window artefact that costs the run. The window now follows the
+      band it is given, the fit returns `f_edge`, and the arm prints "AT THE EDGE of that
+      band, so this f is the search's own edge and the mode is outside it" rather than
+      leaving a reader to take the edge for a peak. The narrow window's failure is asserted
+      in the controls, so the fix cannot pass by both windows agreeing.
+- [x] **A tail could not outlive its run** (2f). One decaying sinusoid is the model the arm
+      fits; a tail holding two of them needs a second model, and without the samples on disk
+      that model costs the Orin again. `--save-tail PATH` writes the record with its `dt`,
+      its start step, the drive's frequency and its band (`save_record`), and `load_record`
+      reads back the argument the writer was handed -- including `np.savez`'s own `.npz`,
+      which is why the arm prints the name it actually wrote. Control: a synthetic tail saved
+      and read back re-fits to the line fitted in memory, bit for bit (`again["f"] ==
+      wide["f"]`), off 2,972 samples on disk. The "15" in that sentence is the *test's*
+      assertion, not what the scene printed, and running each revision is what separates the
+      two: `12b674f` prints **16** ok lines against the constant 15, and step 2f's `f91d46c`
+      prints **17** against the same 15 -- so that control was red as committed at both (at
+      `12b674f`, measured: `1 failed in 49.07s`, the assert at `tests/test_paper1_nanowire.py:74`;
+      at `f91d46c` the same assert compares 17 with 15 and cannot pass). `5712be5` (step 2d, 15
+      printed and 15 asserted) is the last revision where the two agreed before the drift, and
+      step 2h is the revision that catches the constant up (18/18), then 19 at 2i and 21 at 2j.
+      Each figure is that revision's own constant from
+      `git show <rev>:tests/test_paper1_nanowire.py`, set against
+      `done.stdout.count("\n  ok   ")` over that same revision's `--tiny` stdout:
+      `tiny: all controls hold`, exit 0.
+- [x] **A failed tail write could take the run's number with it** (2h). The write stood among
+      the arm's own statements, so a path a run cannot write (a file where a directory
+      belongs) raised `NotADirectoryError` out of the arm after the fit had been printed:
+      the number the run was spent for died with the save. The write is now a `try` of its
+      own, after the fit, and the `OSError` a path raises is caught and reported as a
+      `warning` line naming the exception's type -- so the run keeps its fit and its `Q` and
+      still returns 0. Two controls, each holding one half: `tiny`'s own asks the real raise
+      site for the type of what it raises (`save_record` on a path whose parent is a regular
+      file), and a tier-1 fixture drives the same command the bench uses,
+      `--tiny --ringdown --save-tail <a file, not a directory>/tail`, asserting the child's
+      exit status, the `fit` and `Q` lines, the `warning` naming `NotADirectoryError`, and
+      the absence of the write's own success line -- so a fix that drops the number instead
+      of the file cannot pass, and a check that cannot fail would be seen for one. The same
+      flag on a run that never rings down is refused outright (`arm_conflicts`), which is
+      why the flag has to be stated, not inherited, in the arm namespaces the controls
+      build: a live `--save-tail` made the band arm read dirty and the run failed its own
+      controls (measured: exit 1 as committed at 3a183d9, exit 0 after the fix).
+
+## 3d. The emitter's depth is geometry, not resolution (2j)
+
+- [x] **The mesh was moving the emitter, and nothing said so.** The source is snapped to the
+      nearest node (`fdtd_grid._locate`), so the depth below the facet is a property of the
+      node list, not of `--qd-below`. Read off the runs' own `dipole` lines: **rung 8**, dx 20,
+      asked 30 nm -- node (71, 71, 119) at z 1497.01 nm, **39.99 nm** below the facet at
+      1537.00 nm (so its F = 3.2419 is a *40 nm* run and does not stand beside the paper's 17);
+      **rung 7**, dx 30, the same request -- 29.89 nm. The same 10.10 nm shift sits in rungs
+      1 and 2 (dx 20, pad 400, also 39.99), so every 900 nm reading in section 3b is a 40 nm
+      one. Two depths are two geometries: a dipole 10 nm further into a 1375 nm wire with a
+      facet 40 nm above it is a different Purcell factor, and the difference between two dx
+      values had been read as resolution.
+- [x] **The fix** (this step's own sha). `fdtd_layout.plan` takes `request["pin_source_z"]`
+      (default false) and, when it is set for a point source, adds the source's own z to the
+      z axis' lines before `build_grid`, so the axis' own node is the depth asked for. The
+      in-plane axes are left alone on purpose: x and y are uniform at `dx` for every part
+      here, and the same class of defect lives there -- an index is not the axis. Read off
+      the runs' own `dipole` lines, in-plane offsets as `x, y` in nm: rung 1 `+0.00, -9.57`;
+      rungs 2 and 3 `-0.00, +9.87`; rung 6 `-0.00, -9.87`; rung 7 `+0.00, -0.00`; rungs 8 and
+      9 `-9.89, -9.87`; the s1 band arm `-0.00, -9.87`. So at **dx 20** x reads -9.89 in
+      rungs 8 and 9 but -0.00 in rung 6 and in the s1 band arm, and y reads both -9.87 and
+      +9.87. That offset is the nearest node's distance from the axis, and which side it
+      falls on is the run's own node list, not a `dx` signature: rung 6's x axis has 143
+      nodes and rung 9's has 144 (`grid 143 x 144 x 138` against `144 x 144 x 138` in the two
+      logs), so the *same* index 71 lands on a different physical x and one run reads 0.00
+      where the other reads -9.89. A line on a uniform axis would buy one node and cost a
+      graded axis, which is a second decision, so it is **not** fixed here. `paper1_nanowire.py`
+      sets the key on the one request all three arms share, so the pulse, band and CW arms
+      are pinned alike.
+- [x] **The refusal is the load-bearing half.** `build_grid` drops a line that lands outside
+      the extent or within `LINE_SNAP` of an edge, and the source is then snapped anyway with
+      nothing printed -- a silent geometry change, which is worse than a failed run. So
+      `refusals` now takes the plan and refuses when the realised depth is more than 1 nm from
+      `--qd-below`, naming the realised depth, the request and the difference; it is the same
+      function at both entry points (`--tiny` and the bench run), so tier 1 cannot pass a
+      scene the bench would refuse. The realised depth has one reader, `emitter_depth_nm`,
+      used by both the `dipole` line and the refusal, so the two cannot drift.
+- [x] **Controls** (tier 1, `--tiny`: 19 controls at 2i, **21 at 2j** -- the count is that
+      revision's own assertion, `done.stdout.count("\n  ok   ")`). One plans two scenes at
+      dx 20 and dx 30 **with and without the pin**: the control's own (`--qd-below 60`, where
+      the un-pinned depth is **57.11 nm at both dx**, read off the pre-pin run's own `dipole`
+      line in `tiny_2i.log` as well as off the plan) and the paper's, built by the parser's
+      own defaults rather than by a retyped copy (`--qd-below 30`: 39.99 nm at dx 20, 29.89 at
+      dx 30). The un-pinned column is not decoration -- an equality against the pinned plan
+      alone would pass with the pin inert on any mesh whose nodes land on the request, and the
+      paper's dx-30 mesh is 0.11 nm off, i.e. it would pass by luck. The assertion is that each
+      scene has at least one dx past the 1 nm tolerance, and the message marks which readings
+      are. The second control drives `refusals` with a plan whose depth is out of tolerance
+      (the control's own scene, un-pinned) requiring the refusal to name the realised depth,
+      the request and the difference, and with the run's own plan, requiring that call to pass.
+      `test_the_tiny_scene_holds_every_control` also now pins the printed depth at the 0.01 nm
+      the line prints (`< 0.005`, where it was only within one finest cell before): the
+      predicate that let the defect through is the one that would have let the fix through.
+
+## 3e. The progress line's own control was reading a rounded operand
+
+- [x] **The 2j suite found it red** (`1 failed, 18 passed in 970.39s`):
+      `test_the_progress_line_survives_a_killed_run`. It arrived with 2i (`3a183d9`) and is
+      inside the unreviewed `3a183d9..2j` range -- `git show 5938462:tests/... | grep -c` is 0 --
+      so the reviewer never saw it. (The count the lead quoted for 5938462 is the `--tiny`
+      self-test's own `ok` lines, which this test is not part of.)
+- [x] **The cause is the assertion, not the product.** The line prints both of its operands
+      rounded (`progress_seconds:,.1f`, the rate `:,.1f`), and the control recomputed the exact
+      division from the printed seconds and demanded agreement within 0.1 Mcell-steps/s. At the
+      fixture it was written on (12x11x11 = 1452 cells) the loop reaches step 1,000 in **0.2 s**,
+      where a printed tenth is a +-25 per cent span: the printed seconds imply 7.26 against the
+      printed 6.4, so the same line is 0.86 out and red here -- while on a machine slow enough
+      to print 2.0 s for the same step the same rounding is 2.5 per cent and the assertion
+      passes. A verdict that turns on which machine ran it is the one thing a control must not
+      have.
+- [x] **The fix** (this step's own sha). The box is 8x bigger (24x22x22 = 11,616 cells, so the
+      loop's own seconds are **0.7 s** and **1.5 s**, measured off the fixture's own lines:
+      `progress  step 1,000 of 3,000, 0.7 s, 16.2 Mcell-steps/s`), and the assertion asks the
+      printed rate to sit in the band the printed seconds can support -- the slowest and
+      fastest true time that could have rounded to it, each side widened by the rate's own last
+      digit: `implied/(t + 0.05) - 0.05 <= rate <= implied/(t - 0.05) + 0.05`, with `t > 0.1`
+      so the band cannot be vacuous. The band at 0.7 s is [15.44, 17.92].
+- [x] **The control can fail, and was made to.** Mutating the product's rate to
+      `(n_cells - 1000) * step` -- an 8.6 per cent miscount, the smallest thing that should
+      matter -- turns it red at the assertion itself (`14.3` against a band starting at
+      `15.44`), and the product file was then reverted to its committed bytes (`git diff` empty)
+      and the control is green again in 2.49 s. Counts: **19 pytest controls** (18 passing plus
+      this one, `tests/test_paper1_nanowire.py`), `--tiny`'s own **21**.
 
 ## Deferred by the lead, recorded here so it is not dropped
 
@@ -244,7 +592,14 @@ The lead's four steps (queue row, 2026-10-15). One commit each, local only; the 
 
 ## Not verified here
 
-- The paper's method section and its table: what the fetch tool returned is summarised text
-  from a page whose design does not match the abstract. The lead reads the PDF.
+- The paper's figures and its table's exact digits: what the fetch tool returned is the text
+  of the design and method sections, quoted above where a number is used. It is the right
+  paper -- the abstract page and the full text agree on the nanowire cavity, and the "quasi-BIC
+  formed by strong coupling of two resonant optical modes" of the abstract is the mirror-backed
+  wire of the body, not a different design (an earlier reading of this file said the opposite;
+  the quotes above are what settled it). The figure numbers themselves (Figure 1b, Figure 2a,
+  Figure 6) name where a reader should look in the PDF; the lead has the PDF.
 - The Lumerical page: 403.
-- Anything at tier 2 or 3: the Orin run is the lead's.
+- Anything at tier 3 (the cluster) or beyond: not this change's. Tier 2 is the lead-approved
+  Orin rungs in section 3b, run one at a time with the tier-2 wrapper (5 GiB, `nice -n 10`,
+  a 30-minute clock); a rung that the clock refuses is named, not substituted silently.
