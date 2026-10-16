@@ -40,13 +40,14 @@ an A4000 reading is comparable with the Orin's.
 - **THEN** `python3 -c "import cupy; print(cupy.__version__)"` prints the pinned version, so
   the image's risk (a wheel that cannot be installed or imported) is settled off the cluster
 
-### Requirement: The A4000 Job SHALL be pinned to one node and one GPU and SHALL request exactly what it limits
+### Requirement: The A4000 Job SHALL be pinned to one GPU of one product and SHALL request exactly what it limits
 
-`manifests/bench/paper1-a4000-job.yaml` SHALL select one host and one GPU product, SHALL set
-`requests` equal to `limits` for `nvidia.com/gpu`, `cpu` and `memory`, and SHALL set the
-container's BLAS/OpenMP thread counts to its own CPU limit (a container CPU limit does not
+`manifests/bench/paper1-a4000-job.yaml` SHALL select the GPU product and ask for one GPU,
+SHALL set `requests` equal to `limits` for `nvidia.com/gpu`, `cpu` and `memory`, and SHALL set
+the container's BLAS/OpenMP thread counts to its own CPU limit (a container CPU limit does not
 change `os.cpu_count()`, so an unset thread count starts one thread per host core and is
-throttled).
+throttled). Which node carries the Job SHALL be left to the quota and the card's own
+allocatable, and the file SHALL say where a host pin would go.
 
 #### Scenario: the memory limit is derived from the priced grid
 - **WHEN** the priced dx-10 record (9,166,668 cells) is compared with the memory limit
@@ -71,7 +72,7 @@ started, so the deadline is the only live timer on the cluster.
 #### Scenario: the deadline follows the record's own pricing
 - **WHEN** the CW record's deadline is checked against its pricing
 - **THEN** `1.5 × 11,696 s (the table's 8,914.8 s at the Orin's measured factor 1.312) + 300 s
-  setup = 17,817 s`, rounded up to the next half hour, is the 18,000 s in the file, and the
+  setup = 17,844 s`, rounded up to the next half hour, is the 18,000 s in the file, and the
   file states this arithmetic
 
 #### Scenario: the run's own rate is visible before the deadline

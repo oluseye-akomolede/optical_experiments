@@ -22,9 +22,10 @@ merges and pushes. Nothing runs on the cluster until review and the lead's go.
 ## 2. The A4000 Job
 
 - [x] `manifests/bench/paper1-a4000-job.yaml`: ns `mode-search-engine`, nodeSelector
-      `NVIDIA-RTX-A4000` + `kubernetes.io/hostname=sigma-worker2` (worker1's pair carries the
-      lead's own label match — one of the two, stated in the file), limits == requests
-      (`nvidia.com/gpu 1`, `cpu 2`, `memory 8Gi`), OMP/MKL/OPENBLAS/NUMEXPR 2.
+      `nvidia.com/gpu.product=NVIDIA-RTX-A4000` and nothing else — as the row asked: which of
+      the A4000 nodes carries it is the quota's and the card's own allocatable's decision, and
+      the file says where to add a `kubernetes.io/hostname` if one is to be pinned by hand.
+      Limits == requests (`nvidia.com/gpu 1`, `cpu 2`, `memory 8Gi`), OMP/MKL/OPENBLAS/NUMEXPR 2.
 - [x] Memory justified from the pricing: the priced dx-10 grid is ~1.12 GiB (the table's
       ~131 bytes/cell × 9,166,668 cells; the same table prints 0.36 GiB at 2,903,040 cells) —
       7× inside the 8Gi limit and 15 % of the card's 16376 MiB.

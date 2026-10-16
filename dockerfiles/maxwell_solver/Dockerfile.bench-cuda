@@ -1,0 +1,103 @@
+# Paper 1's CUDA bench: the same bench script, on a cluster A4000 instead of the Jetson.
+#
+# Why an image at all: no image of ours carries a CUDA runtime. The web image is
+# python:3.12-slim and the FDTD path imports cupy lazily (scripts/paper1_nanowire.py,
+# the --xp branch), so cupy is never importable there; the Orin bench is one GPU behind a
+# flock'd lock.
+#
+# BASE, pinned at or below what the target nodes report: the A4000 nodes carry
+# nvidia.com/cuda.runtime-version.full=12.7 with driver 565.57.01, so 12.6.3 is the newest
+# tag at or under it. The -runtime variant has the math libraries (cuBLAS/cuFFT/cuSPARSE)
+# the solver needs; the -devel toolchain is not, since nothing is compiled here.
+#
+# FILES: exactly the import closure of the bench script, derived from the script rather than
+# listed by hand. From the repo root:
+#
+#   .venv-mse/bin/python -I -c "import sys; sys.path[:0]=['scripts','dockerfiles/maxwell_solver'];
+#     import paper1_nanowire as p; root='%s/' % __import__('os').getcwd();
+#     print(sorted(m.__name__ for m in sys.modules.values() if getattr(m,'__file__','') and
+#       m.__file__.startswith(root)))"
+#
+# reads: fdtd, fdtd_grid, fdtd_layout, fdtd_voxel, mse_common, mse_geometry -- all under
+# dockerfiles/maxwell_solver/ -- plus the script itself. Nothing else is copied: a file
+# outside the closure cannot be needed at run time, and a new local import in the script
+# invalidates this list (re-derive it, do not retype it).
+#
+# LAYOUT: the relative tree is kept (scripts/ beside dockerfiles/maxwell_solver/) because the
+# script inserts its own ``parent.parent/dockerfiles/maxwell_solver`` into sys.path. No
+# PYTHONPATH is set: flattening the tree, or papering over it with a path variable, would make
+# the image run a different module search path from the one the bench numbers came from.
+#
+# PACKAGES, pinned to the versions the bench path was RUN with -- read off the Orin venv that
+# produced r20 (cupy 14.2.0, numpy 2.2.6, scipy 1.15.3, trimesh 5.1.0, python 3.10.12), so an
+# A4000 reading is comparable with the Orin's. One named difference: this image's interpreter
+# is 3.12 (ubuntu24.04, the repo's other images), not the Orin venv's 3.10. cupy-cuda12x is
+# the CUDA-12 wheel of cupy (the Orin's cupy is built against its own JetPack CUDA). trimesh
+# is imported at module level by the script; scipy is pinned beside numpy because
+# dockerfiles/maxwell_solver/requirements.txt pins both, though the closure does not reach it.
+#
+# BUILD (from the repo root, this rig's own docker config, never pushed from here):
+#   export DOCKER_CONFIG=~/.docker-mse
+#   docker build -f dockerfiles/maxwell_solver/Dockerfile.bench-cuda -t paper1-bench-cuda:local .
+#
+# SMOKE, with no GPU on the building host (docker run ignores nice/ulimit, so the container is
+# bounded on its own -- every local docker run needs both):
+#   docker run --rm --cpus=2 --memory=2g --entrypoint python3 IMG -c "import cupy; print(cupy.__version__)"
+#   docker run --rm --cpus=2 --memory=2g IMG --help
+#   docker run --rm --cpus=2 --memory=2g IMG --tiny --xp numpy
+
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=100 \
+    PIP_RETRIES=20 \
+    # The Job is allotted 2 CPUs, and a CPU limit does not change os.cpu_count(): an unset
+    # thread count starts one thread per HOST core and is throttled hard (measured). The Job
+    # manifest sets the same four numbers.
+    OMP_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2 \
+    NUMEXPR_NUM_THREADS=2 \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    PATH=/opt/venv/bin:$PATH \
+    VIRTUAL_ENV=/opt/venv
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/venv \
+    && pip install --upgrade pip \
+    && pip install \
+        numpy==2.2.6 \
+        scipy==1.15.3 \
+        trimesh==5.1.0 \
+        cupy-cuda12x==14.2.0
+
+WORKDIR /opt/app
+
+COPY scripts/paper1_nanowire.py scripts/paper1_nanowire.py
+COPY dockerfiles/maxwell_solver/fdtd.py dockerfiles/maxwell_solver/fdtd.py
+COPY dockerfiles/maxwell_solver/fdtd_grid.py dockerfiles/maxwell_solver/fdtd_grid.py
+COPY dockerfiles/maxwell_solver/fdtd_layout.py dockerfiles/maxwell_solver/fdtd_layout.py
+COPY dockerfiles/maxwell_solver/fdtd_voxel.py dockerfiles/maxwell_solver/fdtd_voxel.py
+COPY dockerfiles/maxwell_solver/mse_common.py dockerfiles/maxwell_solver/mse_common.py
+COPY dockerfiles/maxwell_solver/mse_geometry.py dockerfiles/maxwell_solver/mse_geometry.py
+
+# Build-time proof of the closure and the layout: every module the script imports at run time
+# must load from the copied tree, and cupy must import with no GPU present. A missing COPY
+# fails the build here rather than on a cluster node five hours in.
+RUN python3 -c "import sys; sys.path[:0] = ['scripts', 'dockerfiles/maxwell_solver']; \
+        import paper1_nanowire, fdtd, fdtd_grid, fdtd_layout, fdtd_voxel, mse_common, mse_geometry; \
+        import cupy; print('closure ok, cupy', cupy.__version__)"
+
+# Non-root, and its own home for cupy's kernel cache. The Job names this uid explicitly, so
+# the kubelet does not have to inspect the image to verify runAsNonRoot.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin bench \
+    && chown -R bench:bench /opt/app
+USER bench
+
+# Args come from the Job manifest (the priced record, --xp cupy, the raised bench ceilings):
+# the manifest is this bench's launcher, and it is read by the reviewer.
+ENTRYPOINT ["python3", "-u", "scripts/paper1_nanowire.py"]
