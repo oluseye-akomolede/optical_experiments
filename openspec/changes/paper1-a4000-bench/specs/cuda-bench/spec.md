@@ -1,0 +1,100 @@
+# cuda-bench
+
+## ADDED Requirements
+
+### Requirement: The CUDA bench image SHALL carry exactly the files the bench script imports
+
+`dockerfiles/maxwell_solver/Dockerfile.bench-cuda` SHALL copy the repo's own import closure of
+`scripts/paper1_nanowire.py` and nothing else, in the repository's relative layout, so the
+image runs the same module search path the bench run was measured on. The image SHALL set no
+`PYTHONPATH`: the script inserts its own `parent.parent/dockerfiles/maxwell_solver` into
+`sys.path`, which resolves only if `scripts/` sits beside `dockerfiles/maxwell_solver/`.
+
+#### Scenario: the closure is re-derived, never retyped
+- **WHEN** `scripts/paper1_nanowire.py` gains a local import
+- **THEN** the file list in the Dockerfile is stale by construction, and the derivation
+  command recorded in the Dockerfile (the `-I -c` one-liner that loads the script and lists
+  every loaded module whose file is in the repo) is what names the files to copy again
+
+#### Scenario: the image answers --help from the bench script
+- **WHEN** the built image runs with `--help` (the image's `ENTRYPOINT` is
+  `python3 -u scripts/paper1_nanowire.py`, working directory `/opt/app`)
+- **THEN** the script's own usage prints, so the imports it makes at module level resolved
+  from the copied tree
+
+### Requirement: The image SHALL pin its CUDA base and every package to the versions the bench path has been run with
+
+The base tag SHALL be pinned at or below the CUDA a target node reports, and the four python
+packages SHALL be pinned to the versions under which the bench's own numbers were produced, so
+an A4000 reading is comparable with the Orin's.
+
+#### Scenario: the pins name their source
+- **WHEN** the pins are checked
+- **THEN** the base is `nvidia/cuda:12.6.3-runtime-ubuntu24.04` (the A4000 nodes report
+  `nvidia.com/cuda.runtime-version.full=12.7`, driver 565.57.01) and the packages are
+  `cupy-cuda12x==14.2.0`, `numpy==2.2.6`, `scipy==1.15.3`, `trimesh==5.1.0` — read off the
+  Jetson venv that ran r20, not chosen from a release page
+
+#### Scenario: cupy imports without a GPU
+- **WHEN** the image is run on a host with no GPU
+- **THEN** `python3 -c "import cupy; print(cupy.__version__)"` prints the pinned version, so
+  the image's risk (a wheel that cannot be installed or imported) is settled off the cluster
+
+### Requirement: The A4000 Job SHALL be pinned to one node and one GPU and SHALL request exactly what it limits
+
+`manifests/bench/paper1-a4000-job.yaml` SHALL select one host and one GPU product, SHALL set
+`requests` equal to `limits` for `nvidia.com/gpu`, `cpu` and `memory`, and SHALL set the
+container's BLAS/OpenMP thread counts to its own CPU limit (a container CPU limit does not
+change `os.cpu_count()`, so an unset thread count starts one thread per host core and is
+throttled).
+
+#### Scenario: the memory limit is derived from the priced grid
+- **WHEN** the priced dx-10 record (9,166,668 cells) is compared with the memory limit
+- **THEN** the table's own storage per cell (~131 bytes, from its printed GiB against cells)
+  puts the record at ~1.12 GiB, 7× inside the 8Gi limit and 15 % of the card's 16376 MiB
+
+#### Scenario: the args are the launcher and they name cupy
+- **WHEN** the Job's `args` are read
+- **THEN** they carry the priced record in full (`--wavelength`, `--dx`, `--mirror-pad`,
+  `--periods`, `--xp cupy`) plus the two raised bench ceilings `--max-steps` and
+  `--max-seconds`, because on the cluster there is no `run_cw.sh`: the manifest is the
+  launcher, and the script's default `--xp numpy` would run at about a third of the table's
+  rate with nothing to refuse it
+
+### Requirement: The Job's wall bound SHALL be its own activeDeadlineSeconds, derived from the same estimator's seconds
+
+The Job SHALL carry `activeDeadlineSeconds` derived, and written out in the file, from the
+pricing of the exact record its `args` ask for, with the margin named. A raised
+`--max-seconds` SHALL NOT be presented as that bound: the product does not stop a run that has
+started, so the deadline is the only live timer on the cluster.
+
+#### Scenario: the deadline follows the record's own pricing
+- **WHEN** the CW record's deadline is checked against its pricing
+- **THEN** `1.5 × 11,696 s (the table's 8,914.8 s at the Orin's measured factor 1.312) + 300 s
+  setup = 17,817 s`, rounded up to the next half hour, is the 18,000 s in the file, and the
+  file states this arithmetic
+
+#### Scenario: the run's own rate is visible before the deadline
+- **WHEN** the Job starts
+- **THEN** the script's `progress` lines report Mcell-steps/s within the first minutes (the
+  Orin read 30.3 on cupy for r20), so a machine slower than the margin is seen long before the
+  deadline kills the run
+
+### Requirement: A finished or failed Job's log SHALL survive as the result
+
+The Job SHALL NOT retry (`backoffLimit: 0`), SHALL NOT restart its container
+(`restartPolicy: Never`), and SHALL keep its pod for at least a week after it finishes
+(`ttlSecondsAfterFinished: 604800`), because a multi-hour run cancelled at the deadline leaves
+its partial log as the only measurement there is.
+
+#### Scenario: a cancelled run is still readable
+- **WHEN** the Job is killed by its deadline
+- **THEN** the pod is not deleted while the queue row that launched it is still open, so the
+  progress lines up to the kill can be read
+
+#### Scenario: the args are refused before the scene is built while the cell cap stands
+- **WHEN** the manifest's dx-10 args are run against the shipped code
+- **THEN** the script refuses with the cell limit (`The grid has 9,166,668 cells, over the
+  limit of 8,000,000`) before building anything, which is the open item in the change's
+  `tasks.md`: the third bench ceiling, or the dx-12/pad-600 rung whose deadline the file also
+  carries
