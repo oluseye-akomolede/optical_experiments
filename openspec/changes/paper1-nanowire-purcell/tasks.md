@@ -528,6 +528,36 @@ linewidth is not.
       the line prints (`< 0.005`, where it was only within one finest cell before): the
       predicate that let the defect through is the one that would have let the fix through.
 
+## 3e. The progress line's own control was reading a rounded operand
+
+- [x] **The 2j suite found it red** (`1 failed, 18 passed in 970.39s`):
+      `test_the_progress_line_survives_a_killed_run`. It arrived with 2i (`3a183d9`) and is
+      inside the unreviewed `3a183d9..2j` range -- `git show 5938462:tests/... | grep -c` is 0 --
+      so the reviewer never saw it. (The count the lead quoted for 5938462 is the `--tiny`
+      self-test's own `ok` lines, which this test is not part of.)
+- [x] **The cause is the assertion, not the product.** The line prints both of its operands
+      rounded (`progress_seconds:,.1f`, the rate `:,.1f`), and the control recomputed the exact
+      division from the printed seconds and demanded agreement within 0.1 Mcell-steps/s. At the
+      fixture it was written on (12x11x11 = 1452 cells) the loop reaches step 1,000 in **0.2 s**,
+      where a printed tenth is a +-25 per cent span: the printed seconds imply 7.26 against the
+      printed 6.4, so the same line is 0.86 out and red here -- while on a machine slow enough
+      to print 2.0 s for the same step the same rounding is 2.5 per cent and the assertion
+      passes. A verdict that turns on which machine ran it is the one thing a control must not
+      have.
+- [x] **The fix** (this step's own sha). The box is 8x bigger (24x22x22 = 11,616 cells, so the
+      loop's own seconds are **0.7 s** and **1.5 s**, measured off the fixture's own lines:
+      `progress  step 1,000 of 3,000, 0.7 s, 16.2 Mcell-steps/s`), and the assertion asks the
+      printed rate to sit in the band the printed seconds can support -- the slowest and
+      fastest true time that could have rounded to it, each side widened by the rate's own last
+      digit: `implied/(t + 0.05) - 0.05 <= rate <= implied/(t - 0.05) + 0.05`, with `t > 0.1`
+      so the band cannot be vacuous. The band at 0.7 s is [15.44, 17.92].
+- [x] **The control can fail, and was made to.** Mutating the product's rate to
+      `(n_cells - 1000) * step` -- an 8.6 per cent miscount, the smallest thing that should
+      matter -- turns it red at the assertion itself (`14.3` against a band starting at
+      `15.44`), and the product file was then reverted to its committed bytes (`git diff` empty)
+      and the control is green again in 2.49 s. Counts: **19 pytest controls** (18 passing plus
+      this one, `tests/test_paper1_nanowire.py`), `--tiny`'s own **21**.
+
 ## Deferred by the lead, recorded here so it is not dropped
 
 - [ ] **The dielectric as a function, not a constant** (the lead's step-1 item (7), called a

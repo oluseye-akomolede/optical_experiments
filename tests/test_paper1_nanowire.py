@@ -346,6 +346,11 @@ def test_the_progress_line_survives_a_killed_run(tmp_path):
     the kill the bench delivered, minus the 30 minutes. The lines for steps 1,000
     and 2,000 have to be in the file anyway, which they are only if the loop
     flushed them itself.
+
+    The box is 8x the one this started on (24x22x22 = 11,616 cells, measured here
+    at 0.7 s and 1.5 s for the two lines) because the check on the number below
+    needs the loop's own seconds to be long enough that the tenth the line prints
+    is a small part of them.
     """
     program = tmp_path / "progress_probe.py"
     program.write_text(
@@ -355,10 +360,10 @@ def test_the_progress_line_survives_a_killed_run(tmp_path):
         "def stop(step):\n"
         "    if step >= 2048:\n"
         "        os._exit(9)\n"
-        "eps = np.ones((12, 11, 11), np.float32)\n"
-        "src = fdtd.Source((6, 5, 5), frequency=3e14, bandwidth=1e14,"
+        "eps = np.ones((24, 22, 22), np.float32)\n"
+        "src = fdtd.Source((12, 11, 11), frequency=3e14, bandwidth=1e14,"
         " component='z')\n"
-        "fdtd.simulate(eps, src, 3000, probes=[(7, 5, 5, 'z')],\n"
+        "fdtd.simulate(eps, src, 3000, probes=[(13, 11, 11, 'z')],\n"
         "              spacings=(20e-9,) * 3, boundary='metal', check=stop)\n")
     log = tmp_path / "run.log"
     with log.open("w") as handle:
@@ -366,15 +371,25 @@ def test_the_progress_line_survives_a_killed_run(tmp_path):
                               stderr=subprocess.STDOUT, cwd=ROOT, timeout=300)
     assert done.returncode == 9, done.returncode
     text = log.read_text()
-    # the two lines the run had reached, with the rate it was actually given --
-    # 1452 cells over the loop's own seconds, so the number is the machine's
+    # The two lines the run had reached, with the rate the loop was actually
+    # given.  Both numbers on a line are rounded -- the seconds to a tenth, the
+    # rate to a tenth -- so the exact division is not the thing to compare
+    # against: the first draft did that within 0.1 and was red on this box
+    # (0.2 s / 6.4 Mcell-steps/s, whose exact rate is 7.26) while a slow machine
+    # made the same line pass.  A control whose verdict is the machine's speed
+    # proves nothing, so the number is asked to sit in the band the printed
+    # seconds can support: the slowest and the fastest true time that could have
+    # rounded to it, each side widened by the rate's own last digit.
     lines = re.findall(r"^progress  step ([\d,]+) of 3,000,\s+([\d.]+) s,"
                        r"\s+([\d.]+) Mcell-steps/s$", text, re.M)
     assert [step for step, _, _ in lines] == ["1,000", "2,000"], text
     for step, seconds, rate in lines:
-        cells = 12 * 11 * 11
-        assert abs(float(rate) - cells * int(step.replace(",", ""))
-                   / float(seconds) / 1e6) < 0.1, lines
+        cells = 24 * 22 * 22
+        t = float(seconds)
+        assert t > 0.1, lines
+        implied = cells * int(step.replace(",", "")) / 1e6
+        assert (implied / (t + 0.05) - 0.05
+                <= float(rate) <= implied / (t - 0.05) + 0.05), lines
 
 
 def test_save_tail_without_the_tail_arm_is_refused(tmp_path):
