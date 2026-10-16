@@ -41,9 +41,11 @@ cap by 75.6 %, and the record that resolves the paper's 4 nm mode is that record
 - **WHEN** the bench script's pricing arm (the ladder, which voxelises nothing) prices the
   manifest's own record -- `--hex paper --wavelength 993 --dx 10 --mirror-pad 600 --periods 100
   --pad-nm 320 --pml-nm 200`
-- **THEN** with no bench flag the two finer rungs are refused -- the dx-10/pad-600 row reads
-  `refused: The grid has 14,048,300 cells, over the limit of 8,000,000`, the dx-12 row
-  8,952,300 cells against the same limit, and dx 20 and 15 fit -- and with `--max-cells 15000000
+- **THEN** with no bench flag not one rung is priced, each refused on every ceiling it exceeds --
+  the ladder prints only the first 64 characters of a refusal, so the dx-10/pad-600 row reads
+  `refused: The grid has 14,048,300 cells, over the limit of 8,000,000` and dx-12/pad-600 reads
+  8,952,300 cells against the same limit, while dx 20 and 15 (and dx 12 at pad 400) lead with
+  `The run needs 39,650 time steps, over the limit of 20,000` -- and with `--max-cells 15000000
   --max-steps 200000 --max-seconds 18000` the dx-10 row is priced at 14,048,300 cells,
   39,650 steps and 13,662.4 s in 1.63 GiB
 

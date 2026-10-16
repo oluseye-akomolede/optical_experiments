@@ -41,8 +41,9 @@ centre), 7,552.4 s = 9,909 s (2 h 45 m).
 14,048,300 cells is over `fdtd.MAX_CELLS = 8,000,000` by 6,048,300 (75.6 %), so the record needs
 a third bench ceiling — `--max-cells`, which the lead authorised on 2026-10-16 and this change
 adds — rather than the rung the first pricing offered: at the held boundary dx 12 nm is
-8,952,300 cells and still over the cap, and the nearest rung that fits is dx 15 nm (5,234,775
-cells, 5,091.0 s = 6,679 s on the Orin).
+8,952,300 cells and still over the cell cap, and the nearest rung that fits that cap is dx 15 nm
+(5,234,775 cells, 5,091.0 s = 6,679 s on the Orin) — which is no way out either, because its
+39,650 steps are over the product's 20,000 and force the step ceiling up as well.
 
 The tables and the derived Orin-rate seconds are in `tasks.md`.
 

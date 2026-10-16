@@ -91,15 +91,15 @@ divide 320 nm cannot hold it exactly:
 ```
    dx    pad        cells    steps        s    GiB   dlam
  20.0    600    2,903,040   39,650   2823.3   0.36   9.93   <- r20's own rung (measured)
- 15.0    600    5,234,775   39,650   5091.0   0.63   9.93   <- the nearest rung that fits
+ 15.0    600    5,234,775   39,650   5091.0   0.63   9.93   <- the nearest rung that fits the cell cap
  12.0    600    8,952,300   39,650   8706.4   1.06   9.93   <- over 8 M, so not a way out
  10.0    600   14,048,300   39,650  13662.4   1.63   9.93   <- asked
 ```
 
 `dlam` is rung-independent: it is set by the record's duration, and every rung here is 39,650
-steps of the same dt (396.5 steps/period). The table prints these rows only because
-`--max-cells` admits them; on the product's own ceiling the asked rung is refused before it is
-priced.
+steps of the same dt (396.5 steps/period). The table prints these rows only because all three
+bench ceilings admit them; on the product's own ceilings not one rung is priced -- dx 20, 15 and
+12-at-pad-400 are refused on steps, and the finer ones on cells.
 
 ### (b) The locator — ring-down, 1000 nm ± 100 nm, 30 tail periods
 
@@ -113,8 +113,11 @@ priced.
 
 Two things to read off it. The locator's cells differ from the CW rung's at the same dx
 (2,882,880 against 2,903,040 at dx 20) because a **pulse's band top sets the gold's skin depth**,
-and so the gold's own cap: the two arms do not share a grid, and each is priced with its own
-record. And the band is centred at **1000 nm**, not 993 nm, because the dx-20 resonance sits
+and so the gold's own cap: the two arms do not share a grid at dx 20, 15 or 12, and each is priced
+with its own record -- but at the asked rung they do coincide, both 14,048,300 cells at pad 600
+and both 9,827,700 at pad 400, because the 1000 nm-centred pulse lands on the same gold cap as
+the 993 nm CW record. And the band is centred at **1000 nm**, not 993 nm, because the dx-20
+resonance sits
 outside the band arm's own default 830–970 nm window: the locator's job is to find where the
 finer grid puts the mode. Read with the wrong centre (993 nm) the same record is 21,682 steps and
 7,471.1 s — 1.1 % light — which is why the manifest names 1000 nm.
@@ -213,10 +216,13 @@ not the 3 h 15 m the unheld boundary had priced.
       raised steps and seconds, on both the run path and the estimator's (`ladder`).
 - [x] Tier-1 tests: the fdtd control checks 8,000,000 admitted / 8,000,001 refused / one cell
       over a *raised* ceiling refused naming the raised value and not 8,000,000; the script test
-      prices the real dx-10 record at the held boundary, sees the product refuse it on cells
-      alone (its steps and seconds fit), and sees `--max-cells 15000000 --max-steps 200000
-      --max-seconds 18000` admit and price it; the widened `run_limits` and call-site controls
-      carry the third key.
+      prices the real dx-10 record at the held boundary, sees the product refuse it on every
+      ceiling the record exceeds at once (`check_limits` collects them all: 14,048,300 cells over
+      8,000,000, 39,650 steps over 20,000, 228 minutes over 30 -- the ladder prints only the first
+      64 characters, so the row shows the cell line), sees the coarse rungs refused on steps where
+      the finer ones are refused on cells, and sees `--max-cells 15000000 --max-steps 200000
+      --max-seconds 18000` admit and price it, where `--max-cells 15000000` alone does not; the
+      widened `run_limits` and call-site controls carry the third key.
 - [x] Delta `openspec/changes/paper1-a4000-bench/specs/time-domain/spec.md` (an ADDED
       requirement, so it cannot rewrite the two-ceiling paragraph that
       `paper1-nanowire-purcell` still owns — see "Archive order" below).
@@ -307,3 +313,50 @@ contradict.
   deployment uses to pull `harbor.arcadia-ecs.local/mode-search-engine/mse-web:1cca12b` — the
   manifest's pull secret and registry path are the ones a working consumer already uses.
 - Pushed by nobody yet: the builder does not push; the image is tagged locally for the lead.
+
+## The reviewer's second verdict (row `ec4dddbc`) and the corrections it found
+
+- **Accepted**: `f856bbf` (code) and `9b0c54e` (manifest), with four wrong claims in the docs and
+  comments, all one class — a cap credited with holding a record it does not hold, or a rung said
+  to fit. No code and no measured number changed; the corrections are text and controls.
+- **The mechanism, read from the source and then measured**: `check_limits` appends a clause for
+  every ceiling the record exceeds and raises them together (`fdtd.py:2095-2124`: cells, steps,
+  memory, time), while `ladder` prints only `str(exc)[:64]` (`paper1_nanowire.py:1381-1382` —
+  64 characters, not the 32 the reviewer's note first said). So a row shows whichever limit *leads*
+  the message. Measured with no bench flag at this revision: all eight rungs refused — dx 20, dx 15
+  and dx 12-at-pad-400 lead with `The run needs 39,650 time steps, over the limit of 20,000`;
+  dx 12-at-pad-600 and dx 10 at both pads lead with `The grid has 14,048,300 cells, over the limit
+  of 8,000,000`. The asked record's own refusal carries **three** clauses — 14,048,300 cells,
+  39,650 steps, ~228 minutes over 30 — memory not among them (1.63 GiB is under the 3 GB cap).
+  Tier-1 now asserts a coarse row and a fine one, and that `--max-cells 15000000` alone moves the
+  refusal to the step line instead of admitting the record.
+- **The locator's centre changes the price** — the reviewer's sharpest catch. `--wavelength`
+  defaults to 900.0, and a pulse's own band top sets the gold's face spacing, so the manifest's
+  (a) flags without `--wavelength 1000` are a *different grid*, not the one the deadline was priced
+  from. Measured at the held boundary with mirror-pad 600: as written, 13,931,190 cells / 19,011
+  steps / 6,496.1 s; with the centre named, 14,048,300 / 21,918 / 7,552.4 s — the table's row, and
+  the 16,200 s deadline's own operand. Both runs are `--ringdown --band-half 100 --tail-periods 30`
+  at dx 10 pad 600; only the centre differs.
+- **The two arms' grids**: they differ at dx 20 (2,882,880 against 2,903,040), 15 and 12, and
+  coincide at the asked rung — both 14,048,300 cells at pad 600 and both 9,827,700 at pad 400.
+  Measured; the cause is the same skin-cap effect the manifest's (a) now names.
+- **The four copies of the wrong mechanism**: `specs/time-domain/spec.md` (said "dx 20 and 15 fit"),
+  `specs/cuda-bench/spec.md` (a scenario said `--max-cells` alone admits the record), this file's
+  tier-1 bullet (`on cells alone (its steps and seconds fit)`), and the test comment at
+  `tests/test_paper1_nanowire.py:250`. Grepped at this revision, none of `cells alone`,
+  `two finer rungs`, `refused without the cell ceiling` or `max-cells admits` survives, and every
+  surviving "the nearest rung that fits" is qualified with the cap it fits (`cell cap`, `8 M cells`).
+- **The tag does not move**: all changed files are outside the image's seven `COPY` lines
+  (`scripts/paper1_nanowire.py` plus six modules, `Dockerfile.bench-cuda:80-86`) — checked with
+  `git diff --name-only f856bbf` — so `…/paper1-bench-cuda:f856bbf` still names the bytes it was
+  built from and no rebuild is owed by these corrections.
+- Identity note for whoever archives this: the reviewer's row quotes the image as
+  `sha256:94c9507399a3b6f5a5d154826cae198dfe2ebfa6c74dae14f73d6edc892c5df2` and the local
+  `.Id`/`.RepoDigest` read `sha256:7b12e059…` — different views of one image, settled by the seven
+  per-file md5s above, which match `f856bbf`'s blobs.
+- Tier-1 after the corrections: the whole pair in **one** run (not two selections) —
+  `(ulimit -v 4194304; OMP_NUM_THREADS=1 MKL_NUM_THREADS=1; nice -n 19 .venv-mse/bin/python -m
+  pytest tests/test_paper1_nanowire.py tests/test_fdtd_estimate.py -q)` → `54 passed in 1118.95s
+  (0:18:38)`, exit 0. The count is unmoved from the pre-correction 54 for a reason worth stating:
+  the new assertions went inside an existing test, so they add coverage without adding a line to
+  the count.

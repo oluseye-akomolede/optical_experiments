@@ -44,14 +44,19 @@
 # openspec/changes/paper1-a4000-bench/tasks.md:
 #   (a) THE LOCATOR FIRST, the lead's order: the ring-down locator, the same grid with a shorter
 #       record -- 21,918 steps at its own 1000 nm centre, 7,552.4 s = 9,909 s (2 h 45 m) on the
-#       Orin, so activeDeadlineSeconds 16200, with `--ringdown --band-half 100 --tail-periods 30`
-#       in place of `--wavelength 993`, --periods and --window-periods and
-#       --max-cells/--max-steps/--max-seconds unchanged. It says where a finer grid puts the
+#       Orin, so activeDeadlineSeconds 16200, with `--ringdown --wavelength 1000 --band-half 100
+#       --tail-periods 30` in place of `--wavelength 993`, --periods and --window-periods and
+#       --max-cells/--max-steps/--max-seconds unchanged. THE CENTRE IS NOT OPTIONAL: --wavelength
+#       defaults to 900, and a pulse's own band top sets the gold's face spacing, so the flags
+#       without it are a different grid -- 13,931,190 cells, 19,011 steps, 6,496.1 s, 13 % fewer
+#       steps than the deadline above was derived from. It says where a finer grid puts the
 #       resonance before the 5-hour record is spent on 993 nm.
 #   (b) THE COARSER RUNG IF THIS ONE IS KILLED AND THE CARD IS THE PROBLEM: dx 15 nm is the
-#       nearest rung that fits the product's own 8,000,000 cells with the boundary and the mirror
-#       pad held -- 5,234,775 cells, 5,091.0 s = 6,679 s on the Orin, activeDeadlineSeconds
-#       10800. dx 12 nm is NOT a way out: 8,952,300 cells, still over the cap.
+#       nearest rung that fits the product's own 8,000,000 cell cap with the boundary and the mirror
+#       pad held -- 5,234,775 cells at the same 39,650 steps, so it needs --max-steps and
+#       --max-seconds raised exactly as this record does -- 5,091.0 s = 6,679 s on the Orin,
+#       activeDeadlineSeconds 10800. dx 12 nm is NOT a way out: 8,952,300 cells, still over the
+#       cell cap.
 #
 # activeDeadlineSeconds, derived (not a rate the estimator cannot give): the record's own
 # seconds 13,662.4 s x 1.312 (the Orin's measured factor over the estimator) = 17,925 s, x 1.5

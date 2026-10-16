@@ -108,10 +108,12 @@ its partial log as the only measurement there is.
 - **THEN** the pod is not deleted while the queue row that launched it is still open, so the
   progress lines up to the kill can be read
 
-#### Scenario: the args are refused without the cell ceiling and admitted with it
-- **WHEN** the manifest's dx-10 args are run against the shipped code
-- **THEN** they are refused with the cell limit (`The grid has 14,048,300 cells, over the limit
-  of 8,000,000`) before the scene is built, and with the file's own `--max-cells 15000000` the
-  same args are admitted -- which is the resolution `tasks.md` records: the owner's decision
-  was the third bench ceiling (`--max-cells`), not a coarser rung, because at the held boundary
-  the dx-12 rung is 8,952,300 cells and still over the cap
+#### Scenario: the args are refused on all three product ceilings and admitted with all three flags
+- **WHEN** the manifest's args are run against the shipped code with its three ceiling flags
+  removed
+- **THEN** the refusal names every ceiling the record exceeds before the scene is built --
+  14,048,300 cells over 8,000,000, 39,650 steps over 20,000, and about 228 minutes over 30 -- and
+  no one flag is enough: the file's own `--max-cells 15000000` alone still leaves the step refusal
+  standing. All three are the resolution `tasks.md` records: the owner's decision was the third
+  bench ceiling (`--max-cells`), not a coarser rung, because at the held boundary the dx-12 rung is
+  8,952,300 cells and still over the cell cap, while every rung of this record is over the step cap

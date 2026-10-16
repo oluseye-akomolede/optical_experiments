@@ -230,7 +230,7 @@ def test_the_same_long_record_is_refused_without_a_flag_and_accepted_with_one():
 
 
 def test_the_cell_ceiling_is_the_third_thing_the_bench_flags_can_raise(capsys):
-    """The product's own pricing arm on the manifest's own record: refused on cells, then priced.
+    """The product's own pricing arm on the manifest's own record: refused, then priced.
 
     The ladder is the cheap half of the product's own layout -- ``planned_scene``
     is documented as "the product's own plan, and its cheap estimate (no
@@ -247,13 +247,32 @@ def test_the_cell_ceiling_is_the_third_thing_the_bench_flags_can_raise(capsys):
     record = ["--estimate", "--hex", "paper", "--wavelength", "993", "--dx",
               "10", "--mirror-pad", "600", "--periods", "100",
               "--pad-nm", "320", "--pml-nm", "200"]
-    # Without a bench flag every rung is over the cell cap, so not one is priced
-    # and the table says so rather than printing a number it could not reach.
+    # Without a bench flag not one rung is priced, and the mechanism is per rung:
+    # the coarse ones are over the STEP cap, the finer ones (dx 12 at pad 600,
+    # dx 10 at either pad) over the CELL cap. The ladder prints only the first 64
+    # characters of a refusal, so each row shows the limit that leads its message
+    # -- which is why this comment names two ceilings and the assertions below
+    # read a coarse row and a fine one, not just the record's own.
     assert m.ladder(m.parse_args(list(record))) == 2
     out = capsys.readouterr().out
     assert ("refused: The grid has 14,048,300 cells, over the limit of 8,000,000"
             in out), out
     assert "every rung above was refused" in out, out
+    by_rung = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "600" and parts[0] in ("20.0", "10.0"):
+            by_rung[parts[0]] = line
+    assert "time steps, over the limit of 20,000" in by_rung["20.0"], out
+    assert "14,048,300 cells, over the limit of 8,000,000" in by_rung["10.0"], out
+
+    # The cell ceiling on its own does not admit the record: its 39,650 steps are
+    # over the product's 20,000 whatever the cell cap says, so the refusal only
+    # moves to the next ceiling. All three flags are needed, as the manifest has.
+    assert m.ladder(m.parse_args(record + ["--max-cells", "15000000"])) == 2
+    out = capsys.readouterr().out
+    assert ("refused: The run needs 39,650 time steps, over the limit of 20,000"
+            in out), out
 
     # With the three flags the manifest passes, the same rung is priced, and the
     # price is the one tasks.md quotes: cells, steps, the estimator's seconds and
