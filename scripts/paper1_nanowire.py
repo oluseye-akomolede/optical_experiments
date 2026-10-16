@@ -841,6 +841,28 @@ def measure(args, lay, request, measured):
     F = fdtd.purcell_factor(power, reference)
     print(f"measured  F = {F:.4f} at {args.wavelength:.0f} nm  (P = {power:.6e} W,"
           f" P0 = {reference:.6e} W)")
+    # One number cannot say whether the window it came from had stopped rising:
+    # the same mean over the same window, ended at two places in one record, can.
+    # delivered_power and dipole_moment both take the LAST `periods` of the series
+    # they are handed (`fdtd.delivered_power` slices drive[size - steps:] itself),
+    # so the earlier reading is those same functions on this record cut at the
+    # two-thirds step: the same running scene, not a second run and not a
+    # different estimator.
+    cut = (2 * np.size(sim["source_field"])) // 3
+    early = fdtd.purcell_factor(
+        fdtd.delivered_power(sim["drive"][:cut], sim["source_field"][:cut], dt,
+                             volume=volume, eps_r=eps_cell,
+                             periods=args.window_periods,
+                             frequency=request["frequency_hz"]),
+        fdtd.larmor_power(
+            fdtd.dipole_moment(sim["drive"][:cut], dt, volume=volume,
+                               eps_r=eps_cell, periods=args.window_periods,
+                               frequency=request["frequency_hz"]),
+            request["frequency_hz"], index=index))
+    spread = (f", {100.0 * (F / early - 1.0):+.1f}% between them"
+              if early > 0.0 else "")
+    print(f"settling  F = {early:.4f} at two thirds of the record against"
+          f" {F:.4f} at its end{spread}")
     return F
 
 

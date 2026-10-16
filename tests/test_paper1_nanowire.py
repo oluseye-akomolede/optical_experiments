@@ -361,7 +361,14 @@ def test_a_degenerate_covariance_is_reported_not_rounded_to_zero(capsys):
     # And the arm prints the word where the number would have gone. An error is
     # not reachable on demand from a scene, so the fit is stubbed here -- but a
     # good tau with a degenerate omega is the shape r17's tail actually had.
-    args = m.parse_args(["--tiny", "--ringdown"])
+    # The scene is a carrier for the arm's own report, not a measurement: the fit
+    # is stubbed, so what the tail holds does not matter, only that the arm runs.
+    # It still costs real stepping, so it is asked for the shortest record the arm
+    # accepts -- 1,525 steps = 18.5 fs = 6.2 periods, against 11,487 for the
+    # parser's own --tail-periods 32. The word is what is read, and it is the same
+    # word at either length: 82.4 s for this sequence against 482.61 s.
+    args = m.parse_args(["--tiny", "--ringdown", "--band-half", "200",
+                         "--tail-periods", "6"])
     lay, request, geom = m.solve_scene(args)
     measured = m.filled(args, lay, request)
     real = m.fit_decay
@@ -390,6 +397,60 @@ def test_a_degenerate_covariance_is_reported_not_rounded_to_zero(capsys):
     assert code == m.UNRESOLVED == 3, out
     assert m.UNDETERMINED in out, out
     assert "three-sigma floor" in out and "Q >" not in out, out
+
+
+def test_the_settling_line_reads_the_record_before_its_end(capsys):
+    """The CW arm reads one record twice: at two thirds, and at its end.
+
+    One number cannot say whether the window it was read from had stopped rising,
+    and that is the whole question a settled-record claim rests on, so the arm
+    prints the same mean at both places. What makes the earlier number is
+    `fdtd.delivered_power` and `fdtd.dipole_moment` taking the LAST `periods` of
+    the series they are handed (`delivered_power` slices `drive[size - steps:]`
+    itself): the record cut at the two-thirds step is that window, ended early.
+    `_run` is stubbed because the claim is about the arm's reading of a record
+    whose shape is known, not about a scene; every helper below it is real, and
+    both readings come out of the same ones, which is what keeps this from being
+    a second estimator. Two-sided on purpose: a rising record must read different
+    at the two places, and a settled one must not.
+    """
+    m = _load()
+    args = m.parse_args(["--tiny"])                  # the CW arm, 8-period windows
+    f0, dt, n = 3.019e14, 8.431110137e-18, 20_000   # 993 nm, 20,000 steps
+    t = np.arange(n) * dt                            # 50.9 drive periods
+    drive = np.sin(2.0 * np.pi * f0 * t)
+    real_run = m._run
+
+    def run(sim):
+        m._run = lambda *a, **k: (sim, 1.0e-27, 1.0, 1.0)
+        capsys.readouterr()
+        m.measure(args, None, {"frequency_hz": f0}, {"est": {"dt": dt}})
+        return capsys.readouterr().out
+
+    try:
+        # tau of 300 fs against a 50.9-period record: at two thirds the envelope
+        # is 0.31 of its value at the end, so a reading that says "settled" here
+        # would be wrong by construction rather than by tolerance.
+        out = run({"drive": drive,
+                   "source_field": (1.0 - np.exp(-t / 3.0e-13)) * drive})
+        line = next(row for row in out.splitlines() if row.startswith("settling"))
+        word = line.replace(",", " ").split()
+        early = float(word[word.index("F") + 2])
+        end = float(word[word.index("against") + 1])
+        assert end / early > 1.2, out                    # it has NOT settled
+        # ... and the second number is the arm's own F, not a third estimate.
+        measured = next(row for row in out.splitlines()
+                        if row.startswith("measured"))
+        assert f"F = {end:.4f}" in measured, out
+
+        flat = run({"drive": drive, "source_field": drive.copy()})
+        line = next(row for row in flat.splitlines() if row.startswith("settling"))
+        word = line.replace(",", " ").split()
+        settled = (float(word[word.index("against") + 1])
+                   / float(word[word.index("F") + 2]))
+        assert abs(settled - 1.0) < 0.01, flat           # a tone reads the same
+    finally:
+        m._run = real_run
 
 
 def test_the_progress_line_survives_a_killed_run(tmp_path):

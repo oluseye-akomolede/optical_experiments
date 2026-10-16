@@ -362,3 +362,18 @@ Because `graded_axis` drops a line that lands outside the extent or within `LINE
 - **THEN** `tau_err`, `f_err` and `q_err` are all `None` and `resolved` is false, where the same call at the revision before this requirement returned `f_err: 0.0` and `tau_err: 0.0` (measured at HEAD: `f: 300968713739315.06, f_err: 0.0, tau: 2.2048166084527147e-14, tau_err: 0.0`), so the gate's own assertion `0.0 is None` is the red
 - **AND** the arm prints the word at both of its sites for that fit (`undetermined (degenerate covariance)` where the `f` error and the `Q` error would have gone, two occurrences, neither `+- 0,` nor `+- 0 ` anywhere on stdout), and the unresolved branch, given a `tau_err` of `None`, exits 3 naming the undetermined error with no `Q >` bound
 - **AND** a real error still prints as a number: in the same control `_err(1.0e-16, 1e-15)` is `"0.1"`, so the word is not what the arm prints for errors it does have
+
+### Requirement: A settled record's claim SHALL be readable against the same record before its end
+
+One number cannot say whether the window it was read from had stopped rising, and that question is what a settled-record claim rests on. The CW arm SHALL therefore read its record twice with the same measurement functions -- the mean over the same trailing window ending at the two-thirds step, and the mean over it at the record's end -- and SHALL print both. The earlier reading SHALL be this record truncated at that step, which is that window ended early because `fdtd.delivered_power` and `fdtd.dipole_moment` take the LAST `periods` of the series they are handed (`delivered_power` slices `drive[size - steps:]` itself); it SHALL NOT be a second run, and the number the arm already printed SHALL NOT move.
+
+#### Scenario: a rising record reads differently at the two places
+- **WHEN** the CW arm measures a record whose field is still building up (tier-1 control: a 993 nm tone, 20,000 steps at r17's `dt = 8.431110137e-18`, a 300 fs envelope, `_run` stubbed so the reading and not the scene is under test)
+- **THEN** the settling line's end reading is more than 20% above its two-thirds reading, so a claim that this record had settled would be wrong by construction rather than by tolerance
+- **AND** that end reading is the arm's own `measured F = ...` figure to four decimals, so the pair is one estimator reading one record at two places and not two estimators agreeing
+- **AND** the same tone with no envelope reads the same at both places to within 1%, so the line does not cry wolf when there is nothing to report
+
+#### Scenario: the settled record the lead asked for was refused before it ran
+- **WHEN** the 3 x 102.5 fs settled record is priced on the bench (2026-10-16, `--hex paper --wavelength 993 --dx 20 --periods 93`)
+- **THEN** `--estimate` refuses with `The run needs 36,874 time steps, over the limit of 20,000`, exit 2, on every rung, and the run path owes the same refusal because `refusals()` is the one the two entry points share
+- **AND** `dt` is set by the finest cell and not by `--dx`, so the step count is rung-independent and the cap -- not the tier-2 clock -- is what fixes the bench's longest CW record at 50.4 periods: 165.6 fs, 1.62 tau of the 102.5 fs r17 measured
