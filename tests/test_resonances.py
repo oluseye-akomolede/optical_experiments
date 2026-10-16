@@ -432,7 +432,10 @@ def test_weak_nuisance_mode_costs_nobody_their_bars(real):
     bars are within 1e-3 of their values without the nuisance, and the
     nuisance's own bars are 100 times those of the same mode at amplitude
     1e-4 (bars scale as 1/|a|). The pseudo-inverse of the raw matrix gave
-    the 1e-6 mode bars of 1e-7 and below, a million times too small.
+    the 1e-6 mode's amplitude bars as 2.3e-7 to 2.6e-7 (complex) and 4.5e-7
+    to 5.0e-7 (real), and its f and gamma bars as 5e-14 to 6e-13: too small
+    by 2.7e9 to 3.1e9 in the amplitude columns and 5.1e12 to 1.9e14 in f and
+    gamma.
 
     Mutation (``resonances-fisher-unguarded``): the 1/|a| scaling fails.
     """

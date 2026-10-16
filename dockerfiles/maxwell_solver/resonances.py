@@ -562,7 +562,7 @@ def _noise_variance(residual, dt, f_min, f_max, real, n_modes):
 #: the units and the amplitude of every mode; ``np.linalg.matrix_rank`` on
 #: the raw matrix is not, and its verdict on the same coincident pair flips
 #: with the amplitude of an unrelated third mode (measured: 15/16 with a
-#: nuisance mode at 1e-4, 12/16 at 1e-6, the scaled condition number 6e4
+#: nuisance mode at 1e-4, 12/16 at 1e-6, the scaled condition number 3.3e6
 #: both times). 1e12 is where the inverse's own round-off, about the
 #: condition number times 2e-16, reaches 1e-4 relative in a variance, three
 #: figures in a bar; past it the bars slide towards round-off and, at the

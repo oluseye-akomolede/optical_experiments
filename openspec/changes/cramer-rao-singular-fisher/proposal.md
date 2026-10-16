@@ -18,10 +18,11 @@ because it passes every "more than n of its own errors" test downstream.
 
 The same inverse also mis-served a weak nuisance mode: at 1e-6 of the
 others' amplitude its block of the raw matrix falls under `pinv`'s
-truncation and its bars came out a million times too small
-(`matrix_rank` of the raw matrix drops from 16 to 12 there, while the
-scaled condition number does not move, which is why rank is not the
-measure).
+truncation and its bars came out 2.7e9 to 3.1e9 times too small in the
+amplitude columns and 5.1e12 to 1.9e14 in f and gamma (`matrix_rank` of
+the raw matrix drops from 15 of its 16 parameters to 12 as the amplitude
+goes from 1e-4 to 1e-6, while the scaled condition number does not move,
+which is why rank is not the measure).
 
 ## What Changes
 
