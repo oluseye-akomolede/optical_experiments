@@ -644,6 +644,47 @@ class LorentzDrude(PolarisationTerm):
             raise FDTDError(f"{self.name}: the region must be a 3-D node mask")
         self.parts: dict = {}
 
+    #: The permittivity a metal sample's curl increment is rescaled to.
+    EPS_INF = 1.0
+
+    def samples(self, component: str, shape, periodic=(False, False, False)):
+        """The ``component`` samples this metal owns, as a full-shape mask.
+
+        A sample takes the metal when either node of its segment is metal, and
+        only samples the E update advances count: half positions 0..n-2 along
+        the component's own axis; integer positions 1..n-2 between walls,
+        1..n-1 on a periodic axis (node n-1 is node 0, copied back after the
+        terms). The wall ranges on a periodic axis left row n-1 out of the
+        metal: a vacuum slot through every periodic slab. ``bind`` builds its
+        storage from this mask, and :func:`source_permittivity` reads it.
+        """
+        axis = COMPONENTS.index(component)
+        samples = self.region.copy()
+        low = [slice(None)] * 3
+        high = [slice(None)] * 3
+        low[axis], high[axis] = slice(0, -1), slice(1, None)
+        samples[tuple(low)] |= self.region[tuple(high)]
+        live = tuple(slice(0, -1) if a == axis else
+                     slice(1, None) if periodic[a] else slice(1, -1)
+                     for a in range(3))
+        updated = np.zeros(tuple(shape), dtype=bool)
+        updated[live] = True
+        samples &= updated
+        return samples
+
+    def applied_permittivity(self, component: str, cell, shape,
+                             periodic=(False, False, False)):
+        """``EPS_INF`` if the ``component`` sample at ``cell`` is this metal's
+        (its update is rescaled to it), else ``None``: the term leaves that
+        sample's permittivity to the grid."""
+        if tuple(self.region.shape) != tuple(shape):
+            raise FDTDError(
+                f"{self.name}: the region is {self.region.shape} but the grid "
+                f"is {tuple(shape)}; they must be the same shape")
+        if self.samples(component, shape, periodic)[tuple(cell)]:
+            return self.EPS_INF
+        return None
+
     def stable_dt(self, dt: float, spacings) -> float:
         """``dt`` if the metal is stable at it, else 0.98 of the largest that is.
 
@@ -684,26 +725,9 @@ class LorentzDrude(PolarisationTerm):
                     f"refine the grid so dt shrinks")
         eps_host = 1.0 / (EPS0 * np.asarray(_host_result(inv_eps, xp),
                                             dtype=np.float64))
-        # The samples the E update advances: half positions 0..n-2 along the
-        # component's own axis; integer positions 1..n-2 between walls, 1..n-1
-        # on a periodic axis (node n-1 is node 0, copied back after the terms).
-        # The wall ranges on a periodic axis left row n-1 out of the metal: a
-        # vacuum slot through every periodic slab.
-        live = {component: tuple(
-                    slice(0, -1) if a == axis else
-                    slice(1, None) if periodic[a] else slice(1, -1)
-                    for a in range(3))
-                for axis, component in enumerate(COMPONENTS)}
         self.parts = {}
-        for axis, component in enumerate(COMPONENTS):
-            samples = self.region.copy()
-            low = [slice(None)] * 3
-            high = [slice(None)] * 3
-            low[axis], high[axis] = slice(0, -1), slice(1, None)
-            samples[tuple(low)] |= self.region[tuple(high)]
-            updated = np.zeros(shape, dtype=bool)
-            updated[live[component]] = True
-            samples &= updated
+        for component in COMPONENTS:
+            samples = self.samples(component, shape, periodic)
             if not samples.any():
                 continue
             where = np.argwhere(samples)
@@ -714,8 +738,10 @@ class LorentzDrude(PolarisationTerm):
             self.parts[component] = {
                 "box": box,
                 "keep": xp.asarray(keep, dtype=f32),
-                # eps_r - 1 at metal samples: rescales the curl increment
-                "rescale": xp.asarray((eps_host[box] - 1.0) * keep, dtype=f32),
+                # eps_r / eps_inf - 1 at metal samples: rescales the curl
+                # increment so the sample is updated with eps_inf
+                "rescale": xp.asarray((eps_host[box] / self.EPS_INF - 1.0)
+                                      * keep, dtype=f32),
                 "now": [xp.zeros(size, dtype=f32) for _ in self.metal.poles],
                 "before": [xp.zeros(size, dtype=f32) for _ in self.metal.poles],
                 "e_then": xp.zeros(size, dtype=f32),
@@ -974,6 +1000,61 @@ def source_cell_volume(spacings, cell, component) -> float:
                 f"on axis {a}")
         volume *= float(thickness[index])
     return volume
+
+
+def source_permittivity(eps_r, cell, component, *, ade_terms=(),
+                        boundary="metal") -> float:
+    """The relative permittivity the E update applies at a point source's sample.
+
+    This is the ``eps_r`` :func:`delivered_power`, :func:`delivered_power_spectrum`,
+    :func:`purcell_spectrum` and :func:`dipole_moment` take: the source adds
+    ``dt * S`` to its sample, which is the current ``J = -eps0 eps S`` only
+    with the ``eps`` that sample's own update divides its curl by.
+
+    ``simulate`` does no averaging of its own: the ``component`` sample at
+    array index ``cell`` (half a cell above that node along the component's
+    axis) is advanced with ``1 / (eps0 eps_r[cell])``, the node value of the
+    array it is given (any sub-cell averaging happened when that array was
+    built, e.g. ``fdtd_grid.average_eps``). So in a dielectric, at an interface
+    or not, this is ``float(eps_r[cell])`` exactly. A polarisation term can
+    override it: a Lorentz-Drude metal rescales the curl increment at every
+    sample it owns (either node of the segment is metal) to its ``eps_inf`` of
+    1, so a source next to a metal node, along its own axis, is driven in
+    ``eps = 1`` whatever the node holds. Each term with an
+    ``applied_permittivity(component, cell, shape, periodic)`` method that
+    claims the sample adds its rescale ``eps / eps_inf - 1``, as ``advance``
+    does, and the result is ``eps / (1 + sum)``.
+
+    ``ade_terms`` and ``boundary`` are the ones the run is given; ``simulate``
+    calls this with them and returns the value as ``"source_eps"``. The
+    float32 storage of the grid (a relative rounding under 6e-8) is not part
+    of the value.
+    """
+    if component not in COMPONENTS:
+        raise FDTDError(
+            f"a source permittivity is asked for a component among "
+            f"{COMPONENTS}, got {component!r}")
+    if not hasattr(eps_r, "ndim"):
+        eps_r = np.asarray(eps_r, dtype=np.float64)
+    if eps_r.ndim != 3:
+        raise FDTDError(f"eps_r must be 3-D (nx, ny, nz), got shape {eps_r.shape}")
+    shape = tuple(int(s) for s in eps_r.shape)
+    cell = tuple(int(c) for c in cell)
+    if len(cell) != 3 or not all(0 <= c < n for c, n in zip(cell, shape)):
+        raise FDTDError(f"the cell {cell} is outside the grid {shape}")
+    eps = float(eps_r[cell])
+    if not eps > 0:
+        raise FDTDError(f"the relative permittivity is positive, got {eps!r}")
+    periodic = tuple(side == "periodic" for side in _axis_boundaries(boundary))
+    rescale = 0.0
+    for term in ade_terms:
+        applied = getattr(term, "applied_permittivity", None)
+        if applied is None:
+            continue
+        eps_inf = applied(component, cell, shape, periodic)
+        if eps_inf is not None:
+            rescale += eps / float(eps_inf) - 1.0
+    return eps / (1.0 + rescale)
 
 
 def _span_weights(primal: np.ndarray, lo: int, hi: int) -> np.ndarray:
@@ -1441,6 +1522,12 @@ def dipole_moment(drive, dt: float, *, volume: float, eps_r: float,
     own denominator, and a window over the drive's 5-period ramp would bias it
     against a power measured after the ramp. Pass the same ``periods`` you pass
     there and the ratio is two readings of one steady state.
+
+    ``eps_r`` is the permittivity the update applies at the source's own
+    sample: the run's ``"source_eps"`` (:func:`source_permittivity`). A scalar
+    from the layout's node is the same number in a dielectric, at an interface
+    or not, and wrong on a Lorentz-Drude metal's sample, which is updated with
+    ``eps_inf`` = 1.
     """
     if not volume > 0:
         raise FDTDError(f"a cell volume is positive, got {volume!r}")
@@ -1491,6 +1578,12 @@ def delivered_power(drive, trace, dt: float, *, volume: float, eps_r: float,
     This is the power the dipole DELIVERS -- radiated plus absorbed -- which is
     the numerator a Purcell factor wants in a structure that absorbs, where a
     surface only ever sees what leaves the box (see :func:`radiated_power`).
+
+    ``eps_r`` is the permittivity the update applies at the source's own
+    sample: the run's ``"source_eps"`` (:func:`source_permittivity`). A scalar
+    from the layout's node is the same number in a dielectric, at an interface
+    or not, and wrong on a Lorentz-Drude metal's sample, which is updated with
+    ``eps_inf`` = 1.
 
     The source adds ``dt S(t)`` to one E component each step, so the energy it
     gives that element during step ``n`` is that element's own change of energy,
@@ -1680,6 +1773,7 @@ def purcell_spectrum(drive, trace, dt: float, *, volume: float, eps_r: float,
     as in :func:`purcell_factor`, which this is the band-wide spelling of; the
     reference is built by calling :func:`larmor_power` bin by bin, so the
     denominator has one spelling and this function cannot drift from it.
+    ``eps_r`` is the run's ``"source_eps"``, as in :func:`delivered_power`.
 
     The DC bin has no moment (``p~ = J~ / (-i w)`` at ``w = 0`` is not a dipole),
     so the moment, the reference and F are all 0 there rather than divided by:
@@ -2393,7 +2487,7 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
 
     Returns ``{"traces": (n_probes, n_steps) float32, "dt", "steps",
     "spacings", "energy", "peak", "drive", "source_field", "flux",
-    "source_volume", "phasor_faces"}``, and every
+    "source_volume", "source_eps", "phasor_faces"}``, and every
     one of them is HOST numpy whatever ``xp``
     was: the arrays live on the device for the whole run and cross back in a
     single transfer at the end, so a consumer never has to know which backend
@@ -2449,6 +2543,13 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     ``source_volume`` is the cell the point source's current fills
     (:func:`source_cell_volume`), the volume a moment is derived over. ``None``
     with no point source.
+
+    ``source_eps`` is the relative permittivity the E update applies at the
+    point source's own sample (:func:`source_permittivity`, from this run's
+    ``eps_r``, ``ade_terms`` and ``boundary``): the ``eps_r`` the power and
+    moment readings take. It is ``eps_r[cell]`` in a dielectric and
+    ``eps_inf`` (1) on a Lorentz-Drude metal's sample. ``None`` with no point
+    source.
 
     ``flux_box`` adds ``"flux"``: ``(centre, half_extent)`` in cells (three
     integers each) makes a closed box of NODE layers, and the result is one
@@ -2821,6 +2922,12 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     # another run's cell.
     source_volume = (source_cell_volume(primal, source.cell, source.component)
                      if source.kind == "point" else None)
+    # The permittivity the update applies at the source's own sample, from the
+    # array and terms this run was given: the eps the power and moment
+    # readings take, so a consumer need not pass the layout's node value.
+    source_eps = (source_permittivity(eps_r, source.cell, source.component,
+                                      ade_terms=terms, boundary=boundary)
+                  if source.kind == "point" else None)
     peak = ({c: xp.zeros(shape, dtype=f32) for c in COMPONENTS}
             if record_peak else None)
     movie = frame_at = sampled = None
@@ -3121,6 +3228,7 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             "flux": (None if flux_array is None
                      else _host_result(flux_array, xp)),
             "source_volume": source_volume,
+            "source_eps": source_eps,
             "frames": None if movie is None else _host_result(movie, xp),
             "traces_sin": (_host_result(traces_sin, xp) if paired
                            else None),
