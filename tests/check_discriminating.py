@@ -883,6 +883,76 @@ for _name, _why, _old, _new, _fails in (
     CASES.append(Case(name=_name, why=_why, edits=[(FARFIELD, _old, _new)],
                       expect_failing=set(_fails), test_file=FARFIELD_TEST_FILE))
 
+FDTD = ROOT / "dockerfiles" / "maxwell_solver" / "fdtd.py"
+PHASOR_TEST_FILE = "tests/test_fdtd_phasor_box.py"
+
+# The phasor box monitor in fdtd.simulate: one reversion per mutation a test
+# docstring in tests/test_fdtd_phasor_box.py names, with the exact set each
+# turns red (measured). The far-field pattern and the per-sample dipole fit
+# see every sign, offset and interpolation slip; only the power and the fitted
+# moment's size see the normalisation, which a normalised pattern cannot.
+_PHASOR_SHAPE = {"test_the_monitors_far_field_is_the_hertzian_sin_squared",
+                 "test_the_monitors_fields_are_one_dipoles_e_and_h"}
+for _name, _why, _old, _new, _fails in (
+    ("phasor-half-step",
+     "H stamped at (n+1) dt like E: the power barely moves (0.9954), the pattern and the "
+     "E-H moment phase (6.09 deg) do",
+     '"H": xp.asarray(scale * np.exp(phase_sign * omega * (steps + 0.5) * dt),',
+     '"H": xp.asarray(scale * np.exp(phase_sign * omega * (steps + 1.0) * dt),',
+     _PHASOR_SHAPE),
+    ("phasor-dft-sign",
+     "a running DFT with exp(-i w t): conjugate phasors, which are not a Maxwell solution at w; "
+     "the surface power cannot see it",
+     "        phase_sign = 1j\n",
+     "        phase_sign = -1j\n",
+     _PHASOR_SHAPE),
+    ("phasor-uv-swap",
+     "the face arrays transposed to (v, u): shape-compatible on a cube, so only the field reads it; "
+     "a non-square face is refused by farfield.Face",
+     '                    np.stack([c[f] for c in entry["E"]]),\n'
+     '                    np.stack([c[f] for c in entry["H"]])))',
+     '                    np.stack([c[f].T for c in entry["E"]]),\n'
+     '                    np.stack([c[f].T for c in entry["H"]])))',
+     _PHASOR_SHAPE | {"test_the_monitor_runs_on_the_device_fake_and_returns_host_faces",
+                      "test_without_the_option_nothing_changes"}),
+    ("phasor-one-sided",
+     "H read half a cell outside the face instead of interpolated across it",
+     "                    out = ((above * np.take(out, [0], axis=ax)\n"
+     "                            + below * np.take(out, [1], axis=ax))\n"
+     "                           / (below + above))",
+     "                    out = np.take(out, [1], axis=ax)",
+     _PHASOR_SHAPE),
+    ("phasor-corner",
+     "an in-plane node sample taken at the cell's corner instead of the mean of its two ends",
+     "                out = 0.5 * (np.take(out, range(n - 1), axis=ax)\n"
+     "                             + np.take(out, range(1, n), axis=ax))",
+     "                out = np.take(out, range(n - 1), axis=ax)",
+     _PHASOR_SHAPE),
+    ("phasor-normalisation",
+     "1/sum(w) for 2/sum(w): every power a quarter, every normalised pattern unchanged",
+     "        scale = (2.0 / total) * weights[:, None]",
+     "        scale = (1.0 / total) * weights[:, None]",
+     {"test_the_monitors_surface_power_is_the_delivered_power",
+      "test_the_monitors_fields_are_one_dipoles_e_and_h"}),
+    ("phasor-one-frequency",
+     "every frequency's column phased at the first frequency: the undriven one reads the drive",
+     "        omega = 2.0 * np.pi * freqs[None, :]",
+     "        omega = 2.0 * np.pi * freqs[None, :1]",
+     {"test_the_monitors_surface_power_is_the_delivered_power"}),
+    ("phasor-flux-box-rule",
+     "the flux box's CPML rule, forgetting the half cell of H a phasor face reads outside itself",
+     "        if depth[a] and (lo[a] < depth[a] + 1 or hi[a] > n - 2 - depth[a]):",
+     "        if depth[a] and (lo[a] < depth[a] or hi[a] > n - 1 - depth[a]):",
+     {"test_a_phasor_box_in_the_absorber_is_refused"}),
+    ("phasor-bloch-allowed",
+     "a paired Bloch run allowed a phasor box: its cos set alone transformed as the field",
+     "    if phasor_box is not None and paired:",
+     "    if phasor_box is not None and paired and False:",
+     {"test_a_bloch_run_refuses_a_phasor_box"}),
+):
+    CASES.append(Case(name=_name, why=_why, edits=[(FDTD, _old, _new)],
+                      expect_failing=set(_fails), test_file=PHASOR_TEST_FILE))
+
 
 def run_case(case: Case) -> bool:
     saved = case.snapshot()
