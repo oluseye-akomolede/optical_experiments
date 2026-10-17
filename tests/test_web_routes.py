@@ -246,9 +246,16 @@ class FakeDb:
     def list_modes(self, job_id):
         return self.modes.get(str(job_id), [])
 
-    def next_queued(self):
+    def next_queued(self, target=DB.CLUSTER):
+        # Same WHERE clause as web/db.py's next_queued: queued, on THIS target,
+        # and a kind the cluster can actually run. The target term is what keeps
+        # a jetson row from occupying the cluster's single Job slot; the kind
+        # whitelist is what makes a pc or td row invisible to the cluster queue.
+        # A double that skipped either would let a test pass through a state
+        # production cannot reach -- fifteen did, until this matched.
         for job in self.jobs.values():
-            if job["status"] == DB.QUEUED:
+            if (job["status"] == DB.QUEUED and job["target"] == target
+                    and job["kind"] == DB.CAVITY):
                 return job
         return None
 
@@ -574,7 +581,7 @@ def test_one_call_raising_while_the_other_answers_still_fails_nothing(tmp_path, 
     assert name not in launcher.deleted
 
 
-def test_a_split_answer_the_other_way_round_also_fails_nothing(tmp_path):
+def test_a_split_answer_the_other_way_round_also_fails_nothing(tmp_path, monkeypatch):
     """The mirror: ``job_states`` raises while ``active_job_names`` answers empty.
 
     This is the closer call of the two. An empty name list is a legitimately
@@ -590,7 +597,7 @@ def test_a_split_answer_the_other_way_round_also_fails_nothing(tmp_path):
     and that is the decision the reviewer's defect got wrong.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     name = job["k8s_job_name"]
 
@@ -627,9 +634,9 @@ def test_index_lists_nothing_initially(tmp_path):
     assert "Compute modes" in body
 
 
-def test_an_upload_is_queued_launched_and_redirected(tmp_path):
+def test_an_upload_is_queued_launched_and_redirected(tmp_path, monkeypatch):
     app, store, db, launcher = make_app(tmp_path)
-    response = upload(app.test_client())
+    response = upload_to_the_cluster(app.test_client(), monkeypatch)
     assert response.status_code == 302
     assert "/jobs/" in response.headers["Location"]
 
@@ -642,16 +649,16 @@ def test_an_upload_is_queued_launched_and_redirected(tmp_path):
     assert len(launcher.created) == 1
 
 
-def test_the_upload_form_options_reach_the_job(tmp_path):
+def test_the_upload_form_options_reach_the_job(tmp_path, monkeypatch):
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client(), units="cm", n_index="1.5")
+    upload_to_the_cluster(app.test_client(), monkeypatch, units="cm", n_index="1.5")
     (job,) = db.jobs.values()
     assert (job["units"], job["n_index"]) == ("cm", 1.5)
     assert launcher.created[0]["units"] == "cm"
     assert launcher.created[0]["n_index"] == 1.5
 
 
-def test_the_detail_option_reaches_the_solver_not_just_the_form(tmp_path):
+def test_the_detail_option_reaches_the_solver_not_just_the_form(tmp_path, monkeypatch):
     """The field the whole row exists for: it must not stop at the row.
 
     The feature was accepted and validated and then dropped, so the mesh was
@@ -669,7 +676,7 @@ def test_the_detail_option_reaches_the_solver_not_just_the_form(tmp_path):
     # cap. Worth knowing: a feature fine enough to blow the cap is REFUSED at
     # upload rather than queued, which is the conservative-estimate behaviour
     # doing its job -- 0.05 mm on this box estimates 39.2M elements.
-    upload(app.test_client(), detail="0.2", feature_unit="mm")
+    upload_to_the_cluster(app.test_client(), monkeypatch, detail="0.2", feature_unit="mm")
     (job,) = db.jobs.values()
 
     assert job["min_feature_m"] == pytest.approx(2e-4)
@@ -793,7 +800,7 @@ def test_the_achieved_caption_honours_the_feature_unit_not_the_objects(tmp_path)
     assert "0.27 mm" in body, f"achieved edge not in the typed unit: {body[:400]}"
 
 
-def test_auto_leaves_the_feature_unset_rather_than_zero(tmp_path):
+def test_auto_leaves_the_feature_unset_rather_than_zero(tmp_path, monkeypatch):
     """'auto' must be None, not 0.0 -- 0 is an edge length, and a wrong one.
 
     A stored 0 would reach the solver as a declared feature of zero, which the
@@ -801,7 +808,7 @@ def test_auto_leaves_the_feature_unset_rather_than_zero(tmp_path):
     absence; this is the could-not-ask shape at the form boundary.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client(), detail="auto")
+    upload_to_the_cluster(app.test_client(), monkeypatch, detail="auto")
     (job,) = db.jobs.values()
 
     assert job["min_feature_m"] is None
@@ -810,16 +817,16 @@ def test_auto_leaves_the_feature_unset_rather_than_zero(tmp_path):
     assert "--min-feature" not in launcher.created[0].get("args", [])
 
 
-def test_the_scale_reaches_the_row_and_the_job(tmp_path):
+def test_the_scale_reaches_the_row_and_the_job(tmp_path, monkeypatch):
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client(), scale="1000")
+    upload_to_the_cluster(app.test_client(), monkeypatch, scale="1000")
     (job,) = db.jobs.values()
 
     assert job["scale"] == 1000.0
     assert launcher.created[0]["scale"] == 1000.0
 
 
-def test_an_absent_scale_is_one_not_none(tmp_path):
+def test_an_absent_scale_is_one_not_none(tmp_path, monkeypatch):
     """Blank must mean 1.0, so nothing downstream ever multiplies by None.
 
     And the flag must be OMITTED, not passed as 1.0: an unscaled job's Job
@@ -829,7 +836,7 @@ def test_an_absent_scale_is_one_not_none(tmp_path):
     invalidates their expectations.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
 
     assert job["scale"] == 1.0
@@ -899,9 +906,9 @@ def test_a_non_watertight_upload_is_refused(tmp_path):
 # ---------------------------------------------------------------------------
 # The status JSON the page polls
 # ---------------------------------------------------------------------------
-def test_status_json_for_a_running_job(tmp_path):
+def test_status_json_for_a_running_job(tmp_path, monkeypatch):
     app, _store, db, _launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     payload = app.test_client().get(f"/jobs/{job['job_id']}/status").get_json()
     assert payload["status"] == DB.RUNNING
@@ -1689,13 +1696,13 @@ def test_static_assets_must_revalidate_rather_than_expire_on_a_timer(tmp_path):
 # The scheduler: exactly one Job, a quota 403 is a wait, and a finished Job is
 # deleted so the next upload can start.
 # ---------------------------------------------------------------------------
-def test_a_second_upload_waits_while_one_is_running(tmp_path):
+def test_a_second_upload_waits_while_one_is_running(tmp_path, monkeypatch):
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     first = next(iter(db.jobs.values()))
     assert first["status"] == DB.RUNNING
 
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     second = [j for j in db.jobs.values() if j["job_id"] != first["job_id"]][0]
     assert second["status"] == DB.QUEUED
     assert len(launcher.created) == 1          # only one Job exists
@@ -1710,11 +1717,11 @@ def test_a_quota_403_waits_rather_than_failing(tmp_path):
     assert db.failures == []                   # NOT a failure
 
 
-def test_the_tick_launches_the_next_queued_job_once_the_slot_frees(tmp_path):
+def test_the_tick_launches_the_next_queued_job_once_the_slot_frees(tmp_path, monkeypatch):
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     first = next(iter(db.jobs.values()))
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     second = [j for j in db.jobs.values() if j["job_id"] != first["job_id"]][0]
     assert second["status"] == DB.QUEUED
 
@@ -1729,14 +1736,14 @@ def test_the_tick_launches_the_next_queued_job_once_the_slot_frees(tmp_path):
     assert len(launcher.created) == 2
 
 
-def test_a_finished_job_is_deleted_by_the_tick_without_being_asked(tmp_path):
+def test_a_finished_job_is_deleted_by_the_tick_without_being_asked(tmp_path, monkeypatch):
     """The tick frees the slot itself; nothing else calls launcher.delete.
 
     Regression: delete() had no caller at all, so a finished Job held the
     namespace's single Job slot forever and every later upload sat queued.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     name = job["k8s_job_name"]
     assert launcher.active == [name]
@@ -1749,10 +1756,10 @@ def test_a_finished_job_is_deleted_by_the_tick_without_being_asked(tmp_path):
     assert launcher.active == [], "the slot must actually be free afterwards"
 
 
-def test_a_failed_job_is_deleted_too(tmp_path):
+def test_a_failed_job_is_deleted_too(tmp_path, monkeypatch):
     """A failed solve is recorded in the DB; its Job must not hold the slot."""
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     name = job["k8s_job_name"]
 
@@ -1988,7 +1995,7 @@ def _make_jetson_row(db):
     return db.jobs[job_id]
 
 
-def test_a_403_on_the_list_call_does_not_fail_a_live_solve(tmp_path):
+def test_a_403_on_the_list_call_does_not_fail_a_live_solve(tmp_path, monkeypatch):
     """The reviewer's finding, reproduced: an unreadable cluster is not an empty one.
 
     ``K8sJobLauncher`` used to swallow a 403 from both list calls into ``[]`` and
@@ -2009,7 +2016,7 @@ def test_a_403_on_the_list_call_does_not_fail_a_live_solve(tmp_path):
     behaviourally in ``test_web_app.py``.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     name = job["k8s_job_name"]
     assert job["status"] == DB.RUNNING
@@ -2028,7 +2035,7 @@ def test_a_403_on_the_list_call_does_not_fail_a_live_solve(tmp_path):
     )
 
 
-def test_a_403_does_not_let_the_tick_launch_against_the_quota(tmp_path):
+def test_a_403_does_not_let_the_tick_launch_against_the_quota(tmp_path, monkeypatch):
     """The other half: an unreadable cluster is not a licence to start a Job.
 
     ``active_job_names`` returning ``[]`` on 403 also told the tick the namespace
@@ -2041,7 +2048,7 @@ def test_a_403_does_not_let_the_tick_launch_against_the_quota(tmp_path):
     answer in the first place, is covered behaviourally in ``test_web_app.py``.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     # a healthy Job is occupying the slot, but the app cannot see that
     launcher.cannot_ask = True
@@ -2111,11 +2118,11 @@ def test_a_dead_job_frees_the_slot_for_the_next_upload(tmp_path, monkeypatch):
     )
 
 
-def test_a_launch_failure_is_recorded_against_the_job(tmp_path):
+def test_a_launch_failure_is_recorded_against_the_job(tmp_path, monkeypatch):
     app, _store, db, launcher = make_app(tmp_path)
     launcher.fail_with = JOBS.JobLaunchError(
         "The service account is not allowed to start solver jobs.")
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     assert job["status"] == DB.FAILED
     assert "not allowed" in job["message"]
