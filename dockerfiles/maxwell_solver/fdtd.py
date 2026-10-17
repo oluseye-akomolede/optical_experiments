@@ -1134,6 +1134,238 @@ def _flux_step(field, faces, xp):
     return total
 
 
+# --------------------------------------------------------------------------
+# a phasor box: the closed surface the far-field transform reads
+# --------------------------------------------------------------------------
+
+def _is_half(family: str, component: str, axis: int) -> bool:
+    """Whether a Yee component sits half a cell off the nodes along ``axis``.
+
+    ``E_c`` is half a cell off along its own axis ``c`` and on the nodes along
+    the other two; ``H_c`` the other way round (see ``update_h``/``update_e``).
+    """
+    own = COMPONENTS.index(component) == axis
+    return own if family == "E" else not own
+
+
+def phasor_box_layers(box, shape, pml=0):
+    """The node layers ``(lo, hi)`` of a phasor box, three each, checked.
+
+    ``box`` is ``(centre, half_extent)`` in cells, exactly as for
+    :func:`flux_faces`: the six faces are the NODE layers ``centre +/-
+    half_extent``. The rules are the flux box's, plus the half cell the H
+    interpolation reaches:
+
+    * every face must lie strictly inside the live layers ``1..n-2`` (the
+      outermost node layer is never updated);
+    * on an axis with an absorber ``pml`` node layers deep, a face reads the
+      tangential H half a cell either side of itself, and the H half a cell
+      outside layer ``pml`` is still in the layer's last, damped cell -- so the
+      faces must lie in ``pml + 1 .. n - 2 - pml``, one cell further in than a
+      flux box may go.
+
+    ``pml`` is a scalar or one count per axis (zero where an axis has none).
+    """
+    try:
+        centre, half = box
+        centre = tuple(int(c) for c in centre)
+        half = tuple(int(h) for h in half)
+    except (TypeError, ValueError):
+        raise FDTDError(
+            f"phasor_box is (centre_cell, half_extent_cells), three integers "
+            f"each, got {box!r}") from None
+    if len(centre) != 3 or len(half) != 3:
+        raise FDTDError(
+            f"phasor_box needs three cell indices and three half extents, got "
+            f"{centre!r} and {half!r}")
+    if any(h < 1 for h in half):
+        raise FDTDError(
+            f"a phasor box is at least one cell each way, got {half!r}")
+    try:
+        depth = [int(p) for p in pml]
+    except TypeError:
+        depth = [int(pml)] * 3
+    if len(depth) != 3 or min(depth) < 0:
+        raise FDTDError(
+            f"pml is the absorbing layer's depth, a non-negative scalar "
+            f"or one count per axis, got {pml!r}")
+    lo = [centre[a] - half[a] for a in range(3)]
+    hi = [centre[a] + half[a] for a in range(3)]
+    for a in range(3):
+        n = int(shape[a])
+        if lo[a] < 1 or hi[a] > n - 2:
+            raise FDTDError(
+                f"the phasor box's faces are node layers {lo[a]}..{hi[a]} on "
+                f"axis {a}, and a face must be inside the live layers "
+                f"1..{n - 2} there (the outermost layer is never updated); the "
+                f"grid has {n} nodes on that axis")
+        if depth[a] and (lo[a] < depth[a] + 1 or hi[a] > n - 2 - depth[a]):
+            raise FDTDError(
+                f"the phasor box's faces are node layers {lo[a]}..{hi[a]} on "
+                f"axis {a} of {n}, and {depth[a]} of those nodes are the "
+                f"absorbing layer: each face also reads H half a cell outside "
+                f"itself, and a surface touching the absorber measures the "
+                f"damped field, so its faces must lie in "
+                f"{depth[a] + 1}..{n - 2 - depth[a]}. Widen the grid, or "
+                f"shrink the box, by "
+                f"{max(depth[a] + 1 - lo[a], hi[a] - (n - 2 - depth[a]))} "
+                f"cells on that axis")
+    return lo, hi
+
+
+class _PhasorBox:
+    """A running DFT of E and H on the six faces of a box, on the device.
+
+    Each Yee component is read from the smallest slab of its own samples that
+    the interpolation to the face-cell centres needs (two layers across the
+    face where it sits half a cell off it, one where it sits on it), and folded
+    into one ``complex128`` accumulator per (face, family, component) holding
+    every frequency at once. The per-step phase factors are a precomputed
+    device table, so a step reads no host value and takes no sync; the only
+    transfer is :meth:`faces`, once, after the run.
+    """
+
+    def __init__(self, box, frequencies, *, shape, primal, pml, dt: float,
+                 n_steps: int, start, window, xp):
+        self.lo, self.hi = phasor_box_layers(box, shape, pml)
+        try:
+            freqs = np.atleast_1d(np.asarray(frequencies, dtype=np.float64))
+        except (TypeError, ValueError):
+            raise FDTDError(
+                f"phasor_frequencies is one or more frequencies in Hz, got "
+                f"{frequencies!r}") from None
+        if freqs.ndim != 1 or freqs.size < 1:
+            raise FDTDError(
+                f"phasor_frequencies is one or more frequencies in Hz, got "
+                f"{frequencies!r}")
+        nyquist = 0.5 / dt
+        if not np.all(np.isfinite(freqs)) or np.any(freqs <= 0) \
+                or np.any(freqs >= nyquist):
+            raise FDTDError(
+                f"every phasor frequency must be positive and below this run's "
+                f"Nyquist frequency 1/(2 dt) = {nyquist:.6g} Hz, got "
+                f"{freqs.tolist()!r}")
+        try:
+            start = int(start)
+        except (TypeError, ValueError):
+            raise FDTDError(f"phasor_start is a step index, got {start!r}") from None
+        if not 0 <= start < n_steps:
+            raise FDTDError(
+                f"phasor_start is the first step the phasors read, in "
+                f"0..{n_steps - 1} for this {n_steps}-step run, got {start}")
+        count = n_steps - start
+        weights = _window(count, window)
+        total = float(np.sum(weights))
+        if not total > 0:
+            raise FDTDError(
+                f"the {window!r} window sums to {total!r} over the {count} "
+                f"step(s) from phasor_start {start}; read more steps")
+        self.frequencies = freqs
+        self.start = start
+        self.primal = [np.asarray(p, dtype=np.float64) for p in primal]
+        self.xp = xp
+        # f(t) = Re[F exp(-i w t)] (the convention farfield.py uses) gives
+        # F = 2 sum(w_n f_n exp(+i w t_n)) / sum(w_n) for a steady tone, the
+        # amplitude _windowed_at reads. The sample times differ by family:
+        # at the end of step s, E has just advanced to (s + 1) dt and H was
+        # advanced half a step earlier, to (s + 1/2) dt.
+        steps = np.arange(start, n_steps, dtype=np.float64)[:, None]
+        omega = 2.0 * np.pi * freqs[None, :]
+        scale = (2.0 / total) * weights[:, None]
+        phase_sign = 1j
+        self._phase = {
+            "E": xp.asarray(scale * np.exp(phase_sign * omega * (steps + 1.0) * dt),
+                            dtype=np.complex128),
+            "H": xp.asarray(scale * np.exp(phase_sign * omega * (steps + 0.5) * dt),
+                            dtype=np.complex128),
+        }
+        self._terms = []
+        for a in range(3):
+            for sign, layer in (("+", self.hi[a]), ("-", self.lo[a])):
+                for family in ("E", "H"):
+                    for component in COMPONENTS:
+                        slab = []
+                        for axis in range(3):
+                            half = _is_half(family, component, axis)
+                            if axis == a:
+                                slab.append(slice(layer - 1, layer + 1) if half
+                                            else slice(layer, layer + 1))
+                            else:
+                                slab.append(slice(self.lo[axis], self.hi[axis]
+                                                  + (0 if half else 1)))
+                        size = tuple(s.stop - s.start for s in slab)
+                        acc = xp.zeros((freqs.size,) + size, dtype=np.complex128)
+                        self._terms.append((sign + "xyz"[a], a, layer, family,
+                                            component, tuple(slab), acc))
+
+    def accumulate(self, step: int, e_field: dict, h_field: dict) -> None:
+        """Fold one step's E (at (s+1) dt) and H (at (s+1/2) dt) in."""
+        k = step - self.start
+        if k < 0:
+            return
+        phase = {family: table[k][:, None, None, None]
+                 for family, table in self._phase.items()}
+        for _normal, _a, _layer, family, component, slab, acc in self._terms:
+            source = e_field if family == "E" else h_field
+            values = source[component][slab].astype(self.xp.float64)
+            acc += values[None] * phase[family]
+
+    def _at_centres(self, values, family, component, a, layer):
+        """One component's slab, interpolated to the face-cell centres.
+
+        ``values`` is the host ``(n_freq, s0, s1, s2)`` accumulator. Along the
+        face's normal axis a sample half a cell off the face is interpolated
+        linearly between its two layers, each weighted by the OTHER primal
+        width (exact for a linear field on a graded grid); a sample on the face
+        is taken as it is. Along each in-plane axis a node sample is the mean
+        of the cell's two end nodes and a half-cell sample already sits at the
+        centre. Returns ``(n_freq, n_u, n_v)``.
+        """
+        out = values
+        for axis in range(3):
+            half = _is_half(family, component, axis)
+            ax = axis + 1
+            if axis == a:
+                if half:
+                    below = float(self.primal[a][layer - 1])
+                    above = float(self.primal[a][layer])
+                    out = ((above * np.take(out, [0], axis=ax)
+                            + below * np.take(out, [1], axis=ax))
+                           / (below + above))
+            elif not half:
+                n = out.shape[ax]
+                out = 0.5 * (np.take(out, range(n - 1), axis=ax)
+                             + np.take(out, range(1, n), axis=ax))
+        return np.squeeze(out, axis=a + 1)
+
+    def faces(self) -> list:
+        """One list of six ``farfield.Face`` per frequency, in DIRECTIONS order."""
+        import farfield   # farfield imports fdtd; only a run that asks needs it
+        nodes = [np.concatenate(([0.0], np.cumsum(p))) for p in self.primal]
+        built: dict = {}
+        for normal, a, layer, family, component, _slab, acc in self._terms:
+            host = np.asarray(_host_result(acc, self.xp))
+            entry = built.setdefault(normal, {"a": a, "layer": layer,
+                                              "E": [None] * 3, "H": [None] * 3})
+            entry[family][COMPONENTS.index(component)] = self._at_centres(
+                host, family, component, a, layer)
+        out = []
+        for f in range(self.frequencies.size):
+            faces = []
+            for normal in DIRECTIONS:
+                entry = built[normal]
+                a, layer = entry["a"], entry["layer"]
+                u, v = (axis for axis in range(3) if axis != a)
+                faces.append(farfield.Face(
+                    normal, float(nodes[a][layer]),
+                    nodes[u][self.lo[u]:self.hi[u] + 1],
+                    nodes[v][self.lo[v]:self.hi[v] + 1],
+                    np.stack([c[f] for c in entry["E"]]),
+                    np.stack([c[f] for c in entry["H"]])))
+            out.append(faces)
+        return out
+
+
 def _windowed_at(values, dt: float, frequency: float, scale):
     """The AMPLITUDE at one frequency: ``2 sum(w v e^{-i w t}) / sum(w)``.
 
@@ -2131,6 +2363,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
              record_peak: bool = False, record_drive: bool = False,
              record_source_field: bool = False,
              flux_box=None,
+             phasor_box=None, phasor_frequencies=None, phasor_start: int = 0,
+             phasor_window: str | None = "hann",
              ade_terms=(), check=None,
              frames=None, bloch=None) -> dict:
     """Run the grid and return the probe traces.
@@ -2159,7 +2393,7 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
 
     Returns ``{"traces": (n_probes, n_steps) float32, "dt", "steps",
     "spacings", "energy", "peak", "drive", "source_field", "flux",
-    "source_volume"}``, and every
+    "source_volume", "phasor_faces"}``, and every
     one of them is HOST numpy whatever ``xp``
     was: the arrays live on the device for the whole run and cross back in a
     single transfer at the end, so a consumer never has to know which backend
@@ -2228,6 +2462,40 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     complaining), and in the wave zone: at least a wavelength from every
     scatterer, so that the field on it is an outgoing wave. A paired (Bloch) run
     has no physical field to put a surface around and refuses a box.
+
+    ``phasor_box`` with ``phasor_frequencies`` adds ``"phasor_faces"``: the
+    closed surface ``farfield.py`` transforms, recorded as complex phasors. The
+    box is ``(centre, half_extent)`` in cells, the flux box's spelling, and its
+    faces are the same NODE layers ``centre +/- half_extent``; the rules are the
+    flux box's too (strictly inside the live layers 1..n-2, never in the
+    absorber, and a paired Bloch run refuses it), except that each face also
+    reads H half a cell outside itself, so on an open axis the faces must lie in
+    ``pml_cells + 1 .. n - 2 - pml_cells`` (:func:`phasor_box_layers`).
+    ``phasor_frequencies`` is one frequency or several, in Hz, each positive
+    and below ``1 / (2 dt)``. Every step from ``phasor_start`` on, the six
+    components on each face are folded into a running DFT,
+
+        F(f) = 2 sum_n w_n F_n exp(+i 2 pi f t_n) / sum_n w_n,
+
+    with ``w`` the ``phasor_window`` (``"hann"`` or ``None``, the boxcar) over
+    those steps and ``t_n`` each family's own sample time: ``(n + 1) dt`` for
+    E, ``(n + 1/2) dt`` for H, the half step the leapfrog staggers them by. For
+    a steady tone ``Re[A exp(-i w t)]`` that is the amplitude ``A``, in the
+    ``exp(-i w t)`` convention ``farfield.py`` uses, and it is the
+    normalisation :func:`delivered_power` reads, so a CW run read over its
+    steady tail (``phasor_start`` at the tail's first step) gives powers in W.
+    After the run the staggered samples are interpolated to the face-cell
+    centres -- linearly across the face (H, and the normal E, sit half a cell
+    either side of it), as the mean of the two end nodes along an in-plane axis
+    where a sample sits on the nodes -- so E and H are colocated, as the
+    far-field contract requires. ``"phasor_faces"`` is a list with one entry
+    per frequency, in the order given, and each entry is six ``farfield.Face``
+    in ``DIRECTIONS`` order: position and cell edges in metres with node 0 at
+    the origin of every axis, the cells being the box's own primal cells. The
+    medium outside the box must be vacuum for the transform to apply. The
+    accumulators stay on the device and cross to the host once, at the end;
+    they cost ``36 * n_freq`` complex128 slabs of about one face each. ``None``
+    when not asked for.
 
     ``check``, if given, is called as ``check(step)`` before step 0 and every
     ``CHECK_EVERY`` steps after it, on the host; it stops the run by raising
@@ -2530,6 +2798,24 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                         for axis in range(3)])])
     flux_array = (None if flux_terms is None
                   else xp.zeros(n_steps, dtype=xp.float64))
+    if (phasor_box is None) != (phasor_frequencies is None):
+        raise FDTDError(
+            "a phasor box needs both phasor_box (where) and phasor_frequencies "
+            "(at which frequencies); got only "
+            + ("phasor_box" if phasor_frequencies is None
+               else "phasor_frequencies"))
+    if phasor_box is not None and paired:
+        raise FDTDError(
+            "a phasor box needs the physical field, and away from k = 0 and "
+            "the zone edge a Bloch run's cos set is not it (the field is the "
+            "cos set plus i times the sin set); drop phasor_box or the Bloch "
+            "phase")
+    phasor = (None if phasor_box is None else _PhasorBox(
+        phasor_box, phasor_frequencies, shape=shape, primal=primal,
+        pml=[int(pml_cells) if sides[axis] == "open" else 0
+             for axis in range(3)],
+        dt=dt, n_steps=n_steps, start=phasor_start, window=phasor_window,
+        xp=xp))
     # The volume the source's own moment is taken over -- computed here, from
     # the grid the run actually used, so a consumer cannot pair a moment with
     # another run's cell.
@@ -2815,6 +3101,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                            out=peak[component])
         if flux_array is not None:
             flux_array[step] = _flux_step(field, flux_terms, xp)
+        if phasor is not None:
+            phasor.accumulate(step, field, h_field)
 
     progress_seconds = time.perf_counter() - progress_start
     print(f"progress  step {n_steps:,} of {n_steps:,}, {progress_seconds:,.1f} s,"
@@ -2835,7 +3123,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             "source_volume": source_volume,
             "frames": None if movie is None else _host_result(movie, xp),
             "traces_sin": (_host_result(traces_sin, xp) if paired
-                           else None)}
+                           else None),
+            "phasor_faces": None if phasor is None else phasor.faces()}
 
 
 def _host_result(value, xp):
