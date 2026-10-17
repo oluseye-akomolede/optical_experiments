@@ -335,14 +335,14 @@ CASES.append(Case(
     why="without the reconcile, a Job that dies leaves its row running forever",
     edits=[(
         WEB_APP,
-        "        if name and name in states:\n"
-        "            message = JOBS.failure_message(states[name])\n"
-        "        elif name and name in present:\n"
-        "            continue                       # alive and well; not ours to touch\n"
-        "        else:\n"
-        "            message = JOBS.failure_message(None)",
-        "        continue",
+        "        jobs_db.mark_failed(job[\"job_id\"], JOBS.failure_message(reason))\n"
+        "        failed += 1\n",
+        "        continue                           # BUG: dead row left running\n",
     )],
+    # The reconcile picks ``reason`` first and fails the row at the bottom of
+    # the loop, so the reversion drops that one ``mark_failed``. Everything
+    # before it still runs, including the too-large-for-the-cluster reroute:
+    # that is a different defect, and its tests live in tests/test_routing.py.
     # Five, not the four the names suggest. The fifth is
     # test_a_dead_job_frees_the_slot_for_the_next_upload, and it belongs: that
     # test asserts the queued upload starts once the dead row is failed, so a
