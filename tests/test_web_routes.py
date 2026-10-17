@@ -493,7 +493,7 @@ def io_bytes(data):
 
 
 # ---------------------------------------------------------------------------
-def test_a_transient_list_error_then_a_good_list_behaves_normally(tmp_path):
+def test_a_transient_list_error_then_a_good_list_behaves_normally(tmp_path, monkeypatch):
     """One failed list must not cost the solve its life.
 
     A blip -- a timeout, a 403 that clears, a rolling API server -- makes one
@@ -514,7 +514,7 @@ def test_a_transient_list_error_then_a_good_list_behaves_normally(tmp_path):
     ``_client``.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     name = job["k8s_job_name"]
     assert job["status"] == DB.RUNNING
@@ -537,7 +537,7 @@ def test_a_transient_list_error_then_a_good_list_behaves_normally(tmp_path):
     assert launcher.active == [name]
 
 
-def test_one_call_raising_while_the_other_answers_still_fails_nothing(tmp_path):
+def test_one_call_raising_while_the_other_answers_still_fails_nothing(tmp_path, monkeypatch):
     """The guarantee is "no answer", not the placeholder, and not both calls failing.
 
     These two list calls are made separately, and only one of them has to fail
@@ -555,7 +555,7 @@ def test_one_call_raising_while_the_other_answers_still_fails_nothing(tmp_path):
     fails first.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     name = job["k8s_job_name"]
     assert job["status"] == DB.RUNNING
@@ -1762,11 +1762,11 @@ def test_a_failed_job_is_deleted_too(tmp_path):
     assert launcher.deleted == [name]
 
 
-def test_a_queued_or_running_job_is_never_deleted(tmp_path):
+def test_a_queued_or_running_job_is_never_deleted(tmp_path, monkeypatch):
     """Only terminal rows may be reaped -- deleting a live Job loses the solve."""
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (running,) = [j for j in db.jobs.values() if j["status"] == DB.RUNNING]
 
     APP.run_tick(None, db, launcher, log=lambda *a: None)
@@ -1834,7 +1834,7 @@ def test_a_job_failed_for_an_unknown_reason_does_not_leak_the_kubernetes_token(
     assert "BackoffLimitExceeded" not in message
 
 
-def test_a_live_job_is_never_failed_or_deleted(tmp_path):
+def test_a_live_job_is_never_failed_or_deleted(tmp_path, monkeypatch):
     """The case that must NOT be touched: Job present, no Failed condition.
 
     This is the other half of the fix and the more dangerous half to get wrong.
@@ -1843,7 +1843,7 @@ def test_a_live_job_is_never_failed_or_deleted(tmp_path):
     moment it started writing -- the owner would see failures on every upload.
     """
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     (job,) = db.jobs.values()
     name = job["k8s_job_name"]
     assert launcher.active == [name]
@@ -2079,10 +2079,10 @@ def test_a_running_row_whose_job_vanished_is_failed_not_requeued(tmp_path,
     assert len(launcher.created) == 1, "the dead job must not be relaunched"
 
 
-def test_the_tick_does_nothing_when_the_slot_is_occupied(tmp_path):
+def test_the_tick_does_nothing_when_the_slot_is_occupied(tmp_path, monkeypatch):
     app, _store, db, launcher = make_app(tmp_path)
-    upload(app.test_client())
-    upload(app.test_client())
+    upload_to_the_cluster(app.test_client(), monkeypatch)
+    upload_to_the_cluster(app.test_client(), monkeypatch)
     APP.run_tick(None, db, launcher, log=lambda *a: None)
     assert len(launcher.created) == 1
 
