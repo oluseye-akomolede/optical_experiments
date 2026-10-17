@@ -953,6 +953,58 @@ for _name, _why, _old, _new, _fails in (
     CASES.append(Case(name=_name, why=_why, edits=[(FDTD, _old, _new)],
                       expect_failing=set(_fails), test_file=PHASOR_TEST_FILE))
 
+SOURCE_EPS_TEST_FILE = "tests/test_fdtd_source_eps.py"
+PAPER1 = ROOT / "scripts" / "paper1_nanowire.py"
+
+# The permittivity the update applies at a point source (change
+# source-cell-permittivity): fdtd.source_permittivity, simulate's
+# "source_eps", and the paper-1 arm that reads it. Each set is measured.
+_CLAIMS = "test_a_metal_claims_exactly_the_samples_its_update_rescales"
+for _name, _why, _path, _old, _new, _fails, _file in (
+    ("source-eps-cell-value",
+     "source_permittivity returns the layout's node value, ignoring the metal's eps_inf",
+     FDTD,
+     "    return eps / (1.0 + rescale)\n",
+     "    return eps\n",
+     {"test_a_metal_face_applies_eps_inf_and_only_that_reads_true",
+      f"{_CLAIMS}[node0-z-1.0]", f"{_CLAIMS}[node1-z-1.0]",
+      f"{_CLAIMS}[node4-x-1.0]"},
+     SOURCE_EPS_TEST_FILE),
+    ("source-eps-wrong-component",
+     "the metal's claim read for the next component's sample, not the source's own",
+     FDTD,
+     "        eps_inf = applied(component, cell, shape, periodic)\n",
+     "        eps_inf = applied(COMPONENTS[(COMPONENTS.index(component) + 1) % 3],"
+     " cell, shape, periodic)\n",
+     {"test_a_metal_face_applies_eps_inf_and_only_that_reads_true",
+      f"{_CLAIMS}[node0-z-1.0]", f"{_CLAIMS}[node3-z-4.0]",
+      f"{_CLAIMS}[node4-x-1.0]", f"{_CLAIMS}[node5-x-4.0]"},
+     SOURCE_EPS_TEST_FILE),
+    ("source-eps-simulate-no-terms",
+     "simulate's source_eps computed without the run's polarisation terms",
+     FDTD,
+     "                                      ade_terms=terms, boundary=boundary)\n",
+     "                                      ade_terms=(), boundary=boundary)\n",
+     {"test_a_metal_face_applies_eps_inf_and_only_that_reads_true"},
+     SOURCE_EPS_TEST_FILE),
+    ("paper1-eps-cell",
+     "the paper-1 arm hands its readings the layout's node value instead of the applied one",
+     PAPER1,
+     "    return source, terms, volume, index, eps_applied\n",
+     "    return source, terms, volume, index, eps_cell\n",
+     {"test_the_source_line_prints_the_cell_and_the_applied_permittivity"},
+     "tests/test_paper1_nanowire.py"),
+    ("paper1-eps-print",
+     "the paper-1 source line prints the cell value where it names the applied one",
+     PAPER1,
+     '          f" (cell), {eps_applied:.4f} (applied at E{args.axis})"\n',
+     '          f" (cell), {eps_cell:.4f} (applied at E{args.axis})"\n',
+     {"test_the_source_line_prints_the_cell_and_the_applied_permittivity"},
+     "tests/test_paper1_nanowire.py"),
+):
+    CASES.append(Case(name=_name, why=_why, edits=[(_path, _old, _new)],
+                      expect_failing=set(_fails), test_file=_file))
+
 
 def run_case(case: Case) -> bool:
     saved = case.snapshot()

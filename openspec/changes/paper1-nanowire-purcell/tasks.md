@@ -783,14 +783,14 @@ linewidth is not.
 
 ## Deferred by the lead, recorded here so it is not dropped
 
-- [ ] **The dielectric as a function, not a constant** (the lead's step-1 item (7), called a
-      separate item in that verdict). `delivered_power` and `purcell_spectrum` take a scalar
-      `eps_r`. That is exact for the vacuum controls and for a source that sits in a
-      homogeneous region, because the field is read in the source's own cell; it is not exact
-      for the paper's dipole, which sits inside InP with a facet a few cells away. What this
-      needs is the permittivity at the source's own cell read from the grid's coefficient
-      arrays rather than passed in, and a control at a dielectric interface where the scalar
-      reading is measurably wrong. No fixture in this change claims it today.
+- [x] **The dielectric as a function, not a constant** (the lead's step-1 item (7), called a
+      separate item in that verdict). Done in change `source-cell-permittivity`: `simulate`
+      returns `"source_eps"` (`fdtd.source_permittivity`), the permittivity the update applies
+      at the source's own sample, and the script reads with it and prints it beside the cell
+      value. The solver applies the node value at the sample's own index with no averaging,
+      so at a dielectric facet the scalar was already the applied value (measured +0.0023
+      against a closed-surface power, vacuum +0.0016); it differs only on a Lorentz-Drude
+      metal's sample (eps_inf = 1: +3.0032 with the cell value, +0.0008 with the applied).
 - [x] Extensions kept out of this step (the lead's item (8)): nothing in step 1 depends on the
       paper's geometry, none of it is a far-field transform, and none of it has run anywhere
       but tier 1.

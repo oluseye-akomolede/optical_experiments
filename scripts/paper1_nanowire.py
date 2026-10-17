@@ -757,7 +757,7 @@ def ringdown(args, lay, request, measured):
     record's own tail leaves Q unpinned -- not a failure to hide, and not a
     measurement to invent: the fit's own error is printed either way.
     """
-    sim, volume, index, eps_cell = _run(args, lay, request, measured)
+    sim, volume, index, eps_applied = _run(args, lay, request, measured)
     dt = measured["est"]["dt"]
     f0 = float(request["frequency_hz"])
     start = drive_done(sim["drive"])
@@ -961,14 +961,22 @@ def source_and_terms(args, lay, request):
     terms = [fdtd.LorentzDrude(name, region)
              for name, region in dict(lay["metals"]).items()]
     volume = fdtd.source_cell_volume(lay["spacings"], cell, args.axis)
+    # The host index is the material's (the node value); the readings take the
+    # permittivity the update applies at the source's own E sample, which a
+    # metal node beside it along its axis sets to eps_inf = 1.
+    eps_applied = fdtd.source_permittivity(lay["eps"], cell, args.axis,
+                                           ade_terms=terms,
+                                           boundary=request["boundary"])
     index = math.sqrt(eps_cell)
     print(f"source    node {tuple(int(c) for c in cell)}, eps_r {eps_cell:.4f}"
+          f" (cell), {eps_applied:.4f} (applied at E{args.axis})"
           f" -> host index {index:.4f}, cell volume {volume:.6e} m^3")
-    return source, terms, volume, index, eps_cell
+    return source, terms, volume, index, eps_applied
 
 
 def _run(args, lay, request, measured):
-    source, terms, volume, index, eps_cell = source_and_terms(args, lay, request)
+    source, terms, volume, index, eps_applied = source_and_terms(args, lay,
+                                                                 request)
     started = time.monotonic()
     sim = fdtd.simulate(lay["eps"], source, measured["est"]["steps"],
                         lay["probes"], spacings=lay["spacings"],
@@ -983,17 +991,21 @@ def _run(args, lay, request, measured):
     # a rate that the next machine has to live with.
     print(f"run       {wall:.1f} s wall  ({wall / estimate:.2f} x the"
           f" {estimate:.1f} s estimate)")
-    return sim, volume, index, eps_cell
+    if sim["source_eps"] != eps_applied:
+        raise SystemExit(
+            f"internal: the run applied eps_r {sim['source_eps']!r} at the"
+            f" source, the printed line {eps_applied!r}")
+    return sim, volume, index, eps_applied
 
 
 def measure(args, lay, request, measured):
     """The CW arm: one frequency, a settled tail, F = P/P0."""
-    sim, volume, index, eps_cell = _run(args, lay, request, measured)
+    sim, volume, index, eps_applied = _run(args, lay, request, measured)
     dt = measured["est"]["dt"]
     power = fdtd.delivered_power(sim["drive"], sim["source_field"], dt,
-                                 volume=volume, eps_r=eps_cell, periods=args.window_periods,
+                                 volume=volume, eps_r=eps_applied, periods=args.window_periods,
                                  frequency=request["frequency_hz"])
-    moment = fdtd.dipole_moment(sim["drive"], dt, volume=volume, eps_r=eps_cell,
+    moment = fdtd.dipole_moment(sim["drive"], dt, volume=volume, eps_r=eps_applied,
                                 periods=args.window_periods,
                                 frequency=request["frequency_hz"])
     reference = fdtd.larmor_power(moment, request["frequency_hz"], index=index)
@@ -1010,12 +1022,12 @@ def measure(args, lay, request, measured):
     cut = (2 * np.size(sim["source_field"])) // 3
     early = fdtd.purcell_factor(
         fdtd.delivered_power(sim["drive"][:cut], sim["source_field"][:cut], dt,
-                             volume=volume, eps_r=eps_cell,
+                             volume=volume, eps_r=eps_applied,
                              periods=args.window_periods,
                              frequency=request["frequency_hz"]),
         fdtd.larmor_power(
             fdtd.dipole_moment(sim["drive"][:cut], dt, volume=volume,
-                               eps_r=eps_cell, periods=args.window_periods,
+                               eps_r=eps_applied, periods=args.window_periods,
                                frequency=request["frequency_hz"]),
             request["frequency_hz"], index=index))
     spread = (f", {100.0 * (F / early - 1.0):+.1f}% between them"
@@ -1027,11 +1039,11 @@ def measure(args, lay, request, measured):
 
 def measure_spectrum(args, lay, request, measured):
     """The band arm: a pulse centred in its own record, read bin by bin."""
-    sim, volume, index, eps_cell = _run(args, lay, request, measured)
+    sim, volume, index, eps_applied = _run(args, lay, request, measured)
     half = request["bandwidth"]
     f, power, reference, F = fdtd.purcell_spectrum(
         sim["drive"], sim["source_field"], measured["est"]["dt"], volume=volume,
-        eps_r=eps_cell, index=index,
+        eps_r=eps_applied, index=index,
         band=(request["frequency_hz"] - half, request["frequency_hz"] + half))
     lam = C / np.asarray(f) / NM
     top = int(np.argmax(F))

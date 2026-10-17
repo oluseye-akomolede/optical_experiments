@@ -964,3 +964,36 @@ def test_a_tail_that_cannot_be_written_still_leaves_the_number(tmp_path):
 
 if __name__ == "__main__":       # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_the_source_line_prints_the_cell_and_the_applied_permittivity(capsys):
+    """The `source` line carries both permittivities, and the arm reads the applied one.
+
+    The readings (`delivered_power`, `dipole_moment`, `purcell_spectrum`) take
+    the permittivity the update applies at the source's own E sample
+    (`fdtd.source_permittivity`), not the layout's node value; the two differ
+    only where a Lorentz-Drude metal owns the sample, which it updates with
+    eps_inf = 1. A scene with a gold node next to the source along its own axis
+    (x) makes them differ, so a log shows it and the returned value is 1; the
+    same scene with the gold beside it along y makes them the same. The host
+    index stays the material's: sqrt of the node value.
+    """
+    m = _load()
+    args = m.parse_args(["--tiny"])                  # the CW arm, --axis x
+    eps_inp = m.N_INP ** 2
+    cell = (4, 4, 4)
+    request = {"frequency_hz": 3.3e14, "boundary": "open"}
+    for metal_node, applied in (((5, 4, 4), 1.0), ((4, 5, 4), eps_inp)):
+        region = np.zeros((9, 9, 9), dtype=bool)
+        region[metal_node] = True
+        lay = {"cell": cell, "eps": np.full((9, 9, 9), eps_inp),
+               "metals": {"Au": region}, "spacings": [np.full(8, 2.0e-8)] * 3}
+        capsys.readouterr()
+        _source, _terms, _volume, index, eps_r = m.source_and_terms(
+            args, lay, request)
+        line = next(row for row in capsys.readouterr().out.splitlines()
+                    if row.startswith("source"))
+        assert eps_r == pytest.approx(applied, rel=1e-12, abs=0.0), line
+        assert index == pytest.approx(m.N_INP, rel=1e-12), line
+        assert (f"eps_r {eps_inp:.4f} (cell), {applied:.4f} (applied at Ex)"
+                in line), line
