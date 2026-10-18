@@ -330,6 +330,7 @@ linewidth is not.
       estimated, the rung the lead ran) fits the 1,800 s clock; dx 10 pad 400 (1,567.7 s) does
       not, and dx 10 pad 200 (903.2 s, 3,222,828 cells) does -- and dx 10 is the paper's own
       mesh, so the pad's convergence run is what buys the comparable rung.
+- [ ] Why the CW reading still rises (a curve, its class, the window's phase, a saved series): change `cw-settling`.
 - [x] **The reading superseded one the scene had.** `--hex corners` (corner-to-corner = the
       quoted number) made the flats 363.7 nm, 12 per cent narrow, and was the default until
       the lead's decision below. It stays runnable, because run 1 is the comparison point for
