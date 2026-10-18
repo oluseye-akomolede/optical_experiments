@@ -2259,9 +2259,65 @@ POOL_BASE = 0.4
 POOL_PER_OPEN_AXIS = 0.6
 
 
+def phasor_box_bytes(box, shape, *, frequencies=1, steps: int = 0) -> int:
+    """Device bytes a ``simulate`` phasor box holds: what ``_PhasorBox`` allocates.
+
+    ``box`` is the ``(centre, half_extent)`` the run is given, ``frequencies``
+    the ``phasor_frequencies`` (a list in Hz, or just their count) and
+    ``steps`` how many steps the box reads (``n_steps - phasor_start``).
+    Counts, in ``complex128``: the 36 accumulators (six faces, E and H, three
+    components each, every frequency), each on the slab its component needs
+    -- two layers across the face where the sample sits half a cell off it,
+    one where it sits on it, and the face's nodes or cells in plane -- and the
+    two phase tables (one row per step read, one column per frequency); then
+    the larger of two moments that never overlap: a step's transients (the
+    largest slab's float64 copy and its product with the phase) and the
+    faces' assembly after the last step, while the run's arrays are still
+    alive (the interpolated components and the stacked faces, twice the
+    returned ``E`` and ``H``, plus two of the largest slab's interpolation
+    temporaries). On a discrete GPU the assembly is host memory; on the
+    Jetson's unified memory it is the same RAM, so it is counted. The slab
+    sizes are ``_PhasorBox``'s own, re-derived here so the estimate needs no
+    device; ``tests/test_fdtd_memory.py`` holds the accumulators and tables
+    equal to a real box's and the whole within a measured run's peak.
+    """
+    lo, hi = phasor_box_layers(box, shape)
+    if isinstance(frequencies, (int, np.integer)):
+        count = int(frequencies)                 # a count
+    else:
+        count = int(np.size(frequencies))        # the list (or one value) in Hz
+    if count < 1 or int(steps) < 0:
+        raise FDTDError(
+            f"a phasor box reads at least one frequency over zero or more "
+            f"steps, got {frequencies!r} over {steps!r}")
+    total = 0
+    largest = 0
+    for a in range(3):
+        for _layer in (hi[a], lo[a]):
+            for family in ("E", "H"):
+                for component in COMPONENTS:
+                    size = 1
+                    for axis in range(3):
+                        half = _is_half(family, component, axis)
+                        if axis == a:
+                            size *= 2 if half else 1
+                        else:
+                            size *= hi[axis] - lo[axis] + (0 if half else 1)
+                    total += 16 * count * size
+                    largest = max(largest, size)
+    total += 2 * 16 * count * int(steps)         # the E and H phase tables
+    cells = sum(2 * (hi[u] - lo[u]) * (hi[v] - lo[v])
+                for u, v in ((1, 2), (0, 2), (0, 1)))
+    returned = 16 * count * 6 * cells            # E and H on every face cell
+    step = (8 + 16 * count) * largest            # one step's transients
+    assembly = 2 * returned + 2 * 16 * count * largest
+    return int(total + max(step, assembly))
+
+
 def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
                     record_peak=False, record_frames=False,
-                    max_frames: int = MAX_FRAMES) -> int:
+                    max_frames: int = MAX_FRAMES, phasor_box=None,
+                    phasor_frequencies=1, phasor_steps: int = 0) -> int:
     """Bytes ``simulate`` holds at its peak on the device (float32 arrays).
 
     Counts, per cell: six fields, eps and 1/eps, the transients, the device
@@ -2275,7 +2331,10 @@ def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
     frames. Each metal
     ``(name, region)`` adds, per component, a box over its samples (the region
     widened one node along the component) holding 2 per pole + 4 arrays, plus
-    the solver's boolean union of the regions.
+    the solver's boolean union of the regions. A ``phasor_box`` (the run's
+    ``(centre, half_extent)``, with its ``phasor_frequencies`` and the
+    ``phasor_steps`` it reads) adds :func:`phasor_box_bytes`; without one the
+    estimate is what it was before the option existed.
     """
     shape = tuple(int(s) for s in shape)
     cells = int(np.prod(shape))
@@ -2302,6 +2361,9 @@ def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
             box = extent.copy()
             box[axis] = min(box[axis] + 1, shape[axis])
             total += 4.0 * int(np.prod(box)) * arrays
+    if phasor_box is not None:
+        total += phasor_box_bytes(phasor_box, shape, frequencies=phasor_frequencies,
+                                  steps=phasor_steps)
     return int(total)
 
 
@@ -2355,14 +2417,18 @@ def rate_setup(boundary="metal", metals=()) -> str:
 
 def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
                  pec=None, record_peak=False, record_frames=False,
-                 max_frames: int = MAX_FRAMES) -> dict:
+                 max_frames: int = MAX_FRAMES, phasor_box=None,
+                 phasor_frequencies=1, phasor_steps: int = 0) -> dict:
     """Cells, dt, steps, device bytes and Jetson seconds for a planned run.
 
     ``nodes`` are the three node-coordinate arrays the run will use and
     ``metals``/``pec`` the voxeliser's masks on them. dt is found the way
     ``simulate`` finds it: 0.99 of Courant on the finest spacing per axis,
     then lowered by each metal's ``stable_dt``, so the step count is the
-    one the run will take.
+    one the run will take. ``phasor_box``, ``phasor_frequencies`` and
+    ``phasor_steps`` are counted in the bytes as :func:`memory_estimate`
+    counts them; the seconds do not count the box's per-step folding, which
+    runs only over the steps it reads.
     """
     nodes = [np.asarray(n, dtype=float) for n in nodes]
     shape = tuple(len(n) for n in nodes)
@@ -2385,7 +2451,9 @@ def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
                                  metals=list(metals.items()),
                                  pec=pec is not None, record_peak=record_peak,
                                  record_frames=record_frames,
-                                 max_frames=max_frames),
+                                 max_frames=max_frames, phasor_box=phasor_box,
+                                 phasor_frequencies=phasor_frequencies,
+                                 phasor_steps=phasor_steps),
         "setup": setup,
         "seconds": cells * steps / (RATE_SAFETY * JETSON_RATES[setup]),
         # the requested movie length, so a memory refusal can say that fewer

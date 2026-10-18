@@ -177,3 +177,84 @@ def test_a_120_frame_movie_allocates_what_the_formula_says_over_60():
     # that it is an exact account of every temporary
     assert 0.85 <= added / predicted <= 1.05, (
         f"60 more frames add {added} B measured, {predicted} B by the formula")
+
+
+#: A phasor box off-centre and non-cubic on SHAPE, read over 40 steps at two
+#: frequencies: every one of its 36 slabs has its own size.
+PHASOR_BOX = ((11, 12, 13), (7, 8, 9))
+PHASOR_FREQUENCIES = [4e14, 5e14]
+PHASOR_STEPS, PHASOR_START = 60, 20
+
+
+def test_a_phasor_box_is_counted_as_the_monitor_allocates_it():
+    """``phasor_box_bytes`` against a real ``_PhasorBox``: its 36 accumulators
+    and two phase tables, byte for byte (measured 471,168 + 2,560 bytes here),
+    plus the larger of a step's transients and the faces' assembly. The
+    estimate rises by exactly that when a box is passed, through
+    ``memory_estimate`` and ``estimate_run`` alike, and is unchanged -- equal
+    to the call without the keywords -- when it is not. A frequency count and
+    the list in Hz price the same."""
+    box = fdtd._PhasorBox(PHASOR_BOX, PHASOR_FREQUENCIES, shape=SHAPE,
+                          primal=[np.full(n - 1, 5e-9) for n in SHAPE], pml=0,
+                          dt=1e-17, n_steps=PHASOR_STEPS, start=PHASOR_START,
+                          window="hann", xp=np)
+    held = (sum(term[-1].nbytes for term in box._terms)
+            + sum(table.nbytes for table in box._phase.values()))
+    largest = max(int(np.prod(term[-1].shape[1:])) for term in box._terms)
+    cells = sum(2 * (box.hi[u] - box.lo[u]) * (box.hi[v] - box.lo[v])
+                for u, v in ((1, 2), (0, 2), (0, 1)))
+    count = len(PHASOR_FREQUENCIES)
+    moment = max((8 + 16 * count) * largest,
+                 2 * 16 * count * 6 * cells + 2 * 16 * count * largest)
+    priced = fdtd.phasor_box_bytes(PHASOR_BOX, SHAPE, frequencies=PHASOR_FREQUENCIES,
+                                   steps=PHASOR_STEPS - PHASOR_START)
+    assert priced == held + moment
+    assert priced == fdtd.phasor_box_bytes(PHASOR_BOX, SHAPE, frequencies=count,
+                                           steps=PHASOR_STEPS - PHASOR_START)
+    option = dict(phasor_box=PHASOR_BOX, phasor_frequencies=PHASOR_FREQUENCIES,
+                  phasor_steps=PHASOR_STEPS - PHASOR_START)
+    for boundary in ("metal", "open"):
+        plain = fdtd.memory_estimate(SHAPE, boundary=boundary)
+        assert fdtd.memory_estimate(SHAPE, boundary=boundary, **option) - plain == priced
+        assert fdtd.memory_estimate(SHAPE, boundary=boundary, phasor_box=None,
+                                    phasor_frequencies=7, phasor_steps=99) == plain
+    nodes = [np.arange(n) * 5e-9 for n in SHAPE]
+    before = fdtd.estimate_run(nodes, duration=1e-15, boundary="open")
+    after = fdtd.estimate_run(nodes, duration=1e-15, boundary="open", **option)
+    assert after["bytes"] - before["bytes"] == priced
+    assert {k: v for k, v in after.items() if k != "bytes"} \
+        == {k: v for k, v in before.items() if k != "bytes"}
+    with pytest.raises(fdtd.FDTDError, match="live layers"):
+        fdtd.phasor_box_bytes(((11, 12, 13), (12, 8, 9)), SHAPE)
+    with pytest.raises(fdtd.FDTDError, match="at least one frequency"):
+        fdtd.phasor_box_bytes(PHASOR_BOX, SHAPE, frequencies=[])
+
+
+@pytest.mark.parametrize("box,frequencies,steps,start", [
+    (PHASOR_BOX, PHASOR_FREQUENCIES, PHASOR_STEPS, PHASOR_START),
+    (((11, 12, 13), (3, 9, 5)), [4e14], 80, 10),
+    (((11, 12, 13), (9, 10, 11)), [4e14, 5e14, 6e14], 60, 30)])
+def test_a_phasor_box_run_stays_inside_its_estimate(box, frequencies, steps, start):
+    """The measured peak a box adds to a numpy run, against the estimate's
+    increment. Measured 0.766, 0.500 and 0.825 of it: never over, because the
+    faces' assembly is counted whole although the step loop's own transients
+    are freed by then (they are the larger share on the small box)."""
+    eps = np.ones(SHAPE, dtype=np.float64)
+    source = fdtd.Source((11, 12, 11), frequency=4e14, bandwidth=2e14)
+
+    def measured(**options):
+        tracemalloc.start()
+        tracemalloc.reset_peak()
+        try:
+            fdtd.simulate(eps, source, steps, [(11, 12, 13, "z")], dx=5e-9,
+                          **options)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    added = (measured(phasor_box=box, phasor_frequencies=frequencies,
+                      phasor_start=start) - measured())
+    predicted = fdtd.phasor_box_bytes(box, SHAPE, frequencies=frequencies,
+                                      steps=steps - start)
+    assert 0.45 <= added / predicted <= 1.0, (
+        f"the box adds {added} B measured, {predicted} B by the formula")
