@@ -914,8 +914,9 @@ def fit_decay(values, dt: float, start: int, *, frequency: float,
     # fitted in the wrong basin: change decay-fit-basin measured 33 of 60 tiny
     # synthetic tails wrong (a 1060 fs mode at 108 fs, rms 0.38 of its peak),
     # and multi-starting that descent from the best 3 or 5 cells still 33 and
-    # 31. Bins 1/window apart left 9 of 60 wrong; 1/(4 windows) and 1/(8
-    # windows) none, so the scan uses 8.
+    # 31. With this scan and descent, bins 1/window apart left 5 of 60 long,
+    # quiet lines 13-18% short; 1/(2, 4 or 8 windows) none, at the same cost,
+    # so the scan uses 8, four times finer than the coarsest that worked.
     taus, omegas, S = _decay_scan(y, dt, taus, lo_w, hi_w)
     step_w = float(omegas[1] - omegas[0]) if omegas.size > 1 else edge_w
 

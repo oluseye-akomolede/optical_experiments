@@ -82,21 +82,30 @@ def test_no_wrong_basin_across_the_linewidth_to_grid_ratio():
     """tau from 60 fs to 4000 fs -- a line 0.43 of the old grid step down to
     0.016 of it -- at four places between two old columns. The old search got
     33 of 60 such tails wrong (errors from 14.6% to 97%); multi-starting its
-    descent from the best 3 or 5 cells still 33 and 31; FFT bins 1/window apart
-    9 of 60; bins 1/(4 or 8 windows) apart none (measured).
+    descent from the best 3 or 5 cells still 33 and 31; this search none, at
+    every bin spacing from 1/window to 1/(8 windows) (measured).
+
+    The second half is long lines at 1e-4 of noise, where bins 1/window apart
+    are not enough even with this descent: 5 of 60 such tails (700 fs to 8000
+    fs, 12 places between columns) came back 12.7% to 18.3% short, f right
+    and tau wrong, where bins 1/(2, 4 or 8 windows) apart left none (worst
+    0.04%, measured). These four are among those five.
 
     Tolerance 1%: the worst of the 60 measured with 1/(8 windows) bins was
-    0.19% at this noise, and the smallest wrong-basin error was 14.6%."""
+    0.19% at 1e-3 noise, and the smallest wrong-basin error was 12.7%."""
     rng = np.random.default_rng(11)
     wrong = []
-    for tau_fs in (60, 150, 400, 1060, 4000):
+    cases = [(tau_fs, 7, offset, 1e-3, 1.1) for tau_fs in (60, 150, 400, 1060, 4000)
+             for offset in (0.0, 0.33, 0.5, 0.83)]
+    cases += [(1060, 3, 0.75, 1e-4, 2.3), (4000, 3, 0.75, 1e-4, 2.3),
+              (8000, 3, 0.083, 1e-4, 2.3), (8000, 3, 0.417, 1e-4, 2.3)]
+    for tau_fs, column, offset, noise, phase in cases:
         tau = tau_fs * 1e-15
-        for offset in (0.0, 0.33, 0.5, 0.83):
-            f0 = _between_columns(7, offset)
-            fit = _fit(_mode(tau, f0, phase=1.1) + 1e-3 * rng.standard_normal(N))
-            ratio = 1.0 / (math.pi * tau) / GRID_STEP
-            if abs(fit["tau"] / tau - 1.0) > 0.01:
-                wrong.append((tau_fs, round(ratio, 3), offset, fit["tau"] / 1e-15))
+        f0 = _between_columns(column, offset)
+        fit = _fit(_mode(tau, f0, phase=phase) + noise * rng.standard_normal(N))
+        ratio = 1.0 / (math.pi * tau) / GRID_STEP
+        if abs(fit["tau"] / tau - 1.0) > 0.01:
+            wrong.append((tau_fs, round(ratio, 3), offset, fit["tau"] / 1e-15))
     assert not wrong, wrong
 
 
