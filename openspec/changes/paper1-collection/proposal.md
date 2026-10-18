@@ -112,7 +112,7 @@ power, since part of a finite pad's emission leaves downward past its edges.
 - `scripts/paper1_nanowire.py`, `dockerfiles/maxwell_solver/fdtd.py`
   (`memory_estimate`, `estimate_run`, new `phasor_box_bytes`).
 - Tests: `tests/test_phasor_mirror.py` (new, 4 tests, about 14 s),
-  `tests/test_paper1_collection.py` (new, 13 tests, about 18 s),
+  `tests/test_paper1_collection.py` (new, 12 tests, about 18 s),
   `tests/test_fdtd_memory.py` (+4), 16 cases in
   `tests/check_discriminating.py`.
 - No route, request field, schema, image, manifest or worker change: the
