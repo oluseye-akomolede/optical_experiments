@@ -148,6 +148,12 @@ DRIVE_FLOOR = 1e-4      # of the drive's own peak: where the pulse is over
 MIN_TAIL_PERIODS = 6.0  # a decay needs at least this many periods to be fitted
 TAU_EDGE = 20.0         # the fit's own tau grid reaches this far in windows
 ERR_FLOOR = 1e-9        # of its own value: below this an error is the pinv's
+DECAY_PAD = 8           # the decay scan's omega bins are 1/(8 windows) apart
+RIVALS = 3              # separated minima of the scan refined against the fit
+RIVAL_ITERATIONS = 20   # golden steps for each of them (the fit's own is 40)
+AMBIGUITY_RATIO = 12.0  # a rival minimum under 12 x the fit's residual is a tie:
+                        # measured (decay-fit-basin), 14 of the 16 fits >10% off
+                        # in 105 tails had a rival at 11.1 x or less
 UNRESOLVED = 3          # measured, but the record's tail leaves Q unpinned
 DEFAULT_TAIL_PERIODS = 20.0   # asked for only by --ringdown
 QD_DEPTH_TOL_NM = 1.0   # how far the emitter's realised depth may sit from --qd-below
@@ -776,20 +782,49 @@ def drive_done(drive, floor: float = DRIVE_FLOOR) -> int:
     return int(above[-1]) + 1 if above.size else 0
 
 
-def _decay_scan(t, y, taus, omegas):
-    """Least squares over one decaying sinusoid plus a constant, on a grid."""
-    best = None
-    for tau in taus:
+def _decay_scan(y, dt: float, taus, lo_w: float, hi_w: float):
+    """The residual of one decaying sinusoid at every (tau, omega) of a fine grid.
+
+    At fixed tau the model is linear in its amplitudes, and the energy it takes
+    out of the (mean-removed) tail is, to O(1/(omega tau)), 2 |Y(omega)|^2 /
+    sum(w^2) with Y the transform of the tail weighted by w = exp(-t/tau). So one
+    zero-padded FFT per tau gives the residual at every omega at once, on bins
+    1/(DECAY_PAD windows) apart -- finer than the basin of any mode the record
+    can show (a mode's basin is at least about 1/window wide, and wider by
+    1/(pi tau) for a short one), and never coarser than a twentieth of the band.
+    Returns (taus, omegas, S): S[i, j] the approximate residual at taus[i],
+    omegas[j]. The approximation only chooses the cell; every number the fit
+    reports is from the exact least squares.
+    """
+    n = y.size
+    window = n * dt
+    step = min(2.0 * math.pi / (DECAY_PAD * window), (hi_w - lo_w) / 20.0)
+    npad = 1 << int(math.ceil(math.log2(max(n, 2.0 * math.pi / (dt * step)))))
+    w = 2.0 * math.pi * np.fft.rfftfreq(npad, dt)
+    inside = (w >= lo_w) & (w <= hi_w)
+    omegas = w[inside]
+    t = np.arange(n) * dt
+    yc = y - y.mean()
+    energy = float(yc @ yc)
+    S = np.empty((len(taus), omegas.size))
+    for i, tau in enumerate(taus):
         env = np.exp(-t / tau)
-        for omega in omegas:
-            basis = np.column_stack((env * np.cos(omega * t),
-                                     env * np.sin(omega * t), np.ones(t.size)))
-            coef, *_ = np.linalg.lstsq(basis, y, rcond=None)
-            resid = y - basis @ coef
-            rss = float(resid @ resid)
-            if best is None or rss < best[0]:
-                best = (rss, float(tau), float(omega), coef)
-    return best
+        Y = np.fft.rfft(yc * env, npad)[inside]
+        S[i] = energy - 2.0 * np.abs(Y) ** 2 / float(env @ env)
+    return np.asarray(taus), omegas, S
+
+
+def _local_minima(S):
+    """Cells of S no higher than any of their eight neighbours, lowest first."""
+    padded = np.pad(S, 1, constant_values=np.inf)
+    rows, cols = S.shape
+    low = np.ones(S.shape, dtype=bool)
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            if di or dj:
+                low &= S <= padded[1 + di:1 + di + rows, 1 + dj:1 + dj + cols]
+    cells = np.argwhere(low)
+    return cells[np.argsort(S[low], kind="stable")]
 
 
 def _golden(f, lo: float, hi: float, iterations: int = 40) -> float:
@@ -817,10 +852,18 @@ def fit_decay(values, dt: float, start: int, *, frequency: float,
     The model is a single decaying sinusoid over a constant: a_dip(t) =
     c + e^{-t/tau} (a cos wt + b sin wt), on the record's own sample times from
     ``start``. Linear in (a, b, c) at fixed (tau, w) and nonlinear in those two,
-    so it is a grid scan, then a coordinate descent on the two of them, then a
-    covariance. Nothing here reads the frequency from the DFT's bins: those are
-    1/window apart, far too coarse for a mode the record's own length cannot
-    resolve, and reading the decay is the way to beat them.
+    so it is a scan (``_decay_scan``: 31 taus, and at each one every omega of
+    the band on bins 1/(8 windows) apart -- finer than any mode's basin, so the
+    descent cannot start in the wrong one because of the grid's spacing), then
+    an exact descent in the best cell's basin, then a covariance. The frequency
+    reported is the descent's, not a bin's: the bins only choose the basin.
+
+    ``ambiguous`` is None, or the reason this tau is not a measurement: a
+    second minimum of the scan, separated in frequency from the fit by more
+    than its basin, whose residual is under ``AMBIGUITY_RATIO`` times the
+    fit's (``rival`` holds it either way), or a degenerate tau direction in the
+    covariance. A second minimum that refines LOWER than the first becomes the
+    fit, so the answer does not depend on which cell the scan ranked first.
 
     ``resolved`` is the fit's own significance test, and it is the honest part:
     tau is reported with a covariance error from the model's own residual, and a
@@ -864,26 +907,64 @@ def fit_decay(values, dt: float, start: int, *, frequency: float,
         return float(resid @ resid), coef
 
     taus = np.logspace(math.log10(window / 100.0), math.log10(window * TAU_EDGE), 31)
-    omegas = np.linspace(lo_w, hi_w, 21)
-    edge_w = (hi_w - lo_w) / (omegas.size - 1)
-    rss, tau, omega, coef = _decay_scan(t, y, taus, omegas)
-    at_edge = math.isclose(tau, float(taus[-1]), rel_tol=1e-9)
-    # The scan's grid is coarse (a quarter of an octave in tau), far too coarse
-    # to stop on: descend each axis in turn, which is exact to the search's own
-    # tolerance rather than to a grid step. Measured against synthetic tails, a
-    # fixed number of linspace rounds left tau on the grid -- 0.4% to 2.6% off at
-    # a hundred times its own error -- where this recovers it to the noise.
-    step_tau = (taus[-1] - taus[0]) / (taus.size - 1)
-    step_w = (omegas[-1] - omegas[0]) / (omegas.size - 1)
-    for sweep in range(3):
-        tau = _golden(lambda v: rss_at(v, omega)[0],
-                      max(tau - 1.5 * step_tau, 1e-3 * window), tau + 1.5 * step_tau)
-        omega = _golden(lambda v: rss_at(tau, v)[0],
-                        omega - 1.5 * step_w, omega + 1.5 * step_w)
-        if sweep == 0:                 # the scan's step is used up: tighten
-            step_tau, step_w = step_tau * 0.05, step_w * 0.05
+    edge_w = (hi_w - lo_w) / 20.0
+    # The scan's omega step is set by the record, not by a fixed count across
+    # the band. A 21-column grid across a +-15% band is 4.97 THz at 331 THz,
+    # wider than any line longer than 64 fs, and a mode between two columns was
+    # fitted in the wrong basin: change decay-fit-basin measured 33 of 60 tiny
+    # synthetic tails wrong (a 1060 fs mode at 108 fs, rms 0.38 of its peak),
+    # and multi-starting that descent from the best 3 or 5 cells still 33 and
+    # 31. Bins 1/window apart left 9 of 60 wrong; 1/(4 windows) and 1/(8
+    # windows) none, so the scan uses 8.
+    taus, omegas, S = _decay_scan(y, dt, taus, lo_w, hi_w)
+    step_w = float(omegas[1] - omegas[0]) if omegas.size > 1 else edge_w
+
+    def refine(i, j, iterations=40):
+        """The exact minimum in cell (i, j)'s basin: tau within two grid cells
+        of the cell's (a profile over log tau), and omega at each tau within
+        the larger of two bins and the cell's own line, 1/tau rad/s either side.
+
+        The line matters for a short tau. The scan's residual is good to
+        O(1/(omega tau)), which is 25% for the --tiny vacuum tail's 1.9 fs, and
+        there it chose a cell 22 THz off the exact minimum; two bins could not
+        reach it, and the fit's rms came out 13 x the old search's (measured).
+        A line that wide is one basin, so its whole width is safe to search."""
+        w0 = float(omegas[j])
+        half = max(2.0 * step_w, 1.0 / float(taus[i]))
+        wlo, whi = max(lo_w, w0 - half), min(hi_w, w0 + half)
+
+        def profile(log_tau):
+            tau = math.exp(log_tau)
+            om = _golden(lambda v: rss_at(tau, v)[0], wlo, whi, iterations)
+            return rss_at(tau, om)[0], om
+
+        lo_t = math.log(float(taus[max(i - 2, 0)]))
+        hi_t = math.log(float(taus[min(i + 2, taus.size - 1)]))
+        log_tau = _golden(lambda v: profile(v)[0], lo_t, hi_t, iterations)
+        rss, om = profile(log_tau)
+        return rss, math.exp(log_tau), om
+
+    minima = _local_minima(S)
+    i, j = (int(k) for k in minima[0])
+    at_edge = i == taus.size - 1
+    rss, tau, omega = refine(i, j)
+    # The other basins: the lowest few local minima of the scan whose frequency
+    # is separated from this fit's by more than its own basin (twice the larger
+    # of the line's half width 1/(pi tau) and the record's 1/window). Each is
+    # refined exactly; one that refines lower than the fit becomes the fit.
+    rival = None
+    sep = 2.0 * 2.0 * math.pi * max(1.0 / (math.pi * tau), 1.0 / window)
+    others = [(int(ci), int(cj)) for ci, cj in minima[1:]
+              if abs(float(omegas[cj]) - omega) > sep][:RIVALS]
+    for ci, cj in others:
+        other = refine(ci, cj, RIVAL_ITERATIONS)
+        if other[0] < rss:
+            other, (rss, tau, omega) = (rss, tau, omega), other
+            at_edge = ci == taus.size - 1
+        if rival is None or other[0] < rival[0]:
+            rival = other
     rss, coef = rss_at(tau, omega)
-    f_edge = bool(omega <= omegas[0] + edge_w or omega >= omegas[-1] - edge_w)
+    f_edge = bool(omega <= lo_w + edge_w or omega >= hi_w - edge_w)
 
     def model(p):
         a, b, c, tau, om = p
@@ -947,10 +1028,32 @@ def fit_decay(values, dt: float, start: int, *, frequency: float,
     q = math.pi * f * tau
     q_err = (math.pi * math.hypot(tau * f_err, f * tau_err)
              if f_err is not None and tau_err is not None else None)
+    # Whether this tau is a measurement at all. Two separated minima whose
+    # residuals are within AMBIGUITY_RATIO of each other are two answers the
+    # record does not choose between (two modes, or a mode under the noise), and
+    # a covariance whose tau direction is degenerate has no error to put beside
+    # tau. Either way the arm prints the reason, not a tau.
+    #
+    # f_err is NOT read here. It is None on well-fitted tails too: the pinv
+    # below sees Jacobian columns some 1e24 apart in scale (tau's ~1e13, omega's
+    # ~1e-11) and drops omega's direction (measured, change decay-fit-basin, on
+    # a 1060 fs tail it recovers to 0.03%). Flagging on it would flag every fit.
+    ratio = (rival[0] / rss if rss > 0.0 else math.inf) if rival else None
+    reasons = []
+    if ratio is not None and ratio < AMBIGUITY_RATIO:
+        reasons.append(f"a second minimum at {rival[2] / (2.0 * math.pi) / 1e12:.4f} THz,"
+                       f" tau {rival[1] / 1e-15:.4g} fs, leaves {ratio:.3g} x this"
+                       f" fit's residual (under {AMBIGUITY_RATIO:g} is a tie)")
+    if tau_err is None:
+        reasons.append("tau's own covariance direction is degenerate")
     return {"f": f, "f_err": f_err, "tau": tau, "tau_err": tau_err,
             "q": q, "q_err": q_err, "samples": n, "window": window,
             "rms": math.sqrt(rss / n), "peak": float(np.max(np.abs(y))),
             "at_edge": at_edge, "f_edge": f_edge,
+            "rival": (None if rival is None else
+                      {"f": rival[2] / (2.0 * math.pi), "tau": rival[1],
+                       "rss_ratio": ratio}),
+            "ambiguous": "; ".join(reasons) or None,
             "resolved": bool(tau_err is not None and tau > 3.0 * tau_err and not at_edge)}
 
 
@@ -1040,10 +1143,14 @@ def ringdown(args, lay, request, measured):
                     band=(f0 - half, f0 + half))
     mark = (f"; AT THE EDGE of that band, so this f is the search's own edge and"
             f" the mode is outside it") if fit["f_edge"] else ""
+    ambiguous = fit.get("ambiguous")
+    tau_text = (f"tau AMBIGUOUS ({fit['tau'] / 1e-15:.3f} fs is not a measurement:"
+                f" {ambiguous})" if ambiguous else
+                f"tau = {fit['tau'] / 1e-15:.3f} fs +- {_err(fit['tau_err'], 1e-15)}")
     print(f"fit       f = {fit['f'] / 1e12:.4f} THz +- {_err(fit['f_err'], 1e12)}"
           f" (the drive is {f0 / 1e12:.2f}, searched over"
           f" {C / (f0 + half) / NM:.0f}-{C / (f0 - half) / NM:.0f} nm){mark},"
-          f" tau = {fit['tau'] / 1e-15:.3f} fs +- {_err(fit['tau_err'], 1e-15)},"
+          f" {tau_text},"
           f" rms {fit['rms']:.3e} against a {fit['peak']:.3e} peak")
     print(f"caveat    tau's error is the fit's own, not the geometry's: a tail"
           f" holding two decays still fits one of them. --vacuum is the same arm"
@@ -1064,6 +1171,13 @@ def ringdown(args, lay, request, measured):
             print(f"tail      {np.size(sim['source_field']):,} samples and the dt they"
                   f" were taken with in {wrote}: load_record plus fit_decay re-fits"
                   f" this tail without another run")
+    if ambiguous:
+        # Before the Q line: a tau the record does not choose is not one to
+        # read a Q from, nor to bound one with.
+        print(f"unresolved: the fit is ambiguous -- {ambiguous}. No Q is read"
+              f" from this tail; a two-mode model on the saved record"
+              f" (--save-tail) is the reading that can choose")
+        return fit, UNRESOLVED
     if fit["resolved"]:
         print(f"Q         {fit['q']:.4g} +- {_err(fit['q_err'], 1.0)}, a line of"
               f" {args.wavelength / fit['q']:.2f} nm against the paper's"
