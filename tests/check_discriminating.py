@@ -1234,6 +1234,108 @@ for _name, _why, _old, _new, _fails in (
                       expect_failing=set(_fails), test_file=SETTLING_TEST_FILE))
 
 
+BASIN_TEST_FILE = "tests/test_decay_fit_basin.py"
+_B1060 = "test_a_1060_fs_mode_between_two_grid_columns_recovers_its_tau"
+_BSWEEP = "test_no_wrong_basin_across_the_linewidth_to_grid_ratio"
+_BWIDE = "test_a_line_wider_than_the_band_is_searched_across_its_width"
+_BEQUAL = "test_two_equal_modes_are_flagged_ambiguous"
+_BNOISE = "test_a_mode_under_the_noise_and_noise_alone_are_flagged"
+_BBIAS = "test_a_second_mode_that_biases_tau_is_flagged_below_the_factor"
+_BWEAK = "test_a_clean_mode_and_a_weak_second_mode_are_not_flagged"
+_BADOPT = "test_the_answer_does_not_depend_on_which_cell_the_scan_ranked_first"
+_BDEGEN = "test_a_degenerate_tau_direction_is_flagged"
+_BARM = "test_the_arm_prints_the_reason_where_tau_would_be"
+
+# fit_decay's search and its ambiguity flag (change decay-fit-basin). Each set
+# is measured: the reversion applied, the file run, exactly these tests red.
+for _name, _why, _old, _new, _fails in (
+    ("basin-coarse-omega",
+     "the scan's omega step asked for at a twentieth of the band, not 1/(8 windows)"
+     " (padding then only to the record's own power of two)",
+     "    step = min(2.0 * math.pi / (DECAY_PAD * window), (hi_w - lo_w) / 20.0)\n",
+     "    step = (hi_w - lo_w) / 20.0\n",
+     {_BSWEEP}),
+    ("basin-pad-one",
+     "the scan's omega bins 1/window apart instead of 1/(8 windows)",
+     "DECAY_PAD = 8 ",
+     "DECAY_PAD = 1 ",
+     {_BSWEEP}),
+    ("basin-two-bin-window",
+     "the descent's omega window two bins either side at every tau, not the line's width",
+     "        half = max(2.0 * step_w, 1.0 / float(taus[i]))\n",
+     "        half = 2.0 * step_w\n",
+     {_BWIDE}),
+    ("basin-no-rival-flag",
+     "a rival minimum's residual never makes the fit ambiguous",
+     "    if ratio is not None and ratio < AMBIGUITY_RATIO:\n",
+     "    if False:\n",
+     {_BEQUAL, _BNOISE, _BBIAS, _BARM}),
+    ("basin-factor-three",
+     "the ambiguity factor 3 instead of the measured 12",
+     "AMBIGUITY_RATIO = 12.0 ",
+     "AMBIGUITY_RATIO = 3.0 ",
+     {_BBIAS}),
+    ("basin-factor-fifty",
+     "the ambiguity factor 50 instead of the measured 12",
+     "AMBIGUITY_RATIO = 12.0 ",
+     "AMBIGUITY_RATIO = 50.0 ",
+     {_BWEAK}),
+    ("basin-no-degenerate-flag",
+     "a degenerate tau direction in the covariance is not a reason",
+     "    if tau_err is None:\n        reasons.append(",
+     "    if False:\n        reasons.append(",
+     {_BDEGEN}),
+    ("basin-arm-reads-q",
+     "the arm reads a Q from an ambiguous fit instead of stopping at the reason",
+     "    if ambiguous:\n        # Before the Q line",
+     "    if False:\n        # Before the Q line",
+     {_BARM}),
+    ("basin-arm-prints-tau",
+     "the arm prints an ambiguous tau as tau = ... +- ...",
+     "                f\" {ambiguous})\" if ambiguous else\n",
+     "                f\" {ambiguous})\" if False else\n",
+     {_BARM}),
+    ("basin-rival-not-adopted",
+     "a rival that refines lower than the scan's first cell is not made the fit",
+     "        if other[0] < rss:\n",
+     "        if False:\n",
+     {_BADOPT}),
+):
+    CASES.append(Case(name=_name, why=_why, edits=[(PAPER1, _old, _new)],
+                      expect_failing=set(_fails), test_file=BASIN_TEST_FILE))
+
+# The whole search put back as it was before the change: 21 omegas across the
+# band, the best cell, three coordinate sweeps whose steps shrink after the
+# first, and no rival.
+_NEW_SEARCH = (
+    "    minima = _local_minima(S)\n"
+    "    i, j = (int(k) for k in minima[0])\n"
+    "    at_edge = i == taus.size - 1\n"
+    "    rss, tau, omega = refine(i, j)\n")
+_OLD_SEARCH = (
+    "    omegas = np.linspace(lo_w, hi_w, 21)\n"
+    "    grid = [(rss_at(g_tau, g_om)[0], float(g_tau), float(g_om))\n"
+    "            for g_tau in taus for g_om in omegas]\n"
+    "    rss, tau, omega = min(grid)\n"
+    "    at_edge = math.isclose(tau, float(taus[-1]), rel_tol=1e-9)\n"
+    "    step_tau = (taus[-1] - taus[0]) / (taus.size - 1)\n"
+    "    step_w = (omegas[-1] - omegas[0]) / (omegas.size - 1)\n"
+    "    for sweep in range(3):\n"
+    "        tau = _golden(lambda v: rss_at(v, omega)[0],\n"
+    "                      max(tau - 1.5 * step_tau, 1e-3 * window), tau + 1.5 * step_tau)\n"
+    "        omega = _golden(lambda v: rss_at(tau, v)[0],\n"
+    "                        omega - 1.5 * step_w, omega + 1.5 * step_w)\n"
+    "        if sweep == 0:\n"
+    "            step_tau, step_w = step_tau * 0.05, step_w * 0.05\n"
+    "    minima = []\n")
+CASES.append(Case(
+    name="basin-old-search",
+    why="fit_decay's search as it was: 21 omegas, the best cell, a shrinking descent",
+    edits=[(PAPER1, _NEW_SEARCH, _OLD_SEARCH)],
+    expect_failing={_B1060, _BSWEEP, _BEQUAL, _BNOISE, _BBIAS, _BWEAK, _BADOPT, _BARM},
+    test_file=BASIN_TEST_FILE))
+
+
 def run_case(case: Case) -> bool:
     saved = case.snapshot()
     ok = True
