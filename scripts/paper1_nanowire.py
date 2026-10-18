@@ -75,6 +75,18 @@ measured 0.14 off (openspec change ``paper1-collection``,
 ``tests/test_phasor_mirror.py``). The fraction is the finite pad's, so it
 owes the same pad convergence the F reading does.
 
+The CW arm also says WHY its reading is or is not still moving (change
+``cw-settling``): after the ``measured`` and ``settling`` lines, which are
+printed as they always were, it prints what the window's phase alone does to
+the reading (a 2f swing: the Hann's leakage of the -f image times the source
+field's quadrature ratio, measured and predicted), the same reading at cuts
+locked to the end's drive phase through the record, a fit of that curve
+(F_inf, tau_s and their errors), and one class: settled, approaching (F_inf
+then an extrapolation), growing without a limit (never a Purcell factor), or
+unresolved. ``--locator-tau`` sets tau_s against a ring-down's tau in words;
+``--save-series`` keeps the record (off by default) and ``--from-series``
+re-reads it without a run.
+
 Item (7) of the handoff (a dielectric that is a function, not a scalar) does not
 bind the measurement this script makes: the dipole sits on the wire's axis, 30
 nm below the top facet and clear of every graded interface, so the source cell's
@@ -108,6 +120,7 @@ rung.
 from __future__ import annotations
 
 import argparse
+import inspect
 import math
 import sys
 import tempfile
@@ -138,6 +151,15 @@ ERR_FLOOR = 1e-9        # of its own value: below this an error is the pinv's
 UNRESOLVED = 3          # measured, but the record's tail leaves Q unpinned
 DEFAULT_TAIL_PERIODS = 20.0   # asked for only by --ringdown
 QD_DEPTH_TOL_NM = 1.0   # how far the emitter's realised depth may sit from --qd-below
+# The CW arm's settling curve (change cw-settling).
+SETTLING_STEP = 0.05    # the curve's cuts: one every 5% of the record
+MIN_FIT_CUTS = 5        # three parameters and two degrees of freedom
+SIGNIFICANCE = 3.0      # a difference counts when it is this many of its own errors
+APPROACH_EDGE = 50.0    # the approach fit's rate grid reaches +-50 / (fitted span)
+PHASE_CUTS = 32         # cuts across the last drive period for the phase scan
+# the CW drive's own turn-on, read from the profile rather than retyped
+CW_RAMP_PERIODS = float(
+    inspect.signature(fdtd.cw_profile).parameters["ramp_periods"].default)
 
 
 def paper_clock(args, request):
@@ -665,6 +687,31 @@ def arm_conflicts(args) -> str:
         return ("refused: --save-tail writes the pulse record the tail arm fits,"
                 " so on a non-ring-down (CW or band) run the flag is silently"
                 " ignored and the caller believes a record was written")
+    series = getattr(args, "save_series", None)
+    source = getattr(args, "from_series", None)
+    locator = getattr(args, "locator_tau", None)
+    if source is not None:
+        clash = [flag for flag, on in (
+            ("--tiny", args.tiny), ("--estimate", args.estimate),
+            ("--spectrum", args.spectrum), ("--ringdown", args.ringdown),
+            ("--profile pulse", args.profile != "cw"),
+            ("--collection-na", getattr(args, "collection_na", None) is not None),
+            ("--save-series", series is not None),
+            ("--save-tail", args.save_tail is not None)) if on]
+        if clash:
+            return (f"refused: --from-series re-reads a saved CW record and runs"
+                    f" no scene, so {', '.join(clash)} would be inert")
+    for flag, value in (("--save-series", series), ("--locator-tau", locator)):
+        if value is None:
+            continue
+        if args.profile != "cw":
+            return (f"refused: {flag} belongs to the CW arm's settling curve; a"
+                    f" pulse record (--spectrum, --ringdown, --profile pulse) has"
+                    f" none, so the flag would be silently ignored")
+        if args.estimate or (args.tiny and source is None):
+            return (f"refused: {flag} with {'--estimate' if args.estimate else '--tiny'}:"
+                    f" {'nothing runs' if args.estimate else 'the tier-1 controls read only the vacuum control'},"
+                    f" so the flag would be inert")
     na = getattr(args, "collection_na", None)
     if na is not None:
         if not 0.0 < na <= 1.0:
@@ -1212,19 +1259,519 @@ def _run(args, lay, request, measured):
     return sim, volume, index, eps_applied
 
 
-def measure(args, lay, request, measured):
-    """The CW arm: one frequency, a settled tail, F = P/P0."""
-    sim, volume, index, eps_applied = _run(args, lay, request, measured)
-    dt = measured["est"]["dt"]
-    power = fdtd.delivered_power(sim["drive"], sim["source_field"], dt,
-                                 volume=volume, eps_r=eps_applied, periods=args.window_periods,
-                                 frequency=request["frequency_hz"])
-    moment = fdtd.dipole_moment(sim["drive"], dt, volume=volume, eps_r=eps_applied,
-                                periods=args.window_periods,
-                                frequency=request["frequency_hz"])
-    reference = fdtd.larmor_power(moment, request["frequency_hz"], index=index)
+def cw_powers(drive, field, dt: float, *, volume: float, eps_r: float,
+              index: float, frequency: float, periods):
+    """``(P, P0)``: the CW arm's two powers over the LAST ``periods`` of the series.
+
+    ``fdtd.delivered_power`` and ``fdtd.dipole_moment`` both read the last
+    ``periods`` drive periods of whatever series they are handed, so a reading
+    at an earlier point of one record is this same call on the record cut
+    there. One function, so the end reading, the two-thirds reading, the
+    settling curve and a re-read of a saved series cannot drift apart.
+    """
+    power = fdtd.delivered_power(drive, field, dt, volume=volume, eps_r=eps_r,
+                                 periods=periods, frequency=frequency)
+    moment = fdtd.dipole_moment(drive, dt, volume=volume, eps_r=eps_r,
+                                periods=periods, frequency=frequency)
+    return power, fdtd.larmor_power(moment, frequency, index=index)
+
+
+def cw_reading(drive, field, dt: float, **reading) -> float:
+    """F = P/P0 from :func:`cw_powers` (``fdtd.purcell_factor``: P must be > 0)."""
+    return fdtd.purcell_factor(*cw_powers(drive, field, dt, **reading))
+
+
+def _period_steps(dt: float, frequency: float) -> float:
+    return 1.0 / (float(frequency) * float(dt))
+
+
+def window_steps(dt: float, frequency: float, periods) -> int:
+    """The reading's window in steps: ``fdtd._steady_tail``'s own rounding."""
+    return int(round(int(periods) * _period_steps(dt, frequency)))
+
+
+def window_phase(drive, field, dt: float, **reading) -> dict | None:
+    """How the reading moves with WHERE its window ends, measured on this record.
+
+    The CW reading is ``Re[E~ S~*]`` over a Hann window, and the field at a
+    point source's own cell is almost all reactive: its in-phase (power
+    carrying) part is a small residue of the half-step average the delivered
+    power takes (tiny vacuum scene: 1/4150 of the field). The Hann passes a
+    little of each tone's -f image (3.65e-6 at 8 periods), which rotates at 2f
+    against the drive, and the quadrature multiplies it into the reading. So
+    the reading swings at TWICE the drive frequency as its window's end moves
+    through one period -- measured on the tiny vacuum scene at +-3.03% of F
+    with an 8-period window, where twice the leakage times the quadrature
+    ratio predicts +-3.03%, and at +-25%/+-0.36% with 4/16 periods.
+
+    This scans ``PHASE_CUTS + 1`` cuts across the record's last drive period
+    and fits ``a + b x + c cos(4 pi x) + d sin(4 pi x)`` (x in periods from
+    the end), so a reading that is still moving does not pass its trend off
+    as phase. Returns ``mean`` (a: the end with the 2f term removed),
+    ``swing`` (|c, d|), ``end_term`` (c: the 2f term's value at the end),
+    ``slope`` (b, per period), the measured ``samples``, and the prediction
+    ``predicted`` = 2 x ``leak`` x ``quadrature``. None when the record is
+    too short to cut a window a period before its end.
+    """
+    drive = np.asarray(drive)
+    field = np.asarray(field)
+    n = int(np.size(field))
+    dt = float(dt)
+    frequency = float(reading["frequency"])
+    per = _period_steps(dt, frequency)
+    window = window_steps(dt, frequency, reading["periods"])
+    cuts = sorted({n - int(round(i * per / PHASE_CUTS))
+                   for i in range(PHASE_CUTS + 1)})
+    if cuts[0] < window or window < 2:
+        return None
+    ratios = []
+    for cut in cuts:
+        power, reference = cw_powers(drive[:cut], field[:cut], dt, **reading)
+        ratios.append(power / reference)       # P <= 0 kept: it is the swing
+    ratios = np.asarray(ratios)
+    x = (np.asarray(cuts, dtype=np.float64) - n) / per
+    basis = np.column_stack((np.ones(x.size), x, np.cos(4.0 * math.pi * x),
+                             np.sin(4.0 * math.pi * x)))
+    coef, *_ = np.linalg.lstsq(basis, ratios, rcond=None)
+    # the prediction, from the last window: the estimator's own half-step field
+    trace = field.astype(np.float64)
+    mid = 0.5 * (trace + np.concatenate((trace[:1], trace[:-1])))
+    hann = fdtd._window(window, "hann")
+    s = fdtd._windowed_at(drive[n - window:], dt, frequency, hann)
+    e = fdtd._windowed_at(mid[n - window:], dt, frequency, hann)
+    # the end window's in-phase part carries the end's own share of the swing, so
+    # it is scaled to the phase mean (F is proportional to it) before it is used
+    inphase = (abs(float(np.real(e * np.conj(s)))) / abs(s) if abs(s) > 0 else 0.0)
+    inphase *= abs(float(coef[0]) / ratios[-1]) if ratios[-1] else 0.0
+    quadrature = abs(e) / inphase if inphase > 0 else math.inf
+    leak = float(abs(np.sum(hann * np.exp(-4j * math.pi * frequency * dt
+                                          * np.arange(window))))
+                 / np.sum(hann))
+    return {"mean": float(coef[0]), "slope": float(coef[1]),
+            "swing": float(math.hypot(coef[2], coef[3])), "end_term": float(coef[2]),
+            "samples": ratios, "cuts": cuts, "leak": leak,
+            "quadrature": quadrature, "predicted": 2.0 * leak * quadrature
+            * abs(float(coef[0]))}
+
+
+def settling_curve(drive, field, dt: float, *, step: float = SETTLING_STEP,
+                   **reading) -> dict:
+    """F through the record: the CW reading at cuts every ``step`` of it.
+
+    Each cut is the same reading (``cw_reading``, the last ``periods`` of the
+    record cut there). Every cut sits a WHOLE number of drive periods before
+    the record's end -- the one nearest each 5% mark whose fractional period
+    is smallest, searched over a third of the spacing -- so every window
+    ends at the end's own drive phase and the 2f swing ``window_phase``
+    measures is one constant offset along the curve, not cut-to-cut noise
+    (5%-spaced cuts at free phase alias it into a sawtooth: measured on the
+    tiny vacuum scene, a +-0.15% saw at 8 periods on a reading flat to 6e-5).
+    ``mismatch`` is what is left of the phase, in periods.
+
+    A cut is ``fitted`` once its window starts after the drive's own
+    ``CW_RAMP_PERIODS`` ramp and the reading is a Purcell factor (P > 0).
+    """
+    n = int(np.size(field))
+    frequency = float(reading["frequency"])
+    per = _period_steps(dt, frequency)
+    window = window_steps(dt, frequency, reading["periods"])
+    ramp = int(math.ceil(CW_RAMP_PERIODS * per))
+    marks = int(round(1.0 / step))
+    reach = max(0, int(step * n / per / 3.0))
+    rows, seen = [], set()
+    for k in range(1, marks + 1):
+        target = (marks - k) * step * n / per      # periods before the end
+        best = None
+        for j in range(max(0, int(round(target)) - reach),
+                       int(round(target)) + reach + 1):
+            cut = n - int(round(j * per))
+            miss = abs((n - cut) - j * per) / per
+            key = (round(miss, 12), abs(j - target))
+            if best is None or key < best[0]:
+                best = (key, cut, miss)
+        _, cut, miss = best
+        if cut < window or cut in seen:
+            continue
+        seen.add(cut)
+        try:
+            F = cw_reading(drive[:cut], field[:cut], dt, **reading)
+            why = None
+        except fdtd.FDTDError as exc:
+            F, why = None, str(exc)
+        rows.append({"cut": cut, "t": cut * dt, "periods": cut / per, "F": F,
+                     "why": why, "mismatch": miss,
+                     "fitted": F is not None and cut - window >= ramp})
+    rows.sort(key=lambda r: r["cut"])
+    return {"rows": rows, "window": window, "ramp": ramp, "steps": n, "per": per,
+            "corr": hann_correlation([r["cut"] for r in rows if r["fitted"]],
+                                     window, per)}
+
+
+def _rise(u: float, x):
+    """``(1 - exp(-u x)) / u``, and its limit ``x`` at ``u = 0``."""
+    x = np.asarray(x, dtype=np.float64)
+    return x if u == 0.0 else -np.expm1(-u * x) / u
+
+
+def hann_correlation(cuts, window: int, period_steps: float):
+    """How the readings at ``cuts`` correlate when the field's noise is white.
+
+    Two cuts ``d`` steps apart share ``window - d`` samples of their Hann
+    windows, and the reading projects each sample on the drive's phase, so
+    their noise correlates as ``sum w(s) w(s + d) cos(2 pi d / P) / sum w^2``
+    (P the period in steps), and not at all past one window. Measured against
+    300 noisy synthetic records (cuts 3 periods apart, 8-period windows):
+    0.38 here, 0.35 and 0.43 for the two neighbours of one cut there.
+    """
+    cuts = [int(c) for c in cuts]
+    hann = fdtd._window(int(window), "hann")
+    norm = float(np.sum(hann * hann))
+    out = np.eye(len(cuts))
+    for i, a in enumerate(cuts):
+        for j in range(i + 1, len(cuts)):
+            d = abs(cuts[j] - a)
+            if d < window:
+                out[i, j] = out[j, i] = (float(np.sum(hann[d:] * hann[:window - d]))
+                                         * math.cos(2.0 * math.pi * d / period_steps)
+                                         / norm)
+    return out
+
+
+def fit_approach(t, F, *, floor: float = 0.0, corr=None) -> dict:
+    """``F(t) = F_inf - A exp(-t/tau_s)``, with the rate free to change sign.
+
+    Written as ``c + D (1 - e^{-u x}) / u`` on ``x = (t - t0) / S`` (``t0``
+    the first point, ``S`` the span), which is linear in (c, D) and smooth
+    through ``u = 0`` (a straight line), so ONE fit holds all three shapes: an
+    approach (u > 0, limit ``F_inf = c + D/u``), a straight rise (u = 0) and a
+    growth with no limit (u < 0, a growth time of ``-S/u``). u is scanned on
+    +-``APPROACH_EDGE`` and refined by golden section; (c, D) are linear least
+    squares at each u. UNWEIGHTED: every point counts the same.
+
+    The errors are one sigma, and they allow for the points' noise being
+    CORRELATED (``corr``, from :func:`hann_correlation`; the identity when
+    omitted): the least-squares sandwich ``s2 B J^T V J B``, ``B = (J^T
+    J)^-1``, with ``s2 = rss / tr((I - H) V)`` -- the residual's own variance
+    corrected for what correlated noise hides in a smooth fit -- floored at
+    ``floor`` squared, since no fit knows the curve better than the reading's
+    own floor. Fitted on F over its own scale, so a reading of 1e17 is as
+    well-conditioned as one of 1 (measured: on raw values the covariance's
+    pseudo-inverse dropped a direction and reported a tau error 4.7 x too
+    small at 1e17).
+    """
+    t = np.asarray(t, dtype=np.float64)
+    raw = np.asarray(F, dtype=np.float64)
+    n = t.size
+    if n < 3 or not t[-1] > t[0]:
+        raise ValueError(f"a three-parameter fit needs 3 points over a span, got {n}")
+    scale = float(np.max(np.abs(raw))) or 1.0
+    F = raw / scale
+    span = float(t[-1] - t[0])
+    x = (t - t[0]) / span
+    corr = np.eye(n) if corr is None else np.asarray(corr, dtype=np.float64)
+
+    def solve(u):
+        basis = np.column_stack((np.ones(n), _rise(u, x)))
+        coef, *_ = np.linalg.lstsq(basis, F, rcond=None)
+        resid = F - basis @ coef
+        return float(resid @ resid), coef
+
+    grid = np.concatenate((-np.geomspace(APPROACH_EDGE, 1e-3, 40), [0.0],
+                           np.geomspace(1e-3, APPROACH_EDGE, 40)))
+    scan = [solve(float(u))[0] for u in grid]
+    i = int(np.argmin(scan))
+    u = _golden(lambda v: solve(v)[0], float(grid[max(i - 1, 0)]),
+                float(grid[min(i + 1, grid.size - 1)]), iterations=80)
+    rss, (c, D) = solve(u)
+    h = 1e-6 * max(abs(u), 1.0)
+    jac = np.column_stack((np.ones(n), _rise(u, x),
+                           D * (_rise(u + h, x) - _rise(u - h, x)) / (2.0 * h)))
+    inner = np.linalg.pinv(jac.T @ jac)
+    hat = jac @ inner @ jac.T
+    dof = float(np.trace((np.eye(n) - hat) @ corr))
+    s2 = max(rss / dof if dof > 0 else math.inf, (float(floor) / scale) ** 2)
+    cov = s2 * inner @ jac.T @ corr @ jac @ inner
+    u_err = math.sqrt(max(float(cov[2, 2]), 0.0))
+    out = {"u": u, "u_err": u_err, "c": float(c) * scale, "D": float(D) * scale,
+           "span": span, "t0": float(t[0]), "points": n,
+           "rms": math.sqrt(rss / n) * scale,
+           "edge": bool(i in (0, grid.size - 1)), "sigma": math.sqrt(s2) * scale,
+           "rate": u / span, "rate_err": u_err / span}
+    if u > 0.0:
+        grad = np.array([1.0, 1.0 / u, -D / u ** 2])
+        out.update(F_inf=float(c + D / u) * scale,
+                   F_inf_err=math.sqrt(max(float(grad @ cov @ grad), 0.0)) * scale,
+                   A=float(D / u) * scale, tau=span / u, tau_err=span * u_err / u ** 2)
+    return out
+
+
+def classify_settling(curve: dict, *, floor: float = 0.0) -> dict:
+    """Which of four things the curve is, with the numbers that say so.
+
+    ``floor`` is the reading's own floor at the curve's cuts (what is left of
+    the 2f swing at their phase mismatch, ``settling_report``); the noise the
+    tests below use is the larger of it and the fit's residual rms, so every
+    threshold is a measured error times ``SIGNIFICANCE``:
+
+    (a) ``settled``: the final third moved less than its own noise, and the
+        approach, if there is one, has less left in it than its error;
+    (b) ``approaching``: the fitted rate is positive by more than
+        ``SIGNIFICANCE`` errors -- ``F_inf`` is then an EXTRAPOLATION;
+    (c) ``growing``: the rate is negative by as much -- growth the approach
+        model does not fit, never a Purcell factor;
+    (d) ``unresolved``: too few cuts, or a rate within its errors of zero (a
+        straight rise: the record cannot tell a slow approach from growth).
+    """
+    rows = [r for r in curve["rows"] if r["fitted"]]
+    out = {"rows": len(rows), "floor": floor}
+    if len(rows) < MIN_FIT_CUTS:
+        out.update(kind="unresolved",
+                   why=f"only {len(rows)} cuts read a window past the drive's"
+                       f" {CW_RAMP_PERIODS:g}-period ramp, and the fit needs"
+                       f" {MIN_FIT_CUTS}: record longer")
+        return out
+    t = [r["t"] for r in rows]
+    F = [r["F"] for r in rows]
+    scale = max(abs(v) for v in F)
+    floor = max(float(floor), 1e-12 * scale)
+    out["floor"] = floor
+    corr = curve["corr"]
+    fit = fit_approach(t, F, floor=floor, corr=corr)
+    # The final third, read as a straight line: its slope against the line's own
+    # residual (floored, with the same correlated-noise sandwich as the fit) is a
+    # test of "the last cuts agree within the noise" that no model of the whole
+    # curve enters -- a one-exponential misfit's residual is not noise.
+    third = [k for k, r in enumerate(rows) if 3 * r["cut"] >= 2 * curve["steps"]]
+    if len(third) < 3:
+        third = list(range(len(rows) - 3, len(rows)))
+    tt = np.array([rows[k]["t"] for k in third])
+    ff = np.array([rows[k]["F"] for k in third])
+    sub = corr[np.ix_(third, third)]
+    width = float(tt[-1] - tt[0])
+    basis = np.column_stack((np.ones(tt.size), (tt - tt[0]) / width))
+    inner = np.linalg.pinv(basis.T @ basis)
+    coef = inner @ basis.T @ ff
+    resid = ff - basis @ coef
+    dof = float(np.trace((np.eye(tt.size) - basis @ inner @ basis.T) @ sub))
+    s2 = max(float(resid @ resid) / dof if dof > 0 else math.inf, floor ** 2)
+    noise = math.sqrt(s2)
+    drift = float(coef[1])
+    drift_err = math.sqrt(max(float((s2 * inner @ basis.T @ sub @ basis @ inner)[1, 1]),
+                              0.0))
+    out.update(fit=fit, noise=noise, drift=drift, drift_err=drift_err,
+               third_from=third[0], end=rows[-1]["F"])
+    if abs(drift) <= SIGNIFICANCE * drift_err:
+        out.update(kind="settled")
+    elif fit["u"] - SIGNIFICANCE * fit["u_err"] > 0.0 and not fit["edge"]:
+        out.update(kind="approaching")
+    elif fit["u"] + SIGNIFICANCE * fit["u_err"] < 0.0:
+        out.update(kind="growing")
+    else:
+        bound = fit["u"] + SIGNIFICANCE * fit["u_err"]
+        out.update(kind="unresolved", bound=(fit["span"] / bound if bound > 0 else None),
+                   why="the fitted rate is within its errors of zero: a straight"
+                       " rise over this record, which a slow approach and a"
+                       " growth without a limit both make")
+    return out
+
+
+def parse_locator(text):
+    """``--locator-tau``: ``TAU`` or ``TAU,ERR``, both in fs, TAU > 0."""
+    try:
+        parts = [float(p) for p in str(text).split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--locator-tau wants fs or fs,fs, got {text!r}")
+    if len(parts) not in (1, 2) or not parts[0] > 0 or (len(parts) == 2 and parts[1] < 0):
+        raise argparse.ArgumentTypeError(
+            f"--locator-tau wants a positive tau in fs and an optional error, got {text!r}")
+    return (parts[0], parts[1] if len(parts) == 2 else 0.0)
+
+
+def settling_report(args, drive, field, dt: float, *, F: float, early: float,
+                    **reading) -> dict:
+    """The curve, the window's phase, the fit and the class, printed.
+
+    Every line here is NEW and printed after the two existing ones, which are
+    left exactly as they were; nothing here changes F.
+    """
+    frequency = float(reading["frequency"])
+    per_s = 1.0 / frequency
+    phase = window_phase(drive, field, dt, **reading)
+    curve = settling_curve(drive, field, dt, **reading)
+    rows = curve["rows"]
+    fitted = [r for r in rows if r["fitted"]]
+    floor = 0.0
+    if phase is not None:
+        miss = max((r["mismatch"] for r in fitted), default=0.0)
+        floor = phase["swing"] * 4.0 * math.pi * miss
+        rel = phase["swing"] / abs(phase["mean"]) if phase["mean"] else math.inf
+        print(f"phase     the window's end moved through the last drive period"
+              f" ({len(phase['cuts'])} cuts): F swings +-{phase['swing']:.4g}"
+              f" ({100.0 * rel:.3g}% of F) at twice the drive frequency, where"
+              f" the Hann's leakage of the -f image ({phase['leak']:.3g}), twice,"
+              f" times the field's quadrature ratio ({phase['quadrature']:.4g})"
+              f" predicts +-{phase['predicted']:.4g}; with that term taken out"
+              f" the end reads {phase['mean']:.4f}")
+        print(f"phase     so one reading can sit up to {phase['swing']:.4g} off by"
+              f" its window's phase alone, and two up to {2 * phase['swing']:.4g}"
+              f" apart: the two-thirds line's {F - early:+.4f} is"
+              f" {abs(F - early) / (2 * phase['swing']) if phase['swing'] else math.inf:.3g}"
+              f" of that")
+    print(f"curve     the same reading at cuts a whole number of periods before the"
+          f" end (so every window ends at the end's phase), one per"
+          f" {100 * SETTLING_STEP:g}% of the record; * = fitted (the window starts"
+          f" after the {CW_RAMP_PERIODS:g}-period ramp)")
+    for r in rows:
+        value = (f"{r['F']:.6g}" if r["F"] is not None
+                 else "no reading (" + (r["why"] or "")[:40] + ")")
+        print(f"curve     {100.0 * r['cut'] / curve['steps']:5.1f}%"
+              f" {r['periods']:8.1f} periods  F = {value}"
+              f"{'  *' if r['fitted'] else ''}")
+    verdict = classify_settling(curve, floor=floor)
+    fit = verdict.get("fit")
+    if fit is not None:
+        print(f"fit       F(t) = F_inf - A exp(-t/tau_s) over the {fit['points']}"
+              f" fitted cuts, unweighted least squares; errors are 1 sigma,"
+              f" allowing for neighbouring cuts sharing window samples (their"
+              f" Hann overlap), from the residual or the phase floor"
+              f" ({verdict['floor']:.3g}), whichever is larger")
+        if "tau" in fit:
+            print(f"fit       F_inf = {fit['F_inf']:.6g} +- {fit['F_inf_err']:.3g},"
+                  f" A = {fit['A']:.4g} at {fit['t0'] * frequency:.1f} periods,"
+                  f" tau_s = {fit['tau'] / 1e-15:.4g} +- {fit['tau_err'] / 1e-15:.3g}"
+                  f" fs = {fit['tau'] / per_s:.4g} periods"
+                  f" ({fit['tau'] / (curve['steps'] * dt):.3g} of the record);"
+                  f" residual rms {fit['rms']:.3g}"
+                  f" ({fit['rms'] / verdict['floor']:.3g} x the floor)")
+        else:
+            grow = (f"a growth time of {-fit['span'] / fit['u'] / 1e-15:.4g} fs ="
+                    f" {-fit['span'] / fit['u'] / per_s:.4g} periods"
+                    if fit["u"] < 0 else "no curvature at all")
+            print(f"fit       no limit: the rate is {fit['rate'] * 1e-15:+.4g}"
+                  f" +- {fit['rate_err'] * 1e-15:.3g} per fs, {grow};"
+                  f" residual rms {fit['rms']:.3g}"
+                  f" ({fit['rms'] / verdict['floor']:.3g} x the floor)")
+    kind = verdict["kind"]
+    if kind == "settled":
+        print(f"class     (a) settled: a line through the last third moves"
+              f" {verdict['drift']:+.4g} +- {verdict['drift_err']:.3g} across it,"
+              f" within {SIGNIFICANCE:g} of its errors (the larger of the line's"
+              f" residual and the floor): F = {verdict['end']:.6g} at the end is"
+              f" the steady state as far as this record can tell")
+    elif kind == "approaching":
+        multi = (f"; the residual is {fit['rms'] / verdict['floor']:.3g} x the floor,"
+                 f" so the curve holds more than this one time constant and an"
+                 f" extrapolation from one is biased"
+                 if fit["rms"] > SIGNIFICANCE * verdict["floor"] else "")
+        print(f"class     (b) approaching: the rate is"
+              f" {fit['u'] / fit['u_err'] if fit['u_err'] else math.inf:.3g} of its"
+              f" errors above zero, so F_inf = {fit['F_inf']:.6g} +-"
+              f" {fit['F_inf_err']:.3g} is an EXTRAPOLATION of this curve, not a"
+              f" reading: the end reads {verdict['end']:.6g}{multi}")
+    elif kind == "growing":
+        print(f"class     (c) growing without a limit: the approach model does not"
+              f" fit (its rate is {-fit['u'] / fit['u_err'] if fit['u_err'] else math.inf:.3g}"
+              f" errors below zero). A likely numerical problem: the F above is"
+              f" NOT a Purcell factor")
+    else:
+        extra = (f"; tau_s, if it is an approach, is above"
+                 f" {verdict['bound'] / 1e-15:.4g} fs"
+                 if verdict.get("bound") else "")
+        print(f"class     (d) unresolved: {verdict['why']}{extra}")
+    locator = getattr(args, "locator_tau", None)
+    if locator is not None:
+        locator_line(locator, verdict, frequency=frequency, early=early, F=F,
+                     steps=curve["steps"], dt=dt)
+    verdict.update(curve=curve, phase=phase)
+    return verdict
+
+
+def locator_line(locator, verdict: dict, *, frequency: float, early: float,
+                 F: float, steps: int, dt: float) -> str:
+    """The curve's tau_s against a ring-down locator's tau, in plain words."""
+    tau_l, err_l = float(locator[0]) * 1e-15, float(locator[1]) * 1e-15
+    fit = verdict.get("fit") or {}
+    # what one mode with the locator's tau would leave between the two-thirds cut
+    # and the end, as a share of the change the curve made from its first cut
+    lines = []
+    if verdict["kind"] == "approaching" and "tau" in fit:
+        tau, err = fit["tau"], fit["tau_err"]
+        ratio = tau / tau_l
+        t1 = fit["t0"]
+        t23 = (2 * steps // 3) * dt
+        tend = steps * dt
+        share = ((math.exp(-(t23 - t1) / tau_l) - math.exp(-(tend - t1) / tau_l))
+                 / max(1.0 - math.exp(-(tend - t1) / tau_l), 1e-300))
+        lines.append(
+            f"locator   tau_s = {tau / 1e-15:.4g} +- {err / 1e-15:.3g} fs against the"
+            f" locator's {tau_l / 1e-15:.4g} +- {err_l / 1e-15:.3g} fs: {ratio:.3g} x."
+            f" One mode with the locator's tau would make {100 * share:.3g}% of"
+            f" this curve's rise after the two-thirds cut")
+        if tau - SIGNIFICANCE * err > tau_l + SIGNIFICANCE * err_l:
+            lines.append(
+                "locator   tau_s is longer than the locator's tau beyond both"
+                " errors, so a single mode with the locator's tau cannot make"
+                " this curve. Something slower than that mode is moving the"
+                " reading -- or the locator's tau is not this mode's: a"
+                " ring-down fit whose frequency grid is coarser than the line can"
+                " stop on a short tau (change cw-settling measured fit_decay at"
+                " 113 fs on a 252 fs mode); read its rms against its peak.")
+        elif tau + SIGNIFICANCE * err < tau_l - SIGNIFICANCE * err_l:
+            lines.append("locator   tau_s is shorter than the locator's tau beyond"
+                         " both errors")
+        else:
+            lines.append("locator   tau_s agrees with the locator's tau within"
+                         " their errors: the curve is that mode's own approach")
+    else:
+        lines.append(f"locator   the locator's tau is {tau_l / 1e-15:.4g} fs; this"
+                     f" curve is {verdict['kind']}, so it has no tau_s to set"
+                     f" against it")
+    for line in lines:
+        print(line)
+    return "\n".join(lines)
+
+
+SERIES_KEYS = ("drive", "source_field", "dt", "frequency_hz", "volume", "eps_r",
+               "index", "window_periods", "wavelength_nm")
+
+
+def save_series(path, drive, field, *, dt: float, frequency: float, volume: float,
+                eps_r: float, index: float, window_periods: float,
+                wavelength_nm: float) -> str:
+    """Write the CW record the reading came from, compressed; returns the path.
+
+    Everything ``cw_reading`` needs travels with the two series, at the dtype
+    the run recorded them in, so a re-read of the file gives the identical F
+    and the curve can be re-cut (another window, another fit) without a run.
+    """
+    np.savez_compressed(path, drive=np.asarray(drive), source_field=np.asarray(field),
+                        dt=float(dt), frequency_hz=float(frequency), volume=float(volume),
+                        eps_r=float(eps_r), index=float(index),
+                        window_periods=float(window_periods),
+                        wavelength_nm=float(wavelength_nm))
+    return _npz_path(path)
+
+
+def load_series(path) -> dict:
+    """The other half of :func:`save_series`, read by the argument it was given."""
+    with np.load(_npz_path(path)) as z:
+        missing = [k for k in SERIES_KEYS if k not in z.files]
+        if missing:
+            raise ValueError(f"{_npz_path(path)} is not a --save-series record:"
+                             f" it has no {', '.join(missing)}")
+        out = {k: (z[k] if z[k].ndim else z[k].item()) for k in SERIES_KEYS}
+    return out
+
+
+def read_cw(args, drive, field, dt: float, *, volume: float, eps_r: float,
+            index: float, frequency: float, wavelength_nm: float):
+    """The CW reading of one record, printed: the two lines it always had, the
+    ``--save-series`` write if asked, then the settling block. Returns (F, P)."""
+    reading = {"volume": volume, "eps_r": eps_r, "index": index,
+               "frequency": frequency, "periods": args.window_periods}
+    power, reference = cw_powers(drive, field, dt, **reading)
     F = fdtd.purcell_factor(power, reference)
-    print(f"measured  F = {F:.4f} at {args.wavelength:.0f} nm  (P = {power:.6e} W,"
+    print(f"measured  F = {F:.4f} at {wavelength_nm:.0f} nm  (P = {power:.6e} W,"
           f" P0 = {reference:.6e} W)")
     # One number cannot say whether the window it came from had stopped rising:
     # the same mean over the same window, ended at two places in one record, can.
@@ -1233,21 +1780,59 @@ def measure(args, lay, request, measured):
     # so the earlier reading is those same functions on this record cut at the
     # two-thirds step: the same running scene, not a second run and not a
     # different estimator.
-    cut = (2 * np.size(sim["source_field"])) // 3
-    early = fdtd.purcell_factor(
-        fdtd.delivered_power(sim["drive"][:cut], sim["source_field"][:cut], dt,
-                             volume=volume, eps_r=eps_applied,
-                             periods=args.window_periods,
-                             frequency=request["frequency_hz"]),
-        fdtd.larmor_power(
-            fdtd.dipole_moment(sim["drive"][:cut], dt, volume=volume,
-                               eps_r=eps_applied, periods=args.window_periods,
-                               frequency=request["frequency_hz"]),
-            request["frequency_hz"], index=index))
+    cut = (2 * np.size(field)) // 3
+    early = cw_reading(drive[:cut], field[:cut], dt, **reading)
     spread = (f", {100.0 * (F / early - 1.0):+.1f}% between them"
               if early > 0.0 else "")
     print(f"settling  F = {early:.4f} at two thirds of the record against"
           f" {F:.4f} at its end{spread}")
+    path = getattr(args, "save_series", None)
+    if path:
+        # After the reading is printed and before the new analysis: a failed write
+        # cannot take the number down, and a fault in the analysis cannot lose
+        # the record a full-size run paid for.
+        try:
+            wrote = save_series(path, drive, field, dt=dt, frequency=frequency,
+                                volume=volume, eps_r=eps_r, index=index,
+                                window_periods=args.window_periods,
+                                wavelength_nm=wavelength_nm)
+        except OSError as exc:
+            print(f"warning   the series was not written ({type(exc).__name__}:"
+                  f" {exc}): the reading above is this run's own, and a re-read"
+                  f" of this record now needs another run")
+        else:
+            print(f"series    {np.size(field):,} steps of drive and source field,"
+                  f" with dt and the reading's constants, in {wrote}:"
+                  f" --from-series re-reads it without a run")
+    settling_report(args, drive, field, dt, F=F, early=early, **reading)
+    return F, power
+
+
+def from_series(args) -> int:
+    """``--from-series``: the CW reading of a saved record, without a run."""
+    try:
+        rec = load_series(args.from_series)
+    except (OSError, ValueError) as exc:
+        print(f"refused: {exc}")
+        return 2
+    print(f"series    {np.size(rec['source_field']):,} steps from"
+          f" {_npz_path(args.from_series)}: dt {rec['dt']:.6e} s, f"
+          f" {rec['frequency_hz'] / 1e12:.4f} THz, window {args.window_periods:g}"
+          f" periods (the run read {rec['window_periods']:g})")
+    read_cw(args, rec["drive"], rec["source_field"], rec["dt"], volume=rec["volume"],
+            eps_r=rec["eps_r"], index=rec["index"], frequency=rec["frequency_hz"],
+            wavelength_nm=rec["wavelength_nm"])
+    return 0
+
+
+def measure(args, lay, request, measured):
+    """The CW arm: one frequency, a settled tail, F = P/P0."""
+    sim, volume, index, eps_applied = _run(args, lay, request, measured)
+    dt = measured["est"]["dt"]
+    F, power = read_cw(args, sim["drive"], sim["source_field"], dt, volume=volume,
+                       eps_r=eps_applied, index=index,
+                       frequency=request["frequency_hz"],
+                       wavelength_nm=args.wavelength)
     if measured.get("phasor") is not None:
         measured["collection"] = collection(
             args, sim["phasor_faces"][0], float(request["frequency_hz"]), power)
@@ -1790,6 +2375,20 @@ def PARSER_ARGUMENTS(p) -> None:
                         " scene (wire, oxide and gold pad) and prints the"
                         " fraction of the upward far-field power inside this"
                         " numerical aperture in air; off by default")
+    p.add_argument("--save-series", metavar="PATH", default=None,
+                   help="the CW arm also writes its drive and source-field series"
+                        " (with dt, frequency, cell volume, eps_r and index) to"
+                        " PATH as a compressed .npz, so the reading and its"
+                        " settling curve can be re-read without a run; off by"
+                        " default")
+    p.add_argument("--from-series", metavar="PATH", default=None,
+                   help="re-read a --save-series record: the CW reading, its"
+                        " settling curve and class, with no scene and no run"
+                        " (--window-periods and --locator-tau still apply)")
+    p.add_argument("--locator-tau", metavar="FS[,ERR]", default=None,
+                   type=parse_locator,
+                   help="a ring-down locator's decay time (and error), fs: the"
+                        " CW arm sets its settling time against it in plain words")
 
 
 def main(argv=None) -> int:
@@ -1799,6 +2398,8 @@ def main(argv=None) -> int:
     if why:
         print(why)
         return 2
+    if getattr(args, "from_series", None) is not None:
+        return from_series(args)
     if args.estimate:
         return ladder(args)          # --tiny --estimate is the table at the tiny dims
     if args.tiny:
