@@ -26,8 +26,15 @@ from exact least squares.
 - **THEN** every tau is within 1% of its truth. Measured over 60 such tails,
   the worst was 0.19%. The old search got 33 of 60 wrong by 14.6% to 97%.
   Its descent multi-started from the best 3 or 5 cells got 33 and 31 wrong.
-  This search with bins 1/window apart got 9 wrong, and with bins 1/(4
-  windows) apart none
+  This search got none
+
+#### Scenario: long, quiet lines need bins finer than the window
+- **WHEN** tails with tau 1060, 4000 and 8000 fs under 1e-4 of noise sit
+  0.083 to 0.75 of the way between old columns
+- **THEN** every tau is within 1%. Measured over 60 such tails (700 to 8000
+  fs, 12 places): bins 1/window apart left 5 wrong, 12.7% to 18.3% short with
+  f right. Bins 1/(2, 4 or 8 windows) apart left none (worst 0.04%), all at
+  about 550 ms a fit
 
 ### Requirement: The ring-down fit SHALL descend inside the chosen basin
 

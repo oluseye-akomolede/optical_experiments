@@ -5,8 +5,10 @@
   samples of 0.15 fs) gave 108.05 fs at rms 0.38 of the peak.
 - [x] 2. Measure the three candidate fixes on 60 such tails (10 taus x 6
   places between columns, 1e-3 noise). Multi-starting the old descent from 3
-  and 5 cells left 33 and 31 wrong. FFT bins at 1, 4 and 8 per window left
-  9, 0 and 0 wrong. Chosen: 8.
+  and 5 cells left 33 and 31 wrong; the FFT scan with a basin descent, none.
+  The bin spacing on 60 long lines (700-8000 fs, 1e-4 noise) with the final
+  descent: 1 bin per window left 5 wrong (13-18% short), 2, 4 and 8 none, all
+  at about 550 ms a fit. Chosen: 8, four times the coarsest that worked.
 - [x] 3. `scripts/paper1_nanowire.py`: `_decay_scan` (FFT scan),
   `_local_minima`, `fit_decay`'s basin descent, rivals, `rival` and
   `ambiguous`, plus the constants `DECAY_PAD`, `RIVALS`, `RIVAL_ITERATIONS`
