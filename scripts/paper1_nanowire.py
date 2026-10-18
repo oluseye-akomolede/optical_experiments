@@ -65,6 +65,16 @@ refuses. What its error is not: the model's covariance knows about the residual
 and nothing about the geometry, so the same arm on ``--vacuum`` (no cavity at
 all) is the reading to put beside it.
 
+``--collection-na 0.8`` is the collection reading, an addition to the CW arm
+and off by default: a phasor box (``fdtd.simulate``'s ``phasor_box``) around
+the WHOLE scene -- the wire, the oxide and the entire gold pad, every face in
+the open vacuum pad -- read over the CW tail, and ``farfield``'s fraction of
+the upward far-field power inside that aperture. The mirror is inside the box
+rather than modelled by a PEC image, which on a finite Lorentz-Drude pad was
+measured 0.14 off (openspec change ``paper1-collection``,
+``tests/test_phasor_mirror.py``). The fraction is the finite pad's, so it
+owes the same pad convergence the F reading does.
+
 Item (7) of the handoff (a dielectric that is a function, not a scalar) does not
 bind the measurement this script makes: the dipole sits on the wire's axis, 30
 nm below the top facet and clear of every graded interface, so the source cell's
@@ -361,24 +371,47 @@ def run_limits(args) -> dict:
                             else max(fdtd.MAX_SECONDS, float(seconds)))}
 
 
-def filled(args, lay, request):
-    """The layout's estimate, the caps' verdict, and the record's own reach."""
+def phasor_estimate(plan) -> dict:
+    """``fdtd.estimate_run``'s phasor-box arguments for a collection plan."""
+    if plan is None:
+        return {}
+    return {"phasor_box": plan["box"], "phasor_frequencies": [plan["frequency"]],
+            "phasor_steps": plan["steps"]}
+
+
+def filled(args, lay, request, geom=None):
+    """The layout's estimate, the caps' verdict, and the record's own reach.
+
+    With ``--collection-na`` it also places the phasor box (``geom`` is then
+    required) and prices it into the estimate the caps are checked against;
+    the plan is ``"phasor"`` in the result, None without the flag.
+    """
     est = fdtd.estimate_run(lay["nodes"], duration=request["duration_s"],
                             boundary=request["boundary"], metals=lay["metals"],
                             pec=lay["pec"])
     steps = steps_for(args, request, est["dt"])
     request["duration_s"] = steps * est["dt"]
+    phasor = None
+    if getattr(args, "collection_na", None) is not None:
+        if geom is None:
+            raise ValueError("the collection arm places its box from the scene's"
+                             " geometry; pass geom")
+        phasor = collection_plan(args, lay["nodes"], geom, request, est["dt"],
+                                 steps, eps=lay.get("eps"), metals=lay["metals"])
     est = fdtd.estimate_run(lay["nodes"], duration=request["duration_s"],
                             boundary=request["boundary"], metals=lay["metals"],
-                            pec=lay["pec"])
+                            pec=lay["pec"], **phasor_estimate(phasor))
     exceeded = None
     try:
         fdtd.check_limits(est, **run_limits(args))
     except fdtd.EstimateError as exc:
         exceeded = str(exc)
     dlambda = (args.wavelength * NM) ** 2 / (C * est["steps"] * est["dt"]) / NM
-    return {"est": est, "steps": est["steps"], "exceeded": exceeded,
-            "dlambda_nm": dlambda}
+    out = {"est": est, "steps": est["steps"], "exceeded": exceeded,
+           "dlambda_nm": dlambda}
+    if phasor is not None:
+        out["phasor"] = phasor
+    return out
 
 
 def emitter_depth_nm(lay, geom) -> float:
@@ -391,6 +424,168 @@ def emitter_depth_nm(lay, geom) -> float:
     """
     z = np.asarray(lay["nodes"][2])
     return float((geom["z_top"] - z[int(lay["cell"][2])]) / NM)
+
+
+COLLECTION_CLEAR_CELLS = 2   # node layers between a phasor face and the nearest part
+
+
+def scene_extent(geom):
+    """The parts' bounding box in the layout's frame, metres: ``(lo, hi)``.
+
+    The layout's origin is the parts' bounding-box minimum corner (``scene``),
+    so the box runs from 0 to the mirror's width in x and y and from the
+    gold's underside (0) to the wire's top facet in z.
+    """
+    width = 2.0 * geom["half"]
+    return (0.0, 0.0, 0.0), (width, width, geom["z_top"])
+
+
+def _pick_layers(lo_range, hi_range):
+    """Face layers ``(lo, hi)`` nearest the middle of each range, ``lo + hi`` even.
+
+    ``simulate`` spells a box as ``centre +/- half_extent``, so the two faces
+    on an axis must be an even number of layers apart. None if no pair is.
+    """
+    def by_middle(span):
+        a, b = span
+        mid = 0.5 * (a + b)
+        return sorted(range(a, b + 1), key=lambda k: (abs(k - mid), k))
+    best = None
+    for i, lo in enumerate(by_middle(lo_range)):
+        for j, hi in enumerate(by_middle(hi_range)):
+            if (lo + hi) % 2 == 0 and (best is None or i + j < best[0]):
+                best = (i + j, lo, hi)
+    return None if best is None else best[1:]
+
+
+def collection_box(nodes, geom, pml_cells, *, eps=None, metals=None):
+    """The phasor box of the collection arm: around the WHOLE scene, in vacuum.
+
+    Returns ``{"box": (centre, half_extent), "lo", "hi", "clear", "absorber"}``
+    (node layers, per axis) or raises ``fdtd.FDTDError`` saying which axis has
+    no room. The six faces enclose the wire, the oxide and the entire gold pad,
+    so every source of the scattered field -- the dipole, the wire's and the
+    oxide's polarisation, the gold's induced currents -- is inside, and outside
+    is the open vacuum pad: there the free-space transform ``farfield.py``
+    applies is exact, with no mirror model at all (openspec change
+    ``paper1-collection``: a PEC image of a finite Lorentz-Drude pad was
+    measured +0.14 off on a small one).
+
+    Each face sits in the middle of the free gap on its side: at least
+    ``COLLECTION_CLEAR_CELLS`` node layers outside the parts, so its samples
+    and the H half a cell outside it are vacuum, and inside the layers
+    ``pml + 1 .. n - 2 - pml`` ``fdtd.phasor_box_layers`` allows. ``nodes`` are
+    the layout's (or the plan's) node coordinates. With ``eps`` and ``metals``
+    (a voxelised layout) the faces' own slabs are checked to be vacuum, so a
+    frame slip cannot put a face through the gold unnoticed.
+    """
+    lo_m, hi_m = scene_extent(geom)
+    pml = int(pml_cells)
+    lo, hi, clear, absorber = [], [], [], []
+    for a in range(3):
+        z = np.asarray(nodes[a], dtype=np.float64)
+        n = z.size
+        tol = 1e-6 * float(np.min(np.diff(z)))
+        first = int(np.searchsorted(z, lo_m[a] + tol, "right")) - 1   # node at/below
+        last = int(np.searchsorted(z, hi_m[a] - tol, "left"))         # node at/above
+        lo_range = (pml + 1, first - COLLECTION_CLEAR_CELLS)
+        hi_range = (last + COLLECTION_CLEAR_CELLS, n - 2 - pml)
+        picked = (None if lo_range[0] > lo_range[1] or hi_range[0] > hi_range[1]
+                  else _pick_layers(lo_range, hi_range))
+        if picked is None:
+            raise fdtd.FDTDError(
+                f"the collection box has no room on axis {'xyz'[a]}: the parts"
+                f" span node layers {first}..{last} of {n}, a face must be"
+                f" {COLLECTION_CLEAR_CELLS} layers outside them and inside"
+                f" {pml + 1}..{n - 2 - pml} (the {pml}-cell absorber and the H"
+                f" half cell a face reads), which leaves layers"
+                f" {lo_range[0]}..{lo_range[1]} below and"
+                f" {hi_range[0]}..{hi_range[1]} above; widen --pad-nm or thin"
+                f" the absorber")
+        lo.append(picked[0])
+        hi.append(picked[1])
+        clear.append((first - picked[0], picked[1] - last))
+        absorber.append((picked[0] - pml, n - 1 - pml - picked[1]))
+    box = (tuple((l + h) // 2 for l, h in zip(lo, hi)),
+           tuple((h - l) // 2 for l, h in zip(lo, hi)))
+    if eps is not None:
+        eps = np.asarray(eps)
+        solid = np.zeros(eps.shape, dtype=bool)
+        for region in dict(metals or {}).values():
+            solid |= np.asarray(region, dtype=bool)
+        for a in range(3):
+            for layer in (lo[a], hi[a]):
+                shell = [slice(lo[b] - 1, hi[b] + 2) for b in range(3)]
+                shell[a] = slice(layer - 1, layer + 2)
+                shell = tuple(shell)
+                if np.any(eps[shell] != 1.0) or np.any(solid[shell]):
+                    raise fdtd.FDTDError(
+                        f"the collection box's face at node layer {layer} on"
+                        f" axis {'xyz'[a]} touches material: the free-space"
+                        f" transform needs vacuum outside every source")
+    return {"box": box, "lo": tuple(lo), "hi": tuple(hi), "clear": clear,
+            "absorber": absorber}
+
+
+def tail_steps(args, request, dt: float) -> int:
+    """The CW reading's window in steps: ``fdtd._steady_tail``'s own rounding."""
+    return int(round(int(args.window_periods) / (float(request["frequency_hz"]) * dt)))
+
+
+def collection_plan(args, nodes, geom, request, dt: float, steps: int, *,
+                    eps=None, metals=None):
+    """The phasor box and the steps it reads, or None without --collection-na.
+
+    The box reads the same Hann-windowed tail the CW reading averages, so the
+    surface power and the delivered power are two readings of one window.
+    """
+    if getattr(args, "collection_na", None) is None:
+        return None
+    placed = collection_box(nodes, geom, geom["pml_cells"], eps=eps, metals=metals)
+    tail = min(tail_steps(args, request, dt), int(steps))
+    return {**placed, "frequency": float(request["frequency_hz"]),
+            "start": int(steps) - tail, "steps": tail}
+
+
+def collection_line(plan, geom) -> str:
+    """The box the arm will record, printed before the run."""
+    lo, hi = plan["lo"], plan["hi"]
+    return (f"box       phasor faces at node layers x {lo[0]}..{hi[0]},"
+            f" y {lo[1]}..{hi[1]}, z {lo[2]}..{hi[2]}: the wire, the oxide and"
+            f" the whole {2 * geom['half'] / NM:.0f} nm mirror inside, all six"
+            f" faces in vacuum, {min(min(c) for c in plan['clear'])} or more layers"
+            f" clear of the parts and {min(min(c) for c in plan['absorber'])} or"
+            f" more of the absorber; read over the last {plan['steps']:,} steps")
+
+
+def collection(args, faces, frequency: float, delivered: float) -> dict:
+    """The collection arm's reading of one run's phasor faces, printed.
+
+    The fraction is ``farfield.collection_fraction``: the far-field power in
+    the cone ``theta <= asin(NA)`` about +z over the power in the upper
+    hemisphere. The sanity lines are the box's surface power against the
+    power the source delivered (below 1 by what the gold absorbs: the wire and
+    the oxide are lossless) and the full-sphere far field against the surface
+    power (the transform's own closure, 1 for a box in vacuum).
+    """
+    import farfield     # the far-field module imports fdtd; only this arm needs it
+    na = float(args.collection_na)
+    cone = farfield.cone_power(faces, frequency, math.asin(na))
+    upward = farfield.hemisphere_power(faces, frequency)
+    sphere = farfield.cone_power(faces, frequency, math.pi)
+    surface = farfield.surface_power(faces)
+    fraction = farfield.collection_fraction(faces, frequency, na)
+    print(f"collect   NA {na:.2f}: {fraction:.4f} of the upward far-field power"
+          f" (cone {cone:.6e} W of {upward:.6e} W upward), {cone / sphere:.4f} of"
+          f" all the power radiated")
+    print(f"surface   upward {upward:.6e} W, total {surface:.6e} W through the"
+          f" box ({upward / surface:.4f} of it upward)")
+    print(f"sanity    box surface power / delivered power = {surface / delivered:.4f}"
+          f" (below 1 by what the gold absorbs: the wire and the oxide are"
+          f" lossless); full-sphere far field / surface"
+          f" power = {sphere / surface:.4f}")
+    return {"fraction": fraction, "cone": cone, "upward": upward,
+            "sphere": sphere, "surface": surface, "delivered": delivered}
 
 
 def refusals(args, measured, lay=None, geom=None) -> str:
@@ -470,6 +665,20 @@ def arm_conflicts(args) -> str:
         return ("refused: --save-tail writes the pulse record the tail arm fits,"
                 " so on a non-ring-down (CW or band) run the flag is silently"
                 " ignored and the caller believes a record was written")
+    na = getattr(args, "collection_na", None)
+    if na is not None:
+        if not 0.0 < na <= 1.0:
+            return (f"refused: --collection-na {na:g} is not a numerical aperture"
+                    f" in air, which is in (0, 1]")
+        if args.profile != "cw":
+            return ("refused: --collection-na reads the CW arm's settled steady"
+                    " state at --wavelength; a pulse record (--spectrum,"
+                    " --ringdown, --profile pulse) has no single frequency to read"
+                    " it at")
+        if args.tiny and not args.estimate:
+            return ("refused: --collection-na with --tiny: the tier-1 controls do"
+                    " not read the collection arm, so the flag would be inert;"
+                    " run the arm on its own (--tiny --estimate prices it)")
     pad_nm = getattr(args, "pad_nm", None)
     pml_nm = getattr(args, "pml_nm", None)
     for flag, nm in (("--pad-nm", pad_nm), ("--pml-nm", pml_nm)):
@@ -977,12 +1186,17 @@ def source_and_terms(args, lay, request):
 def _run(args, lay, request, measured):
     source, terms, volume, index, eps_applied = source_and_terms(args, lay,
                                                                  request)
+    # the collection arm's box; without --collection-na the call is unchanged
+    phasor = measured.get("phasor")
+    extra = ({} if phasor is None else
+             {"phasor_box": phasor["box"], "phasor_frequencies": [phasor["frequency"]],
+              "phasor_start": phasor["start"], "phasor_window": "hann"})
     started = time.monotonic()
     sim = fdtd.simulate(lay["eps"], source, measured["est"]["steps"],
                         lay["probes"], spacings=lay["spacings"],
                         boundary=request["boundary"], pec=lay["pec"],
                         pml_cells=lay["pml_cells"], ade_terms=terms, xp=args.xp,
-                        record_drive=True, record_source_field=True)
+                        record_drive=True, record_source_field=True, **extra)
     wall = time.monotonic() - started
     estimate = measured["est"]["seconds"]
     # The run reports its own prediction ratio, so a logged run carries the
@@ -1034,6 +1248,9 @@ def measure(args, lay, request, measured):
               if early > 0.0 else "")
     print(f"settling  F = {early:.4f} at two thirds of the record against"
           f" {F:.4f} at its end{spread}")
+    if measured.get("phasor") is not None:
+        measured["collection"] = collection(
+            args, sim["phasor_faces"][0], float(request["frequency_hz"]), power)
     return F
 
 
@@ -1388,6 +1605,13 @@ def ladder(args) -> int:
             steps = steps_for(sub, request, est["dt"])
             request["duration_s"] = steps * est["dt"]
             est = fdtd_layout.estimate(plan, request, record_frames=False)
+            # the collection arm's box, priced as the run path prices it
+            phasor = collection_plan(sub, plan["nodes"], geom, request,
+                                     est["dt"], est["steps"])
+            if phasor is not None:
+                est["bytes"] += fdtd.phasor_box_bytes(
+                    phasor["box"], est["shape"], frequencies=[phasor["frequency"]],
+                    steps=phasor["steps"])
             fdtd.check_limits(est, **lim)
         except fdtd.FDTDError as exc:
             print(f"{dx:5.1f} {pad:6.0f}   refused"
@@ -1561,6 +1785,11 @@ def PARSER_ARGUMENTS(p) -> None:
     p.add_argument("--spectrum", action="store_true",
                    help="a pulse run, read bin by bin")
     p.add_argument("--tiny", action="store_true", help="the tier-1 control")
+    p.add_argument("--collection-na", type=float, default=None, metavar="NA",
+                   help="the CW arm also records a phasor box around the whole"
+                        " scene (wire, oxide and gold pad) and prints the"
+                        " fraction of the upward far-field power inside this"
+                        " numerical aperture in air; off by default")
 
 
 def main(argv=None) -> int:
@@ -1576,10 +1805,18 @@ def main(argv=None) -> int:
         return tiny(args)
 
     lay, request, geom = solve_scene(args)
-    measured = filled(args, lay, request)
+    try:
+        measured = filled(args, lay, request, geom)
+    except fdtd.FDTDError as exc:
+        if args.collection_na is None:   # not this arm's: as it always was
+            raise
+        print(f"refused: {exc}")         # the collection box has no room
+        return 2
     code = report(args, lay, request, geom, measured)
     if code:
         return code
+    if measured.get("phasor") is not None:
+        print(collection_line(measured["phasor"], geom))
     why = refusals(args, measured, lay, geom)
     if why:
         print(why)

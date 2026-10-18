@@ -22,7 +22,12 @@
   -q` passes; `python tests/check_discriminating.py phasor-<name>` for each
   case; `npx -y @fission-ai/openspec validate phasor-box-monitor --strict`.
   No image smoke test and no e2e job: no job can request the option.
-- [ ] 5. Later, a separate change: the paper-1 run that reads the collection
+- [x] 5. Later, a separate change: the paper-1 run that reads the collection
   fraction within NA 0.8 from these faces, with the box over the gold mirror
   (`pec_mirror_z`, or an open bottom) and the option counted in
-  `memory_estimate` if a job is to request it.
+  `memory_estimate` if a job is to request it. Done in change
+  `paper1-collection`: `--collection-na` on `scripts/paper1_nanowire.py`, the
+  box around the whole gold pad (neither the image nor an open bottom: both
+  measured off on a finite Lorentz-Drude pad), and `phasor_box_bytes` in
+  `memory_estimate`. The full-size reading is that change's task 7, on the
+  GPU.

@@ -1006,6 +1006,144 @@ for _name, _why, _path, _old, _new, _fails, _file in (
                       expect_failing=set(_fails), test_file=_file))
 
 
+COLLECTION_TEST_FILE = "tests/test_paper1_collection.py"
+MEMORY_TEST_FILE = "tests/test_fdtd_memory.py"
+
+# The paper-1 collection arm (change paper1-collection): the box placement, its
+# refusals, the arm's reading, the off-by-default path, and the phasor box in
+# the memory estimate. Each set is measured.
+_ENCLOSE = {f"test_the_box_encloses_the_whole_scene_inside_the_open_pad[{k}]"
+            for k in ("tiny", "tight", "paper", "run-1")}
+_COUNTED = "test_a_phasor_box_is_counted_as_the_monitor_allocates_it"
+_NO_ROOM = "test_a_layout_with_no_room_for_the_box_is_refused"
+_VACUUM = "test_the_arm_reads_the_free_dipole_in_vacuum"
+_PRICED = "test_the_box_is_priced_into_the_estimate_the_caps_read"
+_LADDER_PRICES = "test_the_ladder_prices_the_box_on_every_rung"
+_LADDER_REFUSES = "test_the_ladder_refuses_a_rung_with_no_room"
+_OFF = "test_without_the_flag_the_run_is_the_one_it_was"
+_INSIDE = {f"test_a_phasor_box_run_stays_inside_its_estimate[{k}]"
+           for k in ("box0-frequencies0-60-20", "box1-frequencies1-80-10",
+                     "box2-frequencies2-60-30")}
+for _name, _why, _path, _old, _new, _fails, _file in (
+    ("collection-parts-frame",
+     "the parts' bounds taken in their own centred frame, not the layout's (origin at the "
+     "bounding box's minimum corner): the box shifts by half the mirror",
+     PAPER1,
+     "    return (0.0, 0.0, 0.0), (width, width, geom[\"z_top\"])\n",
+     "    return (-0.5 * width, -0.5 * width, 0.0), (0.5 * width, 0.5 * width,"
+     " geom[\"z_top\"])\n",
+     _ENCLOSE | {_NO_ROOM, _VACUUM, _PRICED, _LADDER_PRICES, _LADDER_REFUSES, _OFF},
+     COLLECTION_TEST_FILE),
+    ("collection-no-clearance",
+     "the high faces placed without the 2 layers of clearance from the parts",
+     PAPER1,
+     "        hi_range = (last + COLLECTION_CLEAR_CELLS, n - 2 - pml)\n",
+     "        hi_range = (last, n - 2 - pml)\n",
+     _ENCLOSE | {_NO_ROOM, _VACUUM, _LADDER_REFUSES},
+     COLLECTION_TEST_FILE),
+    ("collection-absorber",
+     "the low faces placed from layer 1, forgetting the absorber",
+     PAPER1,
+     "        lo_range = (pml + 1, first - COLLECTION_CLEAR_CELLS)\n",
+     "        lo_range = (1, first - COLLECTION_CLEAR_CELLS)\n",
+     _ENCLOSE | {_VACUUM},
+     COLLECTION_TEST_FILE),
+    ("collection-parity",
+     "any pair of layers taken, so centre +/- half_extent is not the faces picked",
+     PAPER1,
+     "            if (lo + hi) % 2 == 0 and (best is None or i + j < best[0]):\n",
+     "            if best is None or i + j < best[0]:\n",
+     _ENCLOSE | {_VACUUM},
+     COLLECTION_TEST_FILE),
+    ("collection-shell-metal",
+     "the faces' vacuum check reads the permittivity only, not the metal masks",
+     PAPER1,
+     "                if np.any(eps[shell] != 1.0) or np.any(solid[shell]):\n",
+     "                if np.any(eps[shell] != 1.0):\n",
+     {"test_a_face_through_material_is_refused"},
+     COLLECTION_TEST_FILE),
+    ("collection-pulse-allowed",
+     "the arm allowed on a pulse record, which has no one frequency to read",
+     PAPER1,
+     "        if args.profile != \"cw\":\n",
+     "        if False:\n",
+     {"test_the_arm_refuses_what_it_cannot_read"},
+     COLLECTION_TEST_FILE),
+    ("collection-whole-record",
+     "the box read from step 0, through the ramp, not over the CW reading's tail",
+     PAPER1,
+     "            \"start\": int(steps) - tail, \"steps\": tail}\n",
+     "            \"start\": 0, \"steps\": tail}\n",
+     {_VACUUM, _PRICED, _OFF},
+     COLLECTION_TEST_FILE),
+    ("collection-of-all",
+     "the fraction printed over all the radiated power, not the upward hemisphere",
+     PAPER1,
+     "    fraction = farfield.collection_fraction(faces, frequency, na)\n",
+     "    fraction = cone / sphere\n",
+     {_VACUUM, _OFF},
+     COLLECTION_TEST_FILE),
+    ("collection-run-without-box",
+     "the run never handed the box: the arm has no faces to read",
+     PAPER1,
+     "    extra = ({} if phasor is None else\n",
+     "    extra = ({} if True else\n",
+     {_VACUUM, _OFF},
+     COLLECTION_TEST_FILE),
+    ("collection-unpriced",
+     "the run path's estimate without the box: the caps check a run smaller than the one run",
+     PAPER1,
+     "                            pec=lay[\"pec\"], **phasor_estimate(phasor))\n",
+     "                            pec=lay[\"pec\"])\n",
+     {_PRICED},
+     COLLECTION_TEST_FILE),
+    ("collection-ladder-unpriced",
+     "the ladder's rungs priced without the box",
+     PAPER1,
+     "                est[\"bytes\"] += fdtd.phasor_box_bytes(\n",
+     "                est[\"bytes\"] += 0 * fdtd.phasor_box_bytes(\n",
+     {_LADDER_PRICES},
+     COLLECTION_TEST_FILE),
+    ("memory-phasor-uncounted",
+     "memory_estimate ignores a phasor box",
+     FDTD,
+     "    if phasor_box is not None:\n        total += phasor_box_bytes(",
+     "    if False:\n        total += phasor_box_bytes(",
+     {_COUNTED},
+     MEMORY_TEST_FILE),
+    ("memory-phasor-uncounted-arm",
+     "the same, seen from the paper-1 run path",
+     FDTD,
+     "    if phasor_box is not None:\n        total += phasor_box_bytes(",
+     "    if False:\n        total += phasor_box_bytes(",
+     {_PRICED},
+     COLLECTION_TEST_FILE),
+    ("memory-phasor-tables",
+     "the phase tables left out of the box's bytes",
+     FDTD,
+     "    total += 2 * 16 * count * int(steps)         # the E and H phase tables\n",
+     "",
+     {_COUNTED},
+     MEMORY_TEST_FILE),
+    ("memory-phasor-assembly",
+     "the faces' assembly after the run left out: the estimate is under the measured peak",
+     FDTD,
+     "    return int(total + max(step, assembly))\n",
+     "    return int(total + step)\n",
+     {_COUNTED} | _INSIDE,
+     MEMORY_TEST_FILE),
+    ("memory-phasor-estimate-run",
+     "estimate_run takes the box and does not pass it on",
+     FDTD,
+     "                                 max_frames=max_frames, phasor_box=phasor_box,\n",
+     "                                 max_frames=max_frames, phasor_box=None,\n",
+     {_COUNTED},
+     MEMORY_TEST_FILE),
+):
+    CASES.append(Case(name=_name, why=_why, edits=[(_path, _old, _new)],
+                      expect_failing=set(_fails), test_file=_file))
+
+
 def run_case(case: Case) -> bool:
     saved = case.snapshot()
     ok = True

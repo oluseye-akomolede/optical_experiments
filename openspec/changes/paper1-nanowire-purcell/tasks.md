@@ -378,8 +378,9 @@ linewidth is not.
       900 nm; the difference is a named one, to be read out of a run rather than argued.
 - [ ] Q from the ring-down of the short record (section 3a), reported with its error -- or
       reported as unresolved with the bound it gives. Those are the two accepted outcomes.
-- [ ] NA 0.8 collection waits for the far-field cloud job that is in flight; it is not an arm
-      of this script today, and nothing here claims it.
+- [ ] NA 0.8 collection: the arm is `--collection-na 0.8` (change `paper1-collection`, the
+      box around the whole gold pad); the reading waits for the GPU run, and nothing here
+      claims the paper's 74% yet.
 - [ ] The 4 nm line, stated honestly: the record's bins resolve 27.66 nm, so the mode's width
       is not in them. The `--ringdown` arm says so in its own output, and the ladder's 4 nm
       line says so when `--ringdown` is set, rather than leaving a reader to conclude the mode

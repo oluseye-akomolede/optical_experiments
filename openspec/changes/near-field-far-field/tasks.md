@@ -18,9 +18,11 @@
   tests/test_fdtd.py -q` passes; `npx -y @fission-ai/openspec validate
   near-field-far-field --strict` passes. No image smoke test and no e2e job:
   nothing is wired into the solver or an image.
-- [ ] 5. Later, separate changes: a phasor box monitor in `fdtd.simulate`
+- [x] 5. Later, separate changes: a phasor box monitor in `fdtd.simulate`
   that writes this layout (interpolating the Yee components to the face-cell
   centres), and the paper-1 run that reads 74% within NA 0.8 from it.
   - [x] 5a. The monitor: change `phasor-box-monitor` (`simulate(...,
     phasor_box=..., phasor_frequencies=...)` returns `"phasor_faces"`).
-  - [ ] 5b. The paper-1 run that reads the NA 0.8 fraction from it.
+  - [x] 5b. The paper-1 run that reads the NA 0.8 fraction from it: change
+    `paper1-collection` (`--collection-na 0.8`); the full-size reading is its
+    task 7, on the GPU.
