@@ -1144,6 +1144,96 @@ for _name, _why, _path, _old, _new, _fails, _file in (
                       expect_failing=set(_fails), test_file=_file))
 
 
+SETTLING_TEST_FILE = "tests/test_cw_settling.py"
+_ONE_EXP = "test_one_exponential_approach_is_class_b_with_its_own_tau_and_limit"
+_TWO_EXP = "test_two_time_constants_is_an_approach_that_says_it_holds_more_than_one"
+_GROWTH = "test_a_slow_exponential_growth_is_class_c_and_never_a_purcell_factor"
+_LINE = "test_a_straight_rise_and_a_short_record_are_class_d"
+_COVER = "test_the_error_bars_cover_the_truth_on_noisy_records"
+_SCALE = "test_the_fit_is_as_well_conditioned_at_any_scale"
+_PHASE_LOCK = "test_the_curve_is_cut_at_the_end_s_own_phase"
+_VACUUM_BOX = "test_an_open_vacuum_box_swings_by_its_own_prediction"
+_BOX_LIMIT = "test_the_lossy_box_s_limit_is_the_one_a_longer_record_reaches"
+_LOCATOR = "test_the_locator_line_says_when_one_mode_cannot_make_the_curve"
+_ROUND_TRIP = "test_the_saved_series_gives_the_identical_reading"
+_SWING = {f"test_the_window_phase_swing_is_the_leakage_times_the_quadrature[{q}]"
+          for q in ("100.0", "2000.0")}
+
+# The CW arm's settling curve and its class (change cw-settling). Each set is
+# measured: the reversion applied, the file run, exactly these tests red.
+for _name, _why, _old, _new, _fails in (
+    ("settling-free-phase",
+     "the curve's cuts at free 5% marks, not a whole number of periods before the end",
+     "            cut = n - int(round(j * per))\n",
+     "            cut = n - int(round(target * per))\n",
+     {_PHASE_LOCK}),
+    ("settling-ramp-fitted",
+     "cuts whose window still holds the drive's ramp are fitted",
+     "                     \"fitted\": F is not None and cut - window >= ramp})\n",
+     "                     \"fitted\": F is not None})\n",
+     {_GROWTH, _LINE, _ONE_EXP, _PHASE_LOCK, _COVER, _LOCATOR, _BOX_LIMIT,
+      _VACUUM_BOX}),
+    ("settling-limit-sign",
+     "the approach's limit taken as c - D/u",
+     "        out.update(F_inf=float(c + D / u) * scale,\n",
+     "        out.update(F_inf=float(c - D / u) * scale,\n",
+     {_ONE_EXP, _BOX_LIMIT}),
+    ("settling-independent-cuts",
+     "the fit's errors computed as if cuts sharing window samples were independent",
+     "    fit = fit_approach(t, F, floor=floor, corr=corr)\n",
+     "    fit = fit_approach(t, F, floor=floor, corr=None)\n",
+     {_COVER}),
+    ("settling-raw-scale",
+     "the fit run on raw readings, so a large F loses a covariance direction",
+     "    scale = float(np.max(np.abs(raw))) or 1.0\n",
+     "    scale = 1.0\n",
+     {_COVER, _SCALE}),
+    ("settling-no-growth-class",
+     "a negative rate never classed as growth",
+     "    elif fit[\"u\"] + SIGNIFICANCE * fit[\"u_err\"] < 0.0:\n",
+     "    elif fit[\"u\"] + SIGNIFICANCE * fit[\"u_err\"] < -math.inf:\n",
+     {_GROWTH}),
+    ("settling-misfit-as-noise",
+     "the settled test reads a one-exponential misfit's residual as noise",
+     "    if abs(drift) <= SIGNIFICANCE * drift_err:\n",
+     "    if abs(drift) <= SIGNIFICANCE * math.sqrt(2.0) * max(noise, fit[\"rms\"]):\n",
+     {_TWO_EXP}),
+    ("settling-phase-once",
+     "the phase prediction counts the -f image's leakage once, not through both transforms",
+     "            \"quadrature\": quadrature, \"predicted\": 2.0 * leak * quadrature\n",
+     "            \"quadrature\": quadrature, \"predicted\": 1.0 * leak * quadrature\n",
+     {_VACUUM_BOX} | _SWING),
+    ("settling-phase-end-window",
+     "the quadrature read from the end window as it is, its own share of the swing left in",
+     "    inphase *= abs(float(coef[0]) / ratios[-1]) if ratios[-1] else 0.0\n",
+     "    inphase *= 1.0\n",
+     {_VACUUM_BOX} | _SWING),
+    ("settling-no-phase-floor",
+     "the curve's floor taken as zero instead of the swing at the cuts' phase mismatch",
+     "        floor = phase[\"swing\"] * 4.0 * math.pi * miss\n",
+     "        floor = 0.0 * miss\n",
+     {_VACUUM_BOX, _PHASE_LOCK}),
+    ("settling-locator-never-longer",
+     "the locator line never says the curve is too slow for the locator's mode",
+     "        if tau - SIGNIFICANCE * err > tau_l + SIGNIFICANCE * err_l:\n",
+     "        if False:\n",
+     {_LOCATOR}),
+    ("settling-series-float64",
+     "the series saved as float64, not at the dtype the run recorded",
+     "    np.savez_compressed(path, drive=np.asarray(drive), source_field=np.asarray(field),\n",
+     "    np.savez_compressed(path, drive=np.asarray(drive),"
+     " source_field=np.asarray(field, dtype=np.float64),\n",
+     {_ROUND_TRIP}),
+    ("settling-series-no-eps",
+     "the series saved without the applied permittivity the reading needs",
+     "                        eps_r=float(eps_r), index=float(index),\n",
+     "                        index=float(index),\n",
+     {_ROUND_TRIP}),
+):
+    CASES.append(Case(name=_name, why=_why, edits=[(PAPER1, _old, _new)],
+                      expect_failing=set(_fails), test_file=SETTLING_TEST_FILE))
+
+
 def run_case(case: Case) -> bool:
     saved = case.snapshot()
     ok = True
