@@ -2463,22 +2463,25 @@ def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
 
 
 def check_limits(estimate: dict, *, max_steps=None, max_seconds=None,
-                 max_cells=None) -> None:
+                 max_cells=None, max_bytes=None) -> None:
     """Raise ``EstimateError`` naming every limit ``estimate`` exceeds, the
     value that exceeded it, and the form setting that reduces it.
 
-    ``max_cells``, ``max_steps`` and ``max_seconds`` are the three limits this
-    call applies, and each defaults to the product's own (``MAX_CELLS``,
-    ``MAX_STEPS``, ``MAX_SECONDS``) when it is None. One caller ever passes
-    them: the paper-1 bench script, whose ``--max-cells`` / ``--max-steps`` /
-    ``--max-seconds`` raise a bench record's ceiling past what the product
-    allows (a settled nanowire record needs more than 20,000 steps, and more
-    than 30 minutes of Jetson, to stop rising; a dx-10 nm record of the same
-    scene needs 9,166,668 cells, over the 8 M cell cap by 14.6%, because the
-    grid's fine layers do not scale with ``--dx``). Nothing else can: there is
-    no environment variable and no module global to set, and no product entry
-    point passes them -- ``worker/td_solve.py`` and the web app call this with
-    the defaults -- so a raised ceiling stays on the bench path alone.
+    ``max_cells``, ``max_steps``, ``max_seconds`` and ``max_bytes`` are the
+    four limits this call applies, and each defaults to the product's own
+    (``MAX_CELLS``, ``MAX_STEPS``, ``MAX_SECONDS``, ``MAX_BYTES``) when it is
+    None. One caller ever passes them: the paper-1 bench script, whose
+    ``--max-cells`` / ``--max-steps`` / ``--max-seconds`` / ``--max-bytes``
+    raise a bench record's ceiling past what the product allows (a settled
+    nanowire record needs more than 20,000 steps, and more than 30 minutes of
+    Jetson, to stop rising; a dx-10 nm record of the same scene needs 9,166,668
+    cells, over the 8 M cell cap by 14.6%, because the grid's fine layers do not
+    scale with ``--dx``; and that scene at dx 5 nm estimates 11.55 GB of GPU
+    memory on the bench's 16 GB A4000, over the 3.0 GB the product may assume).
+    Nothing else can: there is no environment variable and no module global to
+    set, and no product entry point passes them -- ``worker/td_solve.py`` and
+    the web app call this with the defaults -- so a raised ceiling stays on the
+    bench path alone.
     """
     # each read here, not bound at import: a test that moves a constant still
     # moves the limit that constant names
@@ -2488,6 +2491,8 @@ def check_limits(estimate: dict, *, max_steps=None, max_seconds=None,
         max_steps = MAX_STEPS
     if max_seconds is None:
         max_seconds = MAX_SECONDS
+    if max_bytes is None:
+        max_bytes = MAX_BYTES
     e = estimate
     finest = f"{e['finest'] * 1e9:.3g} nm"
     exceeded = []
@@ -2500,11 +2505,11 @@ def check_limits(estimate: dict, *, max_steps=None, max_seconds=None,
             f"The run needs {e['steps']:,} time steps, over the limit of "
             f"{max_steps:,} (dt is {e['dt']:.3g} s, set by the finest cell, "
             f"{finest}). Shorten the duration, or increase dx."))
-    if e["bytes"] > MAX_BYTES:
+    if e["bytes"] > max_bytes:
         frames = e.get("frames") or 0
-        exceeded.append(("memory", e["bytes"], MAX_BYTES,
+        exceeded.append(("memory", e["bytes"], max_bytes,
             f"The run needs about {e['bytes'] / 1e9:.2f} GB of GPU memory, "
-            f"over the limit of {MAX_BYTES / 1e9:.1f} GB. Increase dx, or use "
+            f"over the limit of {max_bytes / 1e9:.1f} GB. Increase dx, or use "
             f"metal walls instead of open ones (each open axis adds an "
             f"absorbing layer's storage across the whole grid)."
             + (f" Or record fewer than the {frames:,} movie frames asked for."

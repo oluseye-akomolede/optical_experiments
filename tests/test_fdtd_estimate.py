@@ -191,6 +191,56 @@ def test_a_bench_may_raise_the_cell_ceiling_and_the_default_is_the_products_own(
     assert "14,048,300" in text and "8,000,000" not in text
 
 
+def test_a_bench_may_raise_the_memory_ceiling_and_the_default_is_the_products_own():
+    """``max_bytes`` is the fourth ceiling, and its default is still 3.0 GB.
+
+    The paper's own scene at dx 5 nm on the 16 GB A4000 estimates 11.55 GB of
+    GPU memory, refused after about two hours of setup under the product's
+    ceiling. A caller that says nothing -- ``worker/td_solve.py``, the web app --
+    still meets 3.0 GB exactly: the control here is the product's own default,
+    and one byte over it is refused. The ceiling is read at call time, so a test
+    that moves the constant moves the limit too.
+    """
+    assert fdtd.MAX_BYTES == 3.0e9
+    e = _estimate(bytes=11.55e9)
+    with pytest.raises(fdtd.EstimateError) as info:
+        fdtd.check_limits(e)
+    (name, value, got_limit, text), = info.value.exceeded
+    assert (name, value, got_limit) == ("memory", 11.55e9, fdtd.MAX_BYTES)
+    assert "11.55 GB" in text and "3.0 GB" in text
+
+    # At exactly what it needs, and above it: both admitted.
+    fdtd.check_limits(e, max_bytes=11.55e9)
+    fdtd.check_limits(e, max_bytes=14e9)
+
+    # One byte over the raised ceiling, and the refusal names the raised ceiling
+    # rather than the product's own.
+    with pytest.raises(fdtd.EstimateError) as info:
+        fdtd.check_limits(_estimate(bytes=14e9 + 1), max_bytes=14e9)
+    (name, value, got_limit, text), = info.value.exceeded
+    assert (name, value, got_limit) == ("memory", 14e9 + 1, 14e9)
+    assert "over the limit of 14.0 GB" in text and "3.0 GB" not in text
+
+
+def test_the_memory_default_is_the_constant_at_call_time(monkeypatch):
+    """The default is ``MAX_BYTES`` itself, not a copy frozen at import.
+
+    A caller that says nothing is measured against whatever the module's own
+    ceiling is when the check runs. Moving the constant has to move the limit
+    with it -- otherwise this test's own premise (and the docstring's) is a
+    claim about a binding nobody exercised.
+    """
+    e = _estimate(bytes=11.55e9)
+    monkeypatch.setattr(fdtd, "MAX_BYTES", 20e9)
+    fdtd.check_limits(e)                             # 11.55 < 20: admitted
+
+    monkeypatch.setattr(fdtd, "MAX_BYTES", 5e9)
+    with pytest.raises(fdtd.EstimateError) as info:
+        fdtd.check_limits(e)                         # 11.55 > 5: refused
+    (name, value, got_limit, _), = info.value.exceeded
+    assert (name, value, got_limit) == ("memory", 11.55e9, 5e9)
+
+
 def test_the_refusal_names_the_value_that_broke_each_limit():
     with pytest.raises(fdtd.EstimateError) as info:
         fdtd.check_limits(_estimate(cells=9_261_000, steps=24_000,

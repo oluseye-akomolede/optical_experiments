@@ -215,7 +215,8 @@ def test_the_same_long_record_is_refused_without_a_flag_and_accepted_with_one():
     plain = m.parse_args(list(LONG))
     assert m.run_limits(plain) == {"max_cells": m.fdtd.MAX_CELLS,
                                    "max_steps": m.fdtd.MAX_STEPS,
-                                   "max_seconds": m.fdtd.MAX_SECONDS}
+                                   "max_seconds": m.fdtd.MAX_SECONDS,
+                                   "max_bytes": m.fdtd.MAX_BYTES}
     lay, request, geom = m.solve_scene(plain)
     measured = m.filled(plain, lay, request)
     assert measured["exceeded"], measured
@@ -223,7 +224,8 @@ def test_the_same_long_record_is_refused_without_a_flag_and_accepted_with_one():
 
     args = m.parse_args(LONG + RAISED)
     assert m.run_limits(args) == {"max_cells": m.fdtd.MAX_CELLS,
-                                  "max_steps": 200_000, "max_seconds": 7200.0}
+                                  "max_steps": 200_000, "max_seconds": 7200.0,
+                                  "max_bytes": m.fdtd.MAX_BYTES}
     lay, request, geom = m.solve_scene(args)
     measured = m.filled(args, lay, request)
     assert measured["exceeded"] is None, measured["exceeded"]
@@ -506,7 +508,8 @@ def test_the_run_path_hands_its_raised_ceiling_to_the_cap_check(monkeypatch):
     lay, request, geom = m.solve_scene(args)
     m.filled(args, lay, request)
     assert calls == [{"max_cells": m.fdtd.MAX_CELLS,
-                      "max_steps": 200_000, "max_seconds": 7200.0}], calls
+                      "max_steps": 200_000, "max_seconds": 7200.0,
+                      "max_bytes": m.fdtd.MAX_BYTES}], calls
 
 
 def test_no_cap_call_site_escapes_the_bench_ceiling():
@@ -535,17 +538,57 @@ def test_a_flag_that_would_lower_a_cap_is_refused_before_any_scene(capsys):
     """
     m = _load()
     for flag, value in (("--max-cells", "1000000"), ("--max-steps", "1000"),
-                        ("--max-seconds", "60")):
+                        ("--max-seconds", "60"), ("--max-bytes", "2")):
         with pytest.raises(SystemExit) as info:
             m.parse_args(["--tiny", flag, value])
         assert info.value.code == 2
         err = capsys.readouterr().err
         assert "may only raise a cap" in err, err
     lowered = argparse.Namespace(max_cells=1_000_000, max_steps=1000,
-                                 max_seconds=60.0)
+                                 max_seconds=60.0, max_bytes=1e9)
     assert m.run_limits(lowered) == {"max_cells": m.fdtd.MAX_CELLS,
                                      "max_steps": m.fdtd.MAX_STEPS,
-                                     "max_seconds": m.fdtd.MAX_SECONDS}
+                                     "max_seconds": m.fdtd.MAX_SECONDS,
+                                     "max_bytes": m.fdtd.MAX_BYTES}
+
+
+def test_the_memory_ceiling_is_the_fourth_thing_the_bench_flags_can_raise():
+    """``--max-bytes`` names GB: ``14`` is 14e9 bytes, and it only raises.
+
+    dx 5 nm of the paper's own scene estimates 11.55 GB against the 3.0 GB the
+    product may assume; this is the flag that lets a measured card price it.
+    """
+    m = _load()
+    args = m.parse_args(["--tiny", "--max-bytes", "14"])
+    assert args.max_bytes == 14e9
+    assert m.run_limits(args)["max_bytes"] == 14e9
+    plain = m.parse_args(["--tiny"])
+    assert plain.max_bytes is None
+    assert m.run_limits(plain)["max_bytes"] == m.fdtd.MAX_BYTES
+
+
+def test_a_raised_memory_ceiling_is_reported_on_the_caps_line(capsys):
+    """A memory-only raise still prints the bench-ceiling parenthetical.
+
+    The dx-5 nm record needs 11.55 GB and no more steps, cells or seconds than
+    the product allows, so the parenthetical's gate must read ``max_bytes`` too
+    -- otherwise the one ceiling the run raised is the one the log line omits.
+    ``--tiny`` bypasses ``report`` (it has its own ``tiny()`` arm), so this calls
+    ``report`` on a cheap scene, the same way the run path does, and the plain
+    call is the control: no flag, no parenthetical.
+    """
+    m = _load()
+    for extra, wanted in ((["--max-bytes", "14"], True), ([], False)):
+        args = m.parse_args(["--dx", "400", *extra])
+        lay, request, geom = m.solve_scene(args)
+        measured = m.filled(args, lay, request)
+        m.report(args, lay, request, geom, measured)
+        caps = [line for line in capsys.readouterr().out.splitlines()
+                if line.startswith("caps")]
+        assert len(caps) == 1, caps
+        assert ("bench ceiling:" in caps[0]) is wanted, caps
+        if wanted:
+            assert "14.0 GB" in caps[0], caps
 
 
 def test_a_record_that_is_not_settled_is_flagged():

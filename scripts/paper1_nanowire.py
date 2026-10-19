@@ -362,7 +362,7 @@ def steps_for_4nm(dt: float, wavelength_nm: float) -> int:
 
 
 def run_limits(args) -> dict:
-    """The three per-run ceilings this bench run is measured against.
+    """The four per-run ceilings this bench run is measured against.
 
     The product's own unless the bench flags raised them. ``--max-steps`` and
     ``--max-seconds`` exist for the one case the owner approved on 2026-10-16: a
@@ -378,6 +378,11 @@ def run_limits(args) -> dict:
     2026-10-16: the knob is per-run and on the bench path only, and the product's
     own 8,000,000 stays exactly what it is.
 
+    ``--max-bytes`` is the same permission for the memory cap, and it names
+    GIGABYTES: the same record at dx 5 nm estimates 11.55 GB of GPU memory on the
+    bench's 16 GB A4000, over the product's 3.0 GB, and ``--max-bytes 14`` is
+    14e9 bytes. The product's own 3.0 GB stays exactly what it is.
+
     One function because the estimator (``ladder``) and the run path (``filled``)
     must read the SAME ceiling: a priced rung that disagreed with the run it
     priced would be a second opinion rather than an estimate.
@@ -391,12 +396,15 @@ def run_limits(args) -> dict:
     cells = getattr(args, "max_cells", None)
     steps = getattr(args, "max_steps", None)
     seconds = getattr(args, "max_seconds", None)
+    nbytes = getattr(args, "max_bytes", None)
     return {"max_cells": (fdtd.MAX_CELLS if cells is None
                           else max(fdtd.MAX_CELLS, int(cells))),
             "max_steps": (fdtd.MAX_STEPS if steps is None
                           else max(fdtd.MAX_STEPS, int(steps))),
             "max_seconds": (fdtd.MAX_SECONDS if seconds is None
-                            else max(fdtd.MAX_SECONDS, float(seconds)))}
+                            else max(fdtd.MAX_SECONDS, float(seconds))),
+            "max_bytes": (fdtd.MAX_BYTES if nbytes is None
+                          else max(fdtd.MAX_BYTES, float(nbytes)))}
 
 
 def phasor_estimate(plan) -> dict:
@@ -1293,7 +1301,8 @@ def report(args, lay, request, geom, measured):
     lim = run_limits(args)
     raised = (lim["max_cells"] > fdtd.MAX_CELLS
               or lim["max_steps"] > fdtd.MAX_STEPS
-              or lim["max_seconds"] > fdtd.MAX_SECONDS)
+              or lim["max_seconds"] > fdtd.MAX_SECONDS
+              or lim["max_bytes"] > fdtd.MAX_BYTES)
     print(f"resolves  {measured['dlambda_nm']:.2f} nm per bin at"
           f" {args.wavelength:.0f} nm; the paper's mode is {PAPER_FWHM_NM:.0f} nm"
           f" and would need {steps_for_4nm(est['dt'], args.wavelength):,} steps"
@@ -1301,7 +1310,8 @@ def report(args, lay, request, geom, measured):
     print(f"caps      {measured['exceeded'] or 'OK'}"
           + (f" (bench ceiling: {lim['max_steps']:,} steps,"
              f" {lim['max_seconds'] / 60:.0f} min,"
-             f" {lim['max_cells']:,} cells)" if raised else ""))
+             f" {lim['max_cells']:,} cells,"
+             f" {lim['max_bytes'] / 1e9:.1f} GB)" if raised else ""))
     if (args.profile == "cw"
             and est["steps"] * est["dt"] * f0 < args.window_periods):
         print(f"refused: the record is"
@@ -2320,7 +2330,8 @@ def ladder(args) -> int:
         dlam = (sub.wavelength * NM) ** 2 / (C * est["steps"] * est["dt"]) / NM
         raised = (lim["max_cells"] > fdtd.MAX_CELLS
                   or lim["max_steps"] > fdtd.MAX_STEPS
-                  or lim["max_seconds"] > fdtd.MAX_SECONDS)
+                  or lim["max_seconds"] > fdtd.MAX_SECONDS
+                  or lim["max_bytes"] > fdtd.MAX_BYTES)
         print(f"{dx:5.1f} {pad:6.0f} {est['cells']:12,} {est['steps']:8,}"
               f" {est['seconds']:8.1f} {est['bytes'] / 2 ** 30:6.2f}"
               f" {dlam:6.2f}  fits ("
@@ -2378,7 +2389,12 @@ def parse_args(argv=None):
     return args
 
 
-def _raised_cap(flag, product_name, unit, kind):
+def _gigabytes(text):
+    """A bench flag's GB number as bytes: ``14`` is 14e9 bytes."""
+    return int(round(float(text) * 1e9))
+
+
+def _raised_cap(flag, product_name, unit, kind, show=None):
     """``type=`` for the bench flags that raise one of the product's caps.
 
     A value below the product's own is refused here, at the parser and before any
@@ -2387,8 +2403,11 @@ def _raised_cap(flag, product_name, unit, kind):
     when the flag is parsed, not when this factory is called, so a test that moves
     the constant moves the floor too -- the same late binding ``run_limits`` and
     ``fdtd.check_limits`` use. ``run_limits`` clamps with ``max()`` as well, so a
-    namespace that never met this parser cannot lower a ceiling either.
+    namespace that never met this parser cannot lower a ceiling either. ``show``
+    formats both numbers in the floor refusal, so a flag that names gigabytes
+    reports gigabytes rather than the bytes its value is held in.
     """
+    show = show or (lambda value: f"{value:,}")
     def parse(text):
         product = getattr(fdtd, product_name)
         try:
@@ -2397,7 +2416,7 @@ def _raised_cap(flag, product_name, unit, kind):
             raise argparse.ArgumentTypeError(f"{flag} wants {unit}, got {text!r}")
         if value < product:
             raise argparse.ArgumentTypeError(
-                f"{flag} {value:,} is below the product's own {product:,}, and the"
+                f"{flag} {show(value)} is below the product's own {show(product)}, and the"
                 f" flag may only raise a cap: a shorter record is a smaller"
                 f" --periods")
         return value
@@ -2474,6 +2493,14 @@ def PARSER_ARGUMENTS(p) -> None:
                                     "seconds", float),
                    help="raise the product's run-time cap, in seconds (distinct"
                         " from the launcher's own MSE_CLOCK)")
+    p.add_argument("--max-bytes", default=None, metavar="GB",
+                   type=_raised_cap("--max-bytes", "MAX_BYTES",
+                                    "gigabytes of GPU memory", _gigabytes,
+                                    show=lambda value: f"{value / 1e9:.1f} GB"),
+                   help="raise the product's GPU-memory cap for this bench run,"
+                        " in GB (e.g. 14 means 14e9 bytes); only this bench"
+                        " script has the flag, so the web app and the k8s jobs"
+                        " cannot reach a raised ceiling")
     p.add_argument("--axis", default="x", help="the dipole's component")
     p.add_argument("--profile", choices=("cw", "pulse"), default="cw")
     p.add_argument("--xp", choices=("numpy", "cupy"), default="numpy")
