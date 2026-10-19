@@ -83,9 +83,12 @@ field's quadrature ratio, measured and predicted), the same reading at cuts
 locked to the end's drive phase through the record, a fit of that curve
 (F_inf, tau_s and their errors), and one class: settled, approaching (F_inf
 then an extrapolation), growing without a limit (never a Purcell factor), or
-unresolved. ``--locator-tau`` sets tau_s against a ring-down's tau in words;
-``--save-series`` keeps the record (off by default) and ``--from-series``
-re-reads it without a run.
+unresolved. Where one time constant does not hold the whole curve, the
+forecast is refit over the record's last half, and an F_inf the record has
+already passed is called inconsistent rather than printed as the
+extrapolation (change ``settling-tail-fit``). ``--locator-tau`` sets tau_s
+against a ring-down's tau in words; ``--save-series`` keeps the record (off
+by default) and ``--from-series`` re-reads it without a run.
 
 Item (7) of the handoff (a dielectric that is a function, not a scalar) does not
 bind the measurement this script makes: the dipole sits on the wire's axis, 30
@@ -162,6 +165,16 @@ SETTLING_STEP = 0.05    # the curve's cuts: one every 5% of the record
 MIN_FIT_CUTS = 5        # three parameters and two degrees of freedom
 SIGNIFICANCE = 3.0      # a difference counts when it is this many of its own errors
 APPROACH_EDGE = 50.0    # the approach fit's rate grid reaches +-50 / (fitted span)
+# The forecast (change settling-tail-fit), each value measured there on sums of
+# two exponentials with known limits.
+TAIL_SHARE = 0.5          # a misfit curve's forecast is refit over its last half
+INCONSISTENT_SIGMA = 2.5  # F_inf behind a moving end by more than this many errors:
+                          # correct forecasts reached 1.92 (1623 noisy records),
+                          # the 600-period curve's old forecast 3.33
+FORECAST_RESIDUAL = 3.0   # the forecast's residual over this x the floor: forecasts
+                          # within 3 errors of their limit reached 2.74 (167 of
+                          # them), the 10 + 60-period curve's tail misses by 3.7
+                          # errors at 3.84
 PHASE_CUTS = 32         # cuts across the last drive period for the phase scan
 # the CW drive's own turn-on, read from the profile rather than retyped
 CW_RAMP_PERIODS = float(
@@ -1630,6 +1643,33 @@ def fit_approach(t, F, *, floor: float = 0.0, corr=None) -> dict:
     return out
 
 
+def forecast_check(fit: dict, *, end: float, drift: float, drift_err: float,
+                   floor: float) -> dict:
+    """Whether an approach's F_inf can stand as the curve's extrapolation.
+
+    ``inconsistent``: the curve is still moving at its end (the final third's
+    line, ``drift``, beyond ``SIGNIFICANCE`` of its error) and F_inf sits on the
+    wrong side of the end's own reading -- below it on a rise, above it on a
+    fall -- by more than ``INCONSISTENT_SIGMA`` of the gap's error (F_inf's and
+    the end's together). A limit the record has already passed is wrong,
+    not uncertain. The end's error is the floor: the last third's line
+    ``noise`` is no error of the end reading, since on a curve that still bends
+    it holds the line's misfit (on the change's 600-period curve it was 0.0138
+    against a floor of 2e-6). ``unreliable``: the forecast fit's residual is over
+    ``FORECAST_RESIDUAL`` x the floor: what it was fitted to still holds more
+    than one time constant, or noise the floor does not account for.
+    """
+    gap = float(fit["F_inf"]) - float(end)
+    gap_err = math.hypot(float(fit["F_inf_err"]), float(floor))
+    moving = abs(drift) > SIGNIFICANCE * drift_err
+    wrong_side = gap * drift < 0.0
+    ratio = fit["rms"] / floor if floor > 0 else math.inf
+    return {"gap": gap, "gap_err": gap_err, "residual_ratio": ratio,
+            "inconsistent": bool(moving and wrong_side
+                                 and abs(gap) > INCONSISTENT_SIGMA * gap_err),
+            "unreliable": bool(ratio > FORECAST_RESIDUAL)}
+
+
 def classify_settling(curve: dict, *, floor: float = 0.0) -> dict:
     """Which of four things the curve is, with the numbers that say so.
 
@@ -1641,11 +1681,16 @@ def classify_settling(curve: dict, *, floor: float = 0.0) -> dict:
     (a) ``settled``: the final third moved less than its own noise, and the
         approach, if there is one, has less left in it than its error;
     (b) ``approaching``: the fitted rate is positive by more than
-        ``SIGNIFICANCE`` errors -- ``F_inf`` is then an EXTRAPOLATION;
+        ``SIGNIFICANCE`` errors -- ``F_inf`` is then an EXTRAPOLATION, checked
+        against the record by :func:`forecast_check`;
     (c) ``growing``: the rate is negative by as much -- growth the approach
         model does not fit, never a Purcell factor;
     (d) ``unresolved``: too few cuts, or a rate within its errors of zero (a
         straight rise: the record cannot tell a slow approach from growth).
+
+    ``whole`` is the fit over every fitted cut; ``fit`` is the forecast, which
+    is ``whole`` unless its residual is over ``SIGNIFICANCE`` x the floor, when
+    it is refit over the cuts in the record's last ``TAIL_SHARE``.
     """
     rows = [r for r in curve["rows"] if r["fitted"]]
     out = {"rows": len(rows), "floor": floor}
@@ -1661,7 +1706,22 @@ def classify_settling(curve: dict, *, floor: float = 0.0) -> dict:
     floor = max(float(floor), 1e-12 * scale)
     out["floor"] = floor
     corr = curve["corr"]
-    fit = fit_approach(t, F, floor=floor, corr=corr)
+    whole = fit_approach(t, F, floor=floor, corr=corr)
+    fit, tail = whole, None
+    # One time constant that does not hold the whole curve (residual above the
+    # floor) is pulled down by the early fast rise: its tau_s is short and its
+    # F_inf low (change settling-tail-fit). The forecast is then refit over the
+    # cuts in the last TAIL_SHARE of the record, where the slow part is left.
+    if whole["rms"] > SIGNIFICANCE * floor:
+        tail = [k for k, r in enumerate(rows)
+                if r["cut"] >= (1.0 - TAIL_SHARE) * curve["steps"]]
+        if len(tail) < MIN_FIT_CUTS:
+            tail = list(range(len(rows) - MIN_FIT_CUTS, len(rows)))
+        if tail[0] == 0:
+            tail = None
+        else:
+            fit = fit_approach([t[k] for k in tail], [F[k] for k in tail],
+                               floor=floor, corr=corr[np.ix_(tail, tail)])
     # The final third, read as a straight line: its slope against the line's own
     # residual (floored, with the same correlated-noise sandwich as the fit) is a
     # test of "the last cuts agree within the noise" that no model of the whole
@@ -1683,12 +1743,15 @@ def classify_settling(curve: dict, *, floor: float = 0.0) -> dict:
     drift = float(coef[1])
     drift_err = math.sqrt(max(float((s2 * inner @ basis.T @ sub @ basis @ inner)[1, 1]),
                               0.0))
-    out.update(fit=fit, noise=noise, drift=drift, drift_err=drift_err,
+    out.update(fit=fit, whole=whole, tail_from=(tail[0] if tail else 0),
+               noise=noise, drift=drift, drift_err=drift_err,
                third_from=third[0], end=rows[-1]["F"])
     if abs(drift) <= SIGNIFICANCE * drift_err:
         out.update(kind="settled")
     elif fit["u"] - SIGNIFICANCE * fit["u_err"] > 0.0 and not fit["edge"]:
         out.update(kind="approaching")
+        out.update(forecast_check(fit, end=rows[-1]["F"], drift=drift,
+                                  drift_err=drift_err, floor=floor))
     elif fit["u"] + SIGNIFICANCE * fit["u_err"] < 0.0:
         out.update(kind="growing")
     else:
@@ -1710,6 +1773,19 @@ def parse_locator(text):
         raise argparse.ArgumentTypeError(
             f"--locator-tau wants a positive tau in fs and an optional error, got {text!r}")
     return (parts[0], parts[1] if len(parts) == 2 else 0.0)
+
+
+def _approach_text(fit: dict, verdict: dict, frequency: float, curve: dict,
+                   dt: float) -> str:
+    """One approach fit as the ``fit`` line prints it."""
+    per_s = 1.0 / frequency
+    return (f"F_inf = {fit['F_inf']:.6g} +- {fit['F_inf_err']:.3g},"
+            f" A = {fit['A']:.4g} at {fit['t0'] * frequency:.1f} periods,"
+            f" tau_s = {fit['tau'] / 1e-15:.4g} +- {fit['tau_err'] / 1e-15:.3g}"
+            f" fs = {fit['tau'] / per_s:.4g} periods"
+            f" ({fit['tau'] / (curve['steps'] * dt):.3g} of the record);"
+            f" residual rms {fit['rms']:.3g}"
+            f" ({fit['rms'] / verdict['floor']:.3g} x the floor)")
 
 
 def settling_report(args, drive, field, dt: float, *, F: float, early: float,
@@ -1754,28 +1830,35 @@ def settling_report(args, drive, field, dt: float, *, F: float, early: float,
               f"{'  *' if r['fitted'] else ''}")
     verdict = classify_settling(curve, floor=floor)
     fit = verdict.get("fit")
-    if fit is not None:
-        print(f"fit       F(t) = F_inf - A exp(-t/tau_s) over the {fit['points']}"
+    whole = verdict.get("whole")
+    if whole is not None:
+        print(f"fit       F(t) = F_inf - A exp(-t/tau_s) over the {whole['points']}"
               f" fitted cuts, unweighted least squares; errors are 1 sigma,"
               f" allowing for neighbouring cuts sharing window samples (their"
               f" Hann overlap), from the residual or the phase floor"
               f" ({verdict['floor']:.3g}), whichever is larger")
-        if "tau" in fit:
-            print(f"fit       F_inf = {fit['F_inf']:.6g} +- {fit['F_inf_err']:.3g},"
-                  f" A = {fit['A']:.4g} at {fit['t0'] * frequency:.1f} periods,"
-                  f" tau_s = {fit['tau'] / 1e-15:.4g} +- {fit['tau_err'] / 1e-15:.3g}"
-                  f" fs = {fit['tau'] / per_s:.4g} periods"
-                  f" ({fit['tau'] / (curve['steps'] * dt):.3g} of the record);"
-                  f" residual rms {fit['rms']:.3g}"
-                  f" ({fit['rms'] / verdict['floor']:.3g} x the floor)")
+        if "tau" in whole:
+            print(f"fit       {_approach_text(whole, verdict, frequency, curve, dt)}")
         else:
-            grow = (f"a growth time of {-fit['span'] / fit['u'] / 1e-15:.4g} fs ="
-                    f" {-fit['span'] / fit['u'] / per_s:.4g} periods"
-                    if fit["u"] < 0 else "no curvature at all")
-            print(f"fit       no limit: the rate is {fit['rate'] * 1e-15:+.4g}"
-                  f" +- {fit['rate_err'] * 1e-15:.3g} per fs, {grow};"
-                  f" residual rms {fit['rms']:.3g}"
-                  f" ({fit['rms'] / verdict['floor']:.3g} x the floor)")
+            grow = (f"a growth time of {-whole['span'] / whole['u'] / 1e-15:.4g} fs ="
+                    f" {-whole['span'] / whole['u'] / per_s:.4g} periods"
+                    if whole["u"] < 0 else "no curvature at all")
+            print(f"fit       no limit: the rate is {whole['rate'] * 1e-15:+.4g}"
+                  f" +- {whole['rate_err'] * 1e-15:.3g} per fs, {grow};"
+                  f" residual rms {whole['rms']:.3g}"
+                  f" ({whole['rms'] / verdict['floor']:.3g} x the floor)")
+    if fit is not None and fit is not whole:
+        lead = (f"the residual is {whole['rms'] / verdict['floor']:.3g} x the"
+                f" floor, so the curve holds more than this one time constant and"
+                f" its early rise pulls tau_s short and F_inf low; the forecast is"
+                f" refit over the last {100 * TAIL_SHARE:g}% of the record"
+                f" ({fit['points']} cuts from {fit['t0'] * frequency:.1f} periods)")
+        if "tau" in fit:
+            print(f"fit       {lead}: {_approach_text(fit, verdict, frequency, curve, dt)}")
+        else:
+            print(f"fit       {lead}: no limit there (the rate is"
+                  f" {fit['rate'] * 1e-15:+.4g} +- {fit['rate_err'] * 1e-15:.3g}"
+                  f" per fs)")
     kind = verdict["kind"]
     if kind == "settled":
         print(f"class     (a) settled: a line through the last third moves"
@@ -1783,16 +1866,28 @@ def settling_report(args, drive, field, dt: float, *, F: float, early: float,
               f" within {SIGNIFICANCE:g} of its errors (the larger of the line's"
               f" residual and the floor): F = {verdict['end']:.6g} at the end is"
               f" the steady state as far as this record can tell")
+    elif kind == "approaching" and verdict["inconsistent"]:
+        way = "rising" if verdict["drift"] > 0 else "falling"
+        side = "below" if verdict["drift"] > 0 else "above"
+        print(f"class     (b) approaching, but the forecast is INCONSISTENT with"
+              f" the record: the curve is still {way} at its end, which reads"
+              f" {verdict['end']:.6g}, and the fit's F_inf = {fit['F_inf']:.6g} +-"
+              f" {fit['F_inf_err']:.3g} lies {side} it by"
+              f" {abs(verdict['gap']) / verdict['gap_err']:.3g} of their joint"
+              f" error (over {INCONSISTENT_SIGMA:g}); no extrapolation is given --"
+              f" the limit is at least as far as the end")
     elif kind == "approaching":
-        multi = (f"; the residual is {fit['rms'] / verdict['floor']:.3g} x the floor,"
-                 f" so the curve holds more than this one time constant and an"
-                 f" extrapolation from one is biased"
-                 if fit["rms"] > SIGNIFICANCE * verdict["floor"] else "")
+        trust = (f"; the forecast is UNRELIABLE: the fit's residual is"
+                 f" {verdict['residual_ratio']:.3g} x the floor (over"
+                 f" {FORECAST_RESIDUAL:g}): what it was fitted to still holds"
+                 f" more than one time constant, or noise the floor does not"
+                 f" account for"
+                 if verdict["unreliable"] else "")
         print(f"class     (b) approaching: the rate is"
               f" {fit['u'] / fit['u_err'] if fit['u_err'] else math.inf:.3g} of its"
               f" errors above zero, so F_inf = {fit['F_inf']:.6g} +-"
               f" {fit['F_inf_err']:.3g} is an EXTRAPOLATION of this curve, not a"
-              f" reading: the end reads {verdict['end']:.6g}{multi}")
+              f" reading: the end reads {verdict['end']:.6g}{trust}")
     elif kind == "growing":
         print(f"class     (c) growing without a limit: the approach model does not"
               f" fit (its rate is {-fit['u'] / fit['u_err'] if fit['u_err'] else math.inf:.3g}"

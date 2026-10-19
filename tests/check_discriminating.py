@@ -1158,30 +1158,40 @@ _LOCATOR = "test_the_locator_line_says_when_one_mode_cannot_make_the_curve"
 _ROUND_TRIP = "test_the_saved_series_gives_the_identical_reading"
 _SWING = {f"test_the_window_phase_swing_is_the_leakage_times_the_quadrature[{q}]"
           for q in ("100.0", "2000.0")}
+_TAIL_600 = "test_the_600_period_curve_s_forecast_is_not_below_its_end"
+_CHECK_600 = "test_the_check_says_the_old_forecast_is_inconsistent_with_the_record"
+_RECOVER = {f"test_two_exponential_curves_recover_their_limit[{fast}-{slow}]"
+            for fast, slow in (("10.0", "80.0"), ("10.0", "300.0"), ("25.0", "150.0"),
+                               ("25.0", "300.0"))}
+_CLEAN = "test_a_clean_single_exponential_keeps_the_whole_curve_fit"
+_NO_ALARM = "test_correct_forecasts_are_never_called_inconsistent"
+_REPLAY = "test_the_replayed_curve_prints_the_tail_forecast"
 
 # The CW arm's settling curve and its class (change cw-settling). Each set is
 # measured: the reversion applied, the file run, exactly these tests red.
+# Re-measured by change settling-tail-fit, whose spec delta says why the
+# free-phase, ramp-fitted, limit-sign and misfit-as-noise sets moved.
 for _name, _why, _old, _new, _fails in (
     ("settling-free-phase",
      "the curve's cuts at free 5% marks, not a whole number of periods before the end",
      "            cut = n - int(round(j * per))\n",
      "            cut = n - int(round(target * per))\n",
-     {_PHASE_LOCK}),
+     {_PHASE_LOCK, _TWO_EXP}),
     ("settling-ramp-fitted",
      "cuts whose window still holds the drive's ramp are fitted",
      "                     \"fitted\": F is not None and cut - window >= ramp})\n",
      "                     \"fitted\": F is not None})\n",
-     {_GROWTH, _LINE, _ONE_EXP, _PHASE_LOCK, _COVER, _LOCATOR, _BOX_LIMIT,
-      _VACUUM_BOX}),
+     {_LINE, _PHASE_LOCK, _COVER, _REPLAY}),
     ("settling-limit-sign",
      "the approach's limit taken as c - D/u",
      "        out.update(F_inf=float(c + D / u) * scale,\n",
      "        out.update(F_inf=float(c - D / u) * scale,\n",
-     {_ONE_EXP, _BOX_LIMIT}),
+     {_ONE_EXP, _BOX_LIMIT, _TWO_EXP, _COVER, _TAIL_600, _CHECK_600, _NO_ALARM,
+      _REPLAY} | _RECOVER),
     ("settling-independent-cuts",
      "the fit's errors computed as if cuts sharing window samples were independent",
-     "    fit = fit_approach(t, F, floor=floor, corr=corr)\n",
-     "    fit = fit_approach(t, F, floor=floor, corr=None)\n",
+     "    whole = fit_approach(t, F, floor=floor, corr=corr)\n",
+     "    whole = fit_approach(t, F, floor=floor, corr=None)\n",
      {_COVER}),
     ("settling-raw-scale",
      "the fit run on raw readings, so a large F loses a covariance direction",
@@ -1196,8 +1206,10 @@ for _name, _why, _old, _new, _fails in (
     ("settling-misfit-as-noise",
      "the settled test reads a one-exponential misfit's residual as noise",
      "    if abs(drift) <= SIGNIFICANCE * drift_err:\n",
-     "    if abs(drift) <= SIGNIFICANCE * math.sqrt(2.0) * max(noise, fit[\"rms\"]):\n",
-     {_TWO_EXP}),
+     "    if abs(drift) <= SIGNIFICANCE * math.sqrt(2.0) * max(noise, whole[\"rms\"]):\n",
+     {_TWO_EXP, _TAIL_600, _CHECK_600}
+     | {f"test_two_exponential_curves_recover_their_limit[{pair}]"
+        for pair in ("10.0-80.0", "25.0-150.0", "25.0-300.0")}),
     ("settling-phase-once",
      "the phase prediction counts the -f image's leakage once, not through both transforms",
      "            \"quadrature\": quadrature, \"predicted\": 2.0 * leak * quadrature\n",
@@ -1229,6 +1241,75 @@ for _name, _why, _old, _new, _fails in (
      "                        eps_r=float(eps_r), index=float(index),\n",
      "                        index=float(index),\n",
      {_ROUND_TRIP}),
+):
+    CASES.append(Case(name=_name, why=_why, edits=[(PAPER1, _old, _new)],
+                      expect_failing=set(_fails), test_file=SETTLING_TEST_FILE))
+
+
+# The forecast that follows the slow tail, and its check against the record
+# (change settling-tail-fit). Each set is measured: the reversion applied, the
+# file run, exactly these tests red.
+for _name, _why, _old, _new, _fails in (
+    ("tail-no-refit",
+     "the forecast is the whole-curve fit even when its residual is far above the floor",
+     "    if whole[\"rms\"] > SIGNIFICANCE * floor:\n        tail = [",
+     "    if False:\n        tail = [",
+     {_TAIL_600, _CHECK_600, _REPLAY, _TWO_EXP} | _RECOVER),
+    ("tail-always-refit",
+     "the forecast is refit over the last half even where one exponential holds",
+     "    if whole[\"rms\"] > SIGNIFICANCE * floor:\n        tail = [",
+     "    if True:\n        tail = [",
+     {_CLEAN}),
+    ("tail-share-90",
+     "the forecast refit over the last 90% of the record, not the last half",
+     "TAIL_SHARE = 0.5 ",
+     "TAIL_SHARE = 0.9 ",
+     {_TAIL_600, _CHECK_600, _REPLAY, _TWO_EXP} | _RECOVER),
+    ("tail-check-never",
+     "the forecast is never called inconsistent with the record",
+     "            \"inconsistent\": bool(moving and wrong_side\n",
+     "            \"inconsistent\": bool(False and moving and wrong_side\n",
+     {_CHECK_600, _REPLAY}),
+    ("tail-check-either-side",
+     "a forecast past the end on the side the curve is moving to is called inconsistent",
+     "    wrong_side = gap * drift < 0.0\n",
+     "    wrong_side = True\n",
+     {_ONE_EXP, _TWO_EXP, _TAIL_600, _CHECK_600, _NO_ALARM, _REPLAY} | _RECOVER),
+    ("tail-check-fit-sigma",
+     "the end's error taken as the fit's own per-point sigma, which holds its misfit",
+     "    gap_err = math.hypot(float(fit[\"F_inf_err\"]), float(floor))\n",
+     "    gap_err = math.hypot(float(fit[\"F_inf_err\"]), float(fit[\"sigma\"]))\n",
+     {_CHECK_600, _REPLAY}),
+    ("tail-check-sigma-1",
+     "the inconsistency threshold at 1 error instead of the measured 2.5",
+     "INCONSISTENT_SIGMA = 2.5 ",
+     "INCONSISTENT_SIGMA = 1.0 ",
+     {_NO_ALARM}),
+    ("tail-check-sigma-4",
+     "the inconsistency threshold at 4 errors instead of the measured 2.5",
+     "INCONSISTENT_SIGMA = 2.5 ",
+     "INCONSISTENT_SIGMA = 4.0 ",
+     {_CHECK_600}),
+    ("tail-unreliable-never",
+     "a forecast whose residual is far above the floor is never called unreliable",
+     "            \"unreliable\": bool(ratio > FORECAST_RESIDUAL)}",
+     "            \"unreliable\": bool(ratio > math.inf)}",
+     {_TAIL_600, _REPLAY, _TWO_EXP}),
+    ("tail-unreliable-30",
+     "the unreliable threshold at 30 x the floor instead of the measured 3",
+     "FORECAST_RESIDUAL = 3.0 ",
+     "FORECAST_RESIDUAL = 30.0 ",
+     {_TWO_EXP}),
+    ("tail-print-no-inconsistent",
+     "an inconsistent forecast printed as the extrapolation",
+     "    elif kind == \"approaching\" and verdict[\"inconsistent\"]:\n",
+     "    elif kind == \"approaching\" and False:\n",
+     {_REPLAY}),
+    ("tail-print-no-unreliable",
+     "an unreliable forecast printed without saying so",
+     "                 if verdict[\"unreliable\"] else \"\")\n",
+     "                 if False else \"\")\n",
+     {_REPLAY, _TWO_EXP}),
 ):
     CASES.append(Case(name=_name, why=_why, edits=[(PAPER1, _old, _new)],
                       expect_failing=set(_fails), test_file=SETTLING_TEST_FILE))

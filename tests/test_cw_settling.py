@@ -138,16 +138,25 @@ def test_one_exponential_approach_is_class_b_with_its_own_tau_and_limit():
 
 
 def test_two_time_constants_is_an_approach_that_says_it_holds_more_than_one():
-    """1 - 0.5 exp(-t/10) - 0.3 exp(-t/60 periods): still an approach (b), with
-    a tau_s between the two (measured 37.4 +- 2.2 periods) and a residual far
-    above the floor (1.1e4 x), which the class line has to say."""
+    """1 - 0.5 exp(-t/10) - 0.3 exp(-t/60 periods): still an approach (b). The
+    whole-curve fit has a tau_s between the two (measured 37.4 +- 2.2 periods)
+    and a residual far above the floor (1.1e4 x), which the arm has to say;
+    its F_inf sat 1.72% under the limit, below the end's own 1.14%. Since
+    change settling-tail-fit the forecast is refit over the last half: tau_s
+    the slow 60 periods (measured 59.91) and F_inf 3.2e-5 under the limit,
+    but 3.7 of its errors, and its residual is 3.84 x the floor, so the class
+    line calls it UNRELIABLE."""
     lines, verdict = _report(*_series(
         lambda p: 1 - 0.5 * np.exp(-p / 10.0) - 0.3 * np.exp(-p / 60.0)))
-    fit = verdict["fit"]
+    whole, fit = verdict["whole"], verdict["fit"]
     assert verdict["kind"] == "approaching", lines
-    assert 10.0 < fit["tau"] * F0 < 60.0
-    assert fit["rms"] > m.SIGNIFICANCE * verdict["floor"]
+    assert 10.0 < whole["tau"] * F0 < 60.0
+    assert whole["rms"] > m.SIGNIFICANCE * verdict["floor"]
     assert any("more than this one time constant" in line for line in lines), lines
+    assert fit is not whole and fit["tau"] * F0 == pytest.approx(60.0, rel=5e-3)
+    assert fit["F_inf"] == pytest.approx(SETTLED_F, rel=1e-4)
+    assert verdict["unreliable"] and not verdict["inconsistent"]
+    assert any("forecast is UNRELIABLE" in line for line in lines), lines
 
 
 def test_a_slow_exponential_growth_is_class_c_and_never_a_purcell_factor():
@@ -174,6 +183,167 @@ def test_a_straight_rise_and_a_short_record_are_class_d():
     assert verdict["kind"] == "unresolved" and "record longer" in verdict["why"]
 
 
+# --- the forecast follows the slow tail (change settling-tail-fit) ---------------------
+
+# A 600-period CW run's printed curve: (cut in periods, F). Its whole-curve fit
+# printed F_inf = 13.1935 +- 0.02, tau_s = 82.99 periods, residual rms 0.0552 =
+# 2.83e4 x the floor -- a limit below the 13.26 the curve had already reached
+# while still rising.
+CURVE_600 = np.array([
+    (31.0, 3.31597), (68.0, 6.9017), (84.0, 8.08599), (121.0, 9.90457),
+    (158.0, 11.111), (174.0, 11.4304), (203.0, 11.9286), (248.0, 12.4086),
+    (264.0, 12.5121), (293.0, 12.6826), (338.0, 12.883), (367.0, 12.974),
+    (383.0, 13.0154), (428.0, 13.1109), (457.0, 13.1565), (473.0, 13.1772),
+    (510.0, 13.2134), (547.0, 13.2382), (563.0, 13.2466), (600.0, 13.26)])
+FLOOR_600 = 0.0552 / 2.83e4
+
+
+def _classify(t, F, floor, steps):
+    """``classify_settling`` on a bare curve: every cut fitted, cut = t (so the
+    record's last half is ``t >= steps / 2``), and uncorrelated cuts -- the
+    600-period run's cuts are 16 or more periods apart under 8-period windows,
+    where ``hann_correlation`` is the identity."""
+    rows = [{"t": a, "F": b, "cut": a, "fitted": True} for a, b in zip(t, F)]
+    return m.classify_settling({"rows": rows, "steps": steps,
+                                "corr": np.eye(len(rows))}, floor=floor)
+
+
+def test_the_600_period_curve_s_forecast_is_not_below_its_end():
+    """The run's own curve: the whole-curve fit is the one it printed (13.1935
+    +- 0.020, 82.99 periods, 2.83e4 x the floor), and the forecast is now the
+    last half's fit (10 cuts from 338 periods): F_inf = 13.3068 +- 0.0039 and
+    tau_s = 115.1 periods (measured), at or above the 13.26 the curve reached.
+    Its residual is still 1029 x the floor, so it is UNRELIABLE, not
+    inconsistent."""
+    t, F = CURVE_600[:, 0], CURVE_600[:, 1]
+    verdict = _classify(t, F, FLOOR_600, 600.0)
+    whole, fit = verdict["whole"], verdict["fit"]
+    assert whole["F_inf"] == pytest.approx(13.1935, abs=1e-4)
+    assert whole["F_inf_err"] == pytest.approx(0.020, abs=1e-3)
+    assert whole["tau"] == pytest.approx(82.99, abs=1e-2)
+    assert whole["rms"] / FLOOR_600 == pytest.approx(2.83e4, rel=1e-3)
+    assert verdict["kind"] == "approaching"
+    assert fit is not whole and fit["points"] == 10 and fit["t0"] == 338.0
+    assert fit["F_inf"] >= 13.26, fit
+    assert not verdict["inconsistent"] and verdict["unreliable"]
+
+
+def test_the_check_says_the_old_forecast_is_inconsistent_with_the_record():
+    """The whole-curve forecast checked against the record it came from: still
+    rising, and F_inf 13.1935 is 3.33 of hypot(its error, the floor) below the
+    end's 13.26 (measured), over INCONSISTENT_SIGMA = 2.5. The same curve
+    mirrored (falling, F -> 26.52 - F) puts F_inf above its end by the same
+    3.33 and is caught the same way."""
+    t, F = CURVE_600[:, 0], CURVE_600[:, 1]
+    for values in (F, 26.52 - F):
+        verdict = _classify(t, values, FLOOR_600, 600.0)
+        check = m.forecast_check(verdict["whole"], end=values[-1],
+                                 drift=verdict["drift"],
+                                 drift_err=verdict["drift_err"], floor=FLOOR_600)
+        assert check["inconsistent"], check
+        assert abs(check["gap"]) / check["gap_err"] == pytest.approx(3.33, abs=0.01)
+        assert not verdict["inconsistent"]          # the tail's forecast is not
+
+
+def _two_exp(seed, fast, slow):
+    """1 - 0.7 exp(-t/fast) - 0.3 exp(-t/slow) at 20 cuts 30 apart (a 600-long
+    record), with white noise of 1e-5 and the floor at that noise."""
+    t = np.arange(1, 21) * 30.0
+    F = 1.0 - 0.7 * np.exp(-t / fast) - 0.3 * np.exp(-t / slow)
+    return t, F + 1e-5 * np.random.default_rng(seed).standard_normal(t.size)
+
+
+@pytest.mark.parametrize("fast, slow", [(10.0, 80.0), (10.0, 300.0), (25.0, 150.0),
+                                        (25.0, 300.0)])
+def test_two_exponential_curves_recover_their_limit(fast, slow):
+    """Sums of two exponentials with limit 1. Measured over 20 seeds x 6 shapes
+    (fast 10, 25; slow 80, 150, 300): the forecast is within 2.53 of its own
+    errors and 1.73e-4 of the limit, never flagged (residual at most 1.41 x the
+    floor); the whole-curve fit misses by 1.6e-3 or more. Asserted: within 3
+    errors and 5e-4, and the whole-curve fit at least 1e-3 off."""
+    verdict = _classify(*_two_exp(0, fast, slow), 1e-5, 600.0)
+    fit = verdict["fit"]
+    assert verdict["kind"] == "approaching"
+    assert abs(fit["F_inf"] - 1.0) <= m.SIGNIFICANCE * fit["F_inf_err"], fit
+    assert abs(fit["F_inf"] - 1.0) <= 5e-4, fit
+    assert abs(verdict["whole"]["F_inf"] - 1.0) >= 1e-3
+    assert not verdict["inconsistent"] and not verdict["unreliable"]
+
+
+def test_a_clean_single_exponential_keeps_the_whole_curve_fit():
+    """No regression where one time constant holds: 1 - 0.8 exp(-t/tau) with
+    1e-5 noise, tau 60, 100 and 200 over a 600-long record. Measured over 900
+    such records: the whole-curve residual reached 1.44 x the floor, under the
+    3 that sends a forecast to the tail, so none was refit. The forecast is
+    the whole-curve fit, value for value."""
+    t = np.arange(1, 21) * 30.0
+    rng = np.random.default_rng(2)
+    for tau in (60.0, 100.0, 200.0):
+        F = 1.0 - 0.8 * np.exp(-t / tau) + 1e-5 * rng.standard_normal(t.size)
+        verdict = _classify(t, F, 1e-5, 600.0)
+        before = m.fit_approach(t, F, floor=1e-5, corr=np.eye(t.size))
+        assert verdict["fit"] is verdict["whole"]
+        assert verdict["fit"]["F_inf"] == before["F_inf"]
+        assert verdict["fit"]["tau"] == before["tau"]
+        assert verdict["tail_from"] == 0 and not verdict["unreliable"]
+
+
+def test_correct_forecasts_are_never_called_inconsistent():
+    """The false-alarm side of INCONSISTENT_SIGMA: single exponentials with
+    noise from 1e-5 to 1e-3 of the limit, records 2.4 to 10 time constants
+    long (the end up to within noise of the limit). Measured over 1623 such
+    records: the forecast's wrong-side gap reached 1.92 of its error, under
+    2.5; and over 206 noisy series through the reading (0.05 of the in-phase
+    amplitude, 60 periods), 0.998. The 1800 records are run here (about
+    5 s): the worst is the measured 1.92, so a threshold of 1 fails."""
+    t = np.arange(1, 21) * 30.0
+    rng = np.random.default_rng(7)
+    worst = 0.0
+    for _ in range(150):
+        for tau in (60.0, 100.0, 150.0, 250.0):
+            for noise in (1e-5, 1e-4, 1e-3):
+                F = 13.5 * (1 - 0.75 * np.exp(-t / tau)) + noise * 13.5 * rng.standard_normal(t.size)
+                verdict = _classify(t, F, noise * 13.5, 600.0)
+                if verdict["kind"] != "approaching":
+                    continue
+                assert not verdict["inconsistent"], verdict
+                worst = max(worst, -np.sign(verdict["drift"]) * verdict["gap"]
+                            / verdict["gap_err"])
+    assert worst < m.INCONSISTENT_SIGMA
+
+
+def _replay_600():
+    """The 600-period curve as a closed-form record, ten times faster (60
+    periods, 3,862 samples): its in-phase envelope is the curve itself."""
+    t, F = CURVE_600[:, 0], CURVE_600[:, 1]
+    return _series(lambda p: np.interp(10.0 * p, np.r_[0.0, t], np.r_[0.0, F]) / 13.26,
+                   periods=60.0)
+
+
+def test_the_replayed_curve_prints_the_tail_forecast(monkeypatch):
+    """Through the reading and the printed lines: the whole-curve F_inf sits
+    under the end (measured 0.16% under), the refit line names the last 50%
+    (11 cuts from 30 periods) and its F_inf is above the end (measured 0.56%),
+    and the class line gives it as the extrapolation, UNRELIABLE (residual
+    49.7 x the floor). With the refit switched off and the threshold dropped
+    to 0.5 (the old forecast is 0.82 of its error under the end, measured) the
+    class line says INCONSISTENT and gives no extrapolation."""
+    lines, verdict = _report(*_replay_600())
+    text = "\n".join(lines)
+    assert verdict["whole"]["F_inf"] < verdict["end"] < verdict["fit"]["F_inf"]
+    assert re.search(r"refit over the last 50% of the record \(11 cuts from 30\.0"
+                     r" periods\)", text), text
+    assert f"so F_inf = {verdict['fit']['F_inf']:.6g} +-" in text, text
+    assert "forecast is UNRELIABLE" in text and "INCONSISTENT" not in text, text
+    monkeypatch.setattr(m, "TAIL_SHARE", 1.0)
+    monkeypatch.setattr(m, "INCONSISTENT_SIGMA", 0.5)
+    lines, verdict = _report(*_replay_600())
+    text = "\n".join(lines)
+    assert verdict["inconsistent"] and "refit over" not in text, text
+    assert "forecast is INCONSISTENT with the record" in text, text
+    assert "EXTRAPOLATION" not in text, text
+
+
 # --- the error bars -----------------------------------------------------------------
 
 def test_the_error_bars_cover_the_truth_on_noisy_records():
@@ -184,20 +354,28 @@ def test_the_error_bars_cover_the_truth_on_noisy_records():
     allow for it. Measured over 300 records: z = (fit - truth) / error has a
     spread of 1.17 for F_inf and 1.16 for tau_s, 65-66% inside 1 and 98-99%
     inside 3 -- against 0.32/0.15 inside 1 when the cuts were treated as
-    independent with a flat overlap factor."""
+    independent with a flat overlap factor.
+
+    This noise is far above the records' phase floor, so since change
+    settling-tail-fit their residual sends the forecast to the last half of
+    the record (all 200 here). Both are held to the same bounds: the
+    whole-curve fit (measured over 6 seeds of 200: spread 0.93-1.21, 97.5-99.5%
+    inside 3) and the forecast (1.12-1.34, 96-99%; this seed is the widest)."""
     envelope = lambda p: 1 - 0.8 * np.exp(-p / 30.0)       # noqa: E731
     drive, clean = _series(envelope, periods=60.0)
     truth = _verdict(drive, clean)[0]["fit"]
     rng = np.random.default_rng(1)
-    z_f, z_tau = [], []
+    z = {"whole": ([], []), "fit": ([], [])}
     for _ in range(200):
         verdict, _curve = _verdict(drive, clean + 0.05 * rng.standard_normal(clean.size))
-        fit = verdict["fit"]
-        z_f.append((fit["F_inf"] - truth["F_inf"]) / fit["F_inf_err"])
-        z_tau.append((fit["tau"] - truth["tau"]) / fit["tau_err"])
-    for z in (np.array(z_f), np.array(z_tau)):
-        assert 0.75 < np.std(z) < 1.4, np.std(z)
-        assert np.mean(np.abs(z) <= 3.0) >= 0.95, np.mean(np.abs(z) <= 3.0)
+        for key, (z_f, z_tau) in z.items():
+            fit = verdict[key]
+            z_f.append((fit["F_inf"] - truth["F_inf"]) / fit["F_inf_err"])
+            z_tau.append((fit["tau"] - truth["tau"]) / fit["tau_err"])
+    for pair in z.values():
+        for zs in map(np.array, pair):
+            assert 0.75 < np.std(zs) < 1.4, np.std(zs)
+            assert np.mean(np.abs(zs) <= 3.0) >= 0.95, np.mean(np.abs(zs) <= 3.0)
 
 
 def test_the_fit_is_as_well_conditioned_at_any_scale():
