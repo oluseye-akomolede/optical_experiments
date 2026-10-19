@@ -1,7 +1,7 @@
 # resonance-extraction Specification
 
 ## Purpose
-TBD - created by archiving change resonance-extraction. Update Purpose after archive.
+Extracting resonances from short time-domain records: find_resonances fits a uniformly sampled real or complex record to a sum of damped sinusoids by filter diagonalization or matrix pencil, and returns frequency, Q, amplitude and Cramer-Rao error bars for every mode the record determines. The spec covers the one phase convention shared by real and complex records, significance tests that keep noise-fitted poles out, agreement between the two methods before any common polish, and a NaN -- never a number -- for a bar the record does not determine.
 
 ## Requirements
 

@@ -1,7 +1,7 @@
 # cuda-bench Specification
 
 ## Purpose
-TBD - created by archiving change paper1-a4000-bench. Update Purpose after archive.
+The CUDA bench image: a container that carries exactly the import closure of scripts/paper1_nanowire.py, with its CUDA base, Python packages and JIT toolkit headers pinned to the versions the bench path was measured with, and with the header lookup proven at build time on a GPU-less host. The A4000 Kubernetes Job that runs it: one GPU of one product, requests equal to limits, thread counts at the CPU limit, a wall bound derived from the same price table as the priced record, and a log that survives the Job. The namespace's GPU quota is stated here as a live obstacle, not a passed precondition.
 
 ## Requirements
 
