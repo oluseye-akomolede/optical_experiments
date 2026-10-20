@@ -761,9 +761,25 @@ run that is solved.
   bounding-box extent is under 4 `dx_m` adds a layer over that extent with
   spacing a quarter of the extent, so it has at least 4 cells across. A metal
   part adds, on each axis, a layer 3 skin depths deep inside each of its two
-  bounding-box faces (the whole extent when it is thinner than 6), with spacing
-  a quarter of the skin depth at the top of the source band; where both apply
-  the smaller spacing wins. The skin depth is `fdtd_grid.skin_depth(metal, f)`
+  bounding-box faces, with spacing a quarter of the skin depth at the top of
+  the source band; where both apply the smaller spacing wins. It gets **one
+  layer across its whole extent at that spacing** instead when the two face
+  layers would meet or cover the part already, or when what they leave between
+  them would be narrower than the wider of one `dx_m` and one skin depth: such
+  a middle is filled with a few cells across it -- four at a quarter of the
+  gap, two and three for middles in between -- and while the gap is under one
+  skin depth those cells are finer than the skin layers themselves: measured
+  at dx 10 nm, middles of 6.1, 11.1, 16.1 and 26.1 nm came out in 1.528, 5.556,
+  5.352 and 6.528 nm (0.21x-0.90x of the spacing), and Run C's 3.2 nm middle
+  in four cells of 0.801 nm. A gap over one skin depth does not need the
+  one-layer rule: with room around the part, middles from 31 to 726 nm
+  measured 0.997x-1.000x of the spacing.
+  One layer across the part takes under `24 + 4*max(dx_m, skin depth)/skin
+  depth` cells across it (28 where a coarse cell is no coarser than the skin
+  depth) at a quarter of the skin depth, never finer than the cells it
+  replaces. The
+  skin depth is
+  `fdtd_grid.skin_depth(metal, f)`
   = c / (2π f κ), κ the imaginary part of √ε(f) of that metal’s model; the worker
   and the estimate both call that function. The top of the band is
   `frequency_hz + bandwidth` for a pulse and `frequency_hz` for `cw` and
@@ -796,6 +812,13 @@ run that is solved.
 - **WHEN** a gold plate thinner than 6 skin depths lies in `open` space
 - **THEN** no cell across the plate is wider than a quarter of gold's skin depth
   at the top of the band, and the plate's faces are grid nodes
+
+#### Scenario: a metal part just over 6 skin depths gets no sliver in its middle
+- **WHEN** a metal part is thick enough that two face layers leave less than one
+  `dx_m`, or less than one skin depth, of bulk between them
+- **THEN** the part is laid out with one layer across its whole extent at a
+  quarter of the skin depth: no cell across it is finer than half that, it
+  takes no more cells than that spacing needs, and its faces are grid nodes
 
 #### Scenario: separate objects need no wall
 - **WHEN** an `open` upload holds two closed parts, neither inside the other
