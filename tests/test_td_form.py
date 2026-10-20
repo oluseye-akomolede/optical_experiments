@@ -295,6 +295,25 @@ def test_a_part_with_no_material_is_refused(tmp_path):
     _refused(tmp_path, "no material for 'cube'", **{"part_index.cube": None})
 
 
+def test_a_pulse_band_outside_its_metals_fit_is_refused_with_its_source(
+        tmp_path):
+    """Au-palik is fitted over 1.1-1.9 eV. The form's own default pulse
+    (450 THz, 100 THz bandwidth) spans about 0.97-2.75 eV, which the model
+    cannot answer for, and the refusal says whose table it is."""
+    _refused(tmp_path, "Palik 1985 fitted for Au-palik, 1.1-1.9 eV",
+             **{"part_index.cube": "Au-palik"})
+
+
+def test_a_pulse_inside_its_metals_fit_is_queued(tmp_path):
+    """The same gold model with a pulse it does cover (1.32-1.68 eV)."""
+    resp, db, _store, flashes = _post(
+        tmp_path, td_frequency_thz="363", td_bandwidth_thz="20",
+        **{"part_index.cube": "Au-palik"})
+    assert resp.status_code == 302 and len(db.jobs) == 1, flashes
+    job = next(iter(db.jobs.values()))
+    assert job["materials"]["cube"] == "Au-palik"
+
+
 def _plates(gap=0.1):
     """Two gold plates with a film between them, NOT nested: the cavity
     parser refuses this (no part encloses the others); a td run takes it."""

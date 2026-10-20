@@ -115,17 +115,21 @@ def palik_rows():
 
 
 def test_the_palik_gold_model_reproduces_its_table():
-    """Every copied Palik point within 3%, and the model is lossy at each.
+    """Every fitted Palik point within 3%, and the model is lossy at each.
 
-    ``data/palik_au_nk.csv`` holds the table's rows between 600 and 1300 nm
-    (12 points, 652.5-1291.5 nm); the model's ``fit_ev`` is those points
-    rounded inward. The fit's measured maximum is 2.11% at 1291 nm
-    (``scripts/fit_palik_gold.py --poles 4 --starts 64``); the gate sits above
-    it and low enough that a moved pole fails, and the measured value itself is
-    asserted so the figure in this docstring cannot drift.
+    ``data/palik_au_nk.csv`` holds the table's 12 rows between 600 and
+    1300 nm (652.5-1291.5 nm). The fit uses the 9 rows at or below 1150 nm:
+    under the damping floor and the smoothness envelope it misses the three
+    rows past that by 4.12%, 19.18% and 20.37%, and their k falls then
+    rises, so the fitted range ends below them. The fit's measured maximum
+    over the fitted rows is 1.4951% at 652.5 nm (the fit prints 1.50% at
+    653 nm; ``scripts/fit_palik_gold.py --poles 4 --starts 64``); the gate
+    sits above it and low enough that a moved pole fails, and the measured
+    value itself is asserted so the figure here cannot drift.
     """
-    rows = palik_rows()
-    assert len(rows) == 12
+    rows = [row for row in palik_rows()
+            if float(row["wavelength_A"]) <= 11500.0]
+    assert len(rows) == 9
     metal = fdtd.LIBRARY["Au-palik"]
     assert all(f > 0 and gamma > 0 for f, _w0, gamma in metal.poles), metal.poles
     worst = 0.0
@@ -136,24 +140,87 @@ def test_the_palik_gold_model_reproduces_its_table():
         assert got.imag > 0, (lam_nm, got)
         worst = max(worst, abs(got - want) / abs(want))
     assert worst < 0.03, worst
-    assert abs(worst - 0.02112) < 1e-4, worst
+    assert abs(worst - 0.014951) < 1e-5, worst
+
+
+def test_the_palik_gold_model_is_smooth_between_its_table_rows():
+    """No pole may ring between two table rows.
+
+    The first fit (af2c616's ``Au-palik``, replaced by this model) had a
+    near-undamped 1.017 eV pole (Gamma = 1e-5): every fitted row sat within
+    3%, but between the 1127 and 1240 nm rows its |eps| peaked at 7.3e4
+    (-2.5e4 + 6.9e4 i, at 1197.2 nm on a 0.05 nm grid) against the table's
+    own 63-77 there. A pulse whose spectrum reaches into that gap would meet
+    a fake high-Q resonance, which is exactly what Run C's ring-down looks
+    for. So the check is a dense grid: over 600-1400 nm every 2 nm the metal
+    is passive, and between the table's own rows its |eps| stays within 1.5x
+    of the linear interpolation between them.
+    """
+    rows = palik_rows()
+    lam = np.array([float(r["wavelength_A"]) / 10.0 for r in rows])
+    mag = np.abs(np.array([complex(float(r["n"]), float(r["k"]))
+                           for r in rows]) ** 2)
+    grid = np.arange(600.0, 1400.0 + 0.5, 2.0)
+    eps = fdtd.permittivity("Au-palik", fdtd.C0 / (grid * 1e-9))
+    assert eps.real.max() < 0, (grid[eps.real.argmax()], eps.real.max())
+    assert eps.imag.min() > 0, (grid[eps.imag.argmin()], eps.imag.min())
+    inside = (grid >= lam.min()) & (grid <= lam.max())
+    cap = 1.5 * np.interp(grid, lam, mag)
+    ratio = np.abs(eps)[inside] / cap[inside]
+    assert ratio.max() <= 1.0, (grid[inside][ratio.argmax()], ratio.max())
+    # The gap the first fit spiked in, 1127-1240 nm: a smooth model follows
+    # the table's own trend there, |eps| ~ 63-77, not thousands.
+    gap = (grid >= 1127.0) & (grid <= 1240.0)
+    assert np.abs(eps[gap]).max() < 100.0, np.abs(eps[gap]).max()
 
 
 def test_a_palik_band_outside_the_fit_names_palik():
     """The refusal names the model's own source, not Rakić's for both."""
     to_hz = fdtd.EV / (2 * math.pi)
-    fdtd.check_metal_band("Au-palik", 1.3 * to_hz, 1.45 * to_hz)   # inside
+    fdtd.check_metal_band("Au-palik", 1.2 * to_hz, 1.7 * to_hz)   # inside
     with pytest.raises(fdtd.FDTDError,
-                       match=r"Palik 1985 fitted for Au-palik, 0\.96-1\.9 eV"):
+                       match=r"Palik 1985 fitted for Au-palik, 1\.1-1\.9 eV"):
         fdtd.check_metal_band("Au-palik", 0.9 * to_hz, 1.2 * to_hz)
+
+
+def test_a_requests_band_is_its_pulses_spectrum():
+    """``source_band`` is the one definition the bench and the app share: the
+    pulse's spectrum is above 1% of its peak within 1/bw * sqrt(log 100)."""
+    f0, bw = 3.6e14, 4e13
+    low, high = fdtd.source_band(f0, "pulse", bw)
+    half = bw * math.sqrt(math.log(100.0))
+    assert (low, high) == pytest.approx((f0 - half, f0 + half), rel=1e-12)
+    assert fdtd.source_band(f0, "cw", None) is None
+    assert fdtd.source_band(f0, "drawn", None) is None
+    with pytest.raises(fdtd.FDTDError, match="the band reaches"):
+        fdtd.source_band(1e13, "pulse", 1e14)
+
+
+def test_the_scene_band_guard_names_the_metals_table():
+    """A scene's named metals are judged against the request's own band;
+    ``pec`` and indices are not dispersive models and are left alone."""
+    request = {"frequency_hz": 3.6e14, "profile": "pulse", "bandwidth": 4e13}
+    fdtd.check_scene_band(["Au-palik"], request)              # 1.40-1.58 eV
+    fdtd.check_scene_band(["pec", 1.5], request)              # not metals
+    with pytest.raises(fdtd.FDTDError,
+                       match=r"Palik 1985 fitted for Au-palik, 1\.1-1\.9 eV"):
+        fdtd.check_scene_band(["pec", "Au-palik"], dict(
+            request, frequency_hz=2e14, bandwidth=2e13))     # 0.65-1.00 eV
+    # A source with no declared band asks nothing of the metal.
+    fdtd.check_scene_band(["Au-palik"], dict(
+        request, profile="cw", bandwidth=None, frequency_hz=6e10))
+    # A scene that names no library metal asks nothing of a fitted range,
+    # even for a pulse wide enough to reach DC (the worker's tiny fixture).
+    fdtd.check_scene_band(["pec", 1.5], dict(
+        request, frequency_hz=6e10, bandwidth=3e10))
 
 
 @pytest.mark.parametrize("nm", (2, 5, 10, 20))
 def test_the_palik_gold_model_is_stable_at_the_bench_spacings(nm):
     """The solver's own reduced dt leaves this model below the growth bound.
 
-    A fitted pole can be high-Q (the 0.9998 eV pole's Gamma is 1e-5), so the
-    check is the one the solver runs: ``stable_dt`` at the bench's 2-20 nm
+    Every pole carries at least the 0.05 eV damping floor, so none is high-Q;
+    the check is still the solver's own: ``stable_dt`` at the bench's 2-20 nm
     gold, then the growth factor at that dt.
     """
     h = (nm * 1e-9,) * 3

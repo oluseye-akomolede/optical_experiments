@@ -2,8 +2,8 @@
 
 The normalised decay rate (Purcell factor) ``F = P / P0`` of an electric
 dipole at height ``d`` above a planar stack -- air, a lossless film of index
-``n_f`` and thickness ``t``, then a semi-infinite substrate (a Rakić 1998
-metal from ``fdtd.permittivity``, a perfect conductor, or any constant
+``n_f`` and thickness ``t``, then a semi-infinite substrate (a library metal
+from ``fdtd.permittivity``, a perfect conductor, or any constant
 permittivity) -- computed from the Sommerfeld-integral form of the reflected
 field at the dipole. It exists to check the FDTD solver's Purcell
 measurement against something exact, so nothing here depends on a grid.
@@ -100,7 +100,7 @@ import fdtd
 
 ORIENTATIONS = ("perp", "par")
 
-#: ``metal`` values that are not a Rakić library name.
+#: ``metal`` values that are not a library metal name.
 PEC = "PEC"
 
 #: The real-axis tail is followed until ``exp(-2 k0 d sqrt(s^2 - 1))`` is
@@ -124,7 +124,7 @@ class PurcellResult(NamedTuple):
 
 
 def substrate_permittivity(metal, wavelength_m: float):
-    """``eps`` of the substrate at ``wavelength_m``: a Rakić metal by name
+    """``eps`` of the substrate at ``wavelength_m``: a library metal by name
     (via ``fdtd.permittivity``), ``"PEC"`` (returned as ``math.inf``), or a
     number used as a constant permittivity (``2.25`` is glass, n = 1.5)."""
     if isinstance(metal, str):
@@ -304,7 +304,7 @@ def purcell_layered(wavelength_m: float, height_m: float, film_thickness_m: floa
 
     ``wavelength_m`` is the free-space wavelength; ``film_thickness_m`` and
     ``film_index`` describe the lossless film (thickness 0, or index 1, means
-    no film); ``metal`` is a Rakić library name, ``"PEC"`` or a constant
+    no film); ``metal`` is a library metal name, ``"PEC"`` or a constant
     permittivity; ``orientation`` is ``"perp"`` (dipole along the surface
     normal) or ``"par"``. ``points`` and ``detour`` are the quadrature knobs
     of the module docstring. Returns ``PurcellResult(F, radiated,
@@ -347,7 +347,7 @@ def main(argv=None) -> int:
     p.add_argument("--film-nm", type=float, default=12.0)
     p.add_argument("--film-index", type=float, default=1.45)
     p.add_argument("--metal", default="Au",
-                   help="a Rakić metal name, PEC, or a constant permittivity")
+                   help="a library metal name, PEC, or a constant permittivity")
     a = p.parse_args(argv)
     try:
         metal = complex(a.metal)

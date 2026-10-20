@@ -304,6 +304,14 @@ def split_parts(data: bytes):
     return names, parts
 
 
+def _named_metals(table, coatings=()) -> list:
+    """Every library metal the scene names, parts then coatings; ``pec`` and
+    indices are not metals."""
+    kinds = list(table.values()) + [material for _part, material, _t
+                                    in coatings or ()]
+    return [k for k in kinds if isinstance(k, str) and k != "pec"]
+
+
 def plan_request(form, data: bytes, units_scale_m: float) -> dict:
     """Parse, lay out and cap-check one td request against its upload.
 
@@ -354,6 +362,10 @@ def plan_request(form, data: bytes, units_scale_m: float) -> dict:
                                    materials=materials, n_index=n_index)
         fdtd_layout.refuse_conductor_points(planned, parts,
                                             length_scale=units_scale_m)
+        # A pulse asks the metal for a band; a model fitted over a narrower
+        # range than that band cannot answer for it, here as in the worker.
+        fdtd.check_scene_band(_named_metals(planned["table"],
+                                            planned["coatings"]), request)
         est = fdtd_layout.estimate(planned, request)
         # The window against the run's own steps and dt, through the worker's
         # own function, so a window refused here is one the worker would refuse

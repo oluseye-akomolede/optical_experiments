@@ -247,6 +247,25 @@ def test_a_layout_refusal_reaches_the_owner_as_a_verdict():
                           xp=np, free_bytes=PLENTY)
 
 
+def test_a_worker_job_whose_band_leaves_its_metals_fit_is_refused():
+    """The app refuses this before it queues; a job that reaches the worker
+    another way meets the same refusal, in the model's own words.
+
+    A 2e14 Hz pulse with 2e13 Hz bandwidth spans 0.65-1.00 eV, below
+    Au-palik's 1.1-1.9 eV fit, so this is the band guard and not a layout
+    error; the file's own default job (no metals) still runs. The guard comes
+    before the layout, so the block's own source-position refusal is never
+    reached: the band is the first thing wrong with this job.
+    """
+    with pytest.raises(td_solve.TDSolveError,
+                       match=r"Palik 1985 fitted for Au-palik, 1\.1-1\.9 eV"):
+        job = _job(frequency_hz=2e14, bandwidth=2e13)
+        job["materials"] = {"block": "Au-palik"}
+        td_solve.solve_td(job, _Store(), xp=np, free_bytes=PLENTY)
+    out = td_solve.solve_td(_job(), _Store(), xp=np, free_bytes=PLENTY)
+    assert out["result"]["traces"].shape[0] == 1
+
+
 def test_a_job_past_the_product_step_cap_is_refused(monkeypatch):
     """A k8s Job meets the product's own ceiling, not the bench's.
 
