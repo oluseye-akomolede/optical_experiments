@@ -585,10 +585,15 @@ limit.
 Gold, silver, aluminium, copper and chromium SHALL be modelled by the
 Lorentz-Drude fits of Rakić et al., Applied Optics 37, 5271 (1998), with
 ε∞ = 1 and the paper's parameters in eV (ω_p, f_j, Γ_j, ω_j), stepped with
-auxiliary differential equations. ADE storage SHALL cover only the metal cells'
+auxiliary differential equations. Gold SHALL also be available as the second
+model fitted to Palik's 1985 table (see "A second gold model SHALL fit Palik's
+table"), chosen by name, and
+the Rakić fits stay the default so an unaltered run models gold as it did
+before. ADE storage SHALL cover only the metal cells'
 bounding box. An E sample on a metal face SHALL take the metal. A run whose
-pulse band leaves the paper's fitted range for a metal in the scene SHALL be
-refused before it is queued.
+pulse band leaves the fitted range of the model it selected for a metal in the
+scene SHALL be refused before it is queued, the refusal naming that model's
+source.
 
 #### Scenario: the stepped metal has the model's susceptibility
 - **WHEN** a metal's term is driven by a sinusoidal field at 20 time steps
@@ -708,7 +713,7 @@ detect is reported by a caveat on the result, not resolved.
 Each sample of a node's dual cell SHALL take the material of the innermost
 uploaded part containing it. Outside every part the grid SHALL be a conductor
 for `metal` and vacuum for `open`. Every part SHALL be given a material: a
-refractive index of at least 1, `pec`, or one of the Rakić metals.
+refractive index of at least 1, `pec`, or one of the library’s dispersive metals (`fdtd.METALS`).
 
 #### Scenario: nested parts in any file order
 - **WHEN** an upload holds a part nested inside another, in either file order
@@ -741,7 +746,7 @@ run that is solved.
   otherwise; the closed check is per part, never on the merged mesh, so parts
   may share faces. There is no enclosing-wall rule: in `open` space the parts are
   separate objects. Each part takes its entry in the job's `materials` table
-  (a refractive index of at least 1, `pec`, or a Rakić metal name); a
+  (a refractive index of at least 1, `pec`, or a library metal name); a
   one-part upload with no table takes the job's `n_index`.
 - **Frame.** Metres are mesh units × the unit's metres × `scale`. The origin is
   the minimum corner of the parts' combined bounding box. `position` and every
@@ -759,7 +764,7 @@ run that is solved.
   bounding-box faces (the whole extent when it is thinner than 6), with spacing
   a quarter of the skin depth at the top of the source band; where both apply
   the smaller spacing wins. The skin depth is `fdtd_grid.skin_depth(metal, f)`
-  = c / (2π f κ), κ the imaginary part of √ε(f) of the Rakić model; the worker
+  = c / (2π f κ), κ the imaginary part of √ε(f) of that metal’s model; the worker
   and the estimate both call that function. The top of the band is
   `frequency_hz + bandwidth` for a pulse and `frequency_hz` for `cw` and
   `drawn`.
@@ -773,7 +778,7 @@ run that is solved.
 - **Refusals.** A probe or point-source position outside the grid, and a
   boundary other than `metal` or `open`, are refused before anything is
   allocated, naming the value. A point source or probe whose nearest node is a
-  conductor (the `metal` boundary's outside, a `pec` part, or a Rakić-metal
+  conductor (the `metal` boundary's outside, a `pec` part, or a library-metal
   part's interior) is refused, naming the position and the part, since its
   source would inject nothing and its trace would read as "no response".
   With `open`, a point source or probe whose nearest node lies in the 10-cell
@@ -808,7 +813,7 @@ run that is solved.
 
 #### Scenario: a source or probe inside a conductor is refused
 - **WHEN** a point source or probe sits on a conductor node (outside the parts
-  with `metal`, inside a `pec` part, or inside a Rakić-metal part)
+  with `metal`, inside a `pec` part, or inside a library-metal part)
 - **THEN** the job is refused before allocation, naming the position and the
   part (or the metal boundary)
 
@@ -1925,3 +1930,51 @@ above. Each case SHALL apply, and SHALL turn exactly its named tests in
   every new test reads F_inf. Misfit-as-noise now reverts on `whole`'s
   residual (the forecast's is small) and turns 6 red. Independent-cuts
   follows `fit` to `whole`, its set unchanged
+
+### Requirement: A second gold model SHALL fit Palik's table
+
+The metal library SHALL offer `Au-palik`, a Lorentz-Drude `Metal` fitted to
+E. D. Palik's handbook gold table over the table's 600-1300 nm points, so a
+validation run can be compared against the paper's own source. The Rakić
+library and its `Au` entry SHALL be unchanged, and every place that accepts a
+library metal (the `_metal` lookup, `METALS`, the layout and voxel material
+checks, and the skin-depth rule) SHALL accept the new name.
+
+#### Scenario: the fit reproduces the table
+
+- **WHEN** the model's complex permittivity is compared with every copied table
+  point in 600-1300 nm
+- **THEN** every point is within 3% relative error, and the test states the
+  measured maximum
+
+#### Scenario: the model is lossy, positive and stable
+
+- **WHEN** the model is evaluated across the fitted band and its ADE term is
+  checked at the bench's spacings
+- **THEN** Im eps is positive at every point, every pole has f > 0 and
+  Gamma > 0, and the growth factor is below 1 + `GROWTH_TOLERANCE`
+
+#### Scenario: the Rakić library is untouched
+
+- **WHEN** the library is listed
+- **THEN** `METALS` contains both `Au` and `Au-palik`, and the published Rakić
+  check still passes against `RAKIC_1998` with the same values
+
+#### Scenario: a band outside the fit is refused naming its source
+
+- **WHEN** a pulse band leaves `Au-palik`'s fitted range
+- **THEN** the refusal names Palik's table and the range, as the Rakić
+  refusals name Rakić
+
+### Requirement: The bench SHALL choose the gold model by name
+
+`scripts/paper1_nanowire.py` SHALL take `--gold-data {rakic,palik}`, defaulting
+to `rakic` so earlier runs reproduce, SHALL use the choice wherever gold is
+selected (the scene's mirror material, the reported skin depth, and the
+estimate), and SHALL log which model the run used.
+
+#### Scenario: the flag selects the material
+
+- **WHEN** the script is parsed with and without `--gold-data palik`
+- **THEN** the scene's mirror material is `Au-palik` and `Au` respectively, the
+  estimate prices the same material, and the report names the model it ran
