@@ -261,9 +261,21 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
                 layers[axis].append(fdtd_grid.Layer(a, b, thin))
             if depth is not None:
                 fine = depth / CELLS_PER_SKIN
-                if b - a < 2 * SKIN_DEPTHS * depth:
-                    # where the thin rule's layer covers the same span,
-                    # build_grid keeps the smaller spacing of the two
+                middle = b - a - 2 * SKIN_DEPTHS * depth
+                if middle < dx:
+                    # either the two skin layers meet or cover the part
+                    # already, or what they leave between them is narrower
+                    # than a coarse cell. That middle strip is bulk metal
+                    # that should be one coarse cell wide; left as its own
+                    # interval the thin-layer rule cuts it into 4 cells of
+                    # gap/4, finer than the skin layers themselves (a 150 nm
+                    # gold mirror at 6 skin depths 147.6 and dx 10 nm left a
+                    # 2.4 nm strip and 0.80 nm cells, 378,896 steps). One
+                    # layer across the part costs about the same cells and
+                    # never subdivides the strip: 150 / (depth/4) is the 24
+                    # cells the two skin layers take.
+                    # Where the thin rule's layer covers the same span,
+                    # build_grid keeps the smaller spacing of the two.
                     layers[axis].append(fdtd_grid.Layer(a, b, fine))
                 else:
                     layers[axis] += [fdtd_grid.Layer(a, a + SKIN_DEPTHS * depth, fine),
