@@ -11,20 +11,21 @@
       measured case (Run C's 150 nm mirror at dx 10 nm: a 3.21 nm strip,
       0.801 nm cells, 378,896 steps for a record that needs 121,121)
 - [x] 1.3 Set the threshold at the wider of `dx_m` and one skin depth, not at
-      `dx_m` alone: the gap between the face layers is filled with four cells
-      at a quarter of its width, so middles of 6.1, 11.1, 16.1 and 26.1 nm
-      came out in cells of 1.528, 2.778, 4.028 and 6.528 nm (0.21x-0.90x of
-      the 7.245 nm spacing), and one skin depth is where a quarter of the
-      middle meets that spacing. One layer across a part in this band costs
-      under 24 + 4*max(dx_m, depth)/depth cells (28 where the coarse cell is
-      no coarser than the skin depth) at depth/4
+      `dx_m` alone: the gap between the face layers is filled with a few cells
+      (four at a quarter of its width for 6.1 and 26.1 nm, two and three for
+      11.1 and 16.1 nm), so middles of 6.1, 11.1, 16.1 and 26.1 nm came out in
+      cells of 1.528, 5.556, 5.352 and 6.528 nm (0.21x-0.90x of the 7.245 nm
+      spacing), and one skin depth is where the split meets that spacing (the
+      finest cell at a 28.1 nm middle is 7.03 nm). One layer across a part in
+      this band costs under 24 + 4*max(dx_m, depth)/depth cells (28 where the
+      coarse cell is no coarser than the skin depth) at depth/4
 - [x] 1.4 Show the threshold closes the measured band rather than moving it:
       with room around the slab (host 3000 nm tall, part 900 nm up), middles
-      from 31.1 to 726.1 nm came out at 0.974x-0.999x of the spacing, every
-      cell the same, so the two-layer branch is harmless above one skin
-      depth. An earlier 31.1 nm / 0.86x and 106 nm / 0.38x reading came from
-      a fixture whose slab sat near its host's ceiling (100 nm and 10 nm
-      under it); the ceiling, not the gap fill, crowded those cells
+      from 36.1 to 726.1 nm came out with a finest cell of exactly 7.2454 nm
+      -- 1.000x the spacing -- and a 28.1 nm middle at 0.970x, so the two-layer
+      branch is harmless above one skin depth. An earlier 31.1 nm / 0.86x and
+      106 nm / 0.38x reading did not reproduce on this fixture and does not
+      hold (31.1 nm reads 1.000x in a 400 nm and in a 3000 nm host)
 
 ## 2. Tests
 
@@ -38,8 +39,8 @@
       unchanged for them): `tests/test_fdtd_layout.py` 68 passed
 - [x] 2.4 Second fixture for the band a coarse-cell threshold alone leaves
       open: 190 nm at dx 10 nm (middle 16.1 nm, over one coarse cell and under
-      one skin depth). On 2e7ae0e it reads 30 cells across the part, against
-      the 27 the 7.245 nm spacing needs, and a 4.028 nm middle cell
+      one skin depth). On 2e7ae0e it reads 29 cells across the part, against
+      the 27 the 7.245 nm spacing needs, and a 5.352 nm middle cell
 
 ## 3. Run C
 

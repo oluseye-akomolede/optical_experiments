@@ -266,21 +266,20 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
                     # either the two face layers meet or cover the part
                     # already, or what they leave between them is under the
                     # wider of one coarse cell and one skin depth.
-                    # graded_axis fills that gap with four cells at
-                    # a quarter of its width -- the split a thin layer gets --
-                    # so every middle under one depth is finer than the skin
-                    # spacing (measured at dx 10 nm, Rakic, 4e14 Hz, spacing
-                    # 7.245 nm: middles of 6.1, 11.1, 16.1 and 26.1 nm came
-                    # out in cells of 1.528, 2.778, 4.028 and 6.528 nm,
-                    # 0.21x-0.90x of the spacing). One skin depth is where the
-                    # four-cell split meets the spacing: at that width a
-                    # quarter of the middle is exactly depth/4. Above it the
-                    # branch is harmless: with room around the slab, middles
-                    # of 31-726 nm came out at 0.974x-0.999x of the spacing,
-                    # every cell equal, so the band this rule has to close
-                    # ends at one skin depth. Run C's
-                    # 150 nm gold mirror at dx 10 nm
-                    # is the extreme case of the band this rule does close --
+                    # graded_axis splits that gap into a few cells -- four at
+                    # a quarter of its width for a 6.1 or 26.1 nm gap, two
+                    # and three for 11.1 and 16.1 -- so every middle under
+                    # one depth is finer than the skin spacing (measured at
+                    # dx 10 nm, Rakic, 4e14 Hz, spacing 7.245 nm: middles of
+                    # 6.1, 11.1, 16.1 and 26.1 nm came out in 1.528, 5.556,
+                    # 5.352 and 6.528 nm, 0.21x-0.90x of it). One skin depth
+                    # is where the split meets the spacing: the finest cell
+                    # at a 28.1 nm middle is 7.03 nm. Above it the branch is
+                    # harmless: with room around the slab, middles of 31-726
+                    # nm came out at 0.997x-1.000x of the spacing, so the
+                    # band this rule has to close ends at one skin depth.
+                    # Run C's 150 nm gold mirror at dx 10 nm is the extreme
+                    # case of the band this rule does close --
                     # Au-palik's depth at that run's band top (362.95 THz) is
                     # 24.466 nm, six depths 146.79 nm, so the 3.21 nm middle
                     # became four 0.801 nm cells, 7.6x under the 6.116 nm

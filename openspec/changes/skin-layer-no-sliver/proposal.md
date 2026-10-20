@@ -30,20 +30,21 @@ band top (depth 27.928 nm) this slab is 5.37 depths, so the layers would meet
 and it was never cut.
 
 **Why a skin depth, not just a coarse cell.** A branch at `middle < dx` alone
-leaves a band open. `graded_axis` fills the gap between two fine layers with
-four cells at a quarter of the gap's width -- the same split a thin layer gets
--- measured with the layout's own two face layers at dx 10 nm (Rakić, 4e14 Hz,
-depth 28.981 nm, spacing 7.245 nm): middles of 6.1, 11.1, 16.1 and 26.1 nm came
-out in cells of 1.528, 2.778, 4.028 and 6.528 nm -- 0.21x to 0.90x of the
-spacing. So every middle under one skin depth is finer than the skin spacing,
-and one skin depth is where the split meets it: a quarter of the middle is then
-exactly `depth/4`. Above that the split is no longer harmful -- with room
-around the slab, middles of 31 to 726 nm came out at 0.974x to 0.999x of the
-spacing, every cell the same -- so the band the two-layer branch harms ends
-where this threshold does. Hence `middle < max(dx_m, depth)`: one layer across
+leaves a band open. `graded_axis` fills the gap between two fine layers with a
+few cells -- four at a quarter of the gap, two and three for two middles in
+between -- measured with the layout's own two face layers at dx 10 nm (Rakić,
+4e14 Hz, depth 28.981 nm, spacing 7.245 nm): middles of 6.1, 11.1, 16.1 and
+26.1 nm came out in cells of 1.528, 5.556, 5.352 and 6.528 nm -- 0.21x to 0.90x
+of the spacing. So every middle under one skin depth is finer than the skin
+spacing, and one skin depth is where the split meets it (a 28.1 nm middle's
+finest cell is 7.03 nm). Above that it is no longer harmful -- with room
+around the slab, middles of 31 to 726 nm came out at 0.997x to 1.000x of the
+spacing -- so the band the two-layer branch harms ends where this threshold
+does. Hence `middle < max(dx_m, depth)`: one layer across
 a part in this band takes under `24 + 4*max(dx_m, depth)/depth` cells (28 where
 a coarse cell is no coarser than the skin depth) at `depth/4`, never finer than
-the cells it replaces. Run C is unaffected (middle 3.21 nm on both revisions).
+the cells it replaces. Run C's mirror is in the band under either rule (middle
+3.21 nm).
 
 ## What Changes
 
@@ -51,9 +52,8 @@ the cells it replaces. Run C is unaffected (middle 3.21 nm on both revisions).
   what they leave between them is at least the wider of one coarse cell and one
   skin depth. Otherwise the part gets **one layer across its whole extent** at
   a quarter of the skin depth -- no strip to subdivide, and the whole part is
-  quantised once (Run C: 25 cells across 150 nm at 6.116 nm, against the 100
-  the two face layers and the split middle took -- 96 of 1.529 nm plus four of
-  0.801 nm). The
+  quantised once (Run C's mirror: four cells of 0.801 nm at `df18afc`, none
+  finer than 3.000 nm now). The
   existing "thinner than 6 skin depths" case is that rule's limit, so one
   condition replaces the special case.
 - Both faces stay grid nodes: the layer spans the part's bounding-box extent

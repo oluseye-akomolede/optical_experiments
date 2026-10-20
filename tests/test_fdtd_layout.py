@@ -208,8 +208,8 @@ def test_a_slab_just_over_six_skin_depths_gets_no_sliver():
     #
     # The second case is the band the coarse-cell threshold alone leaves open:
     # 190 nm at dx 10 nm leaves a 16.1 nm middle, wider than a coarse cell but
-    # under one skin depth, and the two-layer branch fills that middle with 4
-    # cells of 4.028 nm -- 0.56x the 7.245 nm spacing.
+    # under one skin depth, and the two-layer branch fills that middle with 3
+    # cells of 5.352 nm -- 0.74x the 7.245 nm spacing.
     import fdtd_grid
     depth = fdtd_grid.skin_depth("Au", 4.0e14)
     cap = depth / L.CELLS_PER_SKIN

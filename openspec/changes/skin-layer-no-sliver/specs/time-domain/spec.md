@@ -32,13 +32,14 @@ run that is solved.
   layer across its whole extent at that spacing** instead when the two face
   layers would meet or cover the part already, or when what they leave between
   them would be narrower than the wider of one `dx_m` and one skin depth: such
-  a middle is filled with a few cells across it -- four, at a quarter of the
-  gap, the same split a thin layer gets -- so with the gap under four times the
-  spacing those cells are finer than the skin layers themselves: measured at
-  dx 10 nm, middles of 6.1, 11.1, 16.1 and 26.1 nm came out in 1.528, 2.778,
-  4.028 and 6.528 nm (0.21x-0.90x of the spacing), and Run C's 3.2 nm middle
-  in 0.801 nm. A gap over one skin depth does not need the one-layer rule: that
-  fill measured 0.974x-0.999x of the spacing for middles from 31 to 726 nm.
+  a middle is filled with a few cells across it -- four at a quarter of the
+  gap, two and three for middles in between -- and while the gap is under one
+  skin depth those cells are finer than the skin layers themselves: measured
+  at dx 10 nm, middles of 6.1, 11.1, 16.1 and 26.1 nm came out in 1.528, 5.556,
+  5.352 and 6.528 nm (0.21x-0.90x of the spacing), and Run C's 3.2 nm middle
+  in four cells of 0.801 nm. A gap over one skin depth does not need the
+  one-layer rule: with room around the part, middles from 31 to 726 nm
+  measured 0.997x-1.000x of the spacing.
   One layer across the part takes under `24 + 4*max(dx_m, skin depth)/skin
   depth` cells across it (28 where a coarse cell is no coarser than the skin
   depth) at a quarter of the skin depth, never finer than the cells it
