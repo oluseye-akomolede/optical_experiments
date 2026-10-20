@@ -5,6 +5,7 @@ driven directly on a handful of samples, and the two solver runs are under
 16^3 cells.
 """
 
+import csv
 import math
 import sys
 from pathlib import Path
@@ -94,7 +95,8 @@ def test_the_library_matches_a_published_rakic_table():
     2% over 3 rows per metal, 51 of 81 such typos passed; here 77 of 81 fail
     (the four that pass move no row by 1e-3). Both n and k enter, so a
     conjugated convention (k < 0) fails too."""
-    assert sorted(PUBLISHED) == sorted(fdtd.METALS)
+    assert sorted(PUBLISHED) == sorted(fdtd.RAKIC_1998)
+    assert set(PUBLISHED) < set(fdtd.METALS)
     for metal, rows in PUBLISHED.items():
         for wavelength_um, n, k in rows:
             nk = np.sqrt(complex(fdtd.permittivity(
@@ -103,10 +105,70 @@ def test_the_library_matches_a_published_rakic_table():
             assert error < 1e-3, (metal, wavelength_um, nk, (n, k))
 
 
+PALIK_CSV = ROOT / "data" / "palik_au_nk.csv"
+
+
+def palik_rows():
+    text = PALIK_CSV.read_text()
+    return list(csv.DictReader(line for line in text.splitlines()
+                               if not line.startswith("#")))
+
+
+def test_the_palik_gold_model_reproduces_its_table():
+    """Every copied Palik point within 3%, and the model is lossy at each.
+
+    ``data/palik_au_nk.csv`` holds the table's rows between 600 and 1300 nm
+    (12 points, 652.5-1291.5 nm); the model's ``fit_ev`` is those points
+    rounded inward. The fit's measured maximum is 2.11% at 1291 nm
+    (``scripts/fit_palik_gold.py --poles 4 --starts 64``); the gate sits above
+    it and low enough that a moved pole fails, and the measured value itself is
+    asserted so the figure in this docstring cannot drift.
+    """
+    rows = palik_rows()
+    assert len(rows) == 12
+    metal = fdtd.LIBRARY["Au-palik"]
+    assert all(f > 0 and gamma > 0 for f, _w0, gamma in metal.poles), metal.poles
+    worst = 0.0
+    for row in rows:
+        lam_nm = float(row["wavelength_A"]) / 10.0
+        want = complex(float(row["n"]), float(row["k"])) ** 2
+        got = complex(fdtd.permittivity("Au-palik", fdtd.C0 / (lam_nm * 1e-9)))
+        assert got.imag > 0, (lam_nm, got)
+        worst = max(worst, abs(got - want) / abs(want))
+    assert worst < 0.03, worst
+    assert abs(worst - 0.02112) < 1e-4, worst
+
+
+def test_a_palik_band_outside_the_fit_names_palik():
+    """The refusal names the model's own source, not Rakić's for both."""
+    to_hz = fdtd.EV / (2 * math.pi)
+    fdtd.check_metal_band("Au-palik", 1.3 * to_hz, 1.45 * to_hz)   # inside
+    with pytest.raises(fdtd.FDTDError,
+                       match=r"Palik 1985 fitted for Au-palik, 0\.96-1\.9 eV"):
+        fdtd.check_metal_band("Au-palik", 0.9 * to_hz, 1.2 * to_hz)
+
+
+@pytest.mark.parametrize("nm", (2, 5, 10, 20))
+def test_the_palik_gold_model_is_stable_at_the_bench_spacings(nm):
+    """The solver's own reduced dt leaves this model below the growth bound.
+
+    A fitted pole can be high-Q (the 0.9998 eV pole's Gamma is 1e-5), so the
+    check is the one the solver runs: ``stable_dt`` at the bench's 2-20 nm
+    gold, then the growth factor at that dt.
+    """
+    h = (nm * 1e-9,) * 3
+    term = fdtd.LorentzDrude("Au-palik", np.zeros((2, 2, 2), bool))
+    reduced = term.stable_dt(fdtd.courant_dt(*h), h)
+    coefficients = fdtd.lorentz_drude_coefficients("Au-palik", reduced)
+    assert (fdtd.lorentz_drude_growth(coefficients, reduced, h)
+            < 1.0 + fdtd.GROWTH_TOLERANCE)
+
+
 def test_a_band_outside_the_fit_is_refused_naming_it():
     to_hz = fdtd.EV / (2 * math.pi)
     fdtd.check_metal_band("Au", 1.0 * to_hz, 3.0 * to_hz)        # inside
-    with pytest.raises(fdtd.FDTDError, match=r"Au, 0\.2-5 eV"):
+    with pytest.raises(fdtd.FDTDError,
+                       match=r"Rakić et al\. 1998 fitted for Au, 0\.2-5 eV"):
         fdtd.check_metal_band("Au", 0.15 * to_hz, 3.0 * to_hz)
     with pytest.raises(fdtd.FDTDError, match=r"Cr, 0\.1-5 eV"):
         fdtd.check_metal_band("Cr", 1.0 * to_hz, 5.5 * to_hz)
@@ -264,7 +326,8 @@ def test_a_metal_shrinks_dt_only_as_far_as_it_must():
         assert low <= reduced / dt <= high, (nm, reduced / dt)
         if reduced < dt:
             coefficients = fdtd.lorentz_drude_coefficients("Au", reduced)
-            assert fdtd.lorentz_drude_growth(coefficients, reduced, h) < 1 + 1e-6
+            assert (fdtd.lorentz_drude_growth(coefficients, reduced, h)
+            < 1.0 + fdtd.GROWTH_TOLERANCE)
 
 
 def test_simulate_runs_the_metal_at_the_reduced_dt():

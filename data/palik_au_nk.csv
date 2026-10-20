@@ -1,0 +1,18 @@
+# Optical constants of polycrystalline gold, from E. D. Palik (ed.), Handbook of
+# Optical Constants of Solids, Academic Press, 1985, gold chapter (p. 290),
+# as distributed by the IMD collection (Au_palik.nk). Columns: wavelength in
+# ANGSTROM, n, k. Rows are the table's points from 6000 to 13000 A; the table
+# itself has no points between 5635 and 6525 A. Read as data only.
+wavelength_A,n,k
+6525.26,0.166,3.150
+6887.78,0.160,3.800
+7292.94,0.164,4.350
+7748.75,0.174,4.860
+8265.33,0.188,5.390
+8855.71,0.210,5.880
+9536.92,0.236,6.470
+10331.70,0.272,7.070
+11270.90,0.312,7.930
+12398.00,0.372,8.770
+12651.00,0.389,8.090
+12914.60,0.403,8.250

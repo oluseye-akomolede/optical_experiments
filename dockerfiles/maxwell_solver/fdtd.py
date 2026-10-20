@@ -485,6 +485,7 @@ class Metal:
     plasma_ev: float
     poles: tuple                    # (f_j, w_j eV, Gamma_j eV), Drude first
     fit_ev: tuple                   # (lowest, highest) photon energy, eV
+    source: str = "Rakić et al. 1998"   # what the fit is to, for refusals
 
 
 #: A. D. Rakić, A. B. Djurišić, J. M. Elazar and M. L. Majewski, "Optical
@@ -516,15 +517,37 @@ RAKIC_1998 = {
                               (0.825, 8.775, 1.335)),
                 (0.1, 5.0)),
 }
-METALS = tuple(sorted(RAKIC_1998))
+#: E. D. Palik, *Handbook of Optical Constants of Solids* (Academic Press,
+#: 1985), gold chapter, p. 290, as distributed by IMD (``Au_palik.nk``). The
+#: 12 table rows between 600 and 1300 nm are copied to
+#: ``data/palik_au_nk.csv``; the fitted points run 653-1291 nm (the table has
+#: a gap between 5635 and 6525 A, so nothing below 653 nm inside the band).
+#: Four Lorentz poles plus the Drude term, ``eps_inf = 1``, every ``f_j`` and
+#: ``G_j`` positive so the ADE keeps its stable form. Worst relative
+#: complex-permittivity error over the fitted points is 2.11% (at 1291 nm);
+#: put it back with
+#: ``.venv-mse/bin/python scripts/fit_palik_gold.py --poles 4 --starts 64``.
+PALIK_1985 = {
+    "Au-palik": Metal(
+        "Au-palik", 8.645262208,
+        ((1, 0, 1e-05),
+         (0.2546877998, 2.29338809, 0.02509509676),
+         (0.06160089209, 1.016929188, 0.7444953928),
+         (0.01073179599, 1.035616311, 1e-05),
+         (0.0001022865397, 0.9998312645, 1e-05)),
+        (0.96, 1.9),
+        source="Palik 1985"),
+}
+LIBRARY = {**RAKIC_1998, **PALIK_1985}
+METALS = tuple(sorted(LIBRARY))
 
 
 def _metal(metal) -> Metal:
     if isinstance(metal, Metal):
         return metal
-    if metal not in RAKIC_1998:
+    if metal not in LIBRARY:
         raise FDTDError(f"unknown metal {metal!r}; the library has {METALS}")
-    return RAKIC_1998[metal]
+    return LIBRARY[metal]
 
 
 def permittivity(metal, frequency):
@@ -548,7 +571,8 @@ def check_metal_band(metal, f_low: float, f_high: float):
         raise FDTDError(
             f"the pulse band {low_ev:.3g}-{high_ev:.3g} eV "
             f"({f_low / 1e12:.4g}-{f_high / 1e12:.4g} THz) leaves the range "
-            f"Rakić et al. fitted for {metal.name}, {fit_low:g}-{fit_high:g} eV; "
+            f"{metal.source} fitted for {metal.name}, "
+            f"{fit_low:g}-{fit_high:g} eV; "
             f"move the centre frequency or narrow the bandwidth")
 
 

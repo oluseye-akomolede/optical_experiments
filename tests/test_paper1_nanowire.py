@@ -591,6 +591,31 @@ def test_a_raised_memory_ceiling_is_reported_on_the_caps_line(capsys):
             assert "14.0 GB" in caps[0], caps
 
 
+def test_the_gold_flag_selects_what_the_scene_prices_and_reports(capsys):
+    """--gold-data picks the library name in one place, and every reader uses it.
+
+    The scene's mirror material, the estimate's metals table, the skin depth the
+    report prints and the material the run names all come from ``gold_metal``; a
+    run whose estimate priced Rakić while the solver built Palik would report a
+    stack it did not run. Rakić is the default, so earlier records reproduce.
+    """
+    m = _load()
+    plain = m.parse_args([])
+    palik = m.parse_args(["--gold-data", "palik"])
+    assert plain.gold_data == "rakic"
+    assert m.scene(plain)[2]["mirror"] == "Au"
+    assert m.scene(palik)[2]["mirror"] == "Au-palik"
+    args = m.parse_args(["--dx", "400", "--gold-data", "palik"])
+    lay, request, geom = m.solve_scene(args)
+    assert "Au-palik" in lay["metals"], sorted(lay["metals"])
+    measured = m.filled(args, lay, request)
+    m.report(args, lay, request, geom, measured)
+    stack = [line for line in capsys.readouterr().out.splitlines()
+             if line.startswith("stack")]
+    assert len(stack) == 1, stack
+    assert "Au-palik" in stack[0], stack[0]
+
+
 def test_a_record_that_is_not_settled_is_flagged():
     """8 periods with a 4-period tail: the drive has not settled, F reads 4.61.
 

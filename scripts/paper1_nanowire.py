@@ -280,6 +280,16 @@ def boundary_cells(args) -> dict:
             "pml_cells": pml_cells}
 
 
+def gold_metal(args) -> str:
+    """The library name of the gold this run uses (``--gold-data``).
+
+    ``rakic`` is Rakić et al. 1998, the default the earlier runs used;
+    ``palik`` is the second model, fitted to Palik's 1985 table at its
+    600-1300 nm points (``fdtd.PALIK_1985``).
+    """
+    return "Au" if args.gold_data == "rakic" else "Au-palik"
+
+
 def scene(args):
     """The three parts, their materials, and the request the layout reads.
 
@@ -306,7 +316,7 @@ def scene(args):
     parts = [_box((-half, -half, 0.0), (half, half, z_gold1)),
              _box((-half, -half, z_gold1), (half, half, z_ox1)),
              _hex_prism(z_ox1, z_top, radius, args.hex_rotation)]
-    materials = {"mirror": "Au", "oxide": N_SIO2, "wire": N_INP}
+    materials = {"mirror": gold_metal(args), "oxide": N_SIO2, "wire": N_INP}
     if args.vacuum:                    # the control: the same meshes, no material
         materials = {name: 1.0 for name in names}
     request = {
@@ -1275,9 +1285,11 @@ def report(args, lay, request, geom, measured):
           f" {_oxide_slice(z, geom).size} cells of"
           f" {_oxide_cell_nm(z, geom):.2f} nm")
     f0 = request["frequency_hz"]
-    depth = fdtd_grid.skin_depth("Au", f0) / NM
+    metal = gold_metal(args)
+    depth = fdtd_grid.skin_depth(metal, f0) / NM
+    print(f"gold      {metal} (--gold-data {args.gold_data})")
     print(f"stack     gold {args.gold:.0f} nm = {args.gold / depth:.1f} skin depths"
-          f" (skin depth {depth:.1f} nm at {f0 / 1e12:.1f} THz), SiO2"
+          f" (skin depth {depth:.1f} nm at {f0 / 1e12:.1f} THz, {metal}), SiO2"
           f" {args.oxide:.0f} nm, InP {args.height:.0f} nm on a"
           f" {2 * geom['half'] / NM:.0f} nm mirror; the wire is"
           f" {2 * geom['radius'] / NM:.1f} nm across corners,"
@@ -2257,7 +2269,7 @@ def tiny(args) -> int:
                oxide.size > 0 and float(oxide.max()) < real.dx * NM * 0.999))
     ok.append(("the product's own check_axis passes",
                not fdtd_grid.check_axis(z, real.dx * NM)))
-    gold = lay["metals"].get("Au")
+    gold = lay["metals"].get(gold_metal(args))
     ok.append(("the gold is a region", gold is not None and bool(gold.any())))
     if gold is not None and gold.any():
         kz = np.flatnonzero(gold.any(axis=(0, 1)))
@@ -2524,6 +2536,10 @@ def PARSER_ARGUMENTS(p) -> None:
     p.add_argument("--height", type=float, default=1375.0, help="wire height, nm")
     p.add_argument("--oxide", type=float, default=12.0, help="SiO2 buffer, nm")
     p.add_argument("--gold", type=float, default=150.0, help="gold mirror, nm")
+    p.add_argument("--gold-data", choices=("rakic", "palik"), default="rakic",
+                   help="gold model: Rakić et al. 1998 (default, the earlier"
+                        " runs' model) or Palik 1985 fitted at its 600-1300 nm"
+                        " table points")
     p.add_argument("--qd-below", type=float, default=30.0,
                    help="dipole below the top facet, nm")
     p.add_argument("--dx", type=float, default=10.0, help="x-y cell, nm")
