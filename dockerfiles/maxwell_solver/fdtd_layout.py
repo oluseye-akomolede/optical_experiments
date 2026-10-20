@@ -275,8 +275,8 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
                     # 5.352 and 6.528 nm, 0.21x-0.90x of it). One skin depth
                     # is where the split meets the spacing: the finest cell
                     # at a 28.1 nm middle is 7.03 nm. Above it the branch is
-                    # harmless: with room around the slab, middles of 31-726
-                    # nm came out at 0.997x-1.000x of the spacing, so the
+                    # harmless: with room around the slab, middles of 29-726
+                    # nm came out at 1.000x of the spacing, so the
                     # band this rule has to close ends at one skin depth.
                     # Run C's 150 nm gold mirror at dx 10 nm is the extreme
                     # case of the band this rule does close --
