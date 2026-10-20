@@ -772,8 +772,8 @@ run that is solved.
   at dx 10 nm, middles of 6.1, 11.1, 16.1 and 26.1 nm came out in 1.528, 5.556,
   5.352 and 6.528 nm (0.21x-0.90x of the spacing), and Run C's 3.2 nm middle
   in four cells of 0.801 nm. A gap over one skin depth does not need the
-  one-layer rule: with room around the part (a 3000 nm host, the part 900 nm
-  up), middles from 29 to 726 nm measured 1.000x of the spacing.
+  one-layer rule: with room around the part, middles from 31 to 726 nm
+  measured 0.997x-1.000x of the spacing.
   One layer across the part takes under `24 + 4*max(dx_m, skin depth)/skin
   depth` cells across it (28 where a coarse cell is no coarser than the skin
   depth) at a quarter of the skin depth, never finer than the cells it
