@@ -201,6 +201,14 @@ def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
                         * float(job.get("scale") or 1.0))
         names, parts = mse_parts.split_obj_parts(
             store_in.read(f"jobs/{job_id}/input.obj"))
+        # The app refuses a band a metal was not fitted over; this is the same
+        # refusal for any job that reaches the worker without passing the form.
+        # It runs before the layout: the metals are named by the job's own
+        # table, and voxelising a grid only to refuse it wastes the run.
+        fdtd.check_scene_band(
+            [*(job.get("materials") or {}).values(),
+             *(pair[0] for pair in (request.get("coatings") or {}).values())],
+            request)
         lay = fdtd_layout.layout(names, parts, request,
                                  length_scale=length_scale,
                                  materials=job.get("materials"),

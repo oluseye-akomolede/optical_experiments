@@ -616,6 +616,60 @@ def test_the_gold_flag_selects_what_the_scene_prices_and_reports(capsys):
     assert "Au-palik" in stack[0], stack[0]
 
 
+def test_a_gold_run_outside_its_models_fit_is_refused():
+    """The script judges the pulse's 1% spectrum, as the app does.
+
+    1500 nm +- 100 nm as a pulse covers 0.68-1.09 eV (its 1% spectrum is 2.15x
+    the nominal half-width), below Au-palik's 1.10-1.90 eV fit, and the
+    refusal is the product's own sentence. A cw source asks no band, so the
+    same wavelength is accepted; Rakić's 0.2-5 eV covers the pulse; and
+    --vacuum names no metal at all.
+    """
+    m = _load()
+    pulse = ["--profile", "pulse", "--wavelength", "1500", "--band-half", "100"]
+    with pytest.raises(m.fdtd.FDTDError,
+                       match=r"Palik 1985 fitted for Au-palik, 1\.1-1\.9 eV"):
+        m.scene(m.parse_args(["--gold-data", "palik", *pulse]))
+    m.scene(m.parse_args(["--gold-data", "palik", "--wavelength", "1500",
+                          "--band-half", "100"]))          # cw: asks no band
+    m.scene(m.parse_args(pulse))                           # Rakić: covered
+    m.scene(m.parse_args(["--gold-data", "palik", "--vacuum", *pulse]))
+
+
+@pytest.mark.parametrize("band_half, accepted",
+                         ((83, True), (84, False), (100, False)))
+def test_run_c_pulse_is_limited_by_the_palik_fit(band_half, accepted):
+    """Run C's 900 nm pulse meets the app's own band, and the fit's own edge.
+
+    The guard reads the pulse's 1% spectrum through ``fdtd.source_band``, the
+    definition the app and the worker use, so the numbers here are the app's:
+    at 900 nm, 83 nm of nominal half-width floors the band at 1.103 eV (the
+    last accepted value) and 84 nm at 1.099 eV (refused). At Run C's
+    ``--band-half 100`` the band is 1.045-1.710 eV and is refused; whether the
+    run narrows its pulse or the fit widens is the lead's call.
+    """
+    m = _load()
+    args = m.parse_args(["--gold-data", "palik", "--profile", "pulse",
+                         "--wavelength", "900", "--band-half", str(band_half)])
+    request = {"frequency_hz": m.C / (args.wavelength * m.NM),
+               "profile": args.profile, "bandwidth": m.band_hz(args)}
+    low, high = m.fdtd.source_band(request["frequency_hz"], "pulse",
+                                   request["bandwidth"])
+    to_ev = 2.0 * math.pi / m.fdtd.EV
+    assert (low * to_ev, high * to_ev) == pytest.approx(
+        {83: (1.102628, 1.652576), 84: (1.099257, 1.655947),
+         100: (1.045020, 1.710185)}[band_half], abs=1e-6)
+    if accepted:
+        m.scene(args)
+    else:
+        with pytest.raises(m.fdtd.FDTDError) as script_side:
+            m.scene(args)
+        # The same numbers the app would refuse with, sentence for sentence.
+        with pytest.raises(m.fdtd.FDTDError) as app_side:
+            m.fdtd.check_scene_band(["Au-palik"], request)
+        assert str(script_side.value) == str(app_side.value)
+
+
 def test_a_record_that_is_not_settled_is_flagged():
     """8 periods with a 4-period tail: the drive has not settled, F reads 4.61.
 

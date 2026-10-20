@@ -3,7 +3,7 @@
 Every sample point gets the index of the innermost part that contains it
 (``part index + 1``), or ``OUTSIDE`` (0) when no part does. The materials table
 then turns indices into the grid ``simulate`` takes: a relative permittivity per
-node, a PEC mask, and one node mask per Rakić metal. Outside the parts the grid
+node, a PEC mask, and one node mask per library metal. Outside the parts the grid
 is a metal wall (``boundary="metal"``: the upload is a cavity) or vacuum
 (``boundary="open"``: the object sits in the gap the grid builder left).
 
@@ -69,7 +69,7 @@ def nesting_depths(parts) -> list:
 
 def priority_of(material) -> float:
     """Who owns a point on a face two parts share: a conductor (``pec`` or a
-    Rakić metal) over any dielectric, and between dielectrics the higher
+    library metal) over any dielectric, and between dielectrics the higher
     refractive index."""
     return float(material) if not isinstance(material, str) else np.inf
 
@@ -486,7 +486,7 @@ def voxelise(names, parts, materials, nodes, *, boundary: str = "metal",
     """The grid ``simulate`` takes, from named parts and a materials table.
 
     ``materials`` maps every part name to a refractive index, ``"pec"`` or a
-    Rakić metal name. ``nodes`` are the grid's node coordinates in metres and
+    library metal name. ``nodes`` are the grid's node coordinates in metres and
     ``length_scale`` is metres per mesh unit. Returns ``eps`` (relative
     permittivity per node), ``pec`` (bool mask, or None when there is no
     conductor) and ``metals`` ({name: node mask} for each metal present).

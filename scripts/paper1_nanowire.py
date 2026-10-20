@@ -284,8 +284,8 @@ def gold_metal(args) -> str:
     """The library name of the gold this run uses (``--gold-data``).
 
     ``rakic`` is Rakić et al. 1998, the default the earlier runs used;
-    ``palik`` is the second model, fitted to Palik's 1985 table at its
-    600-1300 nm points (``fdtd.PALIK_1985``).
+    ``palik`` is the second model, fitted to Palik's 1985 table over its
+    653-1127 nm rows (``fdtd.PALIK_1985``).
     """
     return "Au" if args.gold_data == "rakic" else "Au-palik"
 
@@ -333,6 +333,16 @@ def scene(args):
     }
     request["frequency_hz"] = C / (args.wavelength * NM)
     request["bandwidth"] = band_hz(args)
+    # The product refuses a band a metal was not fitted over; this run drives
+    # the same band, so it meets the same refusal here, before the scene is
+    # built. ``source_band`` is that one definition -- the pulse's 1% spectrum,
+    # not the nominal half-width below -- so this script and the app agree on
+    # what a pulse asks for, and a cw or drawn source asks nothing. A
+    # --vacuum control names no metal and asks nothing of one.
+    band = fdtd.source_band(request["frequency_hz"], request["profile"],
+                            request["bandwidth"])
+    if band is not None and isinstance(materials["mirror"], str):
+        fdtd.check_metal_band(materials["mirror"], *band)
     cells = boundary_cells(args)
     geom = {"z_top": z_top, "z_oxide": (z_gold1, z_ox1), "radius": radius,
             "half": half,

@@ -38,15 +38,15 @@ EV_NM = 1239.841984
 BAND_NM = (600.0, 1300.0)
 
 
-def load(path=DATA):
-    """(wavelength nm, n, k) for every table row in the band."""
+def load(path=DATA, max_nm=BAND_NM[1]):
+    """(wavelength nm, n, k) for every table row in the band up to ``max_nm``."""
     with open(path) as handle:
         rows = list(csv.DictReader(line for line in handle
                                    if not line.startswith("#")))
     lam = np.array([float(row["wavelength_A"]) / 10.0 for row in rows])
     n = np.array([float(row["n"]) for row in rows])
     k = np.array([float(row["k"]) for row in rows])
-    keep = (lam >= BAND_NM[0]) & (lam <= BAND_NM[1])
+    keep = (lam >= BAND_NM[0]) & (lam <= max_nm)
     return lam[keep], n[keep], k[keep]
 
 
@@ -62,14 +62,25 @@ def model(p, energy_ev):
 
 
 def fit(energy_ev, target, poles, *, starts=64, seed=1,
-        gamma_floor=0.01, max_nfev=8000):
-    """The best of ``starts`` bounded relative-error fits, by cost."""
+        gamma_floor=0.05, envelope=None, envelope_weight=3.0,
+        max_nfev=8000):
+    """The best of ``starts`` bounded relative-error fits, by cost.
+
+    ``envelope`` is ``(wavelength_nm, cap_abs_eps)`` or None: on that grid the
+    model's ``|eps|`` may not exceed ``cap`` (a one-sided residual), which is
+    what stops a narrow pole from spiking between sparse table rows.
+    """
     rng = np.random.default_rng(seed)
 
     def residuals(p):
         got = model(p, energy_ev)
-        return np.concatenate(((got.real - target.real) / np.abs(target),
-                               (got.imag - target.imag) / np.abs(target)))
+        parts = [(got.real - target.real) / np.abs(target),
+                 (got.imag - target.imag) / np.abs(target)]
+        if envelope is not None:
+            lam, cap = envelope
+            over = np.abs(model(p, EV_NM / lam)) / cap - 1.0
+            parts.append(np.maximum(over, 0.0) * envelope_weight)
+        return np.concatenate(parts)
 
     best = None
     for _ in range(starts):
@@ -79,8 +90,8 @@ def fit(energy_ev, target, poles, *, starts=64, seed=1,
         for _ in range(poles):
             p0 += [rng.uniform(1e-3, 2.0), rng.uniform(0.3, 4.0),
                    rng.uniform(gamma_floor, 2.0)]
-            low += [1e-6, 1e-3, gamma_floor]
-            high += [20.0, 10.0, 10.0]
+            low += [1e-6, 0.1, gamma_floor]
+            high += [20.0, 5.0, 10.0]
         found = least_squares(residuals, p0, bounds=(low, high),
                               max_nfev=max_nfev)
         if best is None or found.cost < best.cost:
@@ -88,7 +99,17 @@ def fit(energy_ev, target, poles, *, starts=64, seed=1,
     return best
 
 
-def literal(p):
+def envelope_from(lam_nm, target, factor, step=2.0):
+    """``(|eps| * factor)`` interpolated on a dense grid over the table's span.
+
+    Between two rows the cap moves linearly, so a model may not exceed the
+    neighbouring rows' magnitude by more than ``factor`` anywhere between them.
+    """
+    grid = np.arange(np.ceil(lam_nm.min()), np.floor(lam_nm.max()) + 1, step)
+    return grid, factor * np.interp(grid, lam_nm, np.abs(target))
+
+
+def literal(p, fit_ev):
     """The ``Metal(...)`` literal the fit prints, to 10 significant digits.
 
     The digits matter: 4 of them moved the 2.11% fit to 3.13%, past the gate.
@@ -97,7 +118,8 @@ def literal(p):
     for j in range((len(p) - 2) // 3):
         poles.append(tuple(p[2 + 3 * j:5 + 3 * j]))
     shown = ", ".join(f"({f:.10g}, {w0:.10g}, {g:.10g})" for f, w0, g in poles)
-    return f"Metal(\"Au-palik\", {p[0]:.10g}, ({shown}), (0.96, 1.9))"
+    return (f"Metal(\"Au-palik\", {p[0]:.10g}, ({shown}),"
+            f" ({fit_ev[0]:.2f}, {fit_ev[1]:.2f}))")
 
 
 def main(argv=None):
@@ -106,15 +128,29 @@ def main(argv=None):
                         help="Lorentz poles besides the Drude one (default 4)")
     parser.add_argument("--starts", type=int, default=64)
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--gamma-floor", type=float, default=1e-5,
+    parser.add_argument("--gamma-floor", type=float, default=0.05,
                         help="lowest Lorentz/drude damping the fit may pick")
+    parser.add_argument("--fit-max-nm", type=float, default=1150.0,
+                        help="fit only the table rows at or below this (nm);"
+                             " the three rows past it miss the 3 %% gate under"
+                             " the damping floor and envelope")
+    parser.add_argument("--envelope", type=float, default=1.5,
+                        help="|eps| cap, as a factor on the linear interpolation"
+                             " between rows, on a 2 nm grid; 0 disables")
     args = parser.parse_args(argv)
 
-    lam_nm, n, k = load()
+    lam_nm, n, k = load(max_nm=args.fit_max_nm)
     energy = EV_NM / lam_nm
     target = (n + 1j * k) ** 2
+    fit_ev = (energy.min(), energy.max())
+    envelope = None
+    if args.envelope:
+        all_lam, all_n, all_k = load()
+        envelope = envelope_from(all_lam, (all_n + 1j * all_k) ** 2,
+                                 args.envelope)
     found = fit(energy, target, args.poles, starts=args.starts,
-                seed=args.seed, gamma_floor=args.gamma_floor)
+                seed=args.seed, gamma_floor=args.gamma_floor,
+                envelope=envelope)
     got = model(found.x, energy)
     error = np.abs(got - target) / np.abs(target)
 
@@ -122,11 +158,25 @@ def main(argv=None):
           f" {args.poles} Lorentz poles, {args.starts} starts, seed {args.seed}")
     print(f"# max |eps error| / |eps| = {error.max() * 100:.2f}%"
           f" at {lam_nm[error.argmax()]:.0f} nm")
-    print(literal(found.x))
+    print(literal(found.x, fit_ev))
     print("# wavelength_nm  eps_target  eps_model  rel_error")
     for lam, want, has, err in zip(lam_nm, target, got, error):
         print(f"  {lam:9.1f}  {want.real:9.3f}{want.imag:+8.3f}i"
               f"  {has.real:9.3f}{has.imag:+8.3f}i  {err * 100:5.2f}%")
+    print("# dense grid 600-1400 nm, every 2 nm")
+    grid = np.arange(600.0, 1400.0 + 0.1, 2.0)
+    dense = model(found.x, EV_NM / grid)
+    middle = (grid >= 1100.0) & (grid <= 1300.0)
+    print(f"# Re eps over 1100-1300 nm: {dense.real[middle].min():.1f}"
+          f" .. {dense.real[middle].max():.1f}")
+    print(f"# dense Re eps: max {dense.real.max():.3f}"
+          f" at {grid[dense.real.argmax()]:.0f} nm;"
+          f" min Im eps {dense.imag.min():.3g}"
+          f" at {grid[dense.imag.argmin()]:.0f} nm")
+    if envelope is not None:
+        ratio = np.abs(model(found.x, EV_NM / envelope[0])) / envelope[1]
+        print(f"# max |eps| / (envelope cap) = {ratio.max():.3f}"
+              f" at {envelope[0][ratio.argmax()]:.0f} nm")
     return 0
 
 

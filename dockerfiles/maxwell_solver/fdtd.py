@@ -464,7 +464,7 @@ class PolarisationTerm:
 
 
 # --------------------------------------------------------------------------
-# dispersive metals: Rakić et al. 1998 Lorentz-Drude
+# dispersive metals: library Lorentz-Drude models (Rakić 1998, Palik 1985)
 # --------------------------------------------------------------------------
 
 #: Angular frequency of one electronvolt, e / hbar (CODATA 2018, exact).
@@ -520,22 +520,28 @@ RAKIC_1998 = {
 #: E. D. Palik, *Handbook of Optical Constants of Solids* (Academic Press,
 #: 1985), gold chapter, p. 290, as distributed by IMD (``Au_palik.nk``). The
 #: 12 table rows between 600 and 1300 nm are copied to
-#: ``data/palik_au_nk.csv``; the fitted points run 653-1291 nm (the table has
-#: a gap between 5635 and 6525 A, so nothing below 653 nm inside the band).
+#: ``data/palik_au_nk.csv``; the fit uses the 9 rows at or below 1150 nm
+#: (652.5-1127.1 nm; the table has a gap between 5635 and 6525 A). The three
+#: rows past 1150 nm are not fitted: under the damping floor and smoothness
+#: envelope below, the model misses them by 4.12%, 19.18% and 20.37% against
+#: the 3% gate, and their k falls then rises (8.77, 8.09, 8.25).
 #: Four Lorentz poles plus the Drude term, ``eps_inf = 1``, every ``f_j`` and
-#: ``G_j`` positive so the ADE keeps its stable form. Worst relative
-#: complex-permittivity error over the fitted points is 2.11% (at 1291 nm);
-#: put it back with
+#: ``G_j`` positive and every ``G_j >= 0.05 eV``, so the ADE keeps its stable
+#: form and no pole can ring between two table rows: ``|eps|`` stays within
+#: 1.5x of the linear interpolation between rows on a 2 nm grid (measured
+#: 0.80x), Re eps stays negative and Im eps positive over 600-1400 nm. Worst
+#: relative complex-permittivity error over the fitted rows is 1.4951% at
+#: 652.5 nm (the fit prints 1.50% at 653 nm); put it back with
 #: ``.venv-mse/bin/python scripts/fit_palik_gold.py --poles 4 --starts 64``.
 PALIK_1985 = {
     "Au-palik": Metal(
-        "Au-palik", 8.645262208,
-        ((1, 0, 1e-05),
-         (0.2546877998, 2.29338809, 0.02509509676),
-         (0.06160089209, 1.016929188, 0.7444953928),
-         (0.01073179599, 1.035616311, 1e-05),
-         (0.0001022865397, 0.9998312645, 1e-05)),
-        (0.96, 1.9),
+        "Au-palik", 9.124543443,
+        ((1, 0, 0.05),
+         (0.002824528311, 1.064752361, 0.05),
+         (0.003701072405, 1.438887376, 0.2470700572),
+         (0.002241870303, 1.235860913, 0.111624585),
+         (0.3456226356, 2.431442085, 0.05)),
+        (1.10, 1.90),
         source="Palik 1985"),
 }
 LIBRARY = {**RAKIC_1998, **PALIK_1985}
@@ -574,6 +580,50 @@ def check_metal_band(metal, f_low: float, f_high: float):
             f"{metal.source} fitted for {metal.name}, "
             f"{fit_low:g}-{fit_high:g} eV; "
             f"move the centre frequency or narrow the bandwidth")
+
+
+#: Fraction of a pulse's peak spectrum that counts as its band.
+BAND_FLOOR = 1e-2
+
+
+def source_band(frequency: float, profile: str, bandwidth: float | None):
+    """The ``(f_low, f_high)`` a source's spectrum covers above ``BAND_FLOOR``,
+    or None when it declares no band (``cw`` and ``drawn``).
+
+    The pulse's envelope ``exp(-(t/sigma)^2)``, ``sigma = 1/(pi bw)``, has
+    amplitude spectrum ``exp(-((f - f0)/bw)^2)``, so it is above the floor
+    within ``bw * sqrt(log(1/floor))`` of ``f0``. The bench and the app both
+    ask this, so the band they judge a metal against is one definition.
+    """
+    if profile != "pulse":
+        return None
+    half = bandwidth * math.sqrt(math.log(1.0 / BAND_FLOOR))
+    low = frequency - half
+    if low <= 0:
+        raise FDTDError(f"the band reaches {low:.3g} Hz; narrow it")
+    return low, frequency + half
+
+
+def check_scene_band(materials, request):
+    """Refuse the first named metal whose fit does not cover the source band.
+
+    ``materials`` are the metals the scene places (a part's or a coating's);
+    ``request`` carries ``frequency_hz``, ``profile`` and ``bandwidth``. A
+    source with no declared band (``cw``, ``drawn``) asks nothing: its band is
+    the caller's to know. Library names only; ``pec`` and indices are not
+    dispersive models and have no fitted range, so a scene that names none of
+    the library's models is left alone -- even for a band wide enough to reach
+    DC, which only a fitted metal would have to answer for.
+    """
+    named = [m for m in materials if m != "pec" and m in LIBRARY]
+    if not named:
+        return
+    band = source_band(request["frequency_hz"], request["profile"],
+                       request["bandwidth"])
+    if band is None:
+        return
+    for metal in named:
+        check_metal_band(metal, *band)
 
 
 def lorentz_drude_coefficients(metal, dt: float) -> list:
@@ -641,7 +691,8 @@ def lorentz_drude_growth(coefficients, dt: float, spacings,
 
 
 class LorentzDrude(PolarisationTerm):
-    """A Rakić metal on a node mask, stepped with auxiliary differential equations.
+    """A dispersive metal on a node mask, stepped with auxiliary differential
+    equations.
 
     Each pole carries a polarisation density obeying
     ``P'' + G P' + w0^2 P = eps0 f wp^2 E``, central-differenced in time:

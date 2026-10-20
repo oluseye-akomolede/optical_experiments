@@ -76,7 +76,7 @@ import fdtd  # noqa: E402
 
 #: The spec's numbers.
 REFLECTANCE_TOLERANCE = 0.02         # absolute
-BAND_FLOOR = 1e-2                    # of the incident spectrum's peak
+BAND_FLOOR = fdtd.BAND_FLOOR         # of the incident spectrum's peak
 MIN_CELLS_PER_SKIN_DEPTH = 4.0
 MIN_SKIN_DEPTHS = 10.0
 #: The bench's own: a trace whose last TAIL_FRACTION still holds more than
@@ -230,15 +230,11 @@ def main(argv=None) -> int:
 
     frequency = args.centre_ev * fdtd.EV / (2.0 * math.pi)
     bandwidth = args.bandwidth_ratio * frequency
-    # The band the gate will judge, from the profile's own spectrum: the
-    # envelope exp(-(t/sigma)^2), sigma = 1/(pi bw), has amplitude spectrum
-    # exp(-((f - f0)/bw)^2), above BAND_FLOOR within this half-width. After the
-    # runs the measured band is checked against it.
-    half = bandwidth * math.sqrt(math.log(1.0 / BAND_FLOOR))
-    f_low, f_high = frequency - half, frequency + half
+    # The band the gate will judge is the source's own declared band, from
+    # ``fdtd.source_band`` -- the same definition the app's guard uses. After
+    # the runs the measured band is checked against it.
     try:
-        if f_low <= 0:
-            raise fdtd.FDTDError(f"the band reaches {f_low:.3g} Hz; narrow it")
+        f_low, f_high = fdtd.source_band(frequency, "pulse", bandwidth)
         fdtd.check_metal_band(args.metal, f_low, f_high)
     except fdtd.FDTDError as error:
         print(f"refused: {error}")
@@ -282,7 +278,8 @@ def main(argv=None) -> int:
     inc_probe = (1, 1, low + 1, "x")         # inside the box: incident only
     ref_probe = (1, 1, low - 2, "x")         # scattered field: reflected only
 
-    print(f"metal      {args.metal} (Rakić 1998 Lorentz-Drude), slab nodes "
+    print(f"metal      {args.metal} ({fdtd.LIBRARY[args.metal].source}"
+          f" Lorentz-Drude), slab nodes "
           f"{k0}..{k1} = {slab_cells} cells = {slab_cells*dz*1e9:.4g} nm")
     print(f"band       {f_low*2*math.pi/fdtd.EV:.4g}-"
           f"{f_high*2*math.pi/fdtd.EV:.4g} eV (incident >= {BAND_FLOOR:g} of "
