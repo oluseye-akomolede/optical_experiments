@@ -619,11 +619,11 @@ def test_the_gold_flag_selects_what_the_scene_prices_and_reports(capsys):
 def test_a_gold_run_outside_its_models_fit_is_refused():
     """The script judges the pulse's 1% spectrum, as the app does.
 
-    1500 nm +- 100 nm as a pulse covers 0.68-1.09 eV (its 1% spectrum is 2.15x
-    the nominal half-width), below Au-palik's 1.10-1.90 eV fit, and the
-    refusal is the product's own sentence. A cw source asks no band, so the
-    same wavelength is accepted; Rakić's 0.2-5 eV covers the pulse; and
-    --vacuum names no metal at all.
+    1500 nm +- 100 nm as a pulse covers 0.708-0.945 eV (its 1% spectrum is
+    2.15x the nominal half-width, 0.775-0.886 eV), below Au-palik's
+    1.10-1.90 eV fit, and the refusal is the product's own sentence. A cw
+    source asks no band, so the same wavelength is accepted; Rakić's 0.2-5 eV
+    covers the pulse; and --vacuum names no metal at all.
     """
     m = _load()
     pulse = ["--profile", "pulse", "--wavelength", "1500", "--band-half", "100"]
