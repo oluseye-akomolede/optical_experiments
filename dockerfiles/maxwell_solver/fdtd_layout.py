@@ -262,20 +262,36 @@ def plan(names, parts, request, *, length_scale: float, materials=None,
             if depth is not None:
                 fine = depth / CELLS_PER_SKIN
                 middle = b - a - 2 * SKIN_DEPTHS * depth
-                if middle < dx:
-                    # either the two skin layers meet or cover the part
-                    # already, or what they leave between them is narrower
-                    # than a coarse cell. That middle strip is bulk metal
-                    # that should be one coarse cell wide; left as its own
-                    # interval the thin-layer rule cuts it into 4 cells of
-                    # gap/4, finer than the skin layers themselves (a 150 nm
-                    # gold mirror at 6 skin depths 147.6 and dx 10 nm left a
-                    # 2.4 nm strip and 0.80 nm cells, 378,896 steps). One
-                    # layer across the part costs about the same cells and
-                    # never subdivides the strip: 150 / (depth/4) is the 24
-                    # cells the two skin layers take.
-                    # Where the thin rule's layer covers the same span,
-                    # build_grid keeps the smaller spacing of the two.
+                if middle < max(dx, depth):
+                    # either the two face layers meet or cover the part
+                    # already, or what they leave between them is under the
+                    # wider of one coarse cell and one skin depth.
+                    # graded_axis fills that gap with four cells at
+                    # a quarter of its width -- the split a thin layer gets --
+                    # so every middle under one depth is finer than the skin
+                    # spacing (measured at dx 10 nm, Rakic, 4e14 Hz, spacing
+                    # 7.245 nm: middles of 6.1, 11.1, 16.1 and 26.1 nm came
+                    # out in cells of 1.528, 2.778, 4.028 and 6.528 nm,
+                    # 0.21x-0.90x of the spacing). One skin depth is where the
+                    # four-cell split meets the spacing: at that width a
+                    # quarter of the middle is exactly depth/4. Above it the
+                    # branch is harmless: with room around the slab, middles
+                    # of 31-726 nm came out at 0.974x-0.999x of the spacing,
+                    # every cell equal, so the band this rule has to close
+                    # ends at one skin depth. Run C's
+                    # 150 nm gold mirror at dx 10 nm
+                    # is the extreme case of the band this rule does close --
+                    # Au-palik's depth at that run's band top (362.95 THz) is
+                    # 24.466 nm, six depths 146.79 nm, so the 3.21 nm middle
+                    # became four 0.801 nm cells, 7.6x under the 6.116 nm
+                    # skin spacing, and dt with it: 378,896 steps for a
+                    # record that needs 121,121. So the threshold is
+                    # max(dx, depth): one layer across the part costs at most
+                    # 24 + 4*max(dx, depth)/depth cells (28 where a coarse
+                    # cell is no coarser than the skin depth) at depth/4,
+                    # never finer than the cells it replaces. Where the
+                    # thin-layer rule covers the same span, build_grid keeps
+                    # the smaller spacing of the two.
                     layers[axis].append(fdtd_grid.Layer(a, b, fine))
                 else:
                     layers[axis] += [fdtd_grid.Layer(a, a + SKIN_DEPTHS * depth, fine),

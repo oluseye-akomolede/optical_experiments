@@ -31,9 +31,19 @@ run that is solved.
   the source band; where both apply the smaller spacing wins. It gets **one
   layer across its whole extent at that spacing** instead when the two face
   layers would meet or cover the part already, or when what they leave between
-  them would be narrower than one `dx_m`: a middle strip under a coarse cell is
-  bulk metal that the thin-layer rule would cut into cells finer than the skin
-  layers themselves, for no gain in resolution. The skin depth is
+  them would be narrower than the wider of one `dx_m` and one skin depth: such
+  a middle is filled with a few cells across it -- four, at a quarter of the
+  gap, the same split a thin layer gets -- so with the gap under four times the
+  spacing those cells are finer than the skin layers themselves: measured at
+  dx 10 nm, middles of 6.1, 11.1, 16.1 and 26.1 nm came out in 1.528, 2.778,
+  4.028 and 6.528 nm (0.21x-0.90x of the spacing), and Run C's 3.2 nm middle
+  in 0.801 nm. A gap over one skin depth does not need the one-layer rule: that
+  fill measured 0.974x-0.999x of the spacing for middles from 31 to 726 nm.
+  One layer across the part takes under `24 + 4*max(dx_m, skin depth)/skin
+  depth` cells across it (28 where a coarse cell is no coarser than the skin
+  depth) at a quarter of the skin depth, never finer than the cells it
+  replaces. The
+  skin depth is
   `fdtd_grid.skin_depth(metal, f)`
   = c / (2π f κ), κ the imaginary part of √ε(f) of that metal’s model; the worker
   and the estimate both call that function. The top of the band is
@@ -70,10 +80,10 @@ run that is solved.
 
 #### Scenario: a metal part just over 6 skin depths gets no sliver in its middle
 - **WHEN** a metal part is thick enough that two face layers leave less than one
-  `dx_m` of bulk between them
+  `dx_m`, or less than one skin depth, of bulk between them
 - **THEN** the part is laid out with one layer across its whole extent at a
-  quarter of the skin depth: no cell across it is finer than half that, it takes
-  no more cells than that spacing needs, and its faces are grid nodes
+  quarter of the skin depth: no cell across it is finer than half that, it
+  takes no more cells than that spacing needs, and its faces are grid nodes
 
 #### Scenario: separate objects need no wall
 - **WHEN** an `open` upload holds two closed parts, neither inside the other

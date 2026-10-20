@@ -3,11 +3,28 @@
 ## 1. The layout rule
 
 - [x] 1.1 `fdtd_layout.layout`: add the two face layers only when the middle
-      they leave is at least one `dx_m`; otherwise one layer across the whole
-      extent at a quarter of the skin depth
-- [x] 1.2 Record in the code why the strip matters (the thin-layer rule cuts it
-      into cells finer than the skin layers) and the measured case (150 nm
-      mirror at dx 10 nm: 378,896 steps for a record that needs 121,121)
+      they leave is at least the wider of one `dx_m` and one skin depth;
+      otherwise one layer across the whole extent at a quarter of the skin
+      depth
+- [x] 1.2 Record in the code why the strip matters (graded_axis splits any gap
+      under the coarse cell into 4 cells, finer than the skin layers) and the
+      measured case (Run C's 150 nm mirror at dx 10 nm: a 3.21 nm strip,
+      0.801 nm cells, 378,896 steps for a record that needs 121,121)
+- [x] 1.3 Set the threshold at the wider of `dx_m` and one skin depth, not at
+      `dx_m` alone: the gap between the face layers is filled with four cells
+      at a quarter of its width, so middles of 6.1, 11.1, 16.1 and 26.1 nm
+      came out in cells of 1.528, 2.778, 4.028 and 6.528 nm (0.21x-0.90x of
+      the 7.245 nm spacing), and one skin depth is where a quarter of the
+      middle meets that spacing. One layer across a part in this band costs
+      under 24 + 4*max(dx_m, depth)/depth cells (28 where the coarse cell is
+      no coarser than the skin depth) at depth/4
+- [x] 1.4 Show the threshold closes the measured band rather than moving it:
+      with room around the slab (host 3000 nm tall, part 900 nm up), middles
+      from 31.1 to 726.1 nm came out at 0.974x-0.999x of the spacing, every
+      cell the same, so the two-layer branch is harmless above one skin
+      depth. An earlier 31.1 nm / 0.86x and 106 nm / 0.38x reading came from
+      a fixture whose slab sat near its host's ceiling (100 nm and 10 nm
+      under it); the ceiling, not the gap fill, crowded those cells
 
 ## 2. Tests
 
@@ -19,6 +36,10 @@
       the measured numbers (36 cells, smallest 1.53 nm = 0.21x cap)
 - [x] 2.3 The existing thin-plate and 4-cell tests still pass (the rule is
       unchanged for them): `tests/test_fdtd_layout.py` 68 passed
+- [x] 2.4 Second fixture for the band a coarse-cell threshold alone leaves
+      open: 190 nm at dx 10 nm (middle 16.1 nm, over one coarse cell and under
+      one skin depth). On 2e7ae0e it reads 30 cells across the part, against
+      the 27 the 7.245 nm spacing needs, and a 4.028 nm middle cell
 
 ## 3. Run C
 
@@ -27,9 +48,11 @@
       --wavelength 900 --band-half 80 --dx 10 --mirror-pad 600 --pad-nm 320
       --pml-nm 200 --gold-data palik`): before, at 2e7ae0e, finest z cell
       0.801 nm at z=74.2..75.0 nm, 15,312,024 cells, 378,896 steps; after,
-      finest 3.000 nm, 14,400,594 cells, 121,121 steps (the 15M-cell and
-      200k-step caps). Rakić under the same command: 13,931,190 cells,
-      116,455 steps, finest 3.000 nm.
+      finest 3.000 nm, 14,400,594 cells, 121,121 steps. Both revisions are
+      over the app's caps (8,000,000 cells, 20,000 steps, 1,800 s) and only
+      the fixed grid fits the bench Job's raised ones (15,000,000 cells,
+      200,000 steps, 18,000 s). Rakić under the same command: 13,931,190
+      cells, 116,455 steps, finest 3.000 nm.
 
 ## 4. Validation and handoff
 

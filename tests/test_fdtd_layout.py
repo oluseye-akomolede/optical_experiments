@@ -198,31 +198,42 @@ def test_a_film_two_coarse_cells_thick_is_resolved_by_the_layout_rule():
 def test_a_slab_just_over_six_skin_depths_gets_no_sliver():
     # 180 nm of gold at 4e14 Hz is just over 6 skin depths (173.9 nm). As two
     # face layers it leaves a 6.1 nm bulk strip in the middle, under one 50 nm
-    # coarse cell, and the thin-layer rule then cuts that strip into 4 cells of
-    # 1.5 nm -- finer than the skin layers themselves. That is what a 150 nm
-    # gold mirror at dx 10 nm did: a 2.4 nm strip, 0.80 nm cells, and 378,896
-    # steps for a record that needs 121,121. The part must get one layer
-    # across its whole extent instead, and no cell across it under depth/4.
+    # coarse cell, and the grid's sub-coarse gap rule (graded_axis, MIN_CELLS=4)
+    # then splits that strip into 4 cells of 1.53 nm -- finer than the skin
+    # layers themselves. That is what Run C's 150 nm gold mirror at dx 10 nm
+    # did under Au-palik: a 3.21 nm strip, 0.801 nm cells (7.6x under the
+    # 6.116 nm skin spacing), and 378,896 steps for a record that needs
+    # 121,121. The part must get one layer across its whole extent instead,
+    # and no cell across it under depth/4.
+    #
+    # The second case is the band the coarse-cell threshold alone leaves open:
+    # 190 nm at dx 10 nm leaves a 16.1 nm middle, wider than a coarse cell but
+    # under one skin depth, and the two-layer branch fills that middle with 4
+    # cells of 4.028 nm -- 0.56x the 7.245 nm spacing.
     import fdtd_grid
-    names = ["host", "gold"]
-    parts = [_box((0, 0, 0), (400, 400, 400)),
-             _box((100, 100, 110), (300, 300, 290))]
-    req = _request(dx_m=50e-9, position=[30e-9, 30e-9, 30e-9])
     depth = fdtd_grid.skin_depth("Au", 4.0e14)
-    middle = 180e-9 - 2 * L.SKIN_DEPTHS * depth
-    assert 0 < middle < 50e-9             # the fixture is the sliver case
-    out = L.layout(names, parts, req, length_scale=1e-9,
-                   materials={"host": 1.5, "gold": "Au"})
     cap = depth / L.CELLS_PER_SKIN
-    z = out["nodes"][2]
-    inside = np.diff(z[(z >= 110e-9 - 1e-15) & (z <= 290e-9 + 1e-15)])
-    # one layer of 180/cap cells, each within the count's rounding of cap
-    # (25 cells of 7.20 nm here); a split part instead leaves 4 cells under
-    # a fifth of cap in the strip
-    assert inside.size <= int(np.ceil(180e-9 / cap)), inside.size
-    assert inside.min() >= 0.5 * cap, (
-        f"the {middle * 1e9:.2g} nm strip between the skin layers got a "
-        f"{inside.min():.3g} m cell; one layer across the part wants {cap:.3g}")
+    for thickness, dx, above_dx in ((180e-9, 50e-9, False),
+                                    (190e-9, 10e-9, True)):
+        names = ["host", "gold"]
+        parts = [_box((0, 0, 0), (400, 400, 400)),
+                 _box((100, 100, 110), (300, 300, 110 + thickness / 1e-9))]
+        req = _request(dx_m=dx, position=[30e-9, 30e-9, 30e-9])
+        middle = thickness - 2 * L.SKIN_DEPTHS * depth
+        assert 0 < middle < max(dx, depth)   # the one-layer branch's band
+        assert bool(middle > dx) == above_dx  # this fixture is what it says
+        out = L.layout(names, parts, req, length_scale=1e-9,
+                       materials={"host": 1.5, "gold": "Au"})
+        z = out["nodes"][2]
+        inside = np.diff(z[(z >= 110e-9 - 1e-15)
+                           & (z <= (110 + thickness / 1e-9) * 1e-9 + 1e-15)])
+        # one layer of thickness/cap cells, each within the count's rounding
+        # of cap; a split part instead leaves 4 cells under a fifth of cap
+        assert inside.size <= int(np.ceil(thickness / cap)), inside.size
+        assert inside.min() >= 0.5 * cap, (
+            f"{thickness / 1e-9:.0f} nm of gold at dx {dx / 1e-9:.0f} nm left "
+            f"a {middle * 1e9:.2g} nm middle and got a {inside.min():.3g} m "
+            f"cell; one layer across the part wants {cap:.3g}")
 
 
 # plate thicknesses (um) where, before 5.4d, the 0.2 um film read 1.19, 1.22
