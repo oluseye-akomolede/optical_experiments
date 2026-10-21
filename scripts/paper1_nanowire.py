@@ -1431,15 +1431,19 @@ def axial_profile_command(args) -> int:
 def axis_probe_record(sim, lay) -> dict:
     """The axial arm's half of a saved record: traces, their z, the spans.
 
-    Each probe's z is read off the layout's own node list at the cell the
-    layout placed it on, so the profile's abscissa is the grid's and not a
-    re-typed copy of the request's positions. The wire's span and the emitter's
-    z travel too: the profile marker draws on them, and a reader must not have
-    to reconstruct the scene to say where the wire begins.
+    ``lay`` is the layout the solver ran on (``fdtd_layout.layout``), and its
+    ``probes`` are four-tuples ``(i, j, k, component)`` -- the cell's node
+    indices and the component -- so each probe's z is read off the layout's own
+    node list at ``k``, and the profile's abscissa is the grid's, not a
+    re-typed copy of the request's positions. The wire's span comes from the
+    layout's own ``part_bounds`` (the last part by the scene's names order) and
+    the emitter's z from the node its source cell sits on; the profile marker
+    draws on them, and a reader must not have to reconstruct the scene to say
+    where the wire begins.
     """
     nodes, probes = lay["nodes"], lay["probes"]
-    z = np.array([float(nodes[2][cell[2]]) for cell, _c in probes])
-    comps = np.array([component for _cell, component in probes])
+    z = np.array([float(nodes[2][probe[2]]) for probe in probes])
+    comps = np.array([probe[3] for probe in probes])
     wire = lay["part_bounds"][-1]                  # names order: mirror, oxide, wire
     return {"probe_traces": np.asarray(sim["traces"]),
             "probe_z_m": z,

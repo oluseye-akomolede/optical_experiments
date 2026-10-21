@@ -26,7 +26,10 @@ the gold's top face to three coarse cells above the wire's top facet, at the
 source's own in-plane node -- which is the wire's axis, since the layout builds
 the scene around the source's corner. It stores the traces in the saved tail
 record with each probe's node z, so the profile is read from the record and not
-from a second run.
+from a second run. The record is written from the layout the solver actually
+ran on: its probes are `(i, j, k, component)` four-tuples, and `layout()` now
+passes its plan's `part_bounds` through so the writer reads the wire's span from
+the solved scene instead of planning it again.
 
 `--axial-profile PATH [--axial-frequency-nm NM] [--axial-png OUT]` reads that
 record: a windowed DFT of each trace over the drive-free tail at the drive's

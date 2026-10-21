@@ -155,6 +155,53 @@ def test_the_layout_estimate_prices_the_line_it_planned():
 
 
 # --------------------------------------------------------------------------
+# the record's own writer
+# --------------------------------------------------------------------------
+
+def test_the_writer_takes_the_layout_the_solver_runs_on(tmp_path):
+    """``axis_probe_record`` is handed the layout ``solve_scene`` returns --
+    four-tuple probes ``(i, j, k, component)`` and the parts' own boxes -- and
+    what it writes reads back as a profile.
+
+    This is the path the 13 tests above missed: they planned the line and read
+    a record written by hand, so a writer that unpacked the probes as two
+    tuples, or that asked the layout for a key it does not return, could not
+    fail. The traces here are a ramp in z, so the profile's summed power rises
+    across the whole line: the reader must report no interior maximum rather
+    than invent one at the line's end.
+    """
+    m, args, plan, request, geom = _lined()
+    lay, _request, _geom = m.solve_scene(args)
+    assert len(lay["part_bounds"]) == len(plan["part_bounds"])
+    for got, want in zip(lay["part_bounds"], plan["part_bounds"]):
+        assert np.array_equal(np.asarray(got), np.asarray(want))
+    assert len(lay["probes"]) == len(plan["probes"]) == 3 * len(
+        {float(point[2]) for point in request["probes"]})
+    steps, dt = 400, 1e-17
+    f = m.C / (1550.0 * m.NM)
+    t = np.arange(steps) * dt
+    zs = np.array([lay["nodes"][2][probe[2]] for probe in lay["probes"]])
+    ramp = (zs - zs.min()) / (zs.max() - zs.min())
+    traces = np.array([r * np.cos(2.0 * np.pi * f * t) for r in ramp],
+                      dtype=np.float32)
+    extra = m.axis_probe_record({"traces": traces}, lay)
+    assert extra["probe_traces"].shape == traces.shape
+    assert np.array_equal(extra["probe_z_m"], zs)
+    assert list(extra["probe_components"]) == [p[3] for p in lay["probes"]]
+    wire = lay["part_bounds"][-1]
+    assert extra["wire_z_m"][0] == wire[0][2] and extra["wire_z_m"][1] == wire[1][2]
+    assert extra["emitter_z_m"] == lay["nodes"][2][lay["cell"][2]]
+    path = m.save_record(tmp_path / "tiny.npz", np.zeros(steps), dt, 50,
+                         {"frequency_hz": f, "bandwidth": 0.05 * f}, **extra)
+    profile = m.axial_profile(path)
+    assert (len(zs), profile["size"]) == (48, 16)   # the spec's measured scene
+    assert profile["size"] == len(zs) // 3
+    assert np.allclose(profile["z_m"], zs[::3])
+    assert profile["maxima_z_m"] == []
+    assert m.main(["--axial-profile", str(path)]) == 0
+
+
+# --------------------------------------------------------------------------
 # reading the record
 # --------------------------------------------------------------------------
 

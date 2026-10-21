@@ -47,6 +47,26 @@
   `tests/test_fdtd_layout.py tests/test_paper1_nanowire.py` 110 passed in
   1,807.80 s. All exit 0. `openspec validate paper1-axis-probes --strict`:
   valid; `openspec validate --specs --strict`: 12 passed, 0 failed.
-- [ ] 7. Later, on the bench: Run C's next ring-down with `--axis-probes`, and
+- [x] 7. The review's blocking defect: `axis_probe_record` unpacked the
+  layout's probes as two-tuples and read a `part_bounds` key `layout()` never
+  returned, so the writer crashed on the layout the solver actually runs on and
+  none of the 13 tests above could see it (they planned the line and wrote
+  records by hand). The writer now reads each probe's `(i, j, k, component)`
+  four-tuple, and `layout()` passes its plan's `part_bounds` through, documented
+  in its docstring. The end-to-end test,
+  `test_the_writer_takes_the_layout_the_solver_runs_on`, hands the writer a real
+  `solve_scene` layout, writes the record and reads it back through
+  `axial_profile` (with a ramp trace, so the reader must report no interior
+  maximum rather than invent one). It pins the scene's measured counts -- 48
+  probes, 16 z layers -- which is the figure the spec's new scenario quotes.
+  Verified tier 1: `tests/test_paper1_axis_probes.py` 14 passed in 29.55 s;
+  `tests/test_fdtd_layout.py tests/test_paper1_nanowire.py` 110 passed in
+  1,808.24 s; `openspec validate paper1-axis-probes --strict` valid and
+  `openspec validate --specs --strict` 12 passed, 0 failed. The row's suggested
+  full tiny end-to-end ring-down was priced, not assumed: the tiny scene is
+  211,792 cells and 13,017 steps, 67.6 s short-ladder -- a real solve, so it was
+  not added to a tier-1 test file; the writer-to-reader path is covered without
+  stepping.
+- [ ] 8. Later, on the bench: Run C's next ring-down with `--axis-probes`, and
   `--axial-profile` on its record, to read the antinode positions against the
   emitter's z. Not started here.

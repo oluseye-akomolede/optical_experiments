@@ -6,7 +6,7 @@
 
 `scripts/paper1_nanowire.py --ringdown --save-tail PATH --axis-probes` SHALL add one probe per E component (`x`, `y`, `z` -- never a magnitude) on every z node of the wire's axis from the first node clear of the gold's top face (a millionth of a cell above it: the layout's point-in-part test reads a node on the face as on the mirror, whose field is zero) to three coarse cells above the wire's top facet, the in-plane position being the source's own node (which is the wire's axis: the layout builds the scene around the source's corner). The probes SHALL be placed from a `fdtd_layout.plan` taken before the voxeliser runs -- a probe must sit on a node, and only the plan's node list says where the nodes are -- and the run SHALL compare the plan's nodes with the layout's before stepping and refuse if they differ, so the line is on the nodes the run uses and not merely near them. The plan SHALL NOT pin a z line into the grid for the probes: a pinned line grades the axis it is added to, and probes placed after the grid would move it.
 
-The traces SHALL be written into the `--save-tail` record beside the field: `probe_traces` (one row per probe), `probe_z_m` (each probe's node z read off the layout's nodes at the cell the layout placed it on, in the frame `--qd-below` uses), `probe_components`, the wire's own z span (`wire_z_m`) and the emitter's z (`emitter_z_m`). `--axis-probes` SHALL be refused, before any scene is built, without `--ringdown` and without `--save-tail`, since the traces are read over the tail and would otherwise be recorded and thrown away -- except with `--estimate`, which prices the line and records nothing.
+The traces SHALL be written into the `--save-tail` record beside the field: `probe_traces` (one row per probe), `probe_z_m` (each probe's node z read off the layout's nodes at the cell the layout placed it on, in the frame `--qd-below` uses), `probe_components`, the wire's own z span (`wire_z_m`) and the emitter's z (`emitter_z_m`). The writer SHALL take the layout the solver actually ran on -- whose probes are `(i, j, k, component)` four-tuples and which SHALL carry the parts' own boxes as `part_bounds`, passed through from its plan -- so the record's abscissa and its wire span come from the layout that was solved and not from a second plan of the same scene. `--axis-probes` SHALL be refused, before any scene is built, without `--ringdown` and without `--save-tail`, since the traces are read over the tail and would otherwise be recorded and thrown away -- except with `--estimate`, which prices the line and records nothing.
 
 #### Scenario: a probe is on the node it names, on a graded axis
 - **WHEN** the line is planned on Run C's own scene (dx 10 nm, the wire 162-1537 nm above the origin)
@@ -15,6 +15,10 @@ The traces SHALL be written into the `--save-tail` record beside the field: `pro
 #### Scenario: the line ends where the geometry does
 - **WHEN** the line is built for a scene whose wire top is at `hi` and whose gold top is at `lo`
 - **THEN** its first z is the first node above `lo` by more than floating-point noise and its last is the last node at or below `hi + 3 dx`, and neither reaches into the absorber (`pml <= i <= len(nodes) - 1 - pml`), so a scene with no room is refused rather than probed inside a damped field
+
+#### Scenario: the record is written from the layout that was solved
+- **WHEN** the writer is given the layout the tiny (20 nm) scene's `solve_scene` returns, and its output is saved and read back
+- **THEN** it writes one trace row per probe with that layout's own node z and component per row, the wire's span from the layout's `part_bounds` and the emitter's z from its source node, and `--axial-profile` on the written file prints one layer per z node (measured: 48 probes, 16 layers on that scene) -- the writer-to-reader path, not a hand-made record
 
 ### Requirement: The probes SHALL be priced in every estimate of the run that records them
 

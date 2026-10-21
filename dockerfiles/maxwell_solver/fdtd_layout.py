@@ -527,8 +527,12 @@ def layout(names, parts, request, *, length_scale: float, materials=None,
     source node), ``probes`` ([(i, j, k, component)]), ``origin_m`` (the
     bounding box's minimum corner in mesh-frame metres), ``pad_cells`` and
     ``pml_cells`` (the open boundary's own geometry, as planned -- see
-    ``plan``, which is the only place either is read) and ``caveats``
-    (strings for the result, e.g. a non-box part's thin-feature caveat).
+    ``plan``, which is the only place either is read), ``part_bounds`` (the
+    parts' own boxes in the same owner frame as ``nodes``, passed through from
+    the plan: a caller that measures the layout's geometry -- a probe line's
+    ends, say -- must not have to plan the scene again to know where a part
+    begins) and ``caveats`` (strings for the result, e.g. a non-box part's
+    thin-feature caveat).
     """
     planned = plan(names, parts, request, length_scale=length_scale,
                    materials=materials, n_index=n_index, pad_cells=pad_cells,
@@ -555,4 +559,5 @@ def layout(names, parts, request, *, length_scale: float, materials=None,
             "shape": planned["shape"], "eps": scene["eps"], "pec": scene["pec"],
             "metals": scene["metals"], "box": planned["box"], "cell": cell,
             "probes": probes, "origin_m": lo, "band_top_hz": planned["band_top_hz"],
+            "part_bounds": planned["part_bounds"],
             "pad_cells": planned["pad_cells"], "pml_cells": planned["pml_cells"]}
