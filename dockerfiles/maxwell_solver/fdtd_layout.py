@@ -477,6 +477,9 @@ def estimate(planned, request, *, record_frames=True) -> dict:
                              boundary=planned["boundary"], metals=metals,
                              pec=True if pec else None,
                              record_frames=record_frames,
+                             # the traces the run will record: the layout has
+                             # already placed them, so the price is exact
+                             probes=len(planned["probes"]),
                              max_frames=fdtd.MAX_FRAMES if frames is None
                              else frames)
 

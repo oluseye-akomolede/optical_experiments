@@ -355,21 +355,124 @@ def scene(args):
 
 
 def planned_scene(args):
-    """The product's own plan, and its cheap estimate (no voxeliser)."""
+    """The product's own plan, and its cheap estimate (no voxeliser).
+
+    With ``--axis-probes`` the returned plan and request carry the axial line.
+    The line is placed on the plan's own nodes -- a probe must sit on one --
+    and the plan is built again with those points, so the plan the estimate
+    prices is the plan whose probes the run will record. The two plans' node
+    lists are compared: placing probes may not move the grid, and a grid that
+    moved would put the line on nodes this plan does not have.
+    """
     names, parts, materials, request, geom = scene(args)
     plan = fdtd_layout.plan(names, parts, request, length_scale=1.0,
                             materials=materials, pad_cells=geom["pad_cells"],
                             pml_cells=geom["pml_cells"])
+    if getattr(args, "axis_probes", False):
+        request = with_axis_probes(plan, request)
+        lined = fdtd_layout.plan(names, parts, request, length_scale=1.0,
+                                 materials=materials,
+                                 pad_cells=geom["pad_cells"],
+                                 pml_cells=geom["pml_cells"])
+        for axis, (a, b) in enumerate(zip(plan["nodes"], lined["nodes"])):
+            if not np.array_equal(a, b):
+                raise SystemExit(
+                    f"internal: the axial probes changed the grid on"
+                    f" {'xyz'[axis]} ({len(a)} nodes without the line, {len(b)}"
+                    f" with it); the line would not sit on the nodes this plan"
+                    f" prices")
+        plan = lined
     return plan, request, geom
 
 
 def solve_scene(args):
     """The product's own layout: grid, voxelised scene, source node, probes."""
     names, parts, materials, request, geom = scene(args)
+    planned = None
+    series = getattr(args, "save_series", None)
+    source = getattr(args, "from_series", None)
+    locator = getattr(args, "locator_tau", None)
+    if getattr(args, "axis_probes", False):
+        # The axial line is placed from a PLAN, before the voxeliser runs: a
+        # probe must sit on a grid node, and only the plan's node list says
+        # where the nodes are. Probes do not enter the grid's construction, so
+        # the layout below builds the same nodes -- and that is checked rather
+        # than assumed (the test that pins a probe to its node is why).
+        planned = fdtd_layout.plan(names, parts, request, length_scale=1.0,
+                                   materials=materials,
+                                   pad_cells=geom["pad_cells"],
+                                   pml_cells=geom["pml_cells"])
+        request = with_axis_probes(planned, request)
     lay = fdtd_layout.layout(names, parts, request, length_scale=1.0,
                              materials=materials, pad_cells=geom["pad_cells"],
                              pml_cells=geom["pml_cells"])
+    if planned is not None:
+        for axis, (a, b) in enumerate(zip(planned["nodes"], lay["nodes"])):
+            if not np.array_equal(a, b):
+                raise SystemExit(
+                    f"internal: the axial probes changed the grid on {'xyz'[axis]}"
+                    f" ({len(a)} nodes planned, {len(b)} laid out); the line would"
+                    f" not sit on the nodes this run uses")
     return lay, request, geom
+
+
+AXIS_PROBE_ABOVE_CELLS = 3   # how far above the wire's top facet the line ends
+AXIS_COMPONENTS = fdtd.COMPONENTS   # every E component, never reduced to |E|
+
+
+def axis_probe_points(planned, request) -> list:
+    """The axial line: three probes per z node, from the mirror's top face up.
+
+    The line runs on the source's own in-plane position (the wire's axis) from
+    the first node clear of the gold's top face to ``AXIS_PROBE_ABOVE_CELLS``
+    coarse cells above the wire's top facet, or as far as the absorber allows,
+    whichever comes first. "Clear of" is not the same as "compared greater": a
+    graded axis puts a node within float noise of the face, and the layout's
+    point-in-part test reads that node as on the mirror -- a conductor, whose
+    field is zero, so its trace would read as no response. The line therefore
+    starts a millionth of a cell above the face. Each layer carries one probe
+    per E component: a magnitude would throw away which way the field points,
+    and the mode's E_z is what an emitter on an antinode couples to.
+
+    The points are given in the layout's frame, and every one of them is a node
+    coordinate, so ``plan``/``layout`` locate each probe on the node it names
+    rather than snapping it to a neighbour.
+    """
+    nodes = planned["nodes"]
+    z = np.asarray(nodes[2], dtype=float)
+    lo, hi = float(planned["part_bounds"][-1][0][2]), \
+        float(planned["part_bounds"][-1][1][2])        # the wire, the last part
+    gold_top = float(planned["part_bounds"][0][1][2])   # the first part's top face
+    dx = float(request["dx_m"])
+    pml = int(planned["pml_cells"])
+    start = int(np.searchsorted(z, gold_top + 1e-6 * dx, side="left"))
+    stop = int(np.searchsorted(z, hi + AXIS_PROBE_ABOVE_CELLS * dx,
+                               side="right"))
+    start = max(start, pml)
+    stop = min(stop, len(z) - pml)
+    if not stop > start:
+        raise SystemExit(
+            f"refused: the axial line has no nodes between the mirror's top"
+            f" face ({gold_top / NM:.3f} nm) and {AXIS_PROBE_ABOVE_CELLS} cells"
+            f" above the wire top ({hi / NM:.3f} nm) outside the absorber")
+    # the source's own node, both in plane: the line runs along the wire's axis
+    x = float(nodes[0][planned["cell"][0]])
+    y = float(nodes[1][planned["cell"][1]])
+    # a list, not a generator: the request is read again by the estimate and
+    # by the arm's own refusals, and a consumed generator would price nothing
+    return [[x, y, float(z[i]), component]
+            for i in range(start, stop) for component in AXIS_COMPONENTS]
+
+
+def with_axis_probes(planned, request) -> dict:
+    """``request`` with the axial line as its probes (a copy, not mutated).
+
+    One function for the run path and the ladder, so a priced rung and the run
+    it prices place the same line.
+    """
+    out = dict(request)
+    out["probes"] = axis_probe_points(planned, request)
+    return out
 
 
 def steps_for(args, request, dt: float) -> int:
@@ -457,7 +560,7 @@ def filled(args, lay, request, geom=None):
     """
     est = fdtd.estimate_run(lay["nodes"], duration=request["duration_s"],
                             boundary=request["boundary"], metals=lay["metals"],
-                            pec=lay["pec"])
+                            pec=lay["pec"], probes=len(lay["probes"]))
     steps = steps_for(args, request, est["dt"])
     request["duration_s"] = steps * est["dt"]
     phasor = None
@@ -469,7 +572,8 @@ def filled(args, lay, request, geom=None):
                                  steps, eps=lay.get("eps"), metals=lay["metals"])
     est = fdtd.estimate_run(lay["nodes"], duration=request["duration_s"],
                             boundary=request["boundary"], metals=lay["metals"],
-                            pec=lay["pec"], **phasor_estimate(phasor))
+                            pec=lay["pec"], probes=len(lay["probes"]),
+                            **phasor_estimate(phasor))
     exceeded = None
     try:
         fdtd.check_limits(est, **run_limits(args))
@@ -737,6 +841,39 @@ def arm_conflicts(args) -> str:
     series = getattr(args, "save_series", None)
     source = getattr(args, "from_series", None)
     locator = getattr(args, "locator_tau", None)
+    # the read arm first: it builds nothing, so a flag it cannot read is the
+    # conflict to name, even when that flag has its own rule below
+    read = getattr(args, "axial_profile", None)
+    if read is not None:
+        clash = [flag for flag, on in (
+            ("--tiny", args.tiny), ("--estimate", args.estimate),
+            ("--spectrum", args.spectrum), ("--ringdown", args.ringdown),
+            ("--axis-probes", getattr(args, "axis_probes", False)),
+            ("--save-tail", args.save_tail is not None),
+            ("--save-series", series is not None),
+            ("--from-series", source is not None),
+            ("--collection-na", getattr(args, "collection_na", None) is not None),
+            ("--locator-tau", locator is not None)) if on]
+        if clash:
+            return (f"refused: --axial-profile reads a saved record and builds no"
+                    f" scene, so {', '.join(clash)} would be inert")
+    if getattr(args, "axis_probes", False) and not args.estimate:
+        # --estimate only prices the line (the ladder must quote the run's own
+        # memory); every other arm would record it and needs somewhere to put it
+        if not args.ringdown:
+            return ("refused: --axis-probes stores the line's traces in the tail"
+                    " record, so it belongs to --ringdown (the traces are read"
+                    " over the drive-free part of the record)")
+        if not args.save_tail:
+            return ("refused: --axis-probes' traces travel in the --save-tail"
+                    " record; without it they would be recorded and thrown away,"
+                    " and the antinode map needs a second run")
+    if getattr(args, "axial_frequency_nm", None) is not None and read is None:
+        return ("refused: --axial-frequency-nm chooses the wavelength an axial"
+                " profile is read at; give it with --axial-profile")
+    if getattr(args, "axial_png", None) is not None and read is None:
+        return ("refused: --axial-png draws an axial profile; give it with"
+                " --axial-profile")
     if source is not None:
         clash = [flag for flag, on in (
             ("--tiny", args.tiny), ("--estimate", args.estimate),
@@ -1124,7 +1261,7 @@ def _npz_path(path) -> str:
     return path if path.endswith(".npz") else path + ".npz"
 
 
-def save_record(path, values, dt: float, start: int, request) -> str:
+def save_record(path, values, dt: float, start: int, request, **extra) -> str:
     """Write one record so its tail can be re-fitted without another Orin run.
 
     One decaying sinusoid is the model ``fit_decay`` fits. A tail holding two of
@@ -1132,10 +1269,14 @@ def save_record(path, values, dt: float, start: int, request) -> str:
     the run again. So the dt and the drive travel with the values:
     ``load_record`` returns exactly what the arm fitted, which is the whole
     difference between a re-analysis and a repeat. Returns the path written.
+
+    ``extra`` is written beside them unchanged -- the axial probe arm passes
+    its traces, their node z, the wire's own span and the emitter's z, so the
+    profile is read from this record rather than from a second run.
     """
     np.savez(path, values=np.asarray(values), dt=float(dt), start=int(start),
              frequency_hz=float(request["frequency_hz"]),
-             bandwidth=float(request["bandwidth"]))
+             bandwidth=float(request["bandwidth"]), **extra)
     return _npz_path(path)
 
 
@@ -1149,6 +1290,162 @@ def load_record(path) -> dict:
     half = float(z["bandwidth"])
     return {"values": z["values"], "dt": float(z["dt"]), "start": int(z["start"]),
             "frequency": f, "band": (f - half, f + half)}
+
+
+def axial_profile(record, frequency=None, *, start=None, window="hann") -> dict:
+    """|E(z)|^2 along the axial line, read from a saved record.
+
+    ``record`` is the path of a ``--ringdown --save-tail --axis-probes`` npz.
+    The profile at ``frequency`` is each probe's amplitude there -- the
+    windowed DFT of its trace over the part of the record AFTER the source has
+    decayed (``start``, the step ``save_record`` stored) -- squared and split by
+    component; ``frequency`` defaults to the record's own drive.
+
+    Returns the zs (metres), the per-component powers at each z, their sum, the
+    wire's span and the emitter's z (both stored by the run), and the z of
+    every interior local maximum of the summed power inside the wire -- the
+    antinodes the emitter is being placed on. A maximum in the last or first
+    sample of the range is not a local maximum of the profile but its edge;
+    those are not listed.
+    """
+    with np.load(_npz_path(record)) as z:
+        if "probe_traces" not in z.files:
+            raise ValueError(
+                f"{_npz_path(record)} has no probe traces: it was not written by"
+                f" a --ringdown --save-tail run with --axis-probes")
+        # float32 on disk, and read as it was written: a 441-probe line of
+        # 121,121 steps is 213.7 MB, and a float64 copy of it is another
+        # 213.7 MB the bench does not have to spend (each row is cast as it is
+        # read)
+        traces = np.asarray(z["probe_traces"])
+        probe_z = np.asarray(z["probe_z_m"], dtype=float)
+        comps = np.asarray(z["probe_components"]).astype(str)
+        dt = float(z["dt"])
+        begin = int(z["start"]) if start is None else int(start)
+        f = float(z["frequency_hz"]) if frequency is None else float(frequency)
+        wire = np.asarray(z["wire_z_m"], dtype=float)
+        emitter = float(z["emitter_z_m"])
+    if begin >= traces.shape[1]:
+        raise ValueError(
+            f"the tail starts at step {begin:,} of {traces.shape[1]:,}: there is"
+            f" no decayed part of this record to read")
+    hann = fdtd._window(traces.shape[1] - begin, window)
+    powers, zs = {}, None
+    for component in AXIS_COMPONENTS:
+        rows = np.flatnonzero(comps == component)
+        if rows.size == 0:
+            continue
+        # every component's probes were placed on the same z nodes, in line
+        # order, so their own z column IS the abscissa -- exact equality, not
+        # a mean or a rounding
+        this_z = probe_z[rows]
+        if zs is None:
+            zs = this_z
+        elif not np.array_equal(this_z, zs):
+            raise ValueError(
+                f"{_npz_path(record)} has no single abscissa: its {component}"
+                f" probes sit on {rows.size} z nodes and the"
+                f" {next(iter(powers))} probes on {zs.size}")
+        amp = np.array([fdtd._windowed_at(traces[row, begin:], dt, f, hann)
+                        for row in rows])
+        powers[component] = np.abs(amp) ** 2
+    if zs is None:
+        raise ValueError(f"{_npz_path(record)} carries no E component among "
+                         f"its probes, got {sorted(set(comps))}")
+    total = sum(powers.values())
+    inside = np.flatnonzero((zs >= wire[0] - 1e-12) & (zs <= wire[1] + 1e-12))
+    maxima = [zs[i] for i in inside
+              if 0 < i < total.size - 1
+              and total[i] > total[i - 1] and total[i] > total[i + 1]]
+    return {"z_m": zs, "power": powers, "total": total, "maxima_z_m": maxima,
+            "wire_z_m": wire, "emitter_z_m": emitter, "frequency_hz": f,
+            "tail_start": begin, "tail_steps": traces.shape[1] - begin,
+            "dt": dt, "size": zs.size}
+
+
+def axial_profile_command(args) -> int:
+    """``--axial-profile``: print the saved record's profile, and its picture.
+
+    The table is the measurement; the PNG is a convenience for the owner's
+    eyes, so a machine without matplotlib loses the picture and not the
+    numbers. Both markers the picture draws -- the wire's ends and the
+    emitter's z -- come from the record itself.
+    """
+    profile = axial_profile(args.axial_profile,
+                            None if args.axial_frequency_nm is None
+                            else C / (args.axial_frequency_nm * NM))
+    zs, total = profile["z_m"], profile["total"]
+    peak = float(np.max(total)) if total.size else 0.0
+    print(f"record    {_npz_path(args.axial_profile)}:"
+          f" {profile['size']:,} z layers, {len(profile['power'])} components,"
+          f" tail from step {profile['tail_start']:,}"
+          f" ({profile['tail_steps']:,} steps)")
+    print(f"frequency {profile['frequency_hz'] / 1e12:.4f} THz"
+          f" ({C / profile['frequency_hz'] / NM:.1f} nm)")
+    print(f"wire      {profile['wire_z_m'][0] / NM:.3f} to"
+          f" {profile['wire_z_m'][1] / NM:.3f} nm above the frame origin;"
+          f" the emitter is at {profile['emitter_z_m'] / NM:.3f} nm")
+    print(f"{'z nm':>9} {'|Ex|^2':>10} {'|Ey|^2':>10} {'|Ez|^2':>10}"
+          f" {'total':>10}  (each / the line's peak)")
+    for i in range(zs.size):
+        row = " ".join(f"{profile['power'][c][i] / peak:10.4f}"
+                       if c in profile["power"] else f"{'-':>10}"
+                       for c in AXIS_COMPONENTS)
+        print(f"{zs[i] / NM:9.3f} {row} {total[i] / peak:10.4f}")
+    if profile["maxima_z_m"]:
+        spots = ", ".join(f"{m / NM:.2f}" for m in profile["maxima_z_m"])
+        print(f"maxima    the summed profile peaks inside the wire at z ="
+              f" {spots} nm")
+    else:
+        print("maxima    no interior local maximum inside the wire: the profile"
+              " rises or falls across the whole of it")
+    if args.axial_png:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as exc:      # the picture, not the measurement
+            print(f"warning   no PNG ({type(exc).__name__}: {exc}); the table"
+                  f" above is the record's own")
+            return 0
+        fig, ax = plt.subplots(figsize=(6.0, 4.0))
+        for component in AXIS_COMPONENTS:
+            if component in profile["power"]:
+                ax.plot(zs / NM, profile["power"][component] / peak,
+                        label=f"|E{component}|^2")
+        ax.plot(zs / NM, total / peak, color="black", label="sum")
+        for z, style in ((profile["wire_z_m"][0], ":"), (profile["wire_z_m"][1], ":"),
+                         (profile["emitter_z_m"], "--")):
+            ax.axvline(z / NM, color="grey", linestyle=style, linewidth=0.8)
+        ax.set_xlabel("z above the frame origin (nm)")
+        ax.set_ylabel("|E|^2 over the line's peak")
+        ax.legend(frameon=False, fontsize=8)
+        ax.set_title(f"axial mode profile at {C / profile['frequency_hz'] / NM:.1f} nm")
+        fig.tight_layout()
+        fig.savefig(args.axial_png, dpi=140)
+        print(f"png       {args.axial_png}: the wire's ends dotted, the emitter"
+              f" dashed")
+    return 0
+
+
+def axis_probe_record(sim, lay) -> dict:
+    """The axial arm's half of a saved record: traces, their z, the spans.
+
+    Each probe's z is read off the layout's own node list at the cell the
+    layout placed it on, so the profile's abscissa is the grid's and not a
+    re-typed copy of the request's positions. The wire's span and the emitter's
+    z travel too: the profile marker draws on them, and a reader must not have
+    to reconstruct the scene to say where the wire begins.
+    """
+    nodes, probes = lay["nodes"], lay["probes"]
+    z = np.array([float(nodes[2][cell[2]]) for cell, _c in probes])
+    comps = np.array([component for _cell, component in probes])
+    wire = lay["part_bounds"][-1]                  # names order: mirror, oxide, wire
+    return {"probe_traces": np.asarray(sim["traces"]),
+            "probe_z_m": z,
+            "probe_components": comps,
+            "wire_z_m": np.array([float(wire[0][2]), float(wire[1][2])]),
+            "emitter_z_m": float(nodes[2][int(lay["cell"][2])])}
 
 
 def ringdown(args, lay, request, measured):
@@ -1203,8 +1500,10 @@ def ringdown(args, lay, request, measured):
         # number down with it -- and the only exception a path can raise here is an
         # OSError, which is caught rather than left to end the run.
         try:
+            extra = (axis_probe_record(sim, lay)
+                     if getattr(args, "axis_probes", False) else {})
             wrote = save_record(args.save_tail, sim["source_field"], dt, start,
-                                request)
+                                request, **extra)
         except OSError as exc:
             print(f"warning   the tail was not written ({type(exc).__name__}:"
                   f" {exc}): the fit above is this run's own, and a second model on"
@@ -2428,6 +2727,9 @@ def ladder(args) -> int:
         lim = run_limits(sub)        # the run path reads this same function
         try:
             plan, request, geom = planned_scene(sub)
+            # the plan already carries the axial line (planned_scene places it
+            # from the plan itself), so the estimate prices the probes the run
+            # would record
             est = fdtd_layout.estimate(plan, request, record_frames=False)
             steps = steps_for(sub, request, est["dt"])
             request["duration_s"] = steps * est["dt"]
@@ -2594,6 +2896,23 @@ def PARSER_ARGUMENTS(p) -> None:
     p.add_argument("--save-tail", metavar="PATH",
                    help="write the recorded field with its dt and drive, so its"
                         " tail can be re-fitted offline instead of by another run")
+    p.add_argument("--axis-probes", action="store_true",
+                   help="the ring-down also places one probe per E component on"
+                        " every grid node of the wire's axis, from the gold's top"
+                        " face to a few cells above the wire, and stores their"
+                        " traces in the --save-tail record (it needs --ringdown"
+                        " and --save-tail)")
+    p.add_argument("--axial-profile", metavar="NPZ", default=None,
+                   help="read a saved --axis-probes record: print |E(z)|^2 at its"
+                        " drive (or --axial-frequency-nm) along the line and the"
+                        " z of its interior maxima inside the wire; no scene, no"
+                        " run")
+    p.add_argument("--axial-frequency-nm", metavar="NM", type=float, default=None,
+                   help="the wavelength to read the axial profile at; default is"
+                        " the record's own drive (only with --axial-profile)")
+    p.add_argument("--axial-png", metavar="PATH", default=None,
+                   help="also draw the axial profile to PATH, marking the wire's"
+                        " ends and the emitter's z (only with --axial-profile)")
     p.add_argument("--periods", type=float, default=32.0, help="CW record, periods")
     p.add_argument("--window-periods", type=float, default=8.0,
                    help="the CW reading's tail window, in drive periods")
@@ -2661,6 +2980,12 @@ def main(argv=None) -> int:
     if why:
         print(why)
         return 2
+    if getattr(args, "axial_profile", None) is not None:
+        try:
+            return axial_profile_command(args)
+        except ValueError as exc:    # a record without the traces this arm reads
+            print(f"refused: {exc}")
+            return 2
     if getattr(args, "from_series", None) is not None:
         return from_series(args)
     if args.estimate:
