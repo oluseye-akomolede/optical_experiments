@@ -2392,7 +2392,8 @@ def phasor_box_bytes(box, shape, *, frequencies=1, steps: int = 0) -> int:
 def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
                     record_peak=False, record_frames=False,
                     max_frames: int = MAX_FRAMES, phasor_box=None,
-                    phasor_frequencies=1, phasor_steps: int = 0) -> int:
+                    phasor_frequencies=1, phasor_steps: int = 0,
+                    probes: int = 0, probe_steps: int = 0) -> int:
     """Bytes ``simulate`` holds at its peak on the device (float32 arrays).
 
     Counts, per cell: six fields, eps and 1/eps, the transients, the device
@@ -2409,7 +2410,10 @@ def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
     the solver's boolean union of the regions. A ``phasor_box`` (the run's
     ``(centre, half_extent)``, with its ``phasor_frequencies`` and the
     ``phasor_steps`` it reads) adds :func:`phasor_box_bytes`; without one the
-    estimate is what it was before the option existed.
+    estimate is what it was before the option existed. ``probes`` traces of
+    ``probe_steps`` steps each add 4 bytes a sample, the float32
+    ``traces`` array ``simulate`` fills every step; both default to 0, so an
+    estimate that does not know a run's probes is the estimate it was.
     """
     shape = tuple(int(s) for s in shape)
     cells = int(np.prod(shape))
@@ -2439,6 +2443,13 @@ def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
     if phasor_box is not None:
         total += phasor_box_bytes(phasor_box, shape, frequencies=phasor_frequencies,
                                   steps=phasor_steps)
+    if probes:
+        if not probe_steps:
+            # there is no steps count here to default to, and pricing the traces
+            # at zero would hide them from the cap that reads this number
+            raise ValueError("memory_estimate needs probe_steps when probes are"
+                             " given: it has no run to read the count from")
+        total += 4.0 * int(probes) * int(probe_steps)
     return int(total)
 
 
@@ -2493,7 +2504,8 @@ def rate_setup(boundary="metal", metals=()) -> str:
 def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
                  pec=None, record_peak=False, record_frames=False,
                  max_frames: int = MAX_FRAMES, phasor_box=None,
-                 phasor_frequencies=1, phasor_steps: int = 0) -> dict:
+                 phasor_frequencies=1, phasor_steps: int = 0,
+                 probes: int = 0) -> dict:
     """Cells, dt, steps, device bytes and Jetson seconds for a planned run.
 
     ``nodes`` are the three node-coordinate arrays the run will use and
@@ -2503,7 +2515,11 @@ def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
     one the run will take. ``phasor_box``, ``phasor_frequencies`` and
     ``phasor_steps`` are counted in the bytes as :func:`memory_estimate`
     counts them; the seconds do not count the box's per-step folding, which
-    runs only over the steps it reads.
+    runs only over the steps it reads. ``probes`` is the number of probe
+    traces the run records, counted at the ``steps`` this call finds: Run C's
+    line of 441 probes over 121,121 steps is 441 x 121,121 x 4 = 213.7 MB
+    larger than one without, which is what a long record's probes cost and what
+    the memory cap must see.
     """
     nodes = [np.asarray(n, dtype=float) for n in nodes]
     shape = tuple(len(n) for n in nodes)
@@ -2528,7 +2544,8 @@ def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
                                  record_frames=record_frames,
                                  max_frames=max_frames, phasor_box=phasor_box,
                                  phasor_frequencies=phasor_frequencies,
-                                 phasor_steps=phasor_steps),
+                                 phasor_steps=phasor_steps,
+                                 probes=probes, probe_steps=steps),
         "setup": setup,
         "seconds": cells * steps / (RATE_SAFETY * JETSON_RATES[setup]),
         # the requested movie length, so a memory refusal can say that fewer

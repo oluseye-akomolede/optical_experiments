@@ -224,6 +224,10 @@ def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
         est = fdtd.estimate_run(lay["nodes"], duration=float(request["duration_s"]),
                                 boundary=request["boundary"], metals=lay["metals"],
                                 pec=lay["pec"], record_frames=True,
+                                # the layout's probes are the traces this run
+                                # holds for every step, so the memory check
+                                # prices them too
+                                probes=len(lay["probes"]),
                                 max_frames=fdtd.MAX_FRAMES if frames is None else frames)
         fdtd.check_limits(est)
     except (fdtd.FDTDError, ValueError) as exc:
