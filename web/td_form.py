@@ -4,8 +4,11 @@
 refused HERE, before a row exists, with the message the solver itself writes:
 the grid, source and probe placement come from ``fdtd_layout.plan`` (the
 worker's own layout rule without the voxeliser), the source from
-``fdtd.Source``, and the limits from ``fdtd.check_limits`` on
-``fdtd_layout.estimate``. No second copy of any of those rules lives here.
+``fdtd.Source``, and the device-independent limits from ``fdtd.check_limits``
+on ``fdtd_layout.estimate``. No second copy of any of those rules lives here.
+The memory ceiling is not among them: the run's device is the solver's, and this
+process reads its own, so the memory check is made on the device (``NO_DEVICE``
+below), not here.
 
 Every refusal leaves as ``TDRequestError``, including the ones nobody wrote a
 ``raise`` for (a mesh library failing on a strange file, a TypeError from a
@@ -372,7 +375,11 @@ def plan_request(form, data: bytes, units_scale_m: float) -> dict:
         # too. Its plan is not kept: the worker plans again from the stored
         # request, and that plan is the one the run uses.
         fdtd_layout.movie_window(request, est)
-        fdtd.check_limits(est)
+        # This process is the control plane, not the run's device: it cannot
+        # read the solver's memory, so it checks the two ceilings that are
+        # the product's own (steps, seconds) and leaves the device's budget to
+        # the worker, which reads it where the run will land.
+        fdtd.check_limits(est, budget=fdtd.NO_DEVICE)
         if request["source_kind"] == "plane":
             place = {"kind": "plane", "direction": request["direction"],
                      "box": planned["box"]}

@@ -18,11 +18,15 @@ than its tail, a record over ``fdtd.MAX_STEPS``, and a record too short for the
 hard-started CW drive to have settled (8 periods is F = 4.61 in vacuum, and the
 run says so).
 
-The three per-run ceilings are covered both ways as well: the product's own refuse
-a long record, and the bench flags that raise them (``--max-steps``,
-``--max-seconds`` and ``--max-cells``, the ceilings only a flagged bench run may
-raise) are read by the ladder and the run path through one function and refused
-if they would lower a ceiling instead.
+The per-run ceilings are covered both ways as well: the product's own refuse a
+long record, and the bench flags (``--max-steps`` and ``--max-seconds``, which
+name a floor a flagged run may only raise, and ``--max-cells``/``--max-bytes``,
+which name a ceiling of their own since no product constant is left to raise
+from) are read by the ladder and the run path through one function.
+
+The device's budget is what applies when those flags are absent, so the bench
+tests stay host-independent by naming their ceilings; ``--max-cells 0`` is
+refused at the parser before any scene is built.
 
 The open boundary is covered as a distance (``--pad-nm``/``--pml-nm``), because
 ``fdtd_layout.OPEN_PAD_CELLS`` is a cell count: 16 cells is 320 nm at dx 20 --
@@ -206,32 +210,33 @@ def test_the_same_long_record_is_refused_without_a_flag_and_accepted_with_one():
 
     500 periods on the tiny scene is 126,685 steps at its 6.22 nm finest cell --
     over ``fdtd.MAX_STEPS`` before any solve starts. Without a flag the run path
-    refuses it, and ``run_limits`` is the product's own three constants; with the
-    flags, the same call accepts it. This is the pair the owner's 2026-10-16
-    decision turns on: only a flagged bench run may go longer, and the flag is
-    what the ladder and the run path both read.
+    refuses it, and ``run_limits`` is the product's two step/time ceilings with
+    no cell or byte ceiling of its own (``None`` = the device's budget, read on
+    the device); with the flags, the same call accepts it. This is the pair the
+    owner's 2026-10-16 decision turns on: only a flagged bench run may go
+    longer, and the flag is what the ladder and the run path both read.
     """
     m = _load()
     plain = m.parse_args(list(LONG))
-    assert m.run_limits(plain) == {"max_cells": m.fdtd.MAX_CELLS,
+    assert m.run_limits(plain) == {"max_cells": None,
                                    "max_steps": m.fdtd.MAX_STEPS,
                                    "max_seconds": m.fdtd.MAX_SECONDS,
-                                   "max_bytes": m.fdtd.MAX_BYTES}
+                                   "max_bytes": None}
     lay, request, geom = m.solve_scene(plain)
     measured = m.filled(plain, lay, request)
     assert measured["exceeded"], measured
     assert "over the limit of 20,000" in measured["exceeded"], measured["exceeded"]
 
     args = m.parse_args(LONG + RAISED)
-    assert m.run_limits(args) == {"max_cells": m.fdtd.MAX_CELLS,
+    assert m.run_limits(args) == {"max_cells": None,
                                   "max_steps": 200_000, "max_seconds": 7200.0,
-                                  "max_bytes": m.fdtd.MAX_BYTES}
+                                  "max_bytes": None}
     lay, request, geom = m.solve_scene(args)
     measured = m.filled(args, lay, request)
     assert measured["exceeded"] is None, measured["exceeded"]
 
 
-def test_the_cell_ceiling_is_the_third_thing_the_bench_flags_can_raise(capsys):
+def test_the_dx_10_record_is_priced_once_the_step_ceilings_are_raised(capsys):
     """The product's own pricing arm on the manifest's own record: refused, then priced.
 
     The ladder is the cheap half of the product's own layout -- ``planned_scene``
@@ -241,9 +246,15 @@ def test_the_cell_ceiling_is_the_third_thing_the_bench_flags_can_raise(capsys):
     record holds the open boundary at r20's own distance (``--pad-nm 320
     --pml-nm 200``, the product's own 16/10 cells at dx 20): that is what makes
     the dx-10 record r20's own box at a finer dx -- 14,048,300 cells against
-    r20's 2,903,040, over ``fdtd.MAX_CELLS`` by 75.6 % -- because only the three
-    pad layers take ``--dx`` while the oxide's ``thickness / MIN_CELLS`` and the
-    gold's ``depth / CELLS_PER_SKIN`` are the same capped requests at either dx.
+    r20's 2,903,040 -- because only the three pad layers take ``--dx`` while the
+    oxide's ``thickness / MIN_CELLS`` and the gold's ``depth / CELLS_PER_SKIN``
+    are the same capped requests at either dx.
+
+    No cell flag can admit it any more: with the cell ceiling gone into the
+    device's budget, this record's 14 M cells price at about 1.6 GiB, well
+    inside the pricing process's own budget, and what refuses it is its 39,650
+    steps against the product's 20,000. The two step/time flags the manifest
+    passes are the whole of what admits it.
     """
     m = _load()
     record = ["--estimate", "--hex", "paper", "--wavelength", "993", "--dx",
@@ -257,7 +268,7 @@ def test_the_cell_ceiling_is_the_third_thing_the_bench_flags_can_raise(capsys):
     # read a coarse row and a fine one, not just the record's own.
     assert m.ladder(m.parse_args(list(record))) == 2
     out = capsys.readouterr().out
-    assert ("refused: The grid has 14,048,300 cells, over the limit of 8,000,000"
+    assert ("refused: The run needs 39,650 time steps, over the limit of 20,000"
             in out), out
     assert "every rung above was refused" in out, out
     by_rung = {}
@@ -266,23 +277,22 @@ def test_the_cell_ceiling_is_the_third_thing_the_bench_flags_can_raise(capsys):
         if len(parts) >= 2 and parts[1] == "600" and parts[0] in ("20.0", "10.0"):
             by_rung[parts[0]] = line
     assert "time steps, over the limit of 20,000" in by_rung["20.0"], out
-    assert "14,048,300 cells, over the limit of 8,000,000" in by_rung["10.0"], out
+    assert "39,650 time steps, over the limit of 20,000" in by_rung["10.0"], out
 
-    # The cell ceiling on its own does not admit the record: its 39,650 steps are
-    # over the product's 20,000 whatever the cell cap says, so the refusal only
-    # moves to the next ceiling. All three flags are needed, as the manifest has.
+    # The cell/byte flags no longer change the verdict: the record prices inside
+    # the device's budget either way, and the two step/time flags the manifest
+    # passes are what admit it.
     assert m.ladder(m.parse_args(record + ["--max-cells", "15000000"])) == 2
     out = capsys.readouterr().out
     assert ("refused: The run needs 39,650 time steps, over the limit of 20,000"
             in out), out
 
-    # With the three flags the manifest passes, the same rung is priced, and the
-    # price is the one tasks.md quotes: cells, steps, the estimator's seconds and
-    # GiB. The table's row for dx 10.0 / pad 600, read by its own first two
-    # columns -- this rung is one of the table's own, so it carries no "(as asked)"
-    # marker and a substring search over the whole table could match another row.
-    assert m.ladder(m.parse_args(record + ["--max-cells", "15000000",
-                                           "--max-steps", "200000",
+    # With those two flags the same rung is priced, and the price is the one
+    # tasks.md quotes: cells, steps, the estimator's seconds and GiB. The table's
+    # row for dx 10.0 / pad 600, read by its own first two columns -- this rung
+    # is one of the table's own, so it carries no "(as asked)" marker and a
+    # substring search over the whole table could match another row.
+    assert m.ladder(m.parse_args(record + ["--max-steps", "200000",
                                            "--max-seconds", "18000"])) == 0
     row = None
     for line in capsys.readouterr().out.splitlines():
@@ -356,8 +366,9 @@ def test_the_dx_10_record_holds_r20_s_box_and_only_the_resolution_moves():
 def test_the_boundary_distance_is_rounded_to_the_nearest_cell(capsys):
     """A rung whose dx does not divide 320 nm cannot hold it exactly, and says what it held.
 
-    dx 15 nm is the nearest rung that fits the product's own 8 M cells with the
-    box held; 320/15 and 200/15 are not whole cells, so the plan holds 21 and 13
+    dx 15 nm is the nearest rung that fits the paper's box (the product no
+    longer caps cells; this rung is chosen for the rounding, not for a ceiling);
+    320/15 and 200/15 are not whole cells, so the plan holds 21 and 13
     (315 nm and 195 nm) and reports those. Rounded up instead, the same rung
     would hold 22/14 -- 330/210 nm -- and the two are different boundaries, which
     is why the rounding is pinned rather than assumed.
@@ -507,9 +518,9 @@ def test_the_run_path_hands_its_raised_ceiling_to_the_cap_check(monkeypatch):
     args = m.parse_args(LONG + RAISED)
     lay, request, geom = m.solve_scene(args)
     m.filled(args, lay, request)
-    assert calls == [{"max_cells": m.fdtd.MAX_CELLS,
+    assert calls == [{"max_cells": None,
                       "max_steps": 200_000, "max_seconds": 7200.0,
-                      "max_bytes": m.fdtd.MAX_BYTES}], calls
+                      "max_bytes": None}], calls
 
 
 def test_no_cap_call_site_escapes_the_bench_ceiling():
@@ -528,8 +539,8 @@ def test_no_cap_call_site_escapes_the_bench_ceiling():
     assert all("**" in c for c in calls), calls
 
 
-def test_a_flag_that_would_lower_a_cap_is_refused_before_any_scene(capsys):
-    """The flags raise a ceiling; a value under the product's own is an error.
+def test_the_step_and_time_flags_may_only_raise(capsys):
+    """Those two flags raise the product's own ceilings; a lower value is an error.
 
     Two ways, because the parser is not the only way to reach ``run_limits``:
     argparse refuses the flag at the command line, and the ``max()`` inside
@@ -537,26 +548,48 @@ def test_a_flag_that_would_lower_a_cap_is_refused_before_any_scene(capsys):
     own ceiling rather than a lowered one.
     """
     m = _load()
-    for flag, value in (("--max-cells", "1000000"), ("--max-steps", "1000"),
-                        ("--max-seconds", "60"), ("--max-bytes", "2")):
+    for flag, value in (("--max-steps", "1000"), ("--max-seconds", "60")):
         with pytest.raises(SystemExit) as info:
             m.parse_args(["--tiny", flag, value])
         assert info.value.code == 2
         err = capsys.readouterr().err
         assert "may only raise a cap" in err, err
-    lowered = argparse.Namespace(max_cells=1_000_000, max_steps=1000,
-                                 max_seconds=60.0, max_bytes=1e9)
-    assert m.run_limits(lowered) == {"max_cells": m.fdtd.MAX_CELLS,
+    lowered = argparse.Namespace(max_cells=None, max_steps=1000,
+                                 max_seconds=60.0, max_bytes=None)
+    assert m.run_limits(lowered) == {"max_cells": None,
                                      "max_steps": m.fdtd.MAX_STEPS,
                                      "max_seconds": m.fdtd.MAX_SECONDS,
-                                     "max_bytes": m.fdtd.MAX_BYTES}
+                                     "max_bytes": None}
+
+
+def test_the_cell_and_byte_flags_set_a_ceiling_of_their_own(capsys):
+    """Cells and bytes have no product constant to raise from: the device's
+    budget is the default, and the flag names a ceiling that may sit below it
+    as well as above. Non-positive is refused at the parser."""
+    m = _load()
+    args = m.parse_args(["--tiny", "--max-cells", "1000000",
+                         "--max-bytes", "2"])
+    assert m.run_limits(args) == {"max_cells": 1_000_000,
+                                  "max_steps": m.fdtd.MAX_STEPS,
+                                  "max_seconds": m.fdtd.MAX_SECONDS,
+                                  "max_bytes": 2e9}
+    for flag in ("--max-cells", "--max-bytes"):
+        with pytest.raises(SystemExit) as info:
+            m.parse_args(["--tiny", flag, "0"])
+        assert info.value.code == 2, flag
+        err = capsys.readouterr().err
+        assert flag in err and "is not a ceiling" in err, err
 
 
 def test_the_memory_ceiling_is_the_fourth_thing_the_bench_flags_can_raise():
-    """``--max-bytes`` names GB: ``14`` is 14e9 bytes, and it only raises.
+    """``--max-bytes`` names GB: ``14`` is 14e9 bytes, and it is an explicit
+    ceiling for this run.
 
-    dx 5 nm of the paper's own scene estimates 11.55 GB against the 3.0 GB the
-    product may assume; this is the flag that lets a measured card price it.
+    There is no product byte ceiling to raise any more -- the device's budget
+    applies when the flag is absent. dx 5 nm of the paper's own scene estimates
+    11.55 GB; ``--max-bytes 14`` is how a measured card says it can hold that,
+    and ``--max-bytes 8`` is how a caller pins a ceiling regardless of the host
+    it prices on.
     """
     m = _load()
     args = m.parse_args(["--tiny", "--max-bytes", "14"])
@@ -564,7 +597,7 @@ def test_the_memory_ceiling_is_the_fourth_thing_the_bench_flags_can_raise():
     assert m.run_limits(args)["max_bytes"] == 14e9
     plain = m.parse_args(["--tiny"])
     assert plain.max_bytes is None
-    assert m.run_limits(plain)["max_bytes"] == m.fdtd.MAX_BYTES
+    assert m.run_limits(plain)["max_bytes"] is None      # the device's budget
 
 
 def test_a_raised_memory_ceiling_is_reported_on_the_caps_line(capsys):
@@ -769,12 +802,16 @@ def test_the_ladder_prices_the_rung_that_was_asked_for():
     the one the caller named -- which reads exactly like the asked rung was priced and
     fitted. Both directions: the marker means something only if a standard run lacks it.
     """
-    done = run("--estimate", "--dx", "5", "--mirror-pad", "400")
+    done = run("--estimate", "--dx", "5", "--mirror-pad", "400",
+               "--max-bytes", "8")     # an explicit ceiling, so the verdict is
+                                       # this test's, not the pricing host's
     row = [line for line in done.stdout.splitlines()
            if line.strip().startswith("5.0")]
     assert row, done.stdout + done.stderr
     assert "as asked" in row[0], done.stdout          # priced, and marked as the ask
-    assert "over the limit of 8,000,000" in row[0], done.stdout
+    # the record this rung needs is 155 minutes against the product's 30; the
+    # 8 GB flag is there for host-independence and does not bind first
+    assert "refused" in row[0] and "30 min" in row[0], done.stdout
     plain = run("--estimate", "--dx", "20", "--mirror-pad", "400")
     assert "as asked" not in plain.stdout, plain.stdout
 
