@@ -205,17 +205,30 @@ the two faces normal to its direction.
 ### Requirement: A run SHALL be refused above its limits before it is queued
 
 The estimate SHALL be computed from the form. A request SHALL be refused,
-before it is queued, when it exceeds any of: 8 M cells; 20 000 steps; a GPU
-memory budget of 3.0 GB (fields, CPML auxiliaries and ADE storage, computed
-from the form); or an estimated run time of 30 minutes, computed from the
-measured Jetson rate for that configuration (boundary kind and whether
+before it is queued, when it exceeds the product's step ceiling (20 000 steps,
+computed from the run's own dt) or its time ceiling (30 minutes, computed from
+the measured Jetson rate for that configuration: boundary kind and whether
 dispersive metals are present). The refusal SHALL name the limit, the value
 that exceeded it, and the form lever that reduces it.
 
+The cell and memory ceilings SHALL NOT be fixed numbers. They are the budget of
+the device the run lands on (a separate requirement, below). The web app runs
+on the control plane, not on that device, so it SHALL price the run (bytes,
+cells, steps, seconds) and SHALL check only the two limits above, passing
+`fdtd.NO_DEVICE`: it SHALL NOT refuse a request for memory or cells, because
+any figure it could compare against would be the control plane's, not the
+solver's. The device's own check SHALL be applied where the run happens: the
+worker, through `fdtd.admission_budget` and `fdtd.check_limits`, refusing a run
+that cannot fit that device before it is solved, and deferring one that does
+not fit the free memory at that moment.
+
 #### Scenario: an oversized grid is refused readably
-- **WHEN** the requested frequency and size give more than 8 M cells
-- **THEN** the page shows the refusal with the cell count, the limit and the
-  lever, and the server does not respond 500
+- **WHEN** the requested frequency and size give more cells than the budget of
+  the device the run lands on allows (the product once capped these at 8 M
+  cells, on the page; the page now prices the run and queues it, and the cell
+  count is checked where the run happens)
+- **THEN** the device-side refusal names the cell count, the ceiling in bytes,
+  the figure it came from and the lever, and the server does not respond 500
 
 #### Scenario: too many steps is refused readably
 - **WHEN** the requested duration on the grid's dt needs more than 20 000 steps
@@ -223,9 +236,19 @@ that exceeded it, and the form lever that reduces it.
   lever, and the server does not respond 500
 
 #### Scenario: too much memory is refused readably
-- **WHEN** the estimated GPU memory exceeds 3.0 GB
-- **THEN** the page shows the refusal with the byte estimate, the limit and the
-  lever, and the server does not respond 500
+- **WHEN** the estimated memory exceeds the budget of the device the run lands
+  on
+- **THEN** the refusal names the byte estimate, the ceiling, the figure it came
+  from (the GPU's free memory, the container's limit or the system's available
+  memory) and the lever, and the server does not respond 500
+
+#### Scenario: the page prices memory without refusing on it
+- **WHEN** the form's estimate for a request is larger than any fixed ceiling
+  the product once had (for example the 11.55 GB paper-1 dx-5 nm record)
+- **THEN** the page prices the run -- its estimate, which the movie-window and
+  step checks read -- and admits the request to the queue without comparing the
+  byte figure to a ceiling of its own, because the only honest ceiling is the
+  device's and it is read on the device
 
 #### Scenario: the estimate counts the steps the run will take
 - **WHEN** a run's dt is lowered below 0.99 of Courant by a dispersive metal
@@ -1568,58 +1591,6 @@ stops it arrives, in place of a stack trace about a closed page.
   the cap and the frame count, exits 124, and nothing in the output presents the
   run as a failed page
 
-### Requirement: The cell ceiling SHALL be a per-run argument, raisable by the bench script alone
-
-`fdtd.check_limits` SHALL take a third ceiling, `max_cells`, alongside `max_steps` and
-`max_seconds`, defaulting to `fdtd.MAX_CELLS` read at call time and not bound at import, and
-its refusal SHALL name the ceiling that actually applied rather than the product's constant.
-`fdtd.MAX_CELLS` SHALL keep its value and its meaning: what changes is that the bench path can
-be measured against a raised ceiling without the product's own moving. The paper-1 bench script
-alone SHALL be able to raise it, through `--max-cells N`, and the flag SHALL only raise: a value
-under the product's own SHALL be an argparse error, and `run_limits` SHALL clamp with `max()`
-so a namespace that never met the parser reads the product's own. The web app and the k8s Job
-path SHALL NOT be able to raise it: `worker/td_solve.py` and the web app SHALL call
-`check_limits` with no ceiling, and no environment variable and no module global SHALL set one.
-A run that used a raised ceiling SHALL say so on its `caps` log line, naming the cell ceiling in
-the same parenthetical that names the raised steps and seconds.
-
-The reason the third ceiling is needed at all is the grid's shape: on the paper's own scene a
-dx-10 nm record with the open boundary held at r20's distance is 14,048,300 cells, over the 8 M
-cap by 75.6 %, and the record that resolves the paper's 4 nm mode is that record at 993 nm --
-100 periods, 39,650 steps.
-
-#### Scenario: the product's own default is unchanged and one cell over it is refused
-- **WHEN** `fdtd.check_limits` is called with no ceiling on an estimate of 8,000,000 cells
-- **THEN** it admits it, and on 8,000,001 cells it raises `EstimateError` naming `8,000,000`,
-  so the control is the product's own constant and not a number this change invented
-
-#### Scenario: a raised ceiling is the ceiling the refusal names
-- **WHEN** an estimate of 14,048,301 cells is checked against `max_cells=14,048,300`
-- **THEN** the refusal names `14,048,300` and not `8,000,000`, because the log line's job is to
-  name the ceiling that was in force
-
-#### Scenario: the bench flag is the only way in, and it only raises
-- **WHEN** `--max-cells 1000000` is parsed by the bench script
-- **THEN** argparse refuses it (exit 2, `may only raise a cap`), and a hand-built namespace
-  carrying `max_cells=1_000_000` reads `fdtd.MAX_CELLS` through `run_limits` instead
-
-#### Scenario: the manifest's own record is refused by the product and priced with the flags
-- **WHEN** the bench script's pricing arm (the ladder, which voxelises nothing) prices the
-  manifest's own record -- `--hex paper --wavelength 993 --dx 10 --mirror-pad 600 --periods 100
-  --pad-nm 320 --pml-nm 200`
-- **THEN** with no bench flag not one rung is priced, each refused on every ceiling it exceeds --
-  the ladder prints only the first 64 characters of a refusal, so the dx-10/pad-600 row reads
-  `refused: The grid has 14,048,300 cells, over the limit of 8,000,000` and dx-12/pad-600 reads
-  8,952,300 cells against the same limit, while dx 20 and 15 (and dx 12 at pad 400) lead with
-  `The run needs 39,650 time steps, over the limit of 20,000` -- and with `--max-cells 15000000
-  --max-steps 200000 --max-seconds 18000` the dx-10 row is priced at 14,048,300 cells,
-  39,650 steps and 13,662.4 s in 1.63 GiB
-
-#### Scenario: the wide-scan call sites do not diverge on which ceiling is in force
-- **WHEN** the bench script's `check_limits` call sites are read
-- **THEN** each hands its ceiling over (found by `re.findall`, each passing `**`), so the
-  estimator's rungs and the run path cannot be priced against two different cell ceilings
-
 ### Requirement: The open boundary SHALL be nameable as a distance, so a resolution change is only a resolution change
 
 `fdtd_layout.plan` and `fdtd_layout.layout` SHALL take `pad_cells` and `pml_cells` as
@@ -1778,53 +1749,6 @@ without the key, or with it None, SHALL print exactly as before.
 - **THEN** it prints `tau AMBIGUOUS (` with the second minimum, no `Q` line
   and no `Q >`, and returns 3. On one clean 400 fs mode it prints
   `tau = ...` and its Q, and returns 0
-
-### Requirement: The memory ceiling SHALL be a per-run argument, raisable only by the bench script
-
-`fdtd.check_limits` SHALL take a fourth ceiling, `max_bytes`, alongside `max_steps`,
-`max_seconds` and `max_cells`. Its default SHALL be `fdtd.MAX_BYTES` read at call time, and
-its refusal SHALL name the ceiling that actually applied rather than the product's constant.
-`fdtd.MAX_BYTES` SHALL keep its value (3.0e9 bytes) and its meaning: the product's own
-ceiling is unchanged, and only a measured bench card is measured against a raised one.
-
-The paper-1 bench script alone SHALL be able to raise it, through `--max-bytes GB`
-(gigabytes, so `--max-bytes 14` is 14e9 bytes). The flag SHALL only raise: a value under the
-product's own SHALL be an argparse error (exit 2), and `run_limits` SHALL clamp with `max()`
-so a namespace that never met the parser reads the product's own. The web app and the k8s
-Job path SHALL NOT be able to raise it: `worker/td_solve.py` and the web app SHALL call
-`check_limits` with no ceiling, and no environment variable and no module global SHALL set
-one. A run that used a raised memory ceiling SHALL say so on its `caps` log line, naming the
-memory ceiling in the same parenthetical that names raised steps, seconds and cells.
-
-The refusal this lifts was measured: the paper's Run B at dx 5 nm on the 16 GB A4000
-estimates 11.55 GB of GPU memory and was refused after about two hours of setup under the
-product's 3.0 GB ceiling.
-
-#### Scenario: The default refuses what the card cannot do under the product's ceiling
-
-- **WHEN** an estimate of 11.55e9 bytes is checked with no `max_bytes`
-- **THEN** it SHALL be refused, and the refusal SHALL name "over the limit of 3.0 GB"
-
-#### Scenario: A raised ceiling is the one the refusal names
-
-- **WHEN** the same estimate is checked with `max_bytes=14e9`
-- **THEN** it SHALL be admitted
-- **AND** an estimate of 14e9 + 1 bytes SHALL be refused, naming "over the limit of 14.0 GB"
-  and not the product's 3.0 GB
-
-#### Scenario: The flag only raises
-
-- **WHEN** the bench parser is given `--max-bytes 2`
-- **THEN** it SHALL exit 2 with "may only raise a cap"
-- **AND** a namespace carrying `max_bytes=1e9` SHALL resolve through `run_limits` to
-  `fdtd.MAX_BYTES`, exactly as the other three ceilings do
-
-#### Scenario: A memory-only raise is reported as a bench ceiling
-
-- **WHEN** `report` runs with only `max_bytes` raised
-- **THEN** its `caps` line SHALL carry the bench-ceiling parenthetical and name the memory
-  ceiling (for example "14.0 GB")
-- **AND** with no ceiling raised the same line SHALL carry no parenthetical
 
 ### Requirement: The CW arm's settling forecast SHALL follow the curve's slow tail
 
@@ -2102,7 +2026,15 @@ The traces SHALL be written into the `--save-tail` record beside the field: `pro
 
 ### Requirement: The probes SHALL be priced in every estimate of the run that records them
 
-`fdtd.memory_estimate` and `fdtd.estimate_run` SHALL take `probes` (and `probe_steps`, defaulting to the run's own step count) and count `4 x probes x probe_steps` bytes, the same four bytes a float32 trace is, because that is what the run holds in device memory and what `MAX_BYTES` must see. `fdtd_layout.estimate` SHALL pass the planned layout's own probe count, and the worker SHALL pass its layout's, so the product's memory check prices the traces it will record. The bench script's ladder SHALL price the same line the run will place, by building it from the plan through one function both paths call.
+`fdtd.memory_estimate` and `fdtd.estimate_run` SHALL take `probes` (and
+`probe_steps`, defaulting to the run's own step count) and count
+`4 x probes x probe_steps` bytes, the same four bytes a float32 trace is,
+because that is what the run holds in device memory and what the device's
+admission ceiling must hold. `fdtd_layout.estimate` SHALL pass the planned
+layout's own probe count, and the worker SHALL pass its layout's, so the
+product's memory check prices the traces it will record. The bench script's
+ladder SHALL price the same line the run will place, by building it from the
+plan through one function both paths call.
 
 #### Scenario: a run's estimate grows by its traces
 - **WHEN** `fdtd.estimate_run` is called on the same nodes with `probes=0` and with `probes=n`
@@ -2127,3 +2059,66 @@ The traces SHALL be written into the `--save-tail` record beside the field: `pro
 #### Scenario: a record with no probes is refused, not read as empty
 - **WHEN** `--axial-profile` is given a `--save-tail` record written without `--axis-probes`
 - **THEN** it exits non-zero naming the missing traces, and `--axial-profile` together with any arm that would build a scene (`--ringdown`, `--estimate`, `--spectrum`, `--tiny`, `--save-tail`, `--save-series`, `--from-series`, `--collection-na`, `--locator-tau`, `--axis-probes`) SHALL be refused in `arm_conflicts`, so a flag that cannot be read is never accepted and ignored
+
+### Requirement: The memory and cell ceilings SHALL follow the device the run lands on
+
+`fdtd.admission_budget(xp=None)` SHALL return the admission ceiling of the device
+the calling process runs on: when `xp` is cupy, the device's own memory
+(`cupy.cuda.Device().mem_info`) plus the bytes cupy's pool already holds; else
+the cgroup memory limit when one is set (`/sys/fs/cgroup/memory.max`, or v1's
+`memory/memory.limit_in_bytes`), because that is what the run may hold even when
+the host has more; else the kernel's `MemAvailable`. The ceiling SHALL be the
+binding figure times `fdtd.ADMISSION_MARGIN` (0.9), and the budget SHALL carry
+that figure, its source and its free and capacity values, so a refusal can name
+all three.
+
+`fdtd.check_limits(estimate, *, max_steps=None, max_seconds=None, max_cells=None,
+max_bytes=None, budget=None)` SHALL take the budget: `budget=None` SHALL read
+`admission_budget()` of the calling process at call time, `budget=fdtd.NO_DEVICE`
+SHALL mean the caller is not on the run's device and SHALL check only steps and
+seconds, and an explicit `max_bytes` SHALL override the budget. A memory refusal
+SHALL name the byte estimate, the ceiling, the source of the ceiling and the
+margin that was applied, and the form lever that reduces it. The cell ceiling
+SHALL follow the budget instead of being an independent number: with no explicit
+`max_cells` it SHALL be the most cells that fit `max_bytes` at the cheapest
+configuration's per-cell cost, and that cost SHALL be measured from
+`memory_estimate`'s own accounting -- the difference between two grids that
+differ only in their cell count -- not retyped from its formula.
+
+`fdtd.MAX_CELLS` and `fdtd.MAX_BYTES` SHALL be removed. `fdtd.MAX_STEPS` and
+`fdtd.MAX_SECONDS` SHALL keep their values and their meaning.
+
+#### Scenario: the A4000's own memory admits the record the fixed ceiling refused
+- **WHEN** `admission_budget` is given a device reporting 16 GB total and 14.5 GB
+  free, with no cgroup limit and cupy's pool empty
+- **THEN** its ceiling is 13.05 GB (14.5 GB x 0.9), and `check_limits` admits the
+  paper-1 dx-5 nm record's 11.55 GB estimate that the 3.0 GB constant refused
+
+#### Scenario: the container's limit is the ceiling on the Jetson's host memory
+- **WHEN** the process has no GPU and its cgroup limit is 14 GiB, while the host
+  reports 25 GB available
+- **THEN** the budget's capacity is the 14 GiB limit and its ceiling is
+  min(limit, available) x 0.9, with the limit named as the source, because a run
+  may hold the container's memory and not the host's
+
+#### Scenario: the refusal names the ceiling, its source and the margin
+- **WHEN** an estimate of 14.0 GB is checked against the budget of the scenario
+  above
+- **THEN** the `EstimateError` names 14.00 GB, the ceiling (13.5 GB: the 14 GiB
+  limit is 15.03 GB, x 0.9), the source (this container's memory limit) and the
+  0.9 margin, and keeps naming the form lever
+
+#### Scenario: the cell ceiling follows the budget and can still fire
+- **WHEN** an estimate is checked whose `bytes` is under the ceiling but whose
+  `cells` x the cheapest per-cell cost is over the same ceiling, as an estimate
+  whose two figures disagree would be
+- **THEN** the refusal names the cell ceiling the budget implies, so the check
+  catches an estimator that prices fewer bytes than its own cell count can hold,
+  rather than a second opinion about the machine
+
+#### Scenario: the worker defers a run that does not fit now
+- **WHEN** a `td` job's estimate fits the device's capacity budget but exceeds
+  the device's free memory at admission, times the same margin
+- **THEN** the worker leaves the job queued with its busy status instead of
+  starting it against a full device, and a job over the capacity budget is
+  refused with the estimate's own message
