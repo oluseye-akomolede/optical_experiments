@@ -2648,47 +2648,56 @@ def admission_budget(xp=None, *, margin=ADMISSION_MARGIN, free=True,
     travel with it so a refusal can say what it compared to, where that came
     from and how much was held back.
     """
+    # ``source`` names the operand the capacity was taken from, and
+    # ``free_source`` the operand the free figure was read from. They differ on
+    # a GPU inside a container whose limit binds: the capacity is the
+    # container's, the free figure is still the card's, and a refusal must name
+    # whichever of the two actually set the ceiling.
     source, capacity, free_bytes = None, None, None
+    free_source = None
     device = _device_memory(xp) if xp is not None else None
     if device is not None:
         free_bytes, capacity = device
-        source = "gpu"
+        source = free_source = "gpu"
     limit = _cgroup_limit(cgroup_paths)
-    if limit is not None:
-        capacity = limit if capacity is None else min(capacity, limit)
-        source = source or "cgroup"
+    if limit is not None and (capacity is None or limit < capacity):
+        # the smaller of the two is the most the process may hold, and the
+        # label follows it: a limit under the card's total is the container's
+        capacity, source = limit, "cgroup"
     if free_bytes is None:
         free_bytes = _mem_available(meminfo)
-        source = source or "system"
+        free_source = free_source or "system"
+        source = source or free_source
     def gb(b):
         return f"{b / 1e9:.1f}"
+
+    def capacity_where():
+        if source == "gpu":
+            return f"the GPU's own memory ({gb(capacity)} GB)"
+        if source == "cgroup":
+            return f"this container's memory limit ({gb(capacity)} GB)"
+        return f"this machine's memory ({gb(capacity)} GB)"
 
     if not free and capacity is not None:
         # the device's capacity: a caller with its own busy-deferral wants the
         # run refused only when it could never fit
         figure = capacity
-        where = (f"the GPU's own memory ({gb(capacity)} GB)" if source == "gpu"
-                 else f"this container's memory limit ({gb(capacity)} GB)"
-                 if source == "cgroup"
-                 else f"this machine's memory ({gb(capacity)} GB)")
+        where = capacity_where()
     elif capacity is not None and free_bytes < capacity:
         # the free figure binds, so the phrase names it -- and the limit it is
         # under -- rather than the limit alone, a figure the ceiling was not
         # taken from
         figure = free_bytes
-        where = (f"the GPU's memory free at admission ({gb(free_bytes)} GB)"
-                 if source == "gpu"
-                 else f"this container's memory free ({gb(free_bytes)} GB of a "
-                 f"{gb(capacity)} GB limit)"
-                 if source == "cgroup"
-                 else f"this machine's available memory ({gb(free_bytes)} GB)")
+        if free_source == "gpu":
+            where = f"the GPU's memory free at admission ({gb(free_bytes)} GB)"
+        elif source == "cgroup":
+            where = (f"this container's memory free ({gb(free_bytes)} GB of a "
+                     f"{gb(capacity)} GB limit)")
+        else:
+            where = f"this machine's available memory ({gb(free_bytes)} GB)"
     elif capacity is not None:
         figure = capacity
-        where = (f"the GPU's own memory ({gb(capacity)} GB)"
-                 if source == "gpu"
-                 else f"this container's memory limit ({gb(capacity)} GB)"
-                 if source == "cgroup"
-                 else f"this machine's memory ({gb(capacity)} GB)")
+        where = capacity_where()
     else:
         figure = free_bytes
         where = f"this machine's available memory ({gb(free_bytes)} GB)"

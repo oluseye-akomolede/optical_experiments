@@ -89,6 +89,26 @@ not fit the free memory at that moment.
   open and open-plus-gold runs at about 1 M and 4 M cells on the Jetson, beside
   the estimate, and the run-time limit's rates come from those measurements
 
+### Requirement: The probes SHALL be priced in every estimate of the run that records them
+
+`fdtd.memory_estimate` and `fdtd.estimate_run` SHALL take `probes` (and
+`probe_steps`, defaulting to the run's own step count) and count
+`4 x probes x probe_steps` bytes, the same four bytes a float32 trace is,
+because that is what the run holds in device memory and what the device's
+admission ceiling must hold. `fdtd_layout.estimate` SHALL pass the planned
+layout's own probe count, and the worker SHALL pass its layout's, so the
+product's memory check prices the traces it will record. The bench script's
+ladder SHALL price the same line the run will place, by building it from the
+plan through one function both paths call.
+
+#### Scenario: a run's estimate grows by its traces
+- **WHEN** `fdtd.estimate_run` is called on the same nodes with `probes=0` and with `probes=n`
+- **THEN** the two `bytes` differ by exactly `4 n steps`, and `dt` and `steps` do not change: probes cost memory and no time
+
+#### Scenario: the ladder prices the run's own line
+- **WHEN** `--estimate --axis-probes` is read
+- **THEN** each rung's bytes include `4 x 3 x layers x steps` for the line that rung's plan would place
+
 ## ADDED Requirements
 
 ### Requirement: The memory and cell ceilings SHALL follow the device the run lands on

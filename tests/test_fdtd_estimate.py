@@ -250,6 +250,50 @@ def test_the_container_limit_binds_over_the_hosts_own_memory(tmp_path):
         assert part in text, part
 
 
+def test_a_container_limit_under_the_cards_total_names_the_container(tmp_path):
+    """A GPU inside a container: 16 GB of card, 14.5 free, but 8 GB the process
+    may hold. The ceiling is the limit, so both the free and the capacity
+    phrases -- and the refusal -- must name the container, not the GPU's
+    larger total (the label follows the binding operand, not the first one)."""
+    cgroup = str(_cgroup(tmp_path, str(8_000_000_000)))
+    budget = fdtd.admission_budget(
+        _fake_gpu(free=14.5e9, total=16e9), cgroup_paths=(cgroup,),
+        meminfo=str(_meminfo(tmp_path, 60e9)))
+    assert budget["source"] == "cgroup"
+    assert budget["capacity"] == 8_000_000_000
+    assert budget["bytes"] == int(8_000_000_000 * 0.9)
+    assert "container's memory limit (8.0 GB)" in budget["where"]
+    assert "GPU" not in budget["where"], budget["where"]
+    with pytest.raises(fdtd.EstimateError) as info:
+        fdtd.check_limits(_estimate(bytes=8e9), budget=budget)
+    text = str(info.value)
+    assert "container's memory limit (8.0 GB)" in text and "GPU" not in text
+
+    # the worker's capacity budget (free=False) takes the same figure, and
+    # must carry the same label: its refusal is the one a busy card never sees
+    capacity = fdtd.admission_budget(
+        _fake_gpu(free=14.5e9, total=16e9), free=False, cgroup_paths=(cgroup,),
+        meminfo=str(_meminfo(tmp_path, 60e9)))
+    assert capacity["bytes"] == int(8_000_000_000 * 0.9)
+    assert "container's memory limit (8.0 GB)" in capacity["where"]
+
+
+def test_the_cards_total_binds_over_a_larger_container_limit(tmp_path):
+    """The smaller of the card and the container is the capacity: a 64 GB
+    container limit cannot raise a 16 GB card's ceiling, so the GPU figure wins
+    and its label is the GPU's. This is the ``min``'s own test -- taking the
+    limit unconditionally would report 57.6 GB of ceiling on a 16 GB card.
+    """
+    budget = fdtd.admission_budget(
+        _fake_gpu(free=16e9, total=16e9),
+        cgroup_paths=(str(_cgroup(tmp_path, str(64_000_000_000))),),
+        meminfo=str(_meminfo(tmp_path, 60e9)))
+    assert budget["source"] == "gpu"
+    assert budget["capacity"] == 16e9
+    assert budget["bytes"] == int(16e9 * 0.9)
+    assert "GPU's own memory (16.0 GB)" in budget["where"]
+
+
 def test_no_limit_at_all_falls_back_to_the_systems_available_memory(tmp_path):
     for text in ("max", str(1 << 63)):              # v2 "unlimited", v1's huge
         budget = fdtd.admission_budget(

@@ -6,6 +6,7 @@ Tiny and pure: no store, no solver. The phase-5 form will be pinned against
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -172,9 +173,17 @@ def test_too_little_free_memory_defers_before_any_step(monkeypatch):
     assert ran == [], "the check comes before a single device array"
 
 
-def test_exactly_enough_free_memory_runs():
+def test_the_free_memory_boundary_carries_the_admission_margin():
+    """The worker holds back the same tenth the admission ceiling does: free
+    memory exactly equal to the need is deferred now, because a run admitted
+    to the last byte leaves nothing for the page cache or the solver's own
+    transients. The boundary is free >= need / ADMISSION_MARGIN."""
     need = _bytes_needed()
-    td_solve.solve_td(_job(), _Store(), xp=np, free_bytes=lambda: need)
+    td_solve.solve_td(_job(), _Store(), xp=np,
+                      free_bytes=lambda: math.ceil(
+                          need / FDTD.ADMISSION_MARGIN) + 1)
+    with pytest.raises(td_solve.JetsonBusy, match="busy"):
+        td_solve.solve_td(_job(), _Store(), xp=np, free_bytes=lambda: need)
 
 
 def _bytes_for(frames: int):
@@ -274,9 +283,21 @@ def test_a_job_past_the_product_step_cap_is_refused(monkeypatch):
     where the product's cap has to keep biting: 1e-7 s at this fixture's 1 mm
     cells is tens of thousands of steps, and the refusal names the ceiling. The
     spy is the other half of the claim, and the half a message match cannot make:
-    the ceiling the worker applies is the default, because nothing on this path
-    passes one.
+    the step and time ceilings are the defaults (nothing on this path raises
+    them), while the memory ceiling is the device's own budget -- read for the
+    run's device with ``free=False``, the capacity figure, so a merely busy
+    device defers below rather than refusing a run it could hold.
     """
+    budget = {"bytes": 10**10, "free": 10**10, "capacity": 10**10,
+              "source": "gpu", "margin": 0.9,
+              "where": "the GPU's own memory (10.0 GB)"}
+    asked = []
+
+    def fake_budget(xp=None, **kw):
+        asked.append((xp, kw))
+        return budget
+
+    monkeypatch.setattr(FDTD, "admission_budget", fake_budget)
     seen = []
     real = FDTD.check_limits
 
@@ -287,7 +308,8 @@ def test_a_job_past_the_product_step_cap_is_refused(monkeypatch):
     monkeypatch.setattr(FDTD, "check_limits", spy)
     with pytest.raises(td_solve.TDSolveError, match="over the limit of 20,000"):
         td_solve.solve_td(_job(duration_s=1e-7), _Store(), xp=np, free_bytes=PLENTY)
-    assert seen == [{}], seen
+    assert seen == [{"budget": budget}], seen
+    assert asked == [(np, {"free": False})], asked
 
 
 @pytest.mark.parametrize("changes, needle", [
