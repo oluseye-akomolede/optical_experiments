@@ -249,6 +249,59 @@ def test_the_jc_gold_model_is_stable_at_the_bench_spacings(nm):
             < 1.0 + fdtd.GROWTH_TOLERANCE)
 
 
+def test_the_drude_pole_steps_as_an_exact_decay():
+    """The w0 = 0 pole is a free current, so it steps by the exact solution
+    of J' = -G J + sigma E: a = exp(-G dt), inside the circle at every step
+    and falling as the step grows.
+
+    It must not be central-differenced.  That form's roots are 1 and
+    (1 - G dt/2)/(1 + G dt/2), so its static mode sits at exactly 1: neutral
+    in the homogeneous block the growth check models, reported by eigvals as
+    1 to within its own rounding.  Run K's Au-jc grew in the real run while
+    that check passed it.
+    """
+    steps = (1e-19, 1e-18, 4e-18, 8.196452658685128e-18, 2e-17)
+    for name in ("Au", "Au-palik", "Au-jc", "Ag", "Al", "Cu", "Cr"):
+        metal = fdtd.LIBRARY[name]
+        f, w0, gamma = metal.poles[0]
+        assert w0 == 0.0, name
+        gamma_rad = gamma * fdtd.EV
+        sigma = fdtd.EPS0 * f * (metal.plasma_ev * fdtd.EV) ** 2
+        previous = None
+        for dt in steps:
+            record = fdtd.lorentz_drude_coefficients(name, dt)[0]
+            assert record[0] == "drude", name
+            _, a, b = record
+            assert a == pytest.approx(math.exp(-gamma_rad * dt), rel=1e-12)
+            assert 0.0 < a < 1.0, (name, dt, a)
+            assert b == pytest.approx(sigma * (1.0 - a) / gamma_rad,
+                                      rel=1e-12)
+            if previous is not None:
+                assert a < previous, (name, dt)
+            previous = a
+
+
+def test_the_growth_check_is_below_one_at_the_runs_own_steps():
+    """Both paper runs stepped at their grid's Courant dt.  Their finest
+    spacings were x = y 5.9536 nm (Run I) and 6.2493 nm (Run K), z 3 nm.
+
+    Before the Drude pole was stepped exponentially the check read Run K
+    1 + 1.58e-8 -- inside GROWTH_TOLERANCE, so stable_dt passed it -- and
+    that run grew.  With the static root gone the check reads below 1.
+    """
+    runs = (("Au-palik", 8.067893e-18, (5.9536e-9, 5.9536e-9, 3.0e-9)),
+            ("Au-jc", 8.196452658685128e-18,
+             (6.2493e-9, 6.2493e-9, 3.0e-9)))
+    for metal, dt, spacings in runs:
+        coefficients = fdtd.lorentz_drude_coefficients(metal, dt)
+        growth = fdtd.lorentz_drude_growth(coefficients, dt, spacings)
+        assert growth < 1.0 + fdtd.GROWTH_TOLERANCE, (metal, growth)
+    # Au-jc is the run that grew, and its residue was structural: the check
+    # must now put it strictly below 1, not merely inside the tolerance.
+    coefficients = fdtd.lorentz_drude_coefficients("Au-jc", runs[1][1])
+    assert fdtd.lorentz_drude_growth(coefficients, runs[1][1], runs[1][2]) < 1.0
+
+
 def test_a_jc_band_outside_the_fit_names_jc():
     """The refusal names this table's own source and fitted range."""
     to_hz = fdtd.EV / (2 * math.pi)
@@ -497,9 +550,12 @@ def test_the_growth_check_sees_courant_and_the_metal():
 
 def test_a_metal_shrinks_dt_only_as_far_as_it_must():
     """5 nm gold needs about 0.98 of the Courant dt; 2 nm gold needs none.
-    The 2 nm case pins the rounding tolerance: eigvals reads the Drude
-    pole's static mode up to 6e-8 above 1, and a tolerance below that took
-    2 nm gold down to 0.20 of the Courant dt for nothing."""
+
+    At 2 nm every gold fit leaves about 2e-13, the arithmetic floor of the
+    check's eigvals, and GROWTH_TOLERANCE covers it.  It used to cover far
+    more: the central-differenced Drude pole's static mode sat at exactly 1
+    and eigvals read it up to 6e-8 high, so a tolerance below that took 2 nm
+    gold down to 0.20 of the Courant dt for nothing."""
     term = fdtd.LorentzDrude("Au", np.zeros((2, 2, 2), bool))
     for nm, low, high in ((5, 0.9, 0.99), (2, 1.0, 1.0)):
         h = (nm * 1e-9,) * 3
