@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Fit a Lorentz-Drude gold model to Palik's table (600-1300 nm).
+"""Fit a Lorentz-Drude gold model to a measured gold table (600-1300 nm).
 
-Reads ``data/palik_au_nk.csv`` (E. D. Palik, Handbook of Optical Constants of
-Solids, 1985, gold; via IMD) and fits the model ``fdtd.Metal`` steps,
+Reads a table of n and k -- by default ``data/palik_au_nk.csv`` (E. D. Palik,
+Handbook of Optical Constants of Solids, 1985, gold; via IMD), and with
+``--data data/jc_au_nk.csv --name Au-jc --source "Johnson & Christy 1972"``
+the Johnson & Christy 1972 table -- and fits the model ``fdtd.Metal`` steps,
 
     eps(w) = 1 - fp^2 / (w^2 + i w G0)
              + sum_j f_j fp^2 / (w_j^2 - w^2 - i w G_j)      (energies in eV),
@@ -13,10 +15,13 @@ bounded positive (``f_j > 0`` and ``Gamma_j > 0`` keep every pole damped; the
 solver's ``stable_dt`` still bounds the step at the poles' own frequencies),
 and ``eps_inf`` stays 1, as the rest of the library and the ADE assume.
 
-Prints the ``Metal`` literal for ``fdtd.PALIK_1985`` and the per-point error;
-the worst point is what the test's tolerance is set above. Run:
+Prints the ``Metal`` literal for the named entry and the per-point error; the
+worst point is what the test's tolerance is set above. Run:
 
-    .venv-mse/bin/python scripts/fit_palik_gold.py
+    .venv-mse/bin/python scripts/fit_palik_gold.py --poles 4 --starts 64
+    .venv-mse/bin/python scripts/fit_palik_gold.py --data data/jc_au_nk.csv \
+        --name Au-jc --source "Johnson & Christy 1972" --poles 4 --starts 256 \
+        --fit-max-nm 0
 
 The fit is a seeded multi-start: the same seed and start count print the same
 numbers on the same numpy/scipy. It is tier-1 arithmetic (a few thousand small
@@ -39,11 +44,20 @@ BAND_NM = (600.0, 1300.0)
 
 
 def load(path=DATA, max_nm=BAND_NM[1]):
-    """(wavelength nm, n, k) for every table row in the band up to ``max_nm``."""
+    """(wavelength nm, n, k) for every table row in the band up to ``max_nm``.
+
+    The wavelength column names its unit (``wavelength_A`` or
+    ``wavelength_nm``), so a table copied from a different source keeps its
+    own header; only the unit is read off it.
+    """
     with open(path) as handle:
         rows = list(csv.DictReader(line for line in handle
                                    if not line.startswith("#")))
-    lam = np.array([float(row["wavelength_A"]) / 10.0 for row in rows])
+    column = next(name for name in rows[0] if name.startswith("wavelength_"))
+    # angstrom -> nm is a division, not a multiply by 0.1: the two differ in
+    # the last bit and that moved the Palik fit's worst row from 1.50% to 1.92%
+    lam = np.array([float(row[column]) if column == "wavelength_nm"
+                    else float(row[column]) / 10.0 for row in rows])
     n = np.array([float(row["n"]) for row in rows])
     k = np.array([float(row["k"]) for row in rows])
     keep = (lam >= BAND_NM[0]) & (lam <= max_nm)
@@ -109,7 +123,7 @@ def envelope_from(lam_nm, target, factor, step=2.0):
     return grid, factor * np.interp(grid, lam_nm, np.abs(target))
 
 
-def literal(p, fit_ev):
+def literal(p, fit_ev, name="Au-palik", source="Palik 1985"):
     """The ``Metal(...)`` literal the fit prints, to 10 significant digits.
 
     The digits matter: 4 of them moved the 2.11% fit to 3.13%, past the gate.
@@ -118,12 +132,18 @@ def literal(p, fit_ev):
     for j in range((len(p) - 2) // 3):
         poles.append(tuple(p[2 + 3 * j:5 + 3 * j]))
     shown = ", ".join(f"({f:.10g}, {w0:.10g}, {g:.10g})" for f, w0, g in poles)
-    return (f"Metal(\"Au-palik\", {p[0]:.10g}, ({shown}),"
-            f" ({fit_ev[0]:.2f}, {fit_ev[1]:.2f}))")
+    return (f"Metal(\"{name}\", {p[0]:.10g}, ({shown}),"
+            f" ({fit_ev[0]:.2f}, {fit_ev[1]:.2f}), source=\"{source}\")")
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--data", default=str(DATA),
+                        help="CSV of n and k (default: Palik's gold table)")
+    parser.add_argument("--name", default="Au-palik",
+                        help="the library entry the literal is printed for")
+    parser.add_argument("--source", default="Palik 1985",
+                        help="the Metal.source string the literal carries")
     parser.add_argument("--poles", type=int, default=4,
                         help="Lorentz poles besides the Drude one (default 4)")
     parser.add_argument("--starts", type=int, default=64)
@@ -133,19 +153,21 @@ def main(argv=None):
     parser.add_argument("--fit-max-nm", type=float, default=1150.0,
                         help="fit only the table rows at or below this (nm);"
                              " the three rows past it miss the 3 %% gate under"
-                             " the damping floor and envelope")
+                             " the damping floor and envelope. Palik's default;"
+                             " 0 fits every row in the band")
     parser.add_argument("--envelope", type=float, default=1.5,
                         help="|eps| cap, as a factor on the linear interpolation"
                              " between rows, on a 2 nm grid; 0 disables")
     args = parser.parse_args(argv)
 
-    lam_nm, n, k = load(max_nm=args.fit_max_nm)
+    lam_nm, n, k = load(args.data,
+                        max_nm=args.fit_max_nm or BAND_NM[1])
     energy = EV_NM / lam_nm
     target = (n + 1j * k) ** 2
     fit_ev = (energy.min(), energy.max())
     envelope = None
     if args.envelope:
-        all_lam, all_n, all_k = load()
+        all_lam, all_n, all_k = load(args.data)
         envelope = envelope_from(all_lam, (all_n + 1j * all_k) ** 2,
                                  args.envelope)
     found = fit(energy, target, args.poles, starts=args.starts,
@@ -154,11 +176,11 @@ def main(argv=None):
     got = model(found.x, energy)
     error = np.abs(got - target) / np.abs(target)
 
-    print(f"# {len(lam_nm)} Palik points, {lam_nm.min():.0f}-{lam_nm.max():.0f} nm,"
+    print(f"# {len(lam_nm)} {args.source} points, {lam_nm.min():.0f}-{lam_nm.max():.0f} nm,"
           f" {args.poles} Lorentz poles, {args.starts} starts, seed {args.seed}")
     print(f"# max |eps error| / |eps| = {error.max() * 100:.2f}%"
           f" at {lam_nm[error.argmax()]:.0f} nm")
-    print(literal(found.x, fit_ev))
+    print(literal(found.x, fit_ev, args.name, args.source))
     print("# wavelength_nm  eps_target  eps_model  rel_error")
     for lam, want, has, err in zip(lam_nm, target, got, error):
         print(f"  {lam:9.1f}  {want.real:9.3f}{want.imag:+8.3f}i"

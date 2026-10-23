@@ -649,6 +649,34 @@ def test_the_gold_flag_selects_what_the_scene_prices_and_reports(capsys):
     assert "Au-palik" in stack[0], stack[0]
 
 
+def test_the_jc_gold_flag_selects_what_the_scene_prices_and_reports(capsys):
+    """--gold-data jc names Johnson & Christy's gold everywhere a name shows.
+
+    The scene's mirror material, the layout's metals, the estimate's table and
+    the report's stack line all read ``Au-jc``; and a pulse outside that
+    model's 1.02-2.01 eV fit is refused with that table's own sentence and
+    band, not Palik's (its fit begins at 1.10 eV, 1127 nm).
+    """
+    m = _load()
+    args = m.parse_args(["--dx", "400", "--gold-data", "jc"])
+    assert m.gold_metal(args) == "Au-jc"
+    assert m.scene(args)[2]["mirror"] == "Au-jc"
+    lay, request, geom = m.solve_scene(args)
+    assert "Au-jc" in lay["metals"], sorted(lay["metals"])
+    measured = m.filled(args, lay, request)
+    m.report(args, lay, request, geom, measured)
+    stack = [line for line in capsys.readouterr().out.splitlines()
+             if line.startswith("stack")]
+    assert len(stack) == 1, stack
+    assert "Au-jc" in stack[0], stack[0]
+    pulse = ["--gold-data", "jc", "--profile", "pulse",
+             "--wavelength", "1500", "--band-half", "100"]
+    with pytest.raises(
+            m.fdtd.FDTDError,
+            match=r"Johnson & Christy 1972 fitted for Au-jc, 1\.02-2\.01 eV"):
+        m.scene(m.parse_args(pulse))
+
+
 def test_a_gold_run_outside_its_models_fit_is_refused():
     """The script judges the pulse's 1% spectrum, as the app does.
 

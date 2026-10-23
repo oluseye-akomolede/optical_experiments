@@ -545,7 +545,39 @@ PALIK_1985 = {
         (1.10, 1.90),
         source="Palik 1985"),
 }
-LIBRARY = {**RAKIC_1998, **PALIK_1985}
+#: P. B. Johnson and R. W. Christy, *Optical constants of the noble metals*,
+#: Phys. Rev. B 6, 4370-4379 (1972), as distributed by refractiveindex.info
+#: (public domain, CC0 1.0; ``MAIN_Au-JC.yml``). The table's 9 rows between
+#: 600 and 1300 nm are copied to ``data/jc_au_nk.csv`` (616.8-1216.0 nm) and
+#: all of them are fitted; there is no gap in this range and no row is left
+#: out. Same model shape and gates as Palik's entry above. Four Lorentz poles
+#: plus the Drude term, ``eps_inf = 1``, every ``f_j`` and ``G_j`` positive
+#: and every ``G_j >= 0.05 eV``; the top pole's centre sits on the fitter's
+#: 5 eV upper bound, outside the fitted band. Measured: ``|eps|`` stays within
+#: 1.5x of the linear interpolation between rows on a 2 nm grid (inside the
+#: row span it runs 0.992x-1.002x of it; as Palik's test reports it, the
+#: capped ratio peaks at 0.668), Re eps stays negative (max -10.06 at 600 nm)
+#: and Im eps positive (min 1.023 at 662 nm) over 600-1400 nm, and the worst
+#: relative complex-permittivity error over the fitted rows is 0.4080% at
+#: 892.0 nm (the fit prints 0.41%). At 905 nm its Im eps is 0.816x Palik's
+#: (2.16 against 2.65), 18% less loss -- the same direction the tables' own
+#: rows show (22% less). Put it back with
+#: ``.venv-mse/bin/python scripts/fit_palik_gold.py --data data/jc_au_nk.csv
+#: --name Au-jc --source "Johnson & Christy 1972" --poles 4 --starts 256
+#: --fit-max-nm 0`` (the script's default upper bound is Palik's 1150 nm;
+#: 0 fits every row in the band, which for this table is all 9 rows).
+JOHNSON_CHRISTY_1972 = {
+    "Au-jc": Metal(
+        "Au-jc", 8.319247314,
+        ((1, 0, 0.05),
+         (0.0005044177763, 1.316676495, 0.05),
+         (0.05877548474, 0.6849440222, 0.2137782864),
+         (1.840316077, 5, 0.4192664484),
+         (0.004116897258, 2.071386591, 0.1344840535)),
+        (1.02, 2.01),
+        source="Johnson & Christy 1972"),
+}
+LIBRARY = {**RAKIC_1998, **PALIK_1985, **JOHNSON_CHRISTY_1972}
 METALS = tuple(sorted(LIBRARY))
 
 
