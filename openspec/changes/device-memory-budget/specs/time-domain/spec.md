@@ -11,17 +11,36 @@ the measured Jetson rate for that configuration: boundary kind and whether
 dispersive metals are present). The refusal SHALL name the limit, the value
 that exceeded it, and the form lever that reduces it.
 
-The memory ceiling SHALL NOT be a fixed number. The web app runs on the control
-plane, not on the device, so it SHALL check only the limits above and SHALL pass
-`fdtd.NO_DEVICE`: the page prices the run (bytes, steps, seconds) and says the
-device decides its memory. The device's own check SHALL be applied by the
-worker, which runs on the device, through `fdtd.admission_budget` and
-`fdtd.check_limits`.
+The cell and memory ceilings SHALL NOT be fixed numbers. They are the budget of
+the device the run lands on (a separate requirement, below). The web app runs
+on the control plane, not on that device, so it SHALL price the run (bytes,
+cells, steps, seconds) and SHALL check only the two limits above, passing
+`fdtd.NO_DEVICE`: it SHALL NOT refuse a request for memory or cells, because
+any figure it could compare against would be the control plane's, not the
+solver's. The device's own check SHALL be applied where the run happens: the
+worker, through `fdtd.admission_budget` and `fdtd.check_limits`, refusing a run
+that cannot fit that device before it is solved, and deferring one that does
+not fit the free memory at that moment.
+
+#### Scenario: an oversized grid is refused readably
+- **WHEN** the requested frequency and size give more cells than the budget of
+  the device the run lands on allows (the product once capped these at 8 M
+  cells, on the page; the page now prices the run and queues it, and the cell
+  count is checked where the run happens)
+- **THEN** the device-side refusal names the cell count, the ceiling in bytes,
+  the figure it came from and the lever, and the server does not respond 500
 
 #### Scenario: too many steps is refused readably
 - **WHEN** the requested duration on the grid's dt needs more than 20 000 steps
 - **THEN** the page shows the refusal with the step count, the limit and the
   lever, and the server does not respond 500
+
+#### Scenario: too much memory is refused readably
+- **WHEN** the estimated memory exceeds the budget of the device the run lands
+  on
+- **THEN** the refusal names the byte estimate, the ceiling, the figure it came
+  from (the GPU's free memory, the container's limit or the system's available
+  memory) and the lever, and the server does not respond 500
 
 #### Scenario: the page prices memory without refusing on it
 - **WHEN** the form's estimate for a request is larger than any fixed ceiling
@@ -34,7 +53,41 @@ worker, which runs on the device, through `fdtd.admission_budget` and
 #### Scenario: the estimate counts the steps the run will take
 - **WHEN** a run's dt is lowered below 0.99 of Courant by a dispersive metal
 - **THEN** the estimate's step count uses that lowered dt, the same dt the
-  run takes
+  solver reports, and a duration of a whole number of steps is not rounded up
+  by floating-point noise
+
+#### Scenario: an unmeasured configuration is timed at the slower rate
+- **WHEN** a run's configuration has no row of its own in the Jetson rate table
+  (periodic or mixed faces, or metal walls with a dispersive metal)
+- **THEN** it is timed at the slower measured rate (open, or open with gold),
+  so the 30-minute limit never admits a run on a guessed faster rate
+
+#### Scenario: the run time errs long
+- **WHEN** the run time is estimated
+- **THEN** each configuration's rate is the slowest row it measured over every
+  recorded Jetson run, kept in the code as cited data rather than retyped
+- **AND** the estimate divides by a 0.9 safety factor on that rate, since
+  run-to-run spread is about 3% under background load and an under-estimate
+  would admit a run over 30 minutes
+
+#### Scenario: every exceeded limit is named at once
+- **WHEN** a request exceeds more than one limit
+- **THEN** one refusal names each of them, in the order cells, steps, memory,
+  time, and a value exactly at a limit is admitted
+
+#### Scenario: the memory estimate is checked against the solver's real peak
+- **WHEN** the solver runs a tiny grid with metal, open or periodic faces, a
+  conductor mask, the peak-field record or a Lorentz-Drude metal
+- **THEN** the host-measured peak is between 0.8 and 1.0 of the estimate (the
+  estimate includes the device allocator's cached blocks, which numpy does not
+  keep), and each option's measured increment within 15% of its estimated
+  increment
+- **AND** every row of the Jetson rate table (metal, open and open-plus-gold at
+  1 M and 4 M cells) measures between 0.9 and 1.0 of the estimate, so the
+  memory refusal never admits a run the device cannot hold
+- **AND** a rate script measures cell-steps/s and peak device memory for metal,
+  open and open-plus-gold runs at about 1 M and 4 M cells on the Jetson, beside
+  the estimate, and the run-time limit's rates come from those measurements
 
 ## ADDED Requirements
 

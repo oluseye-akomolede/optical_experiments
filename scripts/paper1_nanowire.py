@@ -2820,7 +2820,9 @@ def _raised_cap(flag, product_name, unit, kind, show=None):
     when the flag is parsed, not when this factory is called, so a test that moves
     the constant moves the floor too -- the same late binding ``run_limits`` and
     ``fdtd.check_limits`` use. ``run_limits`` clamps with ``max()`` as well, so a
-    namespace that never met this parser cannot lower a ceiling either. ``show``
+    namespace that never met this parser cannot lower a ceiling either. (Only the
+    step and time ceilings have a product floor now; ``--max-cells`` and
+    ``--max-bytes`` are explicit ceilings for a run and need none.) ``show``
     formats both numbers in the floor refusal, so a flag that names gigabytes
     reports gigabytes rather than the bytes its value is held in.
     """
