@@ -113,19 +113,28 @@ def _estimate(**over):
     return e
 
 
-LIMITS = [("cells", fdtd.MAX_CELLS, "Increase dx", "8,000,000"),
-          ("steps", fdtd.MAX_STEPS, "Shorten the duration", "20,000"),
-          ("bytes", fdtd.MAX_BYTES, "metal walls", "3.0 GB"),
-          ("seconds", fdtd.MAX_SECONDS, "Shorten the duration", "30 minutes")]
+def _budget(**over):
+    """A device budget as ``fdtd.admission_budget`` returns one: the ceiling,
+    the figure it came from and where that figure was read."""
+    b = {"bytes": 6e9, "free": 7e9, "capacity": 8e9, "source": "gpu",
+         "margin": 0.9, "where": "the GPU's free memory at admission (7.8 GB)"}
+    b.update(over)
+    return b
 
 
-@pytest.mark.parametrize("key,limit,lever,shown", LIMITS)
+LIMITS = [("cells", 50_000_000, "Increase dx", "50,000,000", {"max_cells": 50_000_000}),
+          ("steps", fdtd.MAX_STEPS, "Shorten the duration", "20,000", {}),
+          ("bytes", 14e9, "metal walls", "14.0 GB", {"max_bytes": 14e9}),
+          ("seconds", fdtd.MAX_SECONDS, "Shorten the duration", "30 minutes", {})]
+
+
+@pytest.mark.parametrize("key,limit,lever,shown,ceilings", LIMITS)
 def test_each_limit_admits_its_value_and_refuses_one_over(key, limit, lever,
-                                                          shown):
-    fdtd.check_limits(_estimate(**{key: limit}))
+                                                          shown, ceilings):
+    fdtd.check_limits(_estimate(**{key: limit}), **ceilings)
     over = limit + 1 if isinstance(limit, int) else limit * 1.001
     with pytest.raises(fdtd.EstimateError) as info:
-        fdtd.check_limits(_estimate(**{key: over}))
+        fdtd.check_limits(_estimate(**{key: over}), **ceilings)
     (name, value, got_limit, text), = info.value.exceeded
     assert value == over and got_limit == limit
     assert lever in text and shown in text and str(info.value) == text
@@ -161,90 +170,181 @@ def test_the_two_ceilings_a_bench_may_raise_default_to_the_products_own():
     assert reported == [("steps", over["steps"]), ("time", over["seconds"])]
 
 
-def test_a_bench_may_raise_the_cell_ceiling_and_the_default_is_the_products_own():
-    """``max_cells`` is the third ceiling, and its default is still 8 M.
+def _fake_gpu(free, total, pooled=0):
+    """cupy's surface as ``admission_budget`` reads it: ``Device().mem_info``
+    and the default pool's free blocks."""
+    class Device:
+        def __new__(cls):
+            return type("D", (), {"mem_info": (free, total)})()
+    class Pool:
+        def free_bytes(self):
+            return pooled
+    return type("XP", (), {"cuda": type("C", (), {"Device": Device}),
+                           "get_default_memory_pool": staticmethod(lambda: Pool())})
 
-    The record this change prices -- the paper's own scene at dx 10 nm with the
-    open boundary held where r20's run held it -- is 14,048,300 cells, over the
-    product's cap by 75.6%. A caller that says nothing -- ``worker/td_solve.py``,
-    the web app -- still meets 8,000,000 exactly: the control here is the
-    product's own default, and one cell over it is refused. The ceiling is read
-    at call time, so a test that moves the constant moves the limit too.
-    """
-    e = _estimate(cells=14_048_300)
+
+def _meminfo(tmp_path, available_bytes):
+    path = tmp_path / "meminfo"
+    path.write_text(f"MemTotal: 999999999 kB\n"
+                    f"MemAvailable: {int(available_bytes) // 1024} kB\n")
+    return path
+
+
+def _cgroup(tmp_path, text):
+    path = tmp_path / "memory.max"
+    path.write_text(text)
+    return path
+
+
+def test_the_gpu_free_memory_is_the_figure_and_the_pool_counts(tmp_path):
+    """The device the run holds is the GPU's, so its own free memory is the
+    figure -- plus the blocks cupy's pool already holds, which the driver calls
+    used and this process will not allocate again."""
+    budget = fdtd.admission_budget(
+        _fake_gpu(free=10e9, total=16e9, pooled=1.5e9),
+        cgroup_paths=(str(_cgroup(tmp_path, "max")),),
+        meminfo=str(_meminfo(tmp_path, 40e9)))
+    assert budget["source"] == "gpu"
+    assert budget["free"] == 11.5e9 and budget["capacity"] == 16e9
+    assert budget["bytes"] == int(11.5e9 * 0.9)
+    assert "GPU's memory free at admission" in budget["where"]
+
+
+def test_the_a4000_that_refused_the_record_now_admits_it(tmp_path):
+    """The measured case: 16 GB of card, 14.5 GB free, nothing pooled. The
+    paper-1 dx-5 nm record's 11.55 GB has to pass, and 13.1 GB -- over the
+    ceiling -- has to be refused with the ceiling, its source and the margin."""
+    budget = fdtd.admission_budget(
+        _fake_gpu(free=14.5e9, total=16e9),
+        cgroup_paths=(str(_cgroup(tmp_path, "max")),),
+        meminfo=str(_meminfo(tmp_path, 60e9)))
+    assert budget["bytes"] == int(14.5e9 * 0.9)
+    fdtd.check_limits(_estimate(bytes=11.55e9), budget=budget)   # the record
     with pytest.raises(fdtd.EstimateError) as info:
-        fdtd.check_limits(e)
+        fdtd.check_limits(_estimate(bytes=13.2e9), budget=budget)
     (name, value, got_limit, text), = info.value.exceeded
-    assert (name, value, got_limit) == ("cells", 14_048_300, fdtd.MAX_CELLS)
-    assert "8,000,000" in text and "Increase dx" in text
+    assert (name, value, got_limit) == ("memory", 13.2e9, budget["bytes"])
+    for part in ["13.20 GB", f"{budget['bytes'] / 1e9:.1f} GB",
+                 "GPU's memory free at admission", "0.9 margin",
+                 "metal walls"]:
+        assert part in text, part
 
-    # At exactly what it needs, and above it: both admitted.
-    fdtd.check_limits(e, max_cells=14_048_300)
-    fdtd.check_limits(e, max_cells=15_000_000)
 
-    # One cell over the raised ceiling, and the refusal names the raised ceiling
-    # rather than the product's own -- which the log line would then call in force.
+def test_the_container_limit_binds_over_the_hosts_own_memory(tmp_path):
+    """The Jetson's host memory is not the container's: a 14 GiB cgroup limit
+    is what the run may hold, so it is the capacity, and the available figure
+    is what the ceiling is taken from."""
+    budget = fdtd.admission_budget(
+        None, cgroup_paths=(str(_cgroup(tmp_path, str(14 * 2 ** 30))),),
+        meminfo=str(_meminfo(tmp_path, 25e9)))
+    assert budget["source"] == "cgroup"
+    assert budget["capacity"] == 14 * 2 ** 30
+    assert budget["free"] == 24_999_999_488            # 25e9 floored to kB
+    assert budget["bytes"] == int(min(14 * 2 ** 30, budget["free"]) * 0.9)
+    assert "container's memory limit" in budget["where"]
     with pytest.raises(fdtd.EstimateError) as info:
-        fdtd.check_limits(_estimate(cells=14_048_301), max_cells=14_048_300)
-    (name, value, got_limit, text), = info.value.exceeded
-    assert (name, value, got_limit) == ("cells", 14_048_301, 14_048_300)
-    assert "14,048,300" in text and "8,000,000" not in text
+        fdtd.check_limits(_estimate(bytes=14e9), budget=budget)
+    text = str(info.value)
+    for part in ["14.00 GB", "13.5 GB", "container's memory limit",
+                 "0.9 margin"]:
+        assert part in text, part
 
 
-def test_a_bench_may_raise_the_memory_ceiling_and_the_default_is_the_products_own():
-    """``max_bytes`` is the fourth ceiling, and its default is still 3.0 GB.
+def test_no_limit_at_all_falls_back_to_the_systems_available_memory(tmp_path):
+    for text in ("max", str(1 << 63)):              # v2 "unlimited", v1's huge
+        budget = fdtd.admission_budget(
+            None, cgroup_paths=(str(_cgroup(tmp_path, text)),),
+            meminfo=str(_meminfo(tmp_path, 20e9)))
+        assert budget["source"] == "system" and budget["capacity"] is None
+        assert budget["bytes"] == int(20e9 * 0.9)
 
-    The paper's own scene at dx 5 nm on the 16 GB A4000 estimates 11.55 GB of
-    GPU memory, refused after about two hours of setup under the product's
-    ceiling. A caller that says nothing -- ``worker/td_solve.py``, the web app --
-    still meets 3.0 GB exactly: the control here is the product's own default,
-    and one byte over it is refused. The ceiling is read at call time, so a test
-    that moves the constant moves the limit too.
+
+def test_the_capacity_budget_is_the_devices_size_not_its_free_memory(tmp_path):
+    """``free=False`` is the worker's budget: a merely busy device must defer a
+    run, not refuse one it could hold, so the ceiling there is the capacity."""
+    budget = fdtd.admission_budget(
+        _fake_gpu(free=2e9, total=16e9), free=False,
+        cgroup_paths=(str(_cgroup(tmp_path, "max")),),
+        meminfo=str(_meminfo(tmp_path, 60e9)))
+    assert budget["bytes"] == int(16e9 * 0.9) and budget["free"] == 2e9
+    assert "GPU's own memory" in budget["where"]
+
+
+def test_a_full_container_names_its_free_memory_not_its_limit(tmp_path):
+    """The limit is 15.0 GB and 4 GB is free: the ceiling comes from the 4 GB,
+    so the refusal must say so -- naming the limit would name a figure the
+    ceiling was never taken from."""
+    budget = fdtd.admission_budget(
+        None, cgroup_paths=(str(_cgroup(tmp_path, str(15_000_000_000))),),
+        meminfo=str(_meminfo(tmp_path, 4e9)))
+    assert budget["bytes"] == int(budget["free"] * 0.9) < 4e9
+    with pytest.raises(fdtd.EstimateError) as info:
+        fdtd.check_limits(_estimate(bytes=8e9), budget=budget)
+    text = str(info.value)
+    for part in ["8.00 GB", f"{budget['bytes'] / 1e9:.1f} GB",
+                 f"{budget['free'] / 1e9:.1f} GB of a 15.0 GB limit"]:
+        assert part in text, part
+
+
+def test_the_cell_ceiling_follows_the_budget_and_fires_on_a_split_estimate():
+    """With no explicit ``max_cells`` the ceiling is what the byte ceiling buys
+    at the cheapest per-cell cost, so a run whose bytes fit always fits in
+    cells. It still fires -- on an estimate that prices fewer bytes than its own
+    cell count can hold, which is the estimator disagreement it exists to catch.
     """
-    assert fdtd.MAX_BYTES == 3.0e9
+    budget = _budget(bytes=6e9)
+    cells = 6e9 // fdtd.bytes_per_cell()
+    fdtd.check_limits(_estimate(cells=int(cells) - 1, bytes=0), budget=budget)
+    with pytest.raises(fdtd.EstimateError) as info:
+        fdtd.check_limits(_estimate(cells=int(cells) + 1, bytes=0), budget=budget)
+    (name, value, got_limit, text), = info.value.exceeded
+    assert name == "cells" and value == int(cells) + 1
+    assert got_limit == int(cells) and f"{int(cells):,}" in text
+    assert "bytes a cell" in text
+
+
+def test_the_budget_is_read_when_the_check_runs(monkeypatch):
+    """``budget=None`` calls ``admission_budget()`` at check time, not an import
+    time copy: a caller that says nothing is measured against the device as it
+    is now, which is the only figure that can be right."""
     e = _estimate(bytes=11.55e9)
-    with pytest.raises(fdtd.EstimateError) as info:
-        fdtd.check_limits(e)
-    (name, value, got_limit, text), = info.value.exceeded
-    assert (name, value, got_limit) == ("memory", 11.55e9, fdtd.MAX_BYTES)
-    assert "11.55 GB" in text and "3.0 GB" in text
-
-    # At exactly what it needs, and above it: both admitted.
-    fdtd.check_limits(e, max_bytes=11.55e9)
-    fdtd.check_limits(e, max_bytes=14e9)
-
-    # One byte over the raised ceiling, and the refusal names the raised ceiling
-    # rather than the product's own.
-    with pytest.raises(fdtd.EstimateError) as info:
-        fdtd.check_limits(_estimate(bytes=14e9 + 1), max_bytes=14e9)
-    (name, value, got_limit, text), = info.value.exceeded
-    assert (name, value, got_limit) == ("memory", 14e9 + 1, 14e9)
-    assert "over the limit of 14.0 GB" in text and "3.0 GB" not in text
-
-
-def test_the_memory_default_is_the_constant_at_call_time(monkeypatch):
-    """The default is ``MAX_BYTES`` itself, not a copy frozen at import.
-
-    A caller that says nothing is measured against whatever the module's own
-    ceiling is when the check runs. Moving the constant has to move the limit
-    with it -- otherwise this test's own premise (and the docstring's) is a
-    claim about a binding nobody exercised.
-    """
-    e = _estimate(bytes=11.55e9)
-    monkeypatch.setattr(fdtd, "MAX_BYTES", 20e9)
+    monkeypatch.setattr(fdtd, "admission_budget", lambda *a, **k: _budget(bytes=20e9))
     fdtd.check_limits(e)                             # 11.55 < 20: admitted
 
-    monkeypatch.setattr(fdtd, "MAX_BYTES", 5e9)
+    monkeypatch.setattr(fdtd, "admission_budget", lambda *a, **k: _budget(bytes=5e9))
     with pytest.raises(fdtd.EstimateError) as info:
         fdtd.check_limits(e)                         # 11.55 > 5: refused
     (name, value, got_limit, _), = info.value.exceeded
     assert (name, value, got_limit) == ("memory", 11.55e9, 5e9)
 
 
+def test_a_caller_off_the_device_checks_only_the_products_own_two():
+    """The web app runs on the control plane; its memory is not the run's. With
+    ``NO_DEVICE`` the memory and cell ceilings are not checked at all -- 11.55 GB
+    of estimate passes on a machine that could never hold it -- while the two
+    ceilings that describe the run itself still apply."""
+    fdtd.check_limits(_estimate(bytes=11.55e9, cells=14_048_300),
+                      budget=fdtd.NO_DEVICE)
+    with pytest.raises(fdtd.EstimateError) as info:
+        fdtd.check_limits(_estimate(steps=fdtd.MAX_STEPS + 1),
+                          budget=fdtd.NO_DEVICE)
+    assert [name for name, *_ in info.value.exceeded] == ["steps"]
+
+
+def test_a_memory_refusal_offers_the_frames_lever():
+    """Past MAX_FRAMES the refusal adds the one lever that lowers the
+    estimate without touching the grid: record fewer movie frames."""
+    with pytest.raises(fdtd.EstimateError) as info:
+        fdtd.check_limits(_estimate(bytes=4e9, frames=fdtd.MAX_FRAMES + 60),
+                          max_bytes=3e9)
+    assert f"fewer than the {fdtd.MAX_FRAMES + 60:,} movie frames" in str(info.value)
+
+
 def test_the_refusal_names_the_value_that_broke_each_limit():
     with pytest.raises(fdtd.EstimateError) as info:
         fdtd.check_limits(_estimate(cells=9_261_000, steps=24_000,
-                                    bytes=3.4e9, seconds=2400.0))
+                                    bytes=3.4e9, seconds=2400.0),
+                          max_cells=8_000_000, max_bytes=3e9)
     names = [name for name, *_ in info.value.exceeded]
     assert names == ["cells", "steps", "memory", "time"]
     text = str(info.value)
@@ -257,6 +357,6 @@ def test_a_real_oversized_grid_is_refused_on_cells_alone():
     nodes = [np.linspace(0, 2e-6, 201)] * 3          # 201^3 = 8.12 M cells
     e = fdtd.estimate_run(nodes, duration=1e-15)
     with pytest.raises(fdtd.EstimateError) as info:
-        fdtd.check_limits(e)
+        fdtd.check_limits(e, max_cells=8_000_000)
     assert [name for name, *_ in info.value.exceeded] == ["cells"]
     assert "8,120,601 cells" in str(info.value)

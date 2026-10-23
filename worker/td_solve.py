@@ -229,14 +229,20 @@ def solve_td(job: dict, store_in, store_out=None, stage=None, *, xp=None,
                                 # prices them too
                                 probes=len(lay["probes"]),
                                 max_frames=fdtd.MAX_FRAMES if frames is None else frames)
-        fdtd.check_limits(est)
+        # The memory ceiling is the device's own, read here on the device:
+        # the capacity figure, so a device that is merely busy defers below
+        # rather than refusing a run it could hold.
+        fdtd.check_limits(est, budget=fdtd.admission_budget(xp, free=False))
     except (fdtd.FDTDError, ValueError) as exc:
         # FDTDError covers LayoutError, VoxelError and EstimateError; the
         # meshing errors are ValueErrors. Each already reads as a sentence.
         raise TDSolveError(str(exc)) from exc
 
     free = int(free_bytes())
-    if est["bytes"] > free:
+    # The same margin the admission ceiling applies: a run admitted to within
+    # a tenth of what is free now has nothing left for the page cache, the
+    # solver's own transients or anything else that grows beside it.
+    if est["bytes"] > free * fdtd.ADMISSION_MARGIN:
         raise JetsonBusy(f"The Jetson is busy: this run needs {_gb(est['bytes'])} "
                          f"of memory and {_gb(free)} is free. It will start "
                          f"when memory frees up.")

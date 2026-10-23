@@ -510,9 +510,15 @@ def test_a_malformed_probe_line_is_refused(tmp_path):
 
 
 # --- each limit, readably ---------------------------------------------------
-def test_too_many_cells_is_refused_naming_the_count(tmp_path):
-    _refused(tmp_path, "cells, over the limit of 8,000,000", td_dx="3",
-             td_duration_fs="1")
+def test_a_grid_past_the_old_cell_constant_is_priced_and_admitted(tmp_path):
+    """The page no longer refuses on cells: the count is a property of the
+    request, but the ceiling it would be compared to is the device's, and this
+    process is not the device. The same fixture the 8,000,000-cell constant
+    refused must now reach the queue."""
+    est = _estimate(tmp_path, td_dx="3", td_duration_fs="1")
+    assert est["cells"] > 8_000_000, est        # fixture: past the old constant
+    resp, db, _store, flashes = _post(tmp_path, td_dx="3", td_duration_fs="1")
+    assert resp.status_code == 302 and len(db.jobs) == 1, flashes
 
 
 def test_too_many_steps_is_refused_naming_the_count(tmp_path):
@@ -520,14 +526,24 @@ def test_too_many_steps_is_refused_naming_the_count(tmp_path):
              td_duration_fs="100000")
 
 
-@pytest.mark.parametrize("limit, needle", [
-    ("MAX_BYTES", "GB of GPU memory"), ("MAX_SECONDS", "minutes, over"),
-])
-def test_memory_and_time_limits_reach_the_page(tmp_path, monkeypatch, limit,
-                                               needle):
+def test_the_time_ceiling_reaches_the_page(tmp_path, monkeypatch):
     fdtd, _layout, _parts = TDF._solver()
-    monkeypatch.setattr(fdtd, limit, 0)
-    _refused(tmp_path, needle)
+    monkeypatch.setattr(fdtd, "MAX_SECONDS", 0)
+    _refused(tmp_path, "minutes, over")
+
+
+def test_the_page_never_reads_a_device_budget(tmp_path, monkeypatch):
+    """The control plane's memory is not the run's, so the form must not ask
+    any device what its budget is -- a budget read here would refuse runs the
+    solver could hold. The poisoned reader makes that a failure, not a
+    convention."""
+    fdtd, _layout, _parts = TDF._solver()
+
+    def poison(*_a, **_k):
+        raise AssertionError("the form read a device budget on the control plane")
+    monkeypatch.setattr(fdtd, "admission_budget", poison)
+    resp, db, _store, flashes = _post(tmp_path, td_frame_count="120")
+    assert resp.status_code == 302 and len(db.jobs) == 1, flashes
 
 
 # --- the drawn waveform -----------------------------------------------------
@@ -838,17 +854,13 @@ def test_the_relation_between_a_window_and_its_frames_is_refused(tmp_path):
              td_movie_end_fs="6", td_frame_count="120")
 
 
-def test_a_120_frame_movie_is_refused_where_the_same_run_at_60_fits(
-        tmp_path, monkeypatch):
-    """The estimate is the requested count's, so a machine with only this much
-    memory refuses the 120-frame movie and still takes the 60-frame one."""
-    fdtd, _layout, _parts = TDF._solver()
+def test_the_estimate_is_the_requested_frame_count_s(tmp_path):
+    """More frames cost more, and both are admitted: the count the run asked
+    for is what its estimate prices, and the page has no memory ceiling of its
+    own to refuse either against."""
     sixty = _estimate(tmp_path)
     many = _estimate(tmp_path, td_frame_count="120")
     assert many["bytes"] > sixty["bytes"], "fixture: more frames cost more"
     assert many["frames"] == 120 and sixty["frames"] == 60
-    monkeypatch.setattr(fdtd, "MAX_BYTES", (sixty["bytes"] + many["bytes"]) // 2)
-    refused = _refused(tmp_path, "GB of GPU memory", td_frame_count="120")
-    assert any("fewer than the 120 movie frames" in m for m in refused), refused
-    resp, db, _store, flashes = _post(tmp_path)
+    resp, db, _store, flashes = _post(tmp_path, td_frame_count="120")
     assert resp.status_code == 302 and len(db.jobs) == 1, flashes

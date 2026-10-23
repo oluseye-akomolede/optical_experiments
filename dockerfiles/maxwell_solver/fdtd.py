@@ -61,6 +61,7 @@ reports exactly zero energy from a run that is behaving perfectly.
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass
 
@@ -2329,7 +2330,8 @@ TRANSIENT_ARRAYS = 6
 # (6ffa8bd, cupy, 300 steps, 1 M and 4 M cells; floats per cell = peak bytes /
 # 4 / cells): metal 14.10 / 14.16, open 27.65 / 27.87, open + 1/8 gold
 # 33.65 / 33.83. These constants put every row at 0.97-0.99 of the estimate,
-# never above it, so the 3.0 GB refusal errs on the safe side.
+# never above it, so the admission budget's margin is spent on the device's
+# other tenants and not on the solver's own high-water.
 POOL_BASE = 0.4
 POOL_PER_OPEN_AXIS = 0.6
 
@@ -2454,11 +2456,29 @@ def memory_estimate(shape, *, boundary="metal", metals=(), pec=False,
 
 
 # The spec's per-run limits (requirement "A run SHALL be refused above its
-# limits before it is queued").
-MAX_CELLS = 8_000_000
+# limits before it is queued"). Steps and seconds guard a run running away in
+# time and are the product's own; memory and cells follow the device the run
+# lands on (``admission_budget``), because no constant describes a Jetson and a
+# 16 GB A4000 at once.
 MAX_STEPS = 20_000
-MAX_BYTES = 3.0e9
 MAX_SECONDS = 30 * 60
+
+#: The share of the device's memory a run may plan to use. The estimate already
+#: errs high in its own terms, but it says nothing about the other tenants of a
+#: shared device (the minecraft server on the A4000s, the Jetson's own OS), so a
+#: tenth of the device is the room that keeps an admitted run from dying part
+#: way through when something else grows.
+ADMISSION_MARGIN = 0.9
+
+#: Passed to ``check_limits`` by a caller that is not on the run's device (the
+#: web app, on the control plane): steps and seconds are checked, memory is not,
+#: because a figure read from the wrong machine is worse than no figure.
+NO_DEVICE = "device:unknown"
+
+#: The cgroup files a container's memory limit is read from, v2 first.
+CGROUP_LIMITS = ("/sys/fs/cgroup/memory.max",
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+MEMINFO = "/proc/meminfo"
 
 # Measured Jetson rates in Mcell-steps/s (scripts/fdtd_rate.py, cupy, 300
 # steps; queue row 4a5da177). Each run is (1 M cells, 4 M cells); "dispersive"
@@ -2554,55 +2574,205 @@ def estimate_run(nodes, *, duration: float, boundary="metal", metals=None,
     }
 
 
+def _read_text(path) -> str:
+    with open(path, encoding="utf-8") as fh:
+        return fh.read().strip()
+
+
+def _cgroup_limit(paths=CGROUP_LIMITS):
+    """Bytes of the memory limit on this process, or None when there is none.
+
+    A container's limit is what the run may hold even when the host has more,
+    so it binds before the host's own memory. cgroup v2 writes ``max`` for "no
+    limit"; v1 writes a number near 2^63, which is no limit either.
+    """
+    for path in paths:
+        try:
+            text = _read_text(path)
+        except OSError:
+            continue
+        if text in ("max", ""):
+            return None
+        try:
+            limit = int(text)
+        except ValueError:
+            return None
+        if limit >= 1 << 62:
+            return None
+        return limit
+    return None
+
+
+def _mem_available(path=MEMINFO) -> int:
+    """The kernel's MemAvailable in bytes: what a new allocation can take."""
+    for line in _read_text(path).splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) * 1024
+    raise OSError(f"{path} has no MemAvailable line")
+
+
+def _device_memory(xp):
+    """``(free, total)`` bytes of the array module's device, or None for host
+    arrays.
+
+    ``mem_info`` is what the driver says is free; the blocks cupy's pool already
+    holds are free to this process (they will be reused, not allocated), so they
+    are added, exactly as the worker's own free-memory reading does.
+    """
+    device = getattr(getattr(xp, "cuda", None), "Device", None)
+    if device is None:
+        return None
+    free, total = device().mem_info
+    pool = getattr(xp, "get_default_memory_pool", None)
+    if pool is not None:
+        free += int(pool().free_bytes())
+    return int(free), int(total)
+
+
+def admission_budget(xp=None, *, margin=ADMISSION_MARGIN, free=True,
+                     cgroup_paths=CGROUP_LIMITS, meminfo=MEMINFO) -> dict:
+    """The memory this process's device offers a run, and where the figure came
+    from.
+
+    ``xp`` is the array module the run will use: cupy means the run holds the
+    GPU's memory, so the device's own reading is the figure. Otherwise the
+    container's cgroup limit, when one is set, or the kernel's ``MemAvailable``.
+    With ``free`` (the default) the figure is what is free -- plus the pool's
+    own blocks on a GPU -- bounded by the container's capacity; with
+    ``free=False`` it is the capacity alone, which a caller with its own
+    busy-deferral (the worker) uses so a full device defers a run rather than
+    refusing it.
+
+    The returned ``bytes`` is the figure times ``margin``: the admission
+    ceiling. ``free``, ``capacity``, ``source``, ``margin`` and ``where``
+    travel with it so a refusal can say what it compared to, where that came
+    from and how much was held back.
+    """
+    source, capacity, free_bytes = None, None, None
+    device = _device_memory(xp) if xp is not None else None
+    if device is not None:
+        free_bytes, capacity = device
+        source = "gpu"
+    limit = _cgroup_limit(cgroup_paths)
+    if limit is not None:
+        capacity = limit if capacity is None else min(capacity, limit)
+        source = source or "cgroup"
+    if free_bytes is None:
+        free_bytes = _mem_available(meminfo)
+        source = source or "system"
+    def gb(b):
+        return f"{b / 1e9:.1f}"
+
+    if not free and capacity is not None:
+        # the device's capacity: a caller with its own busy-deferral wants the
+        # run refused only when it could never fit
+        figure = capacity
+        where = (f"the GPU's own memory ({gb(capacity)} GB)" if source == "gpu"
+                 else f"this container's memory limit ({gb(capacity)} GB)"
+                 if source == "cgroup"
+                 else f"this machine's memory ({gb(capacity)} GB)")
+    elif capacity is not None and free_bytes < capacity:
+        # the free figure binds, so the phrase names it -- and the limit it is
+        # under -- rather than the limit alone, a figure the ceiling was not
+        # taken from
+        figure = free_bytes
+        where = (f"the GPU's memory free at admission ({gb(free_bytes)} GB)"
+                 if source == "gpu"
+                 else f"this container's memory free ({gb(free_bytes)} GB of a "
+                 f"{gb(capacity)} GB limit)"
+                 if source == "cgroup"
+                 else f"this machine's available memory ({gb(free_bytes)} GB)")
+    elif capacity is not None:
+        figure = capacity
+        where = (f"the GPU's own memory ({gb(capacity)} GB)"
+                 if source == "gpu"
+                 else f"this container's memory limit ({gb(capacity)} GB)"
+                 if source == "cgroup"
+                 else f"this machine's memory ({gb(capacity)} GB)")
+    else:
+        figure = free_bytes
+        where = f"this machine's available memory ({gb(free_bytes)} GB)"
+    return {"bytes": int(figure * margin), "free": int(free_bytes),
+            "capacity": None if capacity is None else int(capacity),
+            "source": source, "margin": float(margin), "where": where}
+
+
+def bytes_per_cell(*, boundary="metal") -> float:
+    """Bytes one cell costs in the cheapest configuration, as
+    ``memory_estimate`` itself accounts for it.
+
+    Measured by the difference between two grids that differ only in their cell
+    count, so every term that is not per-cell cancels; not retyped from the
+    formula, so a change there moves this figure with it.
+    """
+    small, large = (64, 64, 32), (64, 64, 64)
+    cells = int(np.prod(large)) - int(np.prod(small))
+    return (memory_estimate(large, boundary=boundary)
+            - memory_estimate(small, boundary=boundary)) / cells
+
+
 def check_limits(estimate: dict, *, max_steps=None, max_seconds=None,
-                 max_cells=None, max_bytes=None) -> None:
+                 max_cells=None, max_bytes=None, budget=None) -> None:
     """Raise ``EstimateError`` naming every limit ``estimate`` exceeds, the
     value that exceeded it, and the form setting that reduces it.
 
-    ``max_cells``, ``max_steps``, ``max_seconds`` and ``max_bytes`` are the
-    four limits this call applies, and each defaults to the product's own
-    (``MAX_CELLS``, ``MAX_STEPS``, ``MAX_SECONDS``, ``MAX_BYTES``) when it is
-    None. One caller ever passes them: the paper-1 bench script, whose
-    ``--max-cells`` / ``--max-steps`` / ``--max-seconds`` / ``--max-bytes``
-    raise a bench record's ceiling past what the product allows (a settled
-    nanowire record needs more than 20,000 steps, and more than 30 minutes of
-    Jetson, to stop rising; a dx-10 nm record of the same scene needs 9,166,668
-    cells, over the 8 M cell cap by 14.6%, because the grid's fine layers do not
-    scale with ``--dx``; and that scene at dx 5 nm estimates 11.55 GB of GPU
-    memory on the bench's 16 GB A4000, over the 3.0 GB the product may assume).
-    Nothing else can: there is no environment variable and no module global to
-    set, and no product entry point passes them -- ``worker/td_solve.py`` and
-    the web app call this with the defaults -- so a raised ceiling stays on the
-    bench path alone.
+    ``max_steps`` and ``max_seconds`` are the product's own two ceilings and
+    default to ``MAX_STEPS`` / ``MAX_SECONDS``; the paper-1 bench's
+    ``--max-steps`` / ``--max-seconds`` raise them, because a settled nanowire
+    record needs more than 20,000 steps and more than 30 minutes of Jetson.
+
+    The memory ceiling is not a constant: it is the budget of the device the
+    run lands on. ``budget=None`` reads ``admission_budget()`` of the calling
+    process here, at call time; ``budget=NO_DEVICE`` says the caller is not on
+    that device (the web app, on the control plane) and leaves memory and cells
+    unchecked; ``max_bytes=`` overrides the budget with an explicit ceiling (the
+    bench's ``--max-bytes``). The cell ceiling follows whichever byte ceiling
+    applied: the most cells that fit it at ``bytes_per_cell()``. That is an
+    invariant on the estimate -- ``bytes`` and ``cells`` must agree -- and it
+    fires only when they do not, because a run whose bytes fit the budget
+    always fits it in cells at the cheapest rate.
     """
     # each read here, not bound at import: a test that moves a constant still
     # moves the limit that constant names
-    if max_cells is None:
-        max_cells = MAX_CELLS
     if max_steps is None:
         max_steps = MAX_STEPS
     if max_seconds is None:
         max_seconds = MAX_SECONDS
-    if max_bytes is None:
-        max_bytes = MAX_BYTES
+    if budget == NO_DEVICE:
+        where = "an explicit ceiling"
+    else:
+        if budget is None:
+            budget = admission_budget()
+        if max_bytes is None:
+            max_bytes = float(budget["bytes"])
+            where = f"{budget['where']} x a {budget['margin']:g} margin"
+        else:
+            where = "an explicit ceiling"
+    if max_cells is None and max_bytes is not None:
+        max_cells = int(max_bytes // bytes_per_cell())
+        cells_where = f"the most that fit the memory ceiling at " \
+                      f"{bytes_per_cell():.0f} bytes a cell"
+    else:
+        cells_where = "an explicit ceiling"
     e = estimate
     finest = f"{e['finest'] * 1e9:.3g} nm"
     exceeded = []
-    if e["cells"] > max_cells:
+    if max_cells is not None and e["cells"] > max_cells:
         exceeded.append(("cells", e["cells"], max_cells,
             f"The grid has {e['cells']:,} cells, over the limit of "
-            f"{max_cells:,}. Increase dx to use fewer, larger cells."))
+            f"{max_cells:,} ({cells_where}). Increase dx to use fewer, "
+            f"larger cells."))
     if e["steps"] > max_steps:
         exceeded.append(("steps", e["steps"], max_steps,
             f"The run needs {e['steps']:,} time steps, over the limit of "
             f"{max_steps:,} (dt is {e['dt']:.3g} s, set by the finest cell, "
             f"{finest}). Shorten the duration, or increase dx."))
-    if e["bytes"] > max_bytes:
+    if max_bytes is not None and e["bytes"] > max_bytes:
         frames = e.get("frames") or 0
         exceeded.append(("memory", e["bytes"], max_bytes,
-            f"The run needs about {e['bytes'] / 1e9:.2f} GB of GPU memory, "
-            f"over the limit of {max_bytes / 1e9:.1f} GB. Increase dx, or use "
-            f"metal walls instead of open ones (each open axis adds an "
+            f"The run needs about {e['bytes'] / 1e9:.2f} GB of memory, over "
+            f"the limit of {max_bytes / 1e9:.1f} GB ({where}). Increase dx, or "
+            f"use metal walls instead of open ones (each open axis adds an "
             f"absorbing layer's storage across the whole grid)."
             + (f" Or record fewer than the {frames:,} movie frames asked for."
                if frames > MAX_FRAMES else "")))
