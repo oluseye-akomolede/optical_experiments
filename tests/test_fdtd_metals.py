@@ -174,6 +174,121 @@ def test_the_palik_gold_model_is_smooth_between_its_table_rows():
     assert np.abs(eps[gap]).max() < 100.0, np.abs(eps[gap]).max()
 
 
+JC_CSV = ROOT / "data" / "jc_au_nk.csv"
+
+
+def jc_rows():
+    text = JC_CSV.read_text()
+    return list(csv.DictReader(line for line in text.splitlines()
+                               if not line.startswith("#")))
+
+
+def test_the_jc_gold_model_reproduces_its_table():
+    """Every Johnson & Christy point within 3%, and the model is lossy there.
+
+    ``data/jc_au_nk.csv`` holds the 1972 table's 9 rows between 600 and
+    1300 nm (616.8-1216.0 nm), and all of them are fitted (the regeneration
+    passes ``--fit-max-nm 0``; the script's default bound is Palik's 1150 nm):
+    this table has no gap and no row was left out. The fit's measured maximum
+    over them is 0.4080% at 892.0 nm (the fit prints 0.41%); the gate sits
+    above it and low enough that
+    a moved pole fails, and the measured value is asserted so the figure here
+    cannot drift. The source string is the model's own, so a refusal names
+    this table and not Rakić's.
+    """
+    rows = jc_rows()
+    assert len(rows) == 9
+    metal = fdtd.LIBRARY["Au-jc"]
+    assert metal.source == "Johnson & Christy 1972"
+    assert all(f > 0 and gamma > 0 for f, _w0, gamma in metal.poles), metal.poles
+    assert all(gamma >= 0.05 for _f, _w0, gamma in metal.poles), metal.poles
+    worst = 0.0
+    for row in rows:
+        lam_nm = float(row["wavelength_nm"])
+        want = complex(float(row["n"]), float(row["k"])) ** 2
+        got = complex(fdtd.permittivity("Au-jc", fdtd.C0 / (lam_nm * 1e-9)))
+        assert got.imag > 0, (lam_nm, got)
+        worst = max(worst, abs(got - want) / abs(want))
+    assert worst < 0.03, worst
+    assert abs(worst - 0.004080326) < 1e-9, worst
+
+
+def test_the_jc_gold_model_is_smooth_between_its_table_rows():
+    """Same dense-grid check as Palik's, plus the lower side of "within 1.5x".
+
+    Passive across 600-1400 nm; between the table's own rows |eps| runs
+    0.9919x-1.0024x of the linear interpolation. As Palik's test reports it
+    (against 1.5x the interpolation), the capped ratio's maximum is 0.668.
+    """
+    rows = jc_rows()
+    lam = np.array([float(r["wavelength_nm"]) for r in rows])
+    mag = np.abs(np.array([complex(float(r["n"]), float(r["k"]))
+                           for r in rows]) ** 2)
+    grid = np.arange(600.0, 1400.0 + 0.5, 2.0)
+    eps = fdtd.permittivity("Au-jc", fdtd.C0 / (grid * 1e-9))
+    assert eps.real.max() < 0, (grid[eps.real.argmax()], eps.real.max())
+    assert eps.imag.min() > 0, (grid[eps.imag.argmin()], eps.imag.min())
+    inside = (grid >= lam.min()) & (grid <= lam.max())
+    ratio = np.abs(eps)[inside] / np.interp(grid, lam, mag)[inside]
+    assert ratio.max() <= 1.5, (grid[inside][ratio.argmax()], ratio.max())
+    assert ratio.min() >= 1 / 1.5, (grid[inside][ratio.argmin()], ratio.min())
+    # Pinned so the figures in the docstring and in fdtd's comment cannot drift.
+    assert ratio.min() == pytest.approx(0.991913, abs=1e-6)
+    assert ratio.max() == pytest.approx(1.002390, abs=1e-6)
+    assert ratio.max() / 1.5 == pytest.approx(0.668, abs=1e-3)
+
+
+@pytest.mark.parametrize("nm", (2, 5, 10, 20))
+def test_the_jc_gold_model_is_stable_at_the_bench_spacings(nm):
+    """The solver's own reduced dt leaves this model below the growth bound."""
+    h = (nm * 1e-9,) * 3
+    term = fdtd.LorentzDrude("Au-jc", np.zeros((2, 2, 2), bool))
+    reduced = term.stable_dt(fdtd.courant_dt(*h), h)
+    coefficients = fdtd.lorentz_drude_coefficients("Au-jc", reduced)
+    assert (fdtd.lorentz_drude_growth(coefficients, reduced, h)
+            < 1.0 + fdtd.GROWTH_TOLERANCE)
+
+
+def test_a_jc_band_outside_the_fit_names_jc():
+    """The refusal names this table's own source and fitted range."""
+    to_hz = fdtd.EV / (2 * math.pi)
+    fdtd.check_metal_band("Au-jc", 1.1 * to_hz, 1.9 * to_hz)      # inside
+    with pytest.raises(
+            fdtd.FDTDError,
+            match=r"Johnson & Christy 1972 fitted for Au-jc, 1\.02-2\.01 eV"):
+        fdtd.check_metal_band("Au-jc", 0.9 * to_hz, 1.3 * to_hz)
+
+
+def test_jc_gold_is_less_lossy_than_palik_at_the_paper_wavelength():
+    """At 905 nm Johnson & Christy's gold absorbs less than Palik's.
+
+    The measured tables say so themselves: their own rows interpolate to
+    Im eps 2.040 (J&C) against 2.630 (Palik), 22% less. The fitted models keep
+    the direction and the size: Im eps 2.1608 against 2.6490, a ratio of
+    0.8157 (18% less). What this pins is the pair the paper's choice rests
+    on, not a claim that the run's answered question number moves with it.
+    """
+    jc = fdtd.permittivity("Au-jc", fdtd.C0 / 905e-9)
+    palik = fdtd.permittivity("Au-palik", fdtd.C0 / 905e-9)
+    assert jc.imag < palik.imag
+    assert jc.imag / palik.imag == pytest.approx(0.815726, abs=1e-6)
+    assert 0.75 < jc.imag / palik.imag < 0.85
+    # The tables themselves, interpolated at 905 nm, give the same answer and
+    # are asserted here so the docstring's row figures cannot drift.
+    def rows_at_905(path, column, scale):
+        rows = list(csv.DictReader(line for line in path.read_text().splitlines()
+                                   if not line.startswith("#")))
+        lam = np.array([float(r[column]) * scale for r in rows])
+        n = np.array([float(r["n"]) for r in rows])
+        k = np.array([float(r["k"]) for r in rows])
+        return 2 * np.interp(905.0, lam, n) * np.interp(905.0, lam, k)
+    jc_rows_imag = rows_at_905(JC_CSV, "wavelength_nm", 1.0)
+    palik_rows_imag = rows_at_905(PALIK_CSV, "wavelength_A", 0.1)
+    assert jc_rows_imag == pytest.approx(2.0398, abs=1e-4)
+    assert palik_rows_imag == pytest.approx(2.6300, abs=1e-4)
+    assert jc_rows_imag / palik_rows_imag == pytest.approx(0.7756, abs=1e-4)
+
+
 def test_a_palik_band_outside_the_fit_names_palik():
     """The refusal names the model's own source, not Rakić's for both."""
     to_hz = fdtd.EV / (2 * math.pi)

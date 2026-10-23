@@ -284,10 +284,11 @@ def gold_metal(args) -> str:
     """The library name of the gold this run uses (``--gold-data``).
 
     ``rakic`` is Rakić et al. 1998, the default the earlier runs used;
-    ``palik`` is the second model, fitted to Palik's 1985 table over its
-    653-1127 nm rows (``fdtd.PALIK_1985``).
+    ``palik`` is fitted to Palik's 1985 table over its
+    653-1127 nm rows (``fdtd.PALIK_1985``); ``jc`` is Johnson & Christy's
+    1972 table fitted over 617-1216 nm (``fdtd.JOHNSON_CHRISTY_1972``).
     """
-    return "Au" if args.gold_data == "rakic" else "Au-palik"
+    return {"rakic": "Au", "palik": "Au-palik", "jc": "Au-jc"}[args.gold_data]
 
 
 def scene(args):
@@ -2867,10 +2868,12 @@ def PARSER_ARGUMENTS(p) -> None:
     p.add_argument("--height", type=float, default=1375.0, help="wire height, nm")
     p.add_argument("--oxide", type=float, default=12.0, help="SiO2 buffer, nm")
     p.add_argument("--gold", type=float, default=150.0, help="gold mirror, nm")
-    p.add_argument("--gold-data", choices=("rakic", "palik"), default="rakic",
+    p.add_argument("--gold-data", choices=("rakic", "palik", "jc"),
+                   default="rakic",
                    help="gold model: Rakić et al. 1998 (default, the earlier"
-                        " runs' model) or Palik 1985 fitted at its 600-1300 nm"
-                        " table points")
+                        " runs' model), Palik 1985 fitted at its 600-1300 nm"
+                        " table points, or Johnson & Christy 1972 fitted at"
+                        " their 600-1300 nm points")
     p.add_argument("--qd-below", type=float, default=30.0,
                    help="dipole below the top facet, nm")
     p.add_argument("--dx", type=float, default=10.0, help="x-y cell, nm")
