@@ -8,10 +8,14 @@ solution over one time step, `J^{n+1} = exp(-G dt) J^n + sigma (1 -
 exp(-G dt))/G E^n`, and its contribution to the E update SHALL be
 `dt J^{n+1}`. It SHALL NOT be central-differenced: that form's characteristic
 roots are 1 and `(1 - G dt/2)/(1 + G dt/2)`, so its static mode sits at exactly
-1 at every finite dt -- neutral in the homogeneous block the growth check
-models, and therefore reportable only as 1 to within rounding. The Lorentz
-poles (`w0 > 0`) keep their central-difference recursion, and the
-frequency-domain permittivity the fits are judged by is unchanged.
+1 at every finite dt -- a current mode that never decays, where the exact
+solution decays as `exp(-G dt)`. The Lorentz poles (`w0 > 0`) keep their
+central-difference recursion, and the frequency-domain permittivity the fits
+are judged by is unchanged.
+
+The growth check SHALL subtract each pole's contribution to the E update once
+per step, `(d^{n+1} - d^n)`, matching what `advance` subtracts; it SHALL NOT
+difference that contribution a second time.
 
 #### Scenario: the static mode decays at every step
 - **WHEN** any library metal's Drude pole is stepped at 1e-19, 1e-18, 4e-18,
@@ -20,8 +24,8 @@ frequency-domain permittivity the fits are judged by is unchanged.
   circle, and falls as the step grows
 
 #### Scenario: the growth check certifies the runs' own steps
-- **WHEN** the growth check runs for Au-palik at Run I's dt and finest
-  spacings, or for Au-jc at Run K's
-- **THEN** the spectral radius is below `1 + GROWTH_TOLERANCE`
-- **AND** for Au-jc it is strictly below 1, where the central-differenced form
-  read `1 + 1.58e-8`
+- **WHEN** the growth check runs for Rakic gold, Au-jc or Au-palik at Run I's
+  dt and finest spacings, and again at Run K's
+- **THEN** the spectral radius is at most `1 + GROWTH_TOLERANCE`
+- **AND** a check that second-differences the Drude contribution reads 1.0379
+  and 1.0634 there, and is refused

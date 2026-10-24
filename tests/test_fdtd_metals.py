@@ -254,11 +254,14 @@ def test_the_drude_pole_steps_as_an_exact_decay():
     of J' = -G J + sigma E: a = exp(-G dt), inside the circle at every step
     and falling as the step grows.
 
-    It must not be central-differenced.  That form's roots are 1 and
-    (1 - G dt/2)/(1 + G dt/2), so its static mode sits at exactly 1: neutral
-    in the homogeneous block the growth check models, reported by eigvals as
-    1 to within its own rounding.  Run K's Au-jc grew in the real run while
-    that check passed it.
+    It must not be central-differenced.  That form's own roots are 1 and
+    (1 - G dt/2)/(1 + G dt/2), so the pole carries a mode that never decays at
+    any dt, where the exact solution decays as exp(-G dt).
+
+    That changes the pole's step; it does not make the growth check read
+    below 1.  At S = 0 a uniform static field is a fixed point of the coupled
+    update whatever the pole does, so the check reads 1 there, within
+    GROWTH_TOLERANCE (see ``test_the_growth_check_passes_the_runs_own_steps``).
     """
     steps = (1e-19, 1e-18, 4e-18, 8.196452658685128e-18, 2e-17)
     for name in ("Au", "Au-palik", "Au-jc", "Ag", "Al", "Cu", "Cr"):
@@ -281,13 +284,15 @@ def test_the_drude_pole_steps_as_an_exact_decay():
             previous = a
 
 
-def test_the_growth_check_is_below_one_at_the_runs_own_steps():
+def test_the_growth_check_passes_the_runs_own_steps():
     """Both paper runs stepped at their grid's Courant dt.  Their finest
     spacings were x = y 5.9536 nm (Run I) and 6.2493 nm (Run K), z 3 nm.
 
-    Before the Drude pole was stepped exponentially the check read Run K
-    1 + 1.58e-8 -- inside GROWTH_TOLERANCE, so stable_dt passed it -- and
-    that run grew.  With the static root gone the check reads below 1.
+    Before the Drude pole was stepped by its exact decay the check read Run K
+    1 + 1.58e-8 -- inside GROWTH_TOLERANCE, so stable_dt passed it.  The
+    residue is gone, but the check still reads 1 at the S = 0 static fixed
+    point, so the assertion is "no growth", not "growth below 1": the latter
+    would pin eigvals rounding rather than a physical result.
     """
     runs = (("Au-palik", 8.067893e-18, (5.9536e-9, 5.9536e-9, 3.0e-9)),
             ("Au-jc", 8.196452658685128e-18,
@@ -295,11 +300,31 @@ def test_the_growth_check_is_below_one_at_the_runs_own_steps():
     for metal, dt, spacings in runs:
         coefficients = fdtd.lorentz_drude_coefficients(metal, dt)
         growth = fdtd.lorentz_drude_growth(coefficients, dt, spacings)
-        assert growth < 1.0 + fdtd.GROWTH_TOLERANCE, (metal, growth)
-    # Au-jc is the run that grew, and its residue was structural: the check
-    # must now put it strictly below 1, not merely inside the tolerance.
-    coefficients = fdtd.lorentz_drude_coefficients("Au-jc", runs[1][1])
-    assert fdtd.lorentz_drude_growth(coefficients, runs[1][1], runs[1][2]) < 1.0
+        assert growth <= 1.0 + fdtd.GROWTH_TOLERANCE, (metal, growth)
+        # and the reading is at 1, not merely inside the tolerance
+        assert abs(growth - 1.0) < fdtd.GROWTH_TOLERANCE, (metal, growth)
+
+
+def test_rakic_gold_passes_the_growth_check_on_the_paper_grids():
+    """Rakic's own gold fit is what the library calls ``Au``, and it has to
+    survive both paper grids: Run I ran it for an hour without growth.
+
+    The E row must subtract the step the solver takes, once per step, not a
+    second difference of it.  With the second difference the check refused
+    Rakic Au at both grids -- 1.0379 on Run I's, 1.0634 on Run K's -- a false
+    refusal, since it was the run that settled.  Lorentz poles keep their
+    second difference, because there the solver's contribution already is one.
+
+    All six readings land on 1 to within 2e-15 -- the neutral static mode,
+    not a damped one -- so the bar is the tolerance, not "below 1".
+    """
+    runs = (8.067893e-18, (5.9536e-9, 5.9536e-9, 3.0e-9)), \
+           (8.196452658685128e-18, (6.2493e-9, 6.2493e-9, 3.0e-9))
+    for metal in ("Au", "Au-jc", "Au-palik"):
+        for dt, spacings in runs:
+            coefficients = fdtd.lorentz_drude_coefficients(metal, dt)
+            growth = fdtd.lorentz_drude_growth(coefficients, dt, spacings)
+            assert growth <= 1.0 + fdtd.GROWTH_TOLERANCE, (metal, dt, growth)
 
 
 def test_a_jc_band_outside_the_fit_names_jc():
@@ -551,11 +576,12 @@ def test_the_growth_check_sees_courant_and_the_metal():
 def test_a_metal_shrinks_dt_only_as_far_as_it_must():
     """5 nm gold needs about 0.98 of the Courant dt; 2 nm gold needs none.
 
-    At 2 nm every gold fit leaves about 2e-13, the arithmetic floor of the
-    check's eigvals, and GROWTH_TOLERANCE covers it.  It used to cover far
-    more: the central-differenced Drude pole's static mode sat at exactly 1
-    and eigvals read it up to 6e-8 high, so a tolerance below that took 2 nm
-    gold down to 0.20 of the Courant dt for nothing."""
+    At 2 nm every gold fit reads 1 to within about 1e-11, which is eigvals
+    rounding around the S = 0 neutral root (a fixed point of the update at
+    every finite dt), and GROWTH_TOLERANCE covers it.  The 1.6e-8 that Run
+    K's Au-jc showed before this change was the same rounding about the same
+    root, not the Drude pole's own step: it did not shrink when dt was
+    quartered."""
     term = fdtd.LorentzDrude("Au", np.zeros((2, 2, 2), bool))
     for nm, low, high in ((5, 0.9, 0.99), (2, 1.0, 1.0)):
         h = (nm * 1e-9,) * 3

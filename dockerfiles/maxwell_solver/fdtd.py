@@ -706,10 +706,13 @@ def lorentz_drude_coefficients(metal, dt: float) -> list:
     return out
 
 
-#: A growth factor this close to 1 is rounding, not growth. The Drude pole's
-#: static mode is a near-defective eigenvalue at exactly 1, which eigvals
-#: returns up to 6e-8 high (measured over the five metals, 2-20 nm, 0.03-1 of
-#: Courant); every real instability measured is above 0.16.
+#: A growth factor this close to 1 is rounding, not growth. The coupled system
+#: has a neutral mode at exactly 1 whenever S = 0: a uniform static field with
+#: the pole state at its steady value is a fixed point of the update, at any
+#: finite dt. ``eigvals`` returns that root up to 1.4e-11 off (measured over
+#: six metals, 2-20 nm, 0.03-1 of Courant), so the check can read "no mode
+#: grows", never "growth is below 1". Every real instability measured is
+#: above 0.16.
 GROWTH_TOLERANCE = 1e-6
 
 
@@ -719,10 +722,17 @@ def lorentz_drude_growth(coefficients, dt: float, spacings,
 
     Von Neumann on a homogeneous metal (eps_inf = 1): a lattice mode of the
     curl-curl with eigenvalue S obeys ``E^{n+1} - 2E^n + E^{n-1} = -S E^n -
-    (dP^{n+1} - dP^n)/eps0`` with each pole's recursion. S runs from 0 to the
-    lattice maximum ``4 (c dt)^2 sum 1/dx_a^2`` (the finest spacing per axis
-    bounds a graded grid). The result is the spectral radius of the companion
-    matrix, maximised over S; above 1 a mode grows every step.
+    (d^{n+1} - d^n)/eps0``, where ``d`` is what ``prepare`` hands ``advance``
+    to subtract: ``dt J^{n+1}/eps0`` for a Drude pole, ``P^{n+1} - P^n`` for a
+    Lorentz one. The difference of ``d`` appears because the curl update reads
+    the E that already carried the previous step's subtraction, exactly as the
+    Yee loop does; differencing ``d`` a second time would model a step the
+    solver never takes. S runs from 0 to the lattice maximum
+    ``4 (c dt)^2 sum 1/dx_a^2`` (the finest spacing per axis bounds a graded
+    grid). The result is the spectral radius of the companion matrix,
+    maximised over S; above 1 a mode grows every step. At S = 0 a uniform
+    static field is a fixed point, so the exact answer is 1 there at every
+    finite dt; a reading below 1 is ``eigvals`` rounding, not damping.
 
     Exact for the scheme on a uniform metal, not a guess like ``w dt < 1``:
     on 20 nm gold that rule refused a dt this check passes.
@@ -748,16 +758,27 @@ def lorentz_drude_growth(coefficients, dt: float, spacings,
                 m[row, row] = alpha
                 m[row, row + 1] = xi
             m[row + 1, row] = 1.0
-        # E^{n+1} = E^n - sum (Q^{n+1} - Q^n) + curl, where the curl term's
-        # step-to-step change is -S E^n: written first-order in E as
-        # E^{n+1} = (2 - S) E^n - E^{n-1} - sum (Q^{n+1} - 2Q^n + Q^{n-1})
+        # E^{n+1} = (2 - S) E^n - E^{n-1} - sum_j (d_j^{n+1} - d_j^{n}), where
+        # d_j is the contribution ``prepare`` hands ``advance`` to subtract:
+        # dt J^{n+1}/eps0 for a Drude pole (Q holds dt J/eps0) and
+        # P^{n+1} - P^n for a Lorentz one (Q holds P/eps0). The step-to-step
+        # difference is there because the curl update reads the E that
+        # already had the previous step's subtraction, the way the Yee loop
+        # does; one difference of the solver's own contribution, not two.
         m[0, 0] = 2.0 - s
         m[0, 1] = -1.0
-        for j in range(poles):
+        for j, record in enumerate(coefficients):
             row = 2 + 2 * j
-            m[0] -= m[row]                        # -Q_j^{n+1}
-            m[0, row] += 2.0
-            m[0, row + 1] -= 1.0
+            if record[0] == "drude":
+                # -(dt J^{n+1} - dt J^n)/eps0 with J^{n+1} = a J^n + b E^n
+                _, a, b = record
+                m[0, 0] -= dt * b / EPS0          # ... from E^n
+                m[0, row] += 1.0 - a              # +dt (1 - a) J^n / eps0
+            else:
+                # -(Q^{n+1} - 2 Q^n + Q^{n-1}) from Q^{n+1} - Q^n - (Q^n - Q^{n-1})
+                m[0] -= m[row]
+                m[0, row] += 2.0
+                m[0, row + 1] -= 1.0
         m[1, 0] = 1.0
         worst = max(worst, float(np.abs(np.linalg.eigvals(m)).max()))
     return worst

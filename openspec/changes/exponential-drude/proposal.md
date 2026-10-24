@@ -4,19 +4,23 @@
 
 Run K's Au-jc grew from round-off through its record while the shipped ADE
 check (`lorentz_drude_growth`, which `stable_dt` consumes) reported the step
-stable. The check did see something: `1 + 1.58e-8`. `GROWTH_TOLERANCE = 1e-6`
-swallowed it, and the tolerance exists precisely because "eigvals returns the
-Drude pole's static mode up to 6e-8 high".
+stable: it read `1 + 1.58e-8`, and `GROWTH_TOLERANCE = 1e-6` swallowed it.
+The check cannot do better than that at `S = 0`. A uniform static field with
+the pole state at its steady value is a fixed point of the coupled update, so
+the exact spectral radius there is 1 at every finite dt, and every value the
+check can print for it is "1, to within rounding". The tolerance's old
+comment put that residue down to a near-defective Drude root returned up to
+6e-8 high; measured now over six metals, 2-20 nm and 0.03-1 of Courant, it is
+at most 1.4e-11. Nor is the Lorentz block behind Au-palik's `1 + 3.8e-9`:
+that is the same rounding about the same root. Those two residues, and the
+difference between them, were not Run K's mechanism.
 
-That static mode is not a rounding accident. Central-differencing the Drude
+What is a real defect is the pole's own step. Central-differencing the Drude
 pole (`w0 = 0`) gives `P'' + G P' = eps0 f wp^2 E` a characteristic polynomial
 whose roots are 1 and `(1 - G dt/2)/(1 + G dt/2)`: one root sits at **exactly
-1**, at every finite dt. In a homogeneous block that mode is neutral, so every
-value the check can print for it is "1, to within rounding". A neutral mode is
-not a stability guarantee, and a check that cannot distinguish neutral from
-slightly growing cannot certify the step. The two golds land on opposite sides
-of that residue: at their runs' steps Au-jc reads `1 + 1.6e-8` and grew,
-Au-palik reads `1 + 3.8e-9` and did not.
+1** at every finite dt, so the scheme carries a current mode that never decays
+and whose amplitude is whatever the initial state set. The exact solution of a
+free current decays as `exp(-G dt)` instead.
 
 ## What Changes
 
@@ -28,15 +32,25 @@ Au-palik reads `1 + 3.8e-9` and did not.
 - The Drude pole's state is the current `J`, not a polarisation; its
   contribution to the E update is `dt J^{n+1}`. The immediate per-step
   coupling is unchanged to O(G dt), so the model's dispersion is untouched.
-- `lorentz_drude_growth` models the new record: the static root is `a < 1`, so
-  a Drude pole no longer contributes a unit-modulus mode. `stable_dt`'s
-  contract (return a step the check accepts, or the step it was given) is
-  unchanged.
+- `lorentz_drude_growth` models the new record, and its E row subtracts the
+  pole's contribution to E **once per step**, `(d^{n+1} - d^n)/eps0`, because
+  the curl update reads the E that already carried the previous step's
+  subtraction -- the same thing `advance` does. Differencing that
+  contribution a second time (the previous code, correct only because the old
+  Drude step was itself a difference) describes a step the solver never
+  takes: it refused Rakic gold at both paper grids, 1.0379 and 1.0634, when
+  Rakic gold is the fit Run I settled with. `stable_dt`'s contract (return a
+  step the check accepts, or the step it was given) is unchanged.
+- The stepping is a small real change to every metal run, not a no-op: the
+  current enters the E update at the step's end rather than its centre, so
+  the metal's response moves by about `omega dt/2` in phase -- 0.49 deg at
+  905 nm on the paper grids, 0.85 per cent of a radian.
 - Tests: the Drude step's law over all seven library metals and five steps
-  (`a == exp(-G dt)`, inside the circle, falling with dt); the two paper runs'
-  own steps read below 1, with Au-jc strictly below; and the 2 nm comment that
-  justified the tolerance is corrected (its residue is now about 2e-13, not
-  6e-8).
+  (`a == exp(-G dt)`, inside the circle, falling with dt); Rakic gold and both
+  gold fits pass the check at both paper grids' dt and finest spacings, where
+  the second-differenced E row refused Rakic at 1.0379 and 1.0634; and the
+  2 nm comment that justified the tolerance is corrected (its residue is
+  1.4e-11, not 6e-8).
 
 ## What this does not establish
 
@@ -52,7 +66,8 @@ own terms -- removing a structural unit root from the scheme, and making the
 check's answer mean what it says -- and not as a confirmed cure for Run K.
 Finding that mechanism needs Run K's own geometry.
 
-The `GROWTH_TOLERANCE` constant stays. It still has a job: the drift-free
-eigenvalues of the coupled E/P matrix carry an arithmetic floor of about
-2e-13, and `eigvals` rounding on the Lorentz block is worth a few 1e-9. What
-goes away is the need to cover a structural mode with it.
+The `GROWTH_TOLERANCE` constant stays, with the job it always had: the
+coupled update's exact spectral radius at `S = 0` is 1, so a passing reading
+is "1 to within rounding", and `eigvals` returns that root up to 1.4e-11 off
+over the sweep measured. The check certifies "no mode grows". It cannot
+certify "growth is below 1", and this change does not make it able to.
