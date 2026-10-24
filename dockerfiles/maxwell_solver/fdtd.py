@@ -660,24 +660,59 @@ def check_scene_band(materials, request):
 
 
 def lorentz_drude_coefficients(metal, dt: float) -> list:
-    """Per pole, (alpha, xi, gamma) of ``P^{n+1} = alpha P^n + xi P^{n-1} +
-    gamma E^n``: ``P'' + G P' + w0^2 P = eps0 f wp^2 E`` central-differenced."""
+    """Per pole, the coefficients that step its state by one time step.
+
+    A Lorentz pole (``w0 > 0``) carries a polarisation density obeying
+    ``P'' + G P' + w0^2 P = eps0 f wp^2 E``, central-differenced:
+    ``("lorentz", alpha, xi, gamma)`` steps ``P^{n+1} = alpha P^n +
+    xi P^{n-1} + gamma E^n`` and contributes ``P^{n+1} - P^n`` to E.
+
+    The Drude pole (``w0 = 0``) is a free current obeying ``J' = -G J +
+    sigma E`` with ``sigma = eps0 f wp^2``.  ``("drude", a, b)`` steps it by
+    the exact solution over one step, ``J^{n+1} = a J^n + b E^n`` with
+    ``a = exp(-G dt)`` and ``b = sigma (1 - a) / G``, and contributes
+    ``dt J^{n+1}`` to E.
+
+    The Drude pole is deliberately NOT central-differenced.  That form puts
+    its static mode at exactly 1 (roots 1 and ``(1 - G dt/2)/(1 + G dt/2)``),
+    which is neutral in a homogeneous block, so ``lorentz_drude_growth``
+    reports 1 to within rounding and both ``bind`` and ``stable_dt`` pass it;
+    a check that cannot separate neutral from slightly growing does not
+    certify a step.  The exponential form's static root is
+    ``a = exp(-G dt) < 1`` at every finite dt, and it falls as dt grows,
+    which is the direction a stable scheme needs.
+
+    Removing that unit root does not by itself remove a coupled growth: a
+    graded Au slab at Run K's spacings still grows under this step, so the
+    unit root is not that fixture's whole mechanism and this change is not
+    a confirmed cure for Run K.
+    """
     metal = _metal(metal)
     wp = metal.plasma_ev * EV
     out = []
     for f, w0, gamma in metal.poles:
         w0, gamma = w0 * EV, gamma * EV
+        if w0 == 0.0:
+            a = math.exp(-gamma * dt)
+            sigma = EPS0 * f * wp ** 2
+            b = sigma * dt if gamma == 0.0 else sigma * (1.0 - a) / gamma
+            out.append(("drude", a, b))
+            continue
         denominator = 1.0 + 0.5 * gamma * dt
-        out.append(((2.0 - (w0 * dt) ** 2) / denominator,
+        out.append(("lorentz",
+                    (2.0 - (w0 * dt) ** 2) / denominator,
                     -(1.0 - 0.5 * gamma * dt) / denominator,
                     EPS0 * f * wp ** 2 * dt ** 2 / denominator))
     return out
 
 
-#: A growth factor this close to 1 is rounding, not growth. The Drude pole's
-#: static mode is a near-defective eigenvalue at exactly 1, which eigvals
-#: returns up to 6e-8 high (measured over the five metals, 2-20 nm, 0.03-1 of
-#: Courant); every real instability measured is above 0.16.
+#: A growth factor this close to 1 is rounding, not growth. The coupled system
+#: has a neutral mode at exactly 1 whenever S = 0: a uniform static field with
+#: the pole state at its steady value is a fixed point of the update, at any
+#: finite dt. ``eigvals`` returns that root up to 1.4e-11 off (measured over
+#: six metals, 2-20 nm, 0.03-1 of Courant), so the check can read "no mode
+#: grows", never "growth is below 1". Every real instability measured is
+#: above 0.16.
 GROWTH_TOLERANCE = 1e-6
 
 
@@ -687,10 +722,17 @@ def lorentz_drude_growth(coefficients, dt: float, spacings,
 
     Von Neumann on a homogeneous metal (eps_inf = 1): a lattice mode of the
     curl-curl with eigenvalue S obeys ``E^{n+1} - 2E^n + E^{n-1} = -S E^n -
-    (dP^{n+1} - dP^n)/eps0`` with each pole's recursion. S runs from 0 to the
-    lattice maximum ``4 (c dt)^2 sum 1/dx_a^2`` (the finest spacing per axis
-    bounds a graded grid). The result is the spectral radius of the companion
-    matrix, maximised over S; above 1 a mode grows every step.
+    (d^{n+1} - d^n)/eps0``, where ``d`` is what ``prepare`` hands ``advance``
+    to subtract: ``dt J^{n+1}/eps0`` for a Drude pole, ``P^{n+1} - P^n`` for a
+    Lorentz one. The difference of ``d`` appears because the curl update reads
+    the E that already carried the previous step's subtraction, exactly as the
+    Yee loop does; differencing ``d`` a second time would model a step the
+    solver never takes. S runs from 0 to the lattice maximum
+    ``4 (c dt)^2 sum 1/dx_a^2`` (the finest spacing per axis bounds a graded
+    grid). The result is the spectral radius of the companion matrix,
+    maximised over S; above 1 a mode grows every step. At S = 0 a uniform
+    static field is a fixed point, so the exact answer is 1 there at every
+    finite dt; a reading below 1 is ``eigvals`` rounding, not damping.
 
     Exact for the scheme on a uniform metal, not a guess like ``w dt < 1``:
     on 20 nm gold that rule refused a dt this check passes.
@@ -702,22 +744,41 @@ def lorentz_drude_growth(coefficients, dt: float, spacings,
         # state: E^n, E^{n-1}, then (Q_j^n, Q_j^{n-1}) with Q = P/eps0
         size = 2 + 2 * poles
         m = np.zeros((size, size))
-        for j, (alpha, xi, gamma) in enumerate(coefficients):
+        for j, record in enumerate(coefficients):
             row = 2 + 2 * j
-            m[row, 0] = gamma / EPS0
-            m[row, row] = alpha
-            m[row, row + 1] = xi
+            # the state is the pole's per-step contribution to E, summed in
+            # ``prepare``: Q^{n+1} from Q^n (and Q^{n-1} for a Lorentz pole)
+            if record[0] == "drude":
+                _, a, b = record
+                m[row, 0] = dt * b / EPS0
+                m[row, row] = a
+            else:
+                _, alpha, xi, gamma = record
+                m[row, 0] = gamma / EPS0
+                m[row, row] = alpha
+                m[row, row + 1] = xi
             m[row + 1, row] = 1.0
-        # E^{n+1} = E^n - sum (Q^{n+1} - Q^n) + curl, where the curl term's
-        # step-to-step change is -S E^n: written first-order in E as
-        # E^{n+1} = (2 - S) E^n - E^{n-1} - sum (Q^{n+1} - 2Q^n + Q^{n-1})
+        # E^{n+1} = (2 - S) E^n - E^{n-1} - sum_j (d_j^{n+1} - d_j^{n}), where
+        # d_j is the contribution ``prepare`` hands ``advance`` to subtract:
+        # dt J^{n+1}/eps0 for a Drude pole (Q holds dt J/eps0) and
+        # P^{n+1} - P^n for a Lorentz one (Q holds P/eps0). The step-to-step
+        # difference is there because the curl update reads the E that
+        # already had the previous step's subtraction, the way the Yee loop
+        # does; one difference of the solver's own contribution, not two.
         m[0, 0] = 2.0 - s
         m[0, 1] = -1.0
-        for j in range(poles):
+        for j, record in enumerate(coefficients):
             row = 2 + 2 * j
-            m[0] -= m[row]                        # -Q_j^{n+1}
-            m[0, row] += 2.0
-            m[0, row + 1] -= 1.0
+            if record[0] == "drude":
+                # -(dt J^{n+1} - dt J^n)/eps0 with J^{n+1} = a J^n + b E^n
+                _, a, b = record
+                m[0, 0] -= dt * b / EPS0          # ... from E^n
+                m[0, row] += 1.0 - a              # +dt (1 - a) J^n / eps0
+            else:
+                # -(Q^{n+1} - 2 Q^n + Q^{n-1}) from Q^{n+1} - Q^n - (Q^n - Q^{n-1})
+                m[0] -= m[row]
+                m[0, row] += 2.0
+                m[0, row + 1] -= 1.0
         m[1, 0] = 1.0
         worst = max(worst, float(np.abs(np.linalg.eigvals(m)).max()))
     return worst
@@ -864,8 +925,17 @@ class LorentzDrude(PolarisationTerm):
             drive = e_then * part["keep"]
             d_p = part["d_p"]
             d_p *= 0.0
-            for index, (alpha, xi, gamma) in enumerate(self.coefficients):
+            for index, record in enumerate(self.coefficients):
                 now, before = part["now"][index], part["before"][index]
+                if record[0] == "drude":
+                    # now holds J^n, and becomes J^{n+1} in place; the step's
+                    # contribution to E is dt J^{n+1}
+                    _, a, b = record
+                    now *= a
+                    now += b * drive
+                    d_p += dt * now
+                    continue
+                _, alpha, xi, gamma = record
                 before *= xi                    # becomes P^{n+1} in place
                 before += alpha * now
                 before += gamma * drive
