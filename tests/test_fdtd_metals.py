@@ -315,7 +315,7 @@ def test_rakic_gold_passes_the_growth_check_on_the_paper_grids():
     refusal, since it was the run that settled.  Lorentz poles keep their
     second difference, because there the solver's contribution already is one.
 
-    All six readings land on 1 to within 2e-15 -- the neutral static mode,
+    All six readings land on 1 to within 2.5e-15 (worst 2.44e-15, Au-palik on Run I's grid) -- the neutral static mode,
     not a damped one -- so the bar is the tolerance, not "below 1".
     """
     runs = (8.067893e-18, (5.9536e-9, 5.9536e-9, 3.0e-9)), \
