@@ -1166,3 +1166,967 @@ def test_the_region_attribute_array_is_tet_indexed_and_names_the_regions():
         f"whose centroid is strictly inside the core -- the region map does not "
         f"agree with the geometry it was built from"
     )
+
+
+# ---------------------------------------------------------------------------
+# The sizing field: the switches it may share a call with, and the grid it is
+# handed. Both are silent when wrong -- a global cap un-grades every region,
+# and a mis-shaped background grid either raises inside tetgen or, worse,
+# loads something that grades nothing.
+# ---------------------------------------------------------------------------
+# The graded path is OPT-IN (``mse_meshing.GRADED_MESHING``, default False):
+# the product still meshes a multi-material upload uniformly at h_min, because
+# making grading the product rule is tasks.md step 3, which is NO GO. The tests
+# below exercise the opt-in path, so they switch it on themselves.
+@pytest.fixture
+def graded_meshing_on(monkeypatch):
+    monkeypatch.setattr(MESH, "GRADED_MESHING", True)
+
+
+def _graded_plan(parts, materials, edge_m, units, verbose=False):
+    """``_region_plan`` with the graded overlay, from a base edge in METRES.
+
+    Main's ``_region_plan`` takes the edge in the SCALED SURFACE's units (the
+    live contract); the WIP's took metres. This converts once, here, with the
+    product's own unit table, so the tests keep the WIP's metre fixtures.
+    """
+    import mse_common as COMMON
+    edge_units = float(edge_m) / COMMON.UNIT_SCALE[units]
+    return MESH._region_plan(parts, materials, edge_units, units, verbose,
+                             graded=True)
+
+
+def test_the_graded_switches_refuse_a_global_cap_and_need_the_metric_flag():
+    """The guard runs on the switch dict the mesh is BUILT with, not a copy.
+
+    ``_sizing_field_switches`` is the one place a graded call's switches live,
+    and ``tetrahedralize`` calls ``_check_sizing_field_switches`` on that dictionary
+    immediately before the call. Two measured negatives are encoded:
+
+      * ``fixedvolume=True`` or a POSITIVE ``maxvolume`` caps the whole mesh at
+        the coarse target and silently loses the fine region -- grading returns
+        a uniform mesh with no error;
+      * ``metric=False`` makes tetgen read the background mesh's third array as
+        the wrong quantity, so the field grades nothing.
+
+    Each is asserted as a RAISE, and the real switch set is asserted to pass,
+    so a later edit that re-adds one of them fails here.
+    """
+    good = MESH._sizing_field_switches()
+    # The good set must pass its own guard; otherwise the guard is a rule
+    # nothing satisfies and the graded arm is dead code.
+    assert MESH._check_sizing_field_switches(good) is None
+
+    with pytest.raises(MESH.MeshingError, match="fixedvolume"):
+        MESH._check_sizing_field_switches({**good, "fixedvolume": True})
+
+    with pytest.raises(MESH.MeshingError, match="maxvolume"):
+        MESH._check_sizing_field_switches({**good, "maxvolume": 1e-9})
+
+    with pytest.raises(MESH.MeshingError, match="metric"):
+        MESH._check_sizing_field_switches({**good, "metric": False})
+
+    # The REAL dict is the one that must be clean: a guard proven only on
+    # synthetic dicts says nothing about the call the mesher makes.
+    assert float(good.get("maxvolume", 0.0)) == 0.0, (
+        "a graded mesh must not carry a positive global maxvolume"
+    )
+    assert not good.get("fixedvolume"), (
+        "a graded mesh must not make a global maxvolume binding"
+    )
+    assert good.get("metric") and good.get("regionattrib"), (
+        "a graded mesh needs metric=True (the field carries LENGTHS) and "
+        "regionattrib=True (the per-region achieved check reads the tags)"
+    )
+
+
+def test_the_background_grid_is_the_shape_tetgens_public_route_reads():
+    """``_sizing_background_grid`` is fed to ``tetrahedralize(bgmesh=...)``.
+
+    tetgen's public route takes a ``pyvista.UnstructuredGrid`` of linear
+    tetrahedra whose point data has ``target_size``, then reads exactly three
+    arrays out of it. Four things about that hand-off are silent when wrong, so
+    each is pinned:
+
+      1. the point-data KEY is tetgen's own (``MTR_POINTDATA_KEY``);
+      2. every cell is a TETRA (a mixed grid is refused by tetgen's own check);
+      3. the cell array is VTK's prefix form, four ids per tet -- an off-by-one
+         here loads a background mesh of the wrong shape rather than failing;
+      4. a real ``TetGen`` accepts the grid the PRODUCT builds, which is the
+         claim that matters.
+
+    (4) is the one that cannot be faked. The background arrays are the ones
+    ``_sizing_background`` returns for a real two-region upload, and the same
+    grid topology is driven with two DIFFERENT per-node size arrays -- coarse
+    then fine -- so the element count must move. A grid tetgen could not read
+    would raise or ignore the field and the two counts would match.
+
+    A hand-built background mesh (a bare box tetrahedralization with no region
+    attributes) SEGFAULTS tetgen's field lookup rather than raising, so this
+    test deliberately uses the product's own background: it is the only
+    background shape the mesher ever hands over, and reproducing it by hand is
+    both more code and a worse fixture.
+    """
+    import tetgen
+    import tetgen.pytetgen as TTG
+
+    assert MESH.TETGEN_MTR_POINTDATA_KEY == TTG.MTR_POINTDATA_KEY, (
+        "the point-data key the mesher writes is not the one tetgen looks for; "
+        "tetgen would raise, but only on the graded path in production"
+    )
+
+    # --- the shape of the grid, on a tiny hand-made one --------------------
+    pts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    tets = np.array([[0, 1, 2, 3]], dtype=np.int64)
+    sizes = np.array([0.5, 0.5, 0.5, 0.5])
+    grid = MESH._sizing_background_grid(pts, tets, sizes)
+
+    assert TTG.MTR_POINTDATA_KEY in grid.point_data, (
+        f"the background grid carries {list(grid.point_data.keys())}; tetgen "
+        f"reads {TTG.MTR_POINTDATA_KEY!r} and nothing else"
+    )
+    assert np.array_equal(grid.point_data[TTG.MTR_POINTDATA_KEY], sizes)
+    assert (grid.celltypes == grid.celltypes.max()).all() and int(
+        grid.celltypes[0]) == 10, (
+        "every background cell must be a linear tetrahedron (VTK type 10)"
+    )
+    assert grid.n_cells == 1 and grid.n_points == 4
+    assert np.allclose(grid.points, pts)
+    # The cells are VTK's PREFIX form: 4 ids per tet, not a flat 3-per-triangle
+    # style array. Read back through the same route tetgen's reader uses.
+    assert np.asarray(grid.cells[:5]).tolist() == [4, 0, 1, 2, 3], (
+        f"the cell array is not VTK's prefix form: {grid.cells[:5].tolist()}"
+    )
+
+    # --- (4) a REAL call, on the product's own background -------------------
+    # A coarse-ish plan keeps the background small (8.6k cells); the fixture is
+    # the nested 6 mm / 2 mm pair, the object the whole feature was measured on.
+    wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
+    core = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    obj = trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8")
+    import mse_parts as PARTS
+    parts = PARTS.load_parts(obj, units="mm")
+    merged = PARTS.merged_surface(PARTS.load_parts(obj, units="mm"))
+    materials = {"wall": 1.0, "core": 2.0}
+    plan = _graded_plan(parts, materials, 1.8e-3, "mm", verbose=False)
+
+    verts = np.asarray(merged.vertices, dtype=np.float64)
+    faces = np.asarray(merged.faces, dtype=np.int32)
+    # The mesher tetrahedralizes in a canonical (O(1)) frame; the background
+    # must be built in the frame it will be looked up in, so do the same.
+    offset = (verts.min(0) + verts.max(0)) / 2.0
+    scale = 1.0 / float(np.max(verts.max(0) - verts.min(0)))
+    canonical_verts = (verts - offset) * scale
+    bg_pts, bg_tets, bg_sizes = MESH._sizing_background(
+        plan, canonical_verts, faces, offset, scale, "mm")
+    assert bg_tets.shape[0] > 0
+
+    def count_with_sizes(size_array):
+        g = MESH._sizing_background_grid(bg_pts, bg_tets, size_array)
+        t2 = tetgen.TetGen(canonical_verts, faces)
+        for region_id, seed in MESH._region_requests(plan, offset, scale):
+            t2.add_region(region_id, tuple(seed))
+        t2.tetrahedralize(**MESH._sizing_field_switches(), bgmesh=g)
+        return int(np.asarray(t2.elem).shape[0])
+
+    coarse_edge = max(plan["edge_m"].values()) / 1e-3 * scale
+    fine_edge = min(plan["edge_m"].values()) / 1e-3 * scale
+    coarse = count_with_sizes(np.full(bg_pts.shape[0], coarse_edge))
+    fine = count_with_sizes(np.full(bg_pts.shape[0], fine_edge))
+    assert fine > coarse * 2, (
+        f"the same background grid with a {coarse_edge * 1e3 / scale:.3f} mm "
+        f"node size gave {coarse:,} tets and with "
+        f"{fine_edge * 1e3 / scale:.3f} mm {fine:,}; the field is not being "
+        f"honoured, so the grid is the wrong shape even though tetgen accepted it"
+    )
+    # And the product's OWN field (per-node sizes from the regions) lands
+    # between the two, which is what "graded" means numerically.
+    graded = count_with_sizes(bg_sizes)
+    assert coarse <= graded <= fine, (
+        f"the graded field gave {graded:,} tets, outside the uniform bracket "
+        f"[{coarse:,}, {fine:,}] -- it is not a graded mesh at all"
+    )
+
+
+def _thin_shell_parts(units="mm"):
+    """Three nested solids whose MIDDLE region is a thin slab.
+
+    The clamp needs a region that is not the finest and whose thickness is
+    under its own ramp edge -- the only arrangement where it can bite. The
+    finest region is floored at ``h_min`` by construction, so a two-region
+    fixture can never show it.
+    """
+    import mse_parts as PARTS
+
+    wall = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    slab = trimesh.creation.box(extents=(0.8, 0.8, 0.3))
+    core = trimesh.creation.box(extents=(0.2, 0.2, 0.2))
+    obj = trimesh.Scene(
+        {"wall": wall, "slab": slab, "core": core}
+    ).export(file_type="obj").encode("utf-8")
+    return PARTS.load_parts(obj, units=units)
+
+
+def test_the_uniform_call_is_exactly_the_call_the_mesher_always_made(monkeypatch):
+    """Byte-identity, proved on the CALL rather than on a count.
+
+    A single-material upload must mesh exactly as it did before per-region
+    grading existed. Two meshers could agree on a count by luck, so the thing
+    that actually makes the bytes identical is that ``tetrahedralize`` is handed
+    the same switch set: for a one-part job, precisely the five keywords it
+    always got, with no ``bgmesh``, no ``metric`` and no region attribute. The
+    real TetGen is wrapped to record what it was called with, so this reads the
+    product's own call rather than a retyped copy of it -- and it is the failure
+    mode that matters: a stray ``metric=True`` or an empty ``bgmesh`` would not
+    raise, it would quietly rebuild every single-material mesh a different way.
+
+    The second half does the same for a MULTI-part job whose parts share one
+    index: it has regions, so it does not take the one-part call, but its edges
+    are equal, so it must not take the sizing field either -- the region
+    attribute and ``docheck`` ride along, and nothing else does.
+    """
+    import tetgen as TET
+
+    recorded: list[dict] = []
+    real = TET.TetGen
+
+    class Recorder(real):
+        def tetrahedralize(self, **kwargs):
+            recorded.append(kwargs)
+            return super().tetrahedralize(**kwargs)
+
+    monkeypatch.setattr(TET, "TetGen", Recorder)
+
+    # (a) A single material, no parts: the one-part call.
+    box = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    _pts, one_tets, _reg = MESH.tetrahedralize(
+        box, "mm", n_modes=3, n_index=1.0, max_tets=200_000,
+        min_feature_m=0.35e-3, verbose=False,
+        materials={"body": 1.0}, parts=None)
+    assert len(recorded) == 1, f"the one-part mesh tetrahedralized {len(recorded)}x"
+    call = recorded[0]
+    assert call == {"order": 1, "mindihedral": 20, "minratio": 2.0,
+                    "maxvolume": call["maxvolume"], "fixedvolume": True}, (
+        f"the one-part call set changed: {sorted(call)} -- a single-material "
+        "mesh is no longer byte-identical to the pre-feature one"
+    )
+    assert call["maxvolume"] > 0, (
+        "the one-part call must still pass a POSITIVE maxvolume; without it "
+        "and without fixedvolume TetGen meshes unconstrained"
+    )
+    # And the same call must still produce the SAME mesh: the switch set alone
+    # proves the graded path is not reached, not that the output survived it.
+    # Measured on this fixture (a 1 mm box, min_feature_m = 0.35 mm, 3 modes)
+    # with TetGen 0.8.4 through the real wrapper, deterministic for one input
+    # and one switch set. A stray metric=True or a bgmesh of any size moves it.
+    assert int(one_tets.shape[0]) == 1257, (
+        f"the one-part mesh is {int(one_tets.shape[0])} tets, not the 1257 "
+        "measured before this feature -- a single-material mesh changed"
+    )
+    # And no region report: a one-part job has no regions to grade, and the
+    # manifest's `mesh` block is written only from this report, so a
+    # single-material modes.json is the file it was before the feature.
+    assert MESH.LAST_MESH_REPORT is None, (
+        "a one-part mesh must leave no mesh report; otherwise every "
+        "single-material job's modes.json gains a `mesh` block"
+    )
+
+    # (b) Two parts, ONE shared index: regions, but one edge, so still uniform.
+    import mse_parts as PARTS
+
+    wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
+    core = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    obj = trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8")
+    parts = PARTS.load_parts(obj, units="mm")
+    merged = PARTS.merged_surface(parts)
+    recorded.clear()
+    MESH.tetrahedralize(merged, "mm", n_modes=3, n_index=1.0, max_tets=200_000,
+                        min_feature_m=0.9e-3, verbose=False,
+                        materials={"wall": 2.0, "core": 2.0}, parts=parts)
+    assert MESH.LAST_MESH_REPORT is not None, "a multi-part mesh must be reported"
+    assert MESH.LAST_MESH_REPORT["graded"] is False, (
+        "equal indices must NOT grade -- there is one edge to grade"
+    )
+    assert len(recorded) == 1, f"the equal-index mesh tetrahedralized {len(recorded)}x"
+    call = recorded[0]
+    assert call == {"order": 1, "mindihedral": 20, "minratio": 2.0,
+                    "maxvolume": call["maxvolume"], "fixedvolume": True,
+                    "regionattrib": True, "docheck": True}, (
+        f"the equal-index call set changed: {sorted(call)} -- the graded "
+        "sizing field must not be reachable when the edges are equal"
+    )
+
+
+@pytest.mark.usefixtures("graded_meshing_on")
+def test_a_coarse_target_is_clamped_under_its_own_thickness():
+    """The clamp, on the fixture where it can fire.
+
+    Measured on this fixture: the slab's thickness proxy is 0.171 mm and its
+    ramp edge at n=1 is 0.5 mm, so ``min(ramp, thickness)`` is the thickness --
+    the region is held FINER than its material index asks for. That is the
+    direction that matters, and it is not the obvious one: the clamp exists
+    because a target that APPROACHES the thickness makes TetGen's sizing field
+    collapse and drop the fine region, so the target is pulled UNDER it.
+
+    Three things are asserted, and the second is the one the acceptance rule
+    depends on:
+
+      * the clamp bites on the slab (edge < unclamped) and is reported;
+      * the FINEST region is never moved: its edge is its own ramp, unclamped,
+        so the job's accuracy does not move with this feature;
+      * the thickness proxy on a slab equals the analytic 2*V/A.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]
+                              / "dockerfiles" / "maxwell_solver"))
+    import mse_common as COMMON
+
+    parts = _thin_shell_parts()
+    h_base_m = 0.5e-3            # 0.5 mm in metres, the caller's coarse edge
+    materials = {"wall": 1.0, "slab": 1.0, "core": 4.0}
+    # The ONE helper, called the way the mesher calls it...
+    raw = COMMON.graded_region_edges(h_base_m, 1.0, materials, parts, "mm")
+    # ...and the mesher's own view of it (names live here, not in the helper).
+    plan = _graded_plan(parts, materials, h_base_m, "mm", verbose=False)
+    by_part = {info["part"]: rid for rid, info in plan["shared"].items()}
+    slab = by_part["slab"]
+    core = by_part["core"]
+    assert [round(raw[r]["edge"], 15) for r in sorted(raw)] == [
+        round(plan["edge_m"][r], 15) for r in sorted(raw)
+    ], "the mesher's plan must be the helper's own output, not a second opinion"
+
+    # The analytic proxy for a slab: 2*V/A is the thickness itself when the
+    # boundary is two big faces and four edges.
+    slab_index = [i for i, info in plan["shared"].items() if info["part"] == "slab"][0]
+    slab_area = COMMON.region_boundary_area(parts, slab_index)
+    slab_fill_m3 = parts.filled_volume_m3(slab_index, "mm")
+    expected_thickness_m = 2.0 * slab_fill_m3 / (slab_area * 1e-6)
+    assert plan["thickness_m"][slab] == pytest.approx(expected_thickness_m, rel=1e-9)
+
+    assert raw[slab]["unclamped"] > raw[slab]["thickness_m"], (
+        "the fixture must have a ramp edge COARSER than the slab thickness, or "
+        "the clamp cannot bite and this test proves nothing"
+    )
+    assert raw[slab]["edge"] == pytest.approx(raw[slab]["thickness_m"], rel=1e-12), (
+        f"the slab's edge should be clamped to its thickness "
+        f"{raw[slab]['thickness_m'] * 1e3:.4f} mm; got "
+        f"{raw[slab]['edge'] * 1e3:.4f} mm"
+    )
+    assert raw[slab]["edge"] < raw[slab]["unclamped"], (
+        "the clamp must make the region FINER than its index asks, never coarser"
+    )
+    assert plan["clamped"][slab] is True, (
+        "the clamp bit on the slab but the mesher's plan did not record it, so "
+        "no job caveat can be written"
+    )
+
+    # The finest region: its edge IS its ramp, and its ramp IS h_min. Nothing
+    # about this feature may move it.
+    h_min = min(info["edge"] for info in raw.values())
+    assert raw[core]["edge"] == pytest.approx(h_min, rel=1e-12)
+    assert raw[core]["edge"] == pytest.approx(raw[core]["unclamped"], rel=1e-12), (
+        "the finest region must be untouched by the clamp, or accuracy moves"
+    )
+    assert plan["clamped"].get(core, False) is False, (
+        "the finest region must not be clamped, or the acceptance rule is "
+        "holding the job to an edge nobody asked for"
+    )
+
+
+@pytest.mark.usefixtures("graded_meshing_on")
+def test_the_clamp_and_the_grading_are_stated_in_the_job_caveats():
+    """A clamped or graded job says so in its ``mesh`` block.
+
+    A clamp that is silent is a resolution the owner never asked for and
+    cannot see; the row asked for it to be stated when it bites. The control
+    is the second half: a plan with no clamp and no grading must carry NO
+    caveat, or the caveat is decoration.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]
+                              / "dockerfiles" / "maxwell_solver"))
+    import mse_common as COMMON
+
+    parts = _thin_shell_parts()
+    materials = {"wall": 1.0, "slab": 1.0, "core": 4.0}
+    edge_m = 0.5e-3
+    plan = _graded_plan(parts, materials, edge_m, "mm", verbose=False)
+
+    n_tets = int(_CUBE_TETS.shape[0])
+    tets = _CUBE_TETS.copy()
+    points_m = _CUBE_POINTS * 1e-3
+    # Every region gets at least one tet, so no region reports ``None``.
+    region_of_tet = np.array([0, 0, 1, 1, 2, 2], dtype=np.int64)[:n_tets]
+
+    report = MESH._mesh_report(
+        plan, region_of_tet, points_m, tets, "mm", achieved=0.4e-3)
+
+    assert report["graded"] is True, "this fixture must take the graded path"
+    text = " || ".join(report["caveats"])
+    assert "GRADED" in text, f"the grading is not stated: {report['caveats']}"
+    assert "FINER than" in text and "thickness" in text, (
+        f"the clamp bit on this fixture but no caveat states it: "
+        f"{report['caveats']}"
+    )
+    # The clamp caveat names the REGION that was clamped, not just the fact.
+    clamped_regions = [rid for rid, bit in plan["clamped"].items() if bit]
+    assert clamped_regions, "this fixture must have clamped a region"
+    for rid in clamped_regions:
+        assert f"region {rid}" in text, (
+            f"no caveat names region {rid}, the one the clamp moved"
+        )
+
+    # CONTROL: the same report for a plan with no clamping and no grading must
+    # carry no caveat at all.
+    plain_plan = {
+        **plan,
+        "graded": False,
+        "clamped": {rid: False for rid in plan["clamped"]},
+        "unclamped_m": {rid: plan["edge_m"][rid] for rid in plan["edge_m"]},
+    }
+    plain = MESH._mesh_report(
+        plain_plan, region_of_tet, points_m, tets, "mm", achieved=0.4e-3)
+    assert plain["caveats"] == [], (
+        f"a uniform, unclamped mesh must carry no caveat; got "
+        f"{plain['caveats']}"
+    )
+
+
+def test_a_single_material_job_never_takes_the_graded_path(monkeypatch):
+    """The byte-identity control: single-material meshes cannot grade.
+
+    The acceptance criterion for per-region grading is that a single-material
+    upload meshes EXACTLY as it did before the feature existed. That is not
+    provable by comparing counts in general (two meshers could agree by luck);
+    it is provable by showing the graded path is never ENTERED, because the
+    graded arm passes a different switch set to TetGen. So both grading
+    entry points are made to explode, and the single-material job must still
+    come back with a mesh.
+
+    This is the control the row asked for: it fails if the graded path is taken.
+    """
+    def _boom(*_args, **_kwargs):
+        raise AssertionError(
+            "a single-material job entered the graded (sizing-field) path: the "
+            "mesh is no longer byte-identical to the pre-feature one"
+        )
+
+    monkeypatch.setattr(MESH, "_sizing_background_grid", _boom)
+    monkeypatch.setattr(MESH, "_sizing_background", _boom)
+    monkeypatch.setattr(MESH, "_region_requests", _boom, raising=False)
+
+    box = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    # A single material, and NO parts: exactly the shape a one-material upload
+    # arrives in.
+    points, tets, region_of_tet = MESH.tetrahedralize(
+        box, "mm", n_modes=3, n_index=1.0, max_tets=200_000,
+        min_feature_m=0.35e-3, verbose=False,
+        materials={"body": 1.0}, parts=None,
+    )
+    assert int(tets.shape[0]) > 0, "the single-material job built no mesh"
+
+    # And the report the job page reads says plainly that nothing was graded.
+    report = MESH.LAST_MESH_REPORT
+    assert report is None or report["graded"] is False, (
+        "a single-material job must not report itself as graded"
+    )
+    assert not report or report["caveats"] == [], (
+        f"a single-material job routes through the ungraded call and has no "
+        f"graded caveat to state; got {report['caveats']}"
+    )
+
+
+def _fine_nested_parts(units="mm"):
+    """Two nested boxes, each faceted to its OWN region edge.
+
+    The graded path can only be exercised with facets fine enough for the
+    fine region's interior: TetGen cannot refine a surface below its facets,
+    so a 12-triangle box would floor the core and the mesh would be refused as
+    too coarse (a different failure, and the one that would hide what these
+    tests are about). The wall is faceted at the wall's edge and the core at
+    the core's, the shape a real upload of a graded object arrives in.
+    """
+    import mse_parts as PARTS
+
+    wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
+    core = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    wall = wall.subdivide_to_size(max_edge=1.2)
+    core = core.subdivide_to_size(max_edge=0.4)
+    obj = trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8")
+    return PARTS.load_parts(obj, units=units)
+
+
+def _mildly_graded_parts(units="mm"):
+    """``_fine_nested_parts`` graded by less than 2x: the one regime the
+    background floor binds in.
+
+    ``bg_edge = min(0.5 * coarse, fine)``, so the floored coarsening
+    ``min(widened, fine)`` can only bite once the pre-floor widening overshoots
+    the FINE edge -- which needs ``0.5 * coarse < fine``, a grading under 2x. At
+    3x (``_fine_nested_parts``) the fine edge is never the binding term, which is
+    why the floor's mutant survived the suite. Same shape: each box faceted to
+    its own region's edge.
+    """
+    import mse_parts as PARTS
+
+    wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
+    core = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    wall = wall.subdivide_to_size(max_edge=1.2)
+    core = core.subdivide_to_size(max_edge=0.8)
+    obj = trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8")
+    return PARTS.load_parts(obj, units=units)
+
+
+def _record_tetgen(monkeypatch) -> list[dict]:
+    """Every call the mesher makes to TetGen, in order.
+
+    Wrapping the class's method rather than patching a private helper means the
+    count is of TETRAHEDRALIZATIONS, whatever the code between them did. That is
+    the quantity the row's question is about: a retry is a second full
+    tetrahedralization with a global ``maxvolume``, and a global maxvolume
+    OVERRIDES the sizing field, so one that happened would silently drop the
+    grading for that job.
+    """
+    import tetgen as TET
+
+    recorded: list[dict] = []
+    real = TET.TetGen
+
+    class Recorder(real):
+        def tetrahedralize(self, **kwargs):
+            recorded.append(kwargs)
+            return super().tetrahedralize(**kwargs)
+
+    monkeypatch.setattr(TET, "TetGen", Recorder)
+    return recorded
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+@pytest.mark.usefixtures("graded_meshing_on")
+def test_a_graded_mesh_over_the_cap_refuses_instead_of_retrying(monkeypatch):
+    """C: the graded path cannot reach the global-``maxvolume`` retry.
+
+    ``maxvolume`` is what the RETRY raises, and a raised ``maxvolume`` overrides
+    the sizing field -- so a graded mesh that retried would come back with every
+    region at ONE edge and nothing in the mesh would say so. Measured here on
+    the calls: a graded over-cap request tetrahedralizes exactly TWICE (one
+    sizing background, one mesh, the second carrying ``bgmesh`` and no positive
+    ``maxvolume``) and raises the graded refusal. It never reaches the retry.
+
+    The control is the SECOND half, and it is what makes the first half mean
+    anything: the same object with one shared index takes the uniform arm, which
+    IS allowed to retry -- so the same instrument must see two or more meshes
+    there. A count of one on the graded side proves nothing unless the
+    instrument can see a retry when one exists.
+    """
+    import mse_parts as PARTS
+
+    parts = _fine_nested_parts()
+    merged = PARTS.merged_surface(parts)
+
+    recorded = _record_tetgen(monkeypatch)
+    with pytest.raises(MESH.MeshingError) as caught:
+        MESH.tetrahedralize(
+            merged, "mm", n_modes=3, n_index=1.0, max_tets=1,
+            min_feature_m=1.2e-3, verbose=False,
+            materials={"wall": 1.0, "core": 3.0}, parts=parts,
+        )
+    graded_calls = list(recorded)
+    message = str(caught.value)
+    assert "graded object would need about" in message, (
+        f"an over-cap graded mesh must raise the GRADED refusal (the fine "
+        f"region's own acceptance is the only thing a graded mesh may fail on); "
+        f"got: {message}"
+    )
+    assert len(graded_calls) == 2, (
+        f"a graded mesh tetrahedralized {len(graded_calls)}x; it must be two "
+        f"(the sizing background and the mesh) and never a third -- a retry "
+        f"would raise a global maxvolume and drop the grading"
+    )
+    assert sum(1 for c in graded_calls if "bgmesh" in c) == 1, (
+        "exactly one of the two calls must be the graded one (it carries the "
+        "sizing field); the other is the background build"
+    )
+    graded_call = next(c for c in graded_calls if "bgmesh" in c)
+    assert graded_call.get("maxvolume", 0.0) in (0.0, None), (
+        f"the graded call must carry NO global maxvolume (got "
+        f"{graded_call.get('maxvolume')}): a global maxvolume overrides the "
+        f"sizing field and silently ungrades the mesh"
+    )
+
+    # THE CONTROL: one shared index -> the uniform arm, which retries.
+    recorded.clear()
+    with pytest.raises(MESH.MeshingError):
+        MESH.tetrahedralize(
+            merged, "mm", n_modes=3, n_index=1.0, max_tets=1,
+            min_feature_m=1.2e-3, verbose=False,
+            materials={"wall": 1.0, "core": 1.0}, parts=parts,
+        )
+    assert len(recorded) >= 2, (
+        f"the uniform over-cap arm retried {len(recorded) - 1} time(s); this "
+        f"control exists to prove the counter can SEE a retry, so it must be "
+        f"at least two meshes -- got {len(recorded)}"
+    )
+    assert len({c.get("maxvolume") for c in recorded}) > 1, (
+        "the uniform retry must actually change the global maxvolume"
+    )
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+@pytest.mark.usefixtures("graded_meshing_on")
+def test_a_graded_mesh_under_the_cap_comes_back_graded(monkeypatch):
+    """C, the other half: the mesh that DOES come back is still graded.
+
+    Refusing over the cap is only half the answer -- the row also asks whether
+    the graded path can hand back an ungraded mesh. This reads the per-region
+    achieved edges EACH REGION'S OWN TETS, which is the only place a lost
+    grading is visible: a whole-mesh median is dominated by the wall and would
+    look the same either way.
+    """
+    import mse_parts as PARTS
+
+    parts = _fine_nested_parts()
+    merged = PARTS.merged_surface(parts)
+    points_m, tets, region_of_tet = MESH.tetrahedralize(
+        merged, "mm", n_modes=3, n_index=1.0, max_tets=600_000,
+        min_feature_m=1.2e-3, verbose=False,
+        materials={"wall": 1.0, "core": 3.0}, parts=parts,
+    )
+    report = MESH.LAST_MESH_REPORT
+    assert report is not None and report["graded"] is True
+    regions = report["regions"]
+    assert len(regions) == 2, f"expected two regions, got {sorted(regions)}"
+
+    (fine_id, fine), = [(rid, r) for rid, r in regions.items() if r["n"] == 3.0]
+    (coarse_id, coarse), = [(rid, r) for rid, r in regions.items() if r["n"] == 1.0]
+    # The two regions are asked for measurably different edges (3x by index,
+    # pulled in by the thickness clamp for the wall, so this is an inequality
+    # rather than the ratio of the indices).
+    assert coarse["target_edge_m"] > 2.0 * fine["target_edge_m"], (
+        f"the two regions were asked for "
+        f"{coarse['target_edge_m'] * 1e3:.4g} and "
+        f"{fine['target_edge_m'] * 1e3:.4g} mm: this fixture is not graded"
+    )
+    assert fine["tets"] and coarse["tets"], "a region came back with no tets"
+
+    # Each region's OWN tets: the fine one is at its own (fine) edge, the coarse
+    # one is measurably coarser -- which is what "still graded" means.
+    assert fine["achieved_edge_m"] <= MESH.MAX_EDGE_OVERSHOOT * fine["target_edge_m"], (
+        f"the fine region's own tets are at {fine['achieved_edge_m'] * 1e3:.4f} "
+        f"mm against its {fine['target_edge_m'] * 1e3:.4f} mm target "
+        f"({fine['achieved_edge_m'] / fine['target_edge_m']:.2f}x, allowance "
+        f"{MESH.MAX_EDGE_OVERSHOOT:.2f}x)"
+    )
+    assert coarse["achieved_edge_m"] > fine["achieved_edge_m"] * 1.2, (
+        f"the coarse region ({coarse['achieved_edge_m'] * 1e3:.4f} mm) is not "
+        f"measurably coarser than the fine one "
+        f"({fine['achieved_edge_m'] * 1e3:.4f} mm): the mesh came back UNGRADED "
+        f"even though the report says otherwise"
+    )
+    # And the report's top-level fine measurement is the fine region's own.
+    assert report["fine_achieved_edge_m"] == pytest.approx(
+        fine["achieved_edge_m"], rel=1e-12)
+
+
+def _fine_nested_parts_thin_wall(units="mm"):
+    """``_fine_nested_parts`` with the core grown so the WALL is thin.
+
+    The wall is the 1 mm shell between the 6 mm and the 4 mm box: thin enough
+    that the thickness clamp bites, which is the fixture the estimate's
+    correction exists for -- the sizing field's transition refines a thin wall
+    hardest, and the plain sum prices the wall at its own target. Facets follow
+    the same rule as its sibling (each part at its OWN region edge), because
+    TetGen cannot refine a surface below its facets and a coarse one would
+    refuse the mesh for a reason that is not what the test is about.
+    """
+    import mse_parts as PARTS
+
+    wall = trimesh.creation.box(extents=(6.0, 6.0, 6.0))
+    core = trimesh.creation.box(extents=(4.0, 4.0, 4.0))
+    wall = wall.subdivide_to_size(max_edge=0.8)
+    core = core.subdivide_to_size(max_edge=0.2667)
+    obj = trimesh.Scene({"wall": wall, "core": core}).export(
+        file_type="obj").encode("utf-8")
+    return PARTS.load_parts(obj, units=units)
+
+
+def test_a_refusal_names_the_part_it_is_about():
+    """The never-silent refusals must NAME the region, and must not crash.
+
+    ``plan["region_of_part"]`` is a LIST in part order (``mse_parts.py``), and an
+    earlier version of both refusal sites read ``.items()`` off it, so the
+    refusal raised ``AttributeError`` instead of the ``MeshingError`` it exists
+    for -- the caller's ``except MeshingError`` never sees it, and the user gets
+    a traceback instead of "try a coarser target for the core". The plan handed
+    in here is the MESHER's own (``_region_plan``), not a hand-built dict, so
+    what this reads is the shape the refusal actually meets.
+    """
+    import mse_parts as PARTS
+
+    parts = _fine_nested_parts()
+    plan = _graded_plan(parts, {"wall": 1.0, "core": 3.0}, 1.2e-3, "mm",
+                             verbose=False)
+    assert isinstance(plan["region_of_part"], list), (
+        "the plan's region_of_part is not the list mse_parts builds; the "
+        "refusals' lookup and this test both assume part-order"
+    )
+    fine = plan["fine_region"]
+    coarse = next(rid for rid in plan["edge_m"] if rid != fine)
+    assert MESH._part_of_region(plan, fine) == "core"
+    assert MESH._part_of_region(plan, coarse) == "wall"
+    # A region the plan cannot name falls back to the id -- never to a raise.
+    assert MESH._part_of_region({"shared": {}}, 7) == "region 7"
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+@pytest.mark.usefixtures("graded_meshing_on")
+def test_a_background_over_the_cap_refuses_before_building_it(monkeypatch):
+    """A: an object too big for one job is refused BEFORE the build.
+
+    The sizing background is the one mesh built before the object exists, so a
+    job that dies building it has already burnt the owner's time and, on the
+    Orin, RAM the solver needed. The cap is priced from the PLC's own volume
+    before the build; when even the coarsest grid that still carries the fine
+    region would not fit, the call refuses with the region named in plain words.
+    The recorder is the assertion: "refused" and "refused after paying for a
+    build" are the same exception, and only the calls tell them apart.
+
+    The control is the same call with the estimate left alone: it builds and
+    comes back graded, so the guard fired on the price and not on the fixture.
+    """
+    import mse_parts as PARTS
+
+    parts = _fine_nested_parts()
+    merged = PARTS.merged_surface(parts)
+    call = dict(n_modes=3, n_index=1.0, max_tets=600_000,
+                min_feature_m=1.2e-3, verbose=False,
+                materials={"wall": 1.0, "core": 3.0}, parts=parts)
+
+    recorded = _record_tetgen(monkeypatch)
+    monkeypatch.setattr(MESH, "_background_tet_estimate", lambda *a, **k: 1.0e9)
+    with pytest.raises(MESH.MeshingError) as caught:
+        MESH.tetrahedralize(merged, "mm", **call)
+    message = str(caught.value)
+    assert "core" in message and "cap" in message, (
+        f"the over-cap refusal must name the fine region and the limit it "
+        f"broke; got: {message}"
+    )
+    assert recorded == [], (
+        f"the over-cap refusal tetrahedralized {len(recorded)}x; it must refuse "
+        f"on the PRICE, before the build -- refusing after the build has already "
+        f"paid for the background it refuses"
+    )
+
+    # THE CONTROL: the real estimate, the same call -- it builds and it grades.
+    monkeypatch.undo()   # also undoes graded_meshing_on, so opt in by name
+    _pts, tets, _reg = MESH.tetrahedralize(merged, "mm", graded=True, **call)
+    assert MESH.LAST_MESH_REPORT["graded"] is True
+    assert len(tets) > 0, "the control build came back empty"
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+@pytest.mark.usefixtures("graded_meshing_on")
+def test_the_graded_estimate_lands_on_the_mesh_the_mesher_builds():
+    """B: the estimate that ROUTES a graded job, against the mesh that follows.
+
+    The plain per-region sum prices a coarse region at its own target, but the
+    sizing field ramps from the fine edge across every boundary, so the mesher
+    builds more elements than that sum says -- and the sum is what picks the
+    machine. Measured here on a thick wall and a thin one: the corrected
+    estimate must land INSIDE the band on both, and the control below shows the
+    uncorrected form leaving it on the thick wall, so the correction is
+    load-bearing rather than decoration.
+
+    The built count is TetGen's OWN element array from the mesher's graded
+    call and the estimate is the overlay's graded estimator, so this compares
+    the two things that must agree -- not two copies of one formula. (The WIP
+    tested ``web.meshing.estimate_tets`` here; on main that entry prices the
+    UNIFORM product mesh and grading is opt-in, so routing a graded job by this
+    estimate is part of the NO-GO step 3.) An under-count is
+    the unsafe direction: it routes the job onto a machine it does not fit.
+
+    Measured on the port (est/built, uncorrected in brackets): thick wall 0.85x
+    (0.47x), thin wall 0.69x (0.61x). The WIP measured 1.04x (0.57x) and 0.85x
+    (0.74x) with the coefficient it then had, ``web.meshing.EST_TETS_C = 14``;
+    main's estimator (1cca12b) prices with the volume law, ``EST_TETS_MARGIN *
+    TETS_PER_UNIT_VOLUME`` = 1.35 * 6 sqrt(2) = 11.46, which is 0.818x of 14 --
+    exactly the shift on all four numbers -- so the overlay prices on main's
+    coefficient and the band is the WIP's (0.70, 1.35) moved by that factor.
+    BAND is wide enough for TetGen-version
+    variation in the built count and narrow enough to fail a 3x over-correction
+    on either fixture; the thick wall's uncorrected 0.47x is what makes the
+    floor load-bearing. The thin wall is the model's tightest point (0.69x), and
+    it is also where the limit shows: the same index ratio leaves the coarse
+    region a different share of the count in each fixture, and one exponent
+    cannot hold both -- ``TRANSITION_EDGE_EXPONENT`` carries the wider measured
+    table and states that as the model's accuracy limit.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "web"))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]
+                              / "dockerfiles" / "maxwell_solver"))
+    import meshing as WEB
+    import mse_common as COMMON
+
+    BAND = (0.55, 1.10)     # the WIP's (0.70, 1.35) x 0.818; see the docstring
+    fixtures = [
+        ("thick wall", _fine_nested_parts(), {"wall": 1.0, "core": 3.0}, 1.2e-3),
+        ("thin wall", _fine_nested_parts_thin_wall(),
+         {"wall": 1.0, "core": 3.0}, 0.8e-3),
+    ]
+    lines, plain_ratios = [], []
+    for label, parts, materials, min_feature_m in fixtures:
+        import mse_parts as PARTS
+
+        merged = PARTS.merged_surface(parts)
+        # The product's routing entry (``web.meshing.estimate_tets``) prices the
+        # UNIFORM mesh the product builds; a graded build is priced by the
+        # overlay's estimator, at the same base edge and the same margin.
+        h_base = COMMON.effective_edge_m(
+            merged, n_modes=2, units="mm", min_feature_m=min_feature_m,
+            parts=parts, materials=materials)
+        margin = WEB.EST_TETS_MARGIN
+        est = COMMON.estimate_tets_graded(parts, materials, h_base, merged,
+                                          "mm", margin)
+        _pts, tets, _reg = MESH.tetrahedralize(
+            merged, "mm", n_modes=2, n_index=1.0, max_tets=600_000,
+            min_feature_m=min_feature_m, verbose=False,
+            materials=materials, parts=parts,
+        )
+        built = int(len(tets))
+        assert built > 0, f"{label}: the mesh came back empty"
+        ratio = est / built
+
+        # THE CONTROL: the SAME plan, priced with no transition correction.
+        plan = COMMON.graded_region_plan(parts, materials, h_base, "mm")
+        plain = int(margin * COMMON.TETS_PER_UNIT_VOLUME * sum(
+            info["filled_volume_m3"] / (info["edge_m"] ** 3)
+            for info in plan.values()))
+        plain_ratios.append(plain / built)
+        lines.append(
+            f"{label}: est {est:,} vs built {built:,} = {ratio:.2f}x "
+            f"(uncorrected {plain:,} = {plain / built:.2f}x)")
+
+        assert BAND[0] <= ratio <= BAND[1], (
+            f"{label}: the routing estimate is {ratio:.2f}x the mesh TetGen "
+            f"builds, outside the stated band {BAND}. " + "; ".join(lines)
+        )
+
+    # The control IS the revert: ``est`` above is the routing entry with the
+    # exponent in place, and ``plain`` is the same plan with ``h_eff = h_r`` --
+    # what the code computes when the exponent is 1, i.e. what it would compute
+    # if the correction were removed. An under-count here is a mutation the
+    # band assertion above catches, so this names the mechanism, not a copy of
+    # the formula.
+    assert min(plain_ratios) < BAND[0], (
+        "the uncorrected sum stays inside the band on every fixture, so this "
+        "test cannot tell the correction from its absence: " + "; ".join(lines)
+    )
+
+
+@pytest.mark.skipif(not _real_tetgen_available(),
+                    reason="tetgen not installed in this environment")
+@pytest.mark.usefixtures("graded_meshing_on")
+def test_the_background_coarsening_is_floored_at_the_fine_regions_edge(monkeypatch):
+    """B: the coarsening floor is load-bearing, on the one plan where it bites.
+
+    Over the cap the sizing background's cells are widened to bring the volume
+    price down -- but never past the FINEST region's own edge: a background cell
+    wider than the region it must resolve leaves that region with no node of its
+    own, and the mesh comes back quietly ungraded. The line is a ``min`` against
+    the fine edge, and the mutant that dropped it left this suite green: no
+    fixture drove the price over the cap while the pre-floor widening overshot
+    the fine edge AND the price at the floored edge stayed legal.
+
+    What is measured is the maxvolume TetGen was HANDED for the background build
+    (``_record_tetgen``), converted back with the same regular-tet volume
+    relation the code uses -- the edge the code CHOSE, not a re-derivation of the
+    formula. The price is supplied here (to the code under test it is a black
+    box, the way TetGen is); the arms make the instrument visible: a price under
+    the cap builds at the WANTED edge, the overshooting price builds at the FINE
+    edge, and the edge the floor refused -- the unfloored widening, 3.3x past --
+    is a value the recorded build must never show.
+    """
+    import mse_common as COMMON
+    import mse_parts as PARTS
+
+    parts = _mildly_graded_parts()
+    merged = PARTS.merged_surface(parts)
+    call = dict(n_modes=3, n_index=1.0, max_tets=600_000,
+                min_feature_m=1.2e-3, verbose=False,
+                materials={"wall": 1.0, "core": 1.5}, parts=parts)
+    CAP = float(MESH.MAX_BACKGROUND_TETS)
+
+    # The plan's own canonical edges, captured from the call the code makes --
+    # not recomputed here, so this arithmetic cannot drift from the code's.
+    seen: dict = {}
+    real_bg = MESH._sizing_background
+
+    def spy(region_plan, vertices, faces, canonical_offset, canonical_scale,
+            units, verbose):
+        edge_c = {int(r): float(h) / COMMON.unit_scale(units) * canonical_scale
+                  for r, h in region_plan["edge_m"].items()}
+        seen["coarse"] = max(edge_c.values())
+        seen["fine"] = min(edge_c.values())
+        return real_bg(region_plan, vertices, faces, canonical_offset,
+                       canonical_scale, units, verbose)
+
+    monkeypatch.setattr(MESH, "_sizing_background", spy)
+
+    def volume(edge):
+        # the code's own regular-tet cell volume
+        return edge ** 3 / (6.0 * np.sqrt(2.0))
+
+    def bg_built(recorded):
+        """The background build -- the only one with no sizing field -- as the
+        cell edge its maxvolume stands for."""
+        return [c for c in recorded if "bgmesh" not in c]
+
+    # ---- arm 1, the control: a price UNDER the cap -> no coarsening -------
+    recorded = _record_tetgen(monkeypatch)
+    monkeypatch.setattr(MESH, "_background_tet_estimate",
+                        lambda v, f, vol: CAP / 10.0)
+    MESH.tetrahedralize(merged, "mm", **call)
+    wanted = min(0.5 * seen["coarse"], seen["fine"])   # the pre-price edge
+    fine = seen["fine"]
+    ctrl = bg_built(recorded)
+    assert len(ctrl) == 1, f"expected one background build, got {len(ctrl)}"
+    assert (float(ctrl[0]["maxvolume"]) * 6.0 * np.sqrt(2.0)) ** (1 / 3) == \
+        pytest.approx(wanted, rel=1e-9), (
+            "with the price under the cap nothing is widened: the control build "
+            "must land on the wanted edge, or the priced arm proves nothing")
+    assert wanted < fine * (1.0 - 1e-9), (
+        "this fixture must be graded under 2x, or the floor never binds: "
+        f"wanted {wanted:.6g} vs fine {fine:.6g} canonical")
+
+    # ---- arm 2, priced: over the cap, with the floored edge legal ---------
+    # E(V) = (cap/2) * (V / V_fine) ** -6 -- an edge dependence steeper than
+    # 1/volume, so the price at the FLOORED edge is legal (the call builds)
+    # while the unfloored widening still overshoots it.
+    recorded.clear()
+    monkeypatch.setattr(
+        MESH, "_background_tet_estimate",
+        lambda v, f, vol: (CAP / 2.0) * (vol / volume(seen["fine"])) ** -6)
+    MESH.tetrahedralize(merged, "mm", **call)
+
+    e_wanted = (CAP / 2.0) * (volume(wanted) / volume(fine)) ** -6
+    unfloored = wanted * (e_wanted / CAP) ** (1.0 / 3.0)
+    priced = bg_built(recorded)
+    assert priced, (
+        "the priced arm must BUILD -- the price at the floored edge is legal; a "
+        "refusal here means the fixture is not the one the floor protects")
+    assert e_wanted > CAP, "the branch must run, or the floor is not exercised"
+    assert unfloored > fine * 1.5, (
+        "the unfloored widening must overshoot the fine edge by a margin the "
+        f"recording can see: unfloored {unfloored:.6g} vs fine {fine:.6g}")
+    built = (float(priced[0]["maxvolume"]) * 6.0 * np.sqrt(2.0)) ** (1 / 3)
+    assert built == pytest.approx(fine, rel=1e-9), (
+        "over the cap the cells were widened PAST the fine region's own edge -- "
+        f"the floor did not hold: built {built:.6g} vs fine {fine:.6g} (the "
+        f"unfloored edge the floor refused would be {unfloored:.6g})")
