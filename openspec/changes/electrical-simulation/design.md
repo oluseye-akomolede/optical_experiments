@@ -157,8 +157,9 @@ Inputs: wire circumradius R = 239.4 nm, hex area (3√3/2)R² = 1.49 × 10⁵ nm
 Nodes per volume at edge h: a regular tet has volume h³/(6√2), so there are 6√2 ≈ 8.49 tets
 per h³, and a tet mesh has about 5.5 tets per node, giving **1.54 nodes per h³**. Memory (all
 estimates, to be replaced by task 2.6's measured per-node cost):
-- Direct sparse LU in 3-D (nested dissection): fill ≈ 10⁹ entries × (n/10⁶)^{4/3}, at
-  12 B/entry × 1.3 overhead. For a k-unknown-per-node system, multiply by k².
+- Direct sparse LU in 3-D (nested dissection): fill ≈ 10⁹ entries × (n/10⁶)^{4/3}, where n
+  is the NODE count, at 12 B/entry × 1.3 overhead (15.6 B/entry). For a k-unknown-per-node
+  system, multiply the fill by k² (electrostatics k = 1; drift-diffusion k = 3, so 9 × 10⁹).
 - AMG-preconditioned CG: about 1.5 kB per unknown.
 - The container limit is 16 GiB, and the namespace's 18 GiB includes the web app.
 
@@ -184,10 +185,14 @@ electrodes are held nodes, so they cost almost nothing to solve.
 
 | box | grid | unknowns | memory | verdict |
 |---|---|---|---|---|
-| 60 × 60 × 40 nm | 0.5 nm | 1.2 × 10⁶ | 0.35 GiB (10 vectors × 3 work copies × 8 B, plus the matrix) | **fits** (per carrier, per voltage) |
-| 480 × 480 × 40 nm (whole cross-section) | 1 nm | 9.2 × 10⁶ | 2.8 GiB | fits, not needed (the confined states decay within ~10 nm of the dot) |
+| 60 × 60 × 40 nm | 0.5 nm | 1.2 × 10⁶ | 0.35 GiB (10 vectors × 3 work copies × 8 B = 0.27 GiB, plus the 7-point matrix at 7 × 12 B/unknown = 0.09 GiB) | **fits** (per carrier, per voltage) |
+| 480 × 480 × 40 nm (whole cross-section) | 1 nm | 9.2 × 10⁶ | 2.8 GiB (2.06 GiB of vectors + 0.72 GiB of matrix, same rule) | fits, not needed (the confined states decay within ~10 nm of the dot) |
 
 ### Drift-diffusion (3 unknowns/node: ψ, n, p; semiconductor and oxide only)
+
+The LU column uses the rule above with k = 3: 9 × 10⁹ × (nodes/10⁶)^{4/3} × 15.6 B, where
+nodes = unknowns/3. Example (D3 5/10): 8.3 × 10⁵ nodes → 9 × 10⁹ × 0.784 × 15.6 B = 103 GiB.
+A coupled non-symmetric Jacobian may fill worse than this; the column is a lower bound.
 
 The junction needs about two nodes per Debye length. In InP (ε_s 12.5, 300 K),
 L_D = √(ε_s ε₀ k_BT/(q²N)) is 42 nm at 10¹⁶ cm⁻³, 13 nm at 10¹⁷ and 4.2 nm at 10¹⁸. The

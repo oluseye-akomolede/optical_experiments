@@ -1,7 +1,11 @@
 # Design — superconductor-models
 
-Moved unchanged (except for the loss-first order) from `electrical-simulation/design.md`
-§1 on 2026-11-01. The rule throughout: start with the simplest model that gives a useful
+Moved from `electrical-simulation/design.md` §1 (as reviewed at fb4d3ee) on 2026-11-01.
+The spec.md is byte-identical to that review. design.md, proposal.md and tasks.md carry
+UNREVIEWED edits made in the move: task 1.3 puts surface resistance (loss) first; the S-step
+list is renumbered (S4); "What exists" drops the electrostatics half. Diff against
+`git show fb4d3ee:openspec/changes/electrical-simulation/design.md` to see them; review them
+when this change starts. The rule throughout: start with the simplest model that gives a useful
 number, check it against an answer we did not compute ourselves, and move up a rung only when
 an owner question needs it. Citations marked **(unsure)** are from memory and must be checked
 against the source before any code or test quotes a number from them.
