@@ -205,7 +205,8 @@ pure numerics with analytic answers, and none needs the web app or more than tie
   never handle the sign.
 - Static permittivity is its own per-part input (`eps_static`) and is never derived from
   the optical index. Static and optical values differ (for GaAs, about 12.9 static vs
-  about 11 at 1 µm), so a silent `n²` would be wrong.
+  about 11 at 1 µm), so a silent `n²` would be wrong. An electrode part may omit it,
+  since its nodes are held at the electrode potential.
 - Electrodes are parts held at a potential. Their tets are conductor, so every node of an
   electrode part is fixed. Electrode charge is read from the assembled residual at those
   nodes (the exact discrete charge), so the capacitance matrix is symmetric by
