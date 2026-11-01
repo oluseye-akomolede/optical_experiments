@@ -596,3 +596,182 @@ def estimate_tets_by_region(parts, materials, edge_units: float,
         by_edge[h_r] = by_edge.get(h_r, 0.0) + v_r
     law = sum(v / (h ** 3) for h, v in by_edge.items())
     return int(float(margin) * TETS_PER_UNIT_VOLUME * law)
+
+
+# --- GRADED overlay (OpenSpec change ``per-region-mesh-grading``) -----------
+#
+# Everything below is OPT-IN. The product's rule is the uniform plan above:
+# ``region_plan`` meshes every region at ``h_min`` and the per-region guard
+# reads ``own_edge_units``. The overlay is built ON TOP of that plan -- it adds
+# keys to it and replaces none -- and only the mesher's ``grading=True`` path
+# and the grading benches read the added keys. Making grading the product's
+# default (tasks.md step 3) is NO GO, so no product caller reaches this code.
+
+#: The thickness clamp. A graded region's target is delivered by TetGen's
+#: sizing field, and a target that approaches the region's own thickness makes
+#: the field collapse: the mesh loses the fine region and the job fails a check
+#: it should never have met. The length used is the thickness proxy
+#: ``2 * V_filled / A_boundary`` (see ``region_boundary_area``): a slab's volume
+#: is thickness x area, so for a thin shell it IS the thickness, and for a fat
+#: region it under-estimates it, which clamps sooner and errs finer.
+#: MEASURED on nested-cube fixtures (wall 2.0, canonical frame, tetgen 0.8.4):
+#: shell 0.375 held at h_wall 0.70 and collapsed at 1.00; shell 0.15 held at
+#: 0.30 and collapsed at 0.45 -- a cliff at 1.9-3x the thickness, independent of
+#: the background mesh's resolution. The proxy is 0.309 and 0.147 for those two
+#: fixtures, so 1.0 x it sits under both cliffs with a 2-3x margin. A region's
+#: graded edge never falls below ``h_min``, so the finest region is never
+#: clamped.
+CLAMP_THICKNESS_FRACTION = 1.0
+
+
+def region_boundary_area(parts, part_index: int) -> float:
+    """Area of the REGION's boundary, in the parts' own units squared.
+
+    The region ``part_index`` bounds is the part MINUS everything nested inside
+    it, so its boundary is the part's own closed surface plus every nested
+    part's -- the same set ``PartSet.filled_volume_m3`` subtracts volumes for.
+    It exists for the thickness proxy ``2 * V_filled / A_boundary`` that
+    ``graded_region_edges`` clamps a coarse target under.
+    """
+    total = 0.0
+    for index in [part_index, *parts.children_of(part_index)]:
+        total += abs(float(parts.parts[index].area))
+    return float(total)
+
+
+def _wall_n(parts, materials) -> float:
+    """The wall region's index, resolved the way :func:`region_plan` does."""
+    by_region = parts.region_materials(materials)
+    wall_index = getattr(parts, "wall_index", None)
+    if wall_index is None:
+        raise MeshingError(
+            "a multi-part mesh needs a wall part to measure the other "
+            "regions against, and this upload has none. The first part "
+            "must contain every other part."
+        )
+    return float(by_region[int(parts.region_of_part[wall_index])])
+
+
+def graded_region_edges(h: float, n_wall: float, materials: dict, parts,
+                        units: str) -> dict:
+    """Each region's GRADED target edge, in METRES:
+    ``{rid: {"edge", "unclamped", "thickness_m"}}``.
+
+    THE GRADED RULE: ``raw_r = min(h, h * n_wall / n_r)`` -- a region less dense
+    than the wall keeps the wall's edge, a denser one gets a finer edge -- then
+    clamped under the region's own thickness (``CLAMP_THICKNESS_FRACTION``) and
+    floored at ``h_min``, the edge :func:`region_plan` meshes EVERY region at.
+    So the finest region's edge is the uniform rule's edge exactly, and the
+    cavity is solved at the resolution it was before.
+
+    The per-region requirement ``h * n_wall / n_r`` is :func:`region_edges`
+    (the product's rule, which also validates the indices); this function adds
+    only the cap at ``h``, the clamp and the floor. ``h`` is in METRES because
+    the clamp compares it with a length.
+    """
+    h = float(h)
+    if not np.isfinite(h) or h <= 0:
+        raise MeshingError(
+            f"graded_region_edges needs the base edge in METRES and got {h:g}."
+        )
+    own = region_edges(h, n_wall, materials, parts)
+    h_min = min([h, *(float(e) for e in own.values())])
+    scale = unit_scale(units)
+    volume_m3: dict = {}
+    area_units2: dict = {}
+    for part_index, region_id in enumerate(parts.region_of_part):
+        region_id = int(region_id)
+        volume_m3[region_id] = (
+            volume_m3.get(region_id, 0.0)
+            + parts.filled_volume_m3(part_index, units)
+        )
+        area_units2[region_id] = (
+            area_units2.get(region_id, 0.0)
+            + region_boundary_area(parts, part_index)
+        )
+    out = {}
+    for region_id, own_edge in own.items():
+        region_id = int(region_id)
+        raw = min(h, float(own_edge))
+        area = area_units2.get(region_id, 0.0)
+        thickness_m = (
+            CLAMP_THICKNESS_FRACTION * 2.0 * volume_m3.get(region_id, 0.0)
+            / (area * scale * scale)
+            if area > 0 else float("inf")
+        )
+        out[region_id] = {
+            "edge": max(min(raw, thickness_m), h_min),
+            "unclamped": raw,
+            "thickness_m": thickness_m,
+        }
+    return out
+
+
+def graded_region_plan(parts, materials, edge_m: float, units: str,
+                       n_wall: float | None = None) -> dict:
+    """:func:`region_plan` with the GRADED keys laid over it.
+
+    Every key the product's plan carries is kept unchanged (``edge_units`` is
+    ``h_min`` for every region, ``own_edge_units`` feeds the per-region guard),
+    computed from the same base edge ``edge_m`` -- so here they are in METRES.
+    Added per region: ``edge_m`` (the graded target), ``unclamped_m`` and
+    ``thickness_m``. Nothing on a product route reads the added keys.
+    """
+    if n_wall is None:
+        n_wall = _wall_n(parts, materials)
+    out = region_plan(parts, materials, edge_m, units, n_wall=n_wall)
+    edges = graded_region_edges(edge_m, n_wall, materials, parts, units)
+    for region_id, info in out.items():
+        g = edges[int(region_id)]
+        info["edge_m"] = float(g["edge"])
+        info["unclamped_m"] = float(g["unclamped"])
+        info["thickness_m"] = float(g["thickness_m"])
+    return out
+
+
+#: How far toward the finest edge the sizing field's transition pulls a
+#: coarse region: a graded coarse region is priced at
+#: ``h_r * (h_min / h_r) ** TRANSITION_EDGE_EXPONENT``, not at its target. The
+#: transition makes a coarse region FINER than its target, so the plain
+#: per-region sum UNDER-counts where the transition is most of the region
+#: (measured est/built 0.74 thin wall, 0.57 thick wall) and over-counts on
+#: nested boxes (1.17-1.97). 0.3 moved those to 0.85, 1.04 and 1.95-2.24 (WIP
+#: measurements, made under the WIP's single-coefficient law; see the change's
+#: tasks.md), under the 3.0 ceiling that is the UNGRADED law's own error on the
+#: nested box.
+TRANSITION_EDGE_EXPONENT = 0.3
+
+
+def estimate_tets_graded(parts, materials, edge_m: float,
+                         surface, units: str, margin: float) -> int:
+    """Element estimate for a GRADED multi-part mesh: the volume law summed
+    per region at each region's DELIVERED edge.
+
+    Same law and margin as :func:`estimate_tets_by_region` (``margin *
+    TETS_PER_UNIT_VOLUME * sum_r V_r / h_r^3``); only the edges differ, so
+    where every region lands on one edge it is that function's number. Not on
+    any product route: the product meshes uniformly, so it prices uniformly.
+    """
+    plan = graded_region_plan(parts, materials, edge_m, units)
+    if not plan:
+        raise MeshingError(
+            "the multi-part estimate was asked for a mesh with no regions; "
+            "this is the one-part path's job and calling it here would route "
+            "a job on a number of zero."
+        )
+    for region_id, info in plan.items():
+        h_r = float(info["edge_m"])
+        v_r = float(info["filled_volume_m3"])
+        if not (h_r > 0) or not (v_r > 0):
+            raise MeshingError(
+                f"region {region_id} of the plan gave h={h_r:g} m and "
+                f"V={v_r:g} m3; neither can be used to size a mesh."
+            )
+    h_min = min(float(info["edge_m"]) for info in plan.values())
+    law = 0.0
+    for info in plan.values():
+        h_r = float(info["edge_m"])
+        if h_r > h_min:
+            h_r *= (h_min / h_r) ** TRANSITION_EDGE_EXPONENT
+        law += float(info["filled_volume_m3"]) / (h_r ** 3)
+    return int(float(margin) * TETS_PER_UNIT_VOLUME * law)
