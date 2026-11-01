@@ -185,9 +185,10 @@ Why this order:
 
 ### Compute (estimates, to be measured)
 
-- Q1 3-D: P1 with ≤ ~3×10⁵ nodes factorises through `mse_backend` within a 16 GiB Job.
-  About 10⁶ nodes needs CG with an AMG preconditioner (pyamg, a new dependency) instead of
-  `splu`. Phase 1 caps nodes and refuses above the cap.
+- Q1 3-D: P1 with ≤ ~3×10⁵ nodes (estimate, not measured) factorises through `mse_backend`
+  within a 16 GiB Job. About 10⁶ nodes needs CG with an AMG preconditioner (pyamg, a new
+  dependency) instead of `splu`. Phase 1 estimates memory from the node count and refuses
+  above the call-time admission budget, like the time-domain solver.
 - Q3 axisymmetric: about 10⁵ unknowns, seconds. 3-D single-band at 0.5 nm over
   60 × 60 × 40 nm is ~10⁶ unknowns: LOBPCG or a Job, not shift-invert on the VM.
 - **Does not fit:** 3-D 8-band k.p at that resolution (~10⁷ complex unknowns). Use

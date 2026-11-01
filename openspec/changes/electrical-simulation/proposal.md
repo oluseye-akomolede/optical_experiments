@@ -47,3 +47,5 @@ Four phases. Each ends at a check against a published or analytic answer (see `d
 4. Are 2-D, axisymmetric and analytic-limit models acceptable, or do you need 3-D? 3-D at
    useful resolution needs a GPU request or more quota.
 5. Is there a target paper for each device, like paper 1, to use as the answer key?
+6. Is the first device limited by loss (resonator Q) or by inductance (detector speed)? This
+   decides whether the film-loss or the kinetic-inductance model is built first.

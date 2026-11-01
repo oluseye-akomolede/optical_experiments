@@ -34,8 +34,9 @@ rig's tier-1 rule. Each numbered group is one reviewable commit.
 - [ ] 2.5 Bench geometries as small `.obj` fixtures: two-layer slab, concentric spheres,
       sphere between plates. Add `scripts/electrostatics_bench.py` with the peak-RSS line.
       Prove the mutation (ε_s ignored → exit 1).
-- [ ] 2.6 Set `MAX_ELECTROSTATIC_NODES` from the measured RSS and record the measurement in
-      the module. Add a test of the refusal before factorisation.
+- [ ] 2.6 Measure the per-node memory cost from the bench RSS and record it in the module. Add
+      `budget=None` (defaulting to `admission_budget()`) and a test that a passed small budget
+      is refused before factorisation.
 
 ## 3. Close Phase 1
 - [ ] 3.1 Reviewer checks each scenario against its test and runs both benches.

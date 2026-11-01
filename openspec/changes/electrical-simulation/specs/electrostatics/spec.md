@@ -13,6 +13,11 @@ a part with no `eps_static` that is not an electrode, or an ε_s < 1.
 - **WHEN** a part has an optical material but no `eps_static` entry and is not an electrode
 - **THEN** `solve` raises `ValueError` naming the part
 
+#### Scenario: An electrode part needs no static permittivity
+- **WHEN** an electrode part has no `eps_static` entry
+- **THEN** `solve` accepts it, because its nodes are held at the electrode potential and its
+  tets are not assembled
+
 #### Scenario: The potential lies between the electrode potentials
 - **WHEN** `solve` returns with electrodes held at potentials V_min ≤ V ≤ V_max
 - **THEN** every nodal potential lies in [V_min, V_max] within 1e-9·(V_max − V_min) (the
@@ -42,13 +47,15 @@ electrode's nodes and return the Maxwell capacitance matrix in farads.
 - **WHEN** `capacitance_matrix` is computed for three or more electrodes
 - **THEN** C is symmetric within 1e-6 relative and each row sums to ≤ 0 off-diagonal
 
-### Requirement: Electrostatics SHALL refuse a mesh above its node cap before factorising
-`solve` SHALL count free nodes before assembly and raise `ValueError` naming the count and the
-cap when the count exceeds `MAX_ELECTROSTATIC_NODES`. The default cap SHALL be stated in the
-module and chosen from a measured peak RSS on the bench, not assumed.
+### Requirement: Electrostatics SHALL refuse a mesh over the admission budget before factorising
+`solve` SHALL take `budget=None` (bytes). With `None` it SHALL read the machine's admission
+budget at call time (`admission_budget()`, as the time-domain `check_limits` does), not a fixed
+constant. Before assembly it SHALL estimate peak memory from the free-node count, using a
+per-node cost measured on the bench and recorded in the module, and raise `ValueError` naming
+the estimate and the budget when the estimate exceeds the budget.
 
-#### Scenario: An oversized mesh is refused before work
-- **WHEN** the mesh's free-node count exceeds `MAX_ELECTROSTATIC_NODES`
+#### Scenario: A mesh over a passed budget is refused before work
+- **WHEN** `solve` is called on a small bench mesh with a `budget` below that mesh's estimate
 - **THEN** `solve` raises before calling `mse_backend.factor`
 
 ### Requirement: The electrostatics bench SHALL print its checks and exit nonzero on a failure
