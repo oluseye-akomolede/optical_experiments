@@ -593,6 +593,16 @@ def write_results(job_id, store_out, surface, points_m, tets, edges, tet_edges,
         # requested resolution so the owner can see the allowance being used
         # rather than having to trust that it was.
         "achieved_median_edge_m": MESH.LAST_ACHIEVED_EDGE_M,
+        # How a MULTI-REGION mesh was graded: each region's target edge, the edge
+        # it achieved and its filled volume, plus the mesher's caveats (a target
+        # clamped under a region's thickness; a coarsened surface). Absent for a
+        # one-part mesh, which has no regions to grade -- so a single-material
+        # job's modes.json is the file it was before this feature. Written only
+        # when the mesher had regions, and never re-derived here: it describes
+        # the mesh that was just built, the same way LAST_BACKEND_DESCRIPTION
+        # describes the factorisation that just ran.
+        **({"mesh": MESH.LAST_MESH_REPORT} if MESH.LAST_MESH_REPORT is not None
+           else {}),
         "grid": {
             "nx": int(nx), "ny": int(ny), "nz": int(nz),
             "origin": [float(v) for v in origin],
