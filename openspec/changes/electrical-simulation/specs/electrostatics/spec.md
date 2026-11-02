@@ -50,13 +50,75 @@ electrode's nodes and return the Maxwell capacitance matrix in farads.
 ### Requirement: Electrostatics SHALL refuse a mesh over the admission budget before factorising
 `solve` SHALL take `budget=None` (bytes). With `None` it SHALL read the machine's admission
 budget at call time (`admission_budget()`, as the time-domain `check_limits` does), not a fixed
-constant. Before assembly it SHALL estimate peak memory from the free-node count, using a
-per-node cost measured on the bench and recorded in the module, and raise `ValueError` naming
-the estimate and the budget when the estimate exceeds the budget.
+constant. Before assembly it SHALL estimate peak memory from the free-node count for the solve
+path it will take (direct or iterative, below), using a per-node cost for each path measured on
+the bench and recorded in the module. It SHALL raise `ValueError` naming the path, the estimate
+and the budget when the estimate exceeds the budget.
 
 #### Scenario: A mesh over a passed budget is refused before work
 - **WHEN** `solve` is called on a small bench mesh with a `budget` below that mesh's estimate
-- **THEN** `solve` raises before calling `mse_backend.factor`
+- **THEN** `solve` raises before calling `mse_backend.factor` or the iterative solver
+
+#### Scenario: The estimate follows the path
+- **WHEN** the same mesh is estimated for the direct path and for the iterative path
+- **THEN** the two estimates differ and each uses its own recorded per-node cost
+
+### Requirement: Electrostatics SHALL solve large 3-D meshes iteratively, with a checked residual
+`solve` SHALL use the direct path (`mse_backend.factor`) up to `direct_max_nodes` free nodes
+(a module constant set from the bench, design estimate about 5 × 10⁵) and above it an
+AMG-preconditioned conjugate-gradient solve (`pyamg`). The iterative path SHALL stop at a
+relative residual ‖b − Ax‖/‖b‖ ≤ 1e-10. It SHALL recompute that residual from the assembled
+matrix after the solve, not take it from the solver's own report, and SHALL raise
+`RuntimeError` naming the residual when it is above the tolerance or the iteration cap is
+reached. The result SHALL record which path ran and the residual.
+
+#### Scenario: Both paths agree
+- **WHEN** a bench mesh below `direct_max_nodes` is solved on both paths (forced by a keyword)
+- **THEN** the nodal potentials agree within 1e-8·(V_max − V_min)
+
+#### Scenario: An unconverged solve is refused
+- **WHEN** the iterative path is run with an iteration cap too small to converge
+- **THEN** `solve` raises `RuntimeError` naming the recomputed residual, and returns no field
+
+### Requirement: The electrostatics mesh SHALL be graded per part through TetGen's sizing field
+`mse_meshing.tetrahedralize` SHALL accept an opt-in `part_edge_m` mapping (part label to a
+target edge in metres) and, when it is given, SHALL grade the mesh with TetGen's `-m` sizing
+field: a coarse background mesh of the same PLC whose nodes carry the target edge of the part
+they lie in, passed as `bgmesh`, with no global `maxvolume` and no `fixedvolume`. With
+`part_edge_m=None` (the default) it SHALL run today's path unchanged, so the `maxwell-solver`
+behaviour does not change. A target edge larger than the thinnest dimension of its part SHALL
+be refused with `ValueError` naming the part, because it would drive the mesh onto the size
+floor.
+
+#### Scenario: Grading keeps the fine part fine and coarsens the rest
+- **WHEN** a thin-layer bench geometry is meshed with a fine edge in the layer and a coarse
+  edge in the surrounding part
+- **THEN** the measured median edge in the layer is within 25 % of its target and the total
+  tet count is below half that of the uniform mesh at the fine edge
+
+#### Scenario: The default path is unchanged
+- **WHEN** `tetrahedralize` is called without `part_edge_m`
+- **THEN** it returns the same arrays as before this change for the existing test meshes
+
+### Requirement: The paper-1 wire geometry SHALL solve in 3-D and respect its symmetry
+The electrostatics bench SHALL include a reduced paper-1 scene: a hexagonal wire of ε_s = 12.5
+on a 12 nm oxide (ε_s = 3.9) over a grounded mirror electrode, with a top electrode, in an air
+box, meshed with `part_edge_m`. The result SHALL be a genuine 3-D field, not an axisymmetric
+one: the bench SHALL print the field at the dot position on the wire axis, and the field at
+the same height off the axis rotated by 60° (a symmetry of the hexagon) and by 30° (not one).
+
+#### Scenario: The on-axis field points along the axis
+- **WHEN** the reduced paper-1 scene is solved with the top electrode at V and the mirror at 0
+- **THEN** at the on-axis dot position |E_x|, |E_y| ≤ 1e-2·|E_z| (the hexagon's symmetry)
+
+#### Scenario: A 60° rotation is a symmetry of the solution
+- **WHEN** the same solve is sampled at 0.8 R off the axis and at that point rotated by 60°
+- **THEN** the two field magnitudes agree within 2 % (a check that fails if the mesh or the
+  sampling breaks the hexagon's symmetry; the 30° point is printed for reading, not checked)
+
+#### Scenario: The field converges under refinement
+- **WHEN** the scene is solved at two gradings whose wire edges differ by 2
+- **THEN** the on-axis |E_z| at the dot changes by less than 2 %
 
 ### Requirement: The electrostatics bench SHALL print its checks and exit nonzero on a failure
 `scripts/electrostatics_bench.py` SHALL build each validation geometry above as a small
@@ -67,3 +129,8 @@ and exit 1 if any check fails.
 #### Scenario: A wrong permittivity fails the bench
 - **WHEN** the per-part ε_s is ignored (all parts treated as vacuum)
 - **THEN** the two-layer and dielectric-sphere checks fail and the bench exits 1
+
+#### Scenario: A dropped residual check fails the bench
+- **WHEN** the iterative path's recomputed residual is replaced by the solver's own report and
+  the iteration cap is set too low
+- **THEN** the both-paths-agree check fails and the bench exits 1
