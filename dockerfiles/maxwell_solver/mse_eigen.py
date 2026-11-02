@@ -143,6 +143,112 @@ def solve_modes(
     verbose: bool = True,
     spd_ordering: bool = True,
     backend: str | None = None,
+    cpu_fits=None,
+):
+    """Solve, retrying on the CPU if the GPU runs out of memory.
+
+    The retry is here, outside the body, because the failure is not specific to
+    a factorisation: ``K`` is the large one, so it is usually the first thing to
+    hit the wall, but ``S`` or the eigensolve can too. Retrying the whole solve
+    covers all three, and it is also what makes the retry correct -- a partial
+    GPU solve is not something the CPU can resume.
+
+    ONLY an out-of-memory failure retries. An absent CUDA stack still raises:
+    it is a configuration fact known before any work is done, and masking it
+    would turn a misconfigured GPU run into a silent CPU run. See
+    :mod:`mse_backend`, which owns that rule and the classifier both paths
+    share.
+
+    ``cpu_fits`` is an optional zero-argument predicate the caller supplies when
+    it can price the assembled problem against what the CPU worker may hold. It
+    is asked BEFORE the CPU attempt starts: a problem the GPU could not hold is
+    often one the CPU cannot either, and discovering that by filling the CPU
+    worker's memory costs the whole job. ``None`` means the caller has no way to
+    price it, and the attempt goes ahead.
+    """
+    resolved = backend or BACKEND.selected_backend()
+    if resolved != BACKEND.GPU:
+        return _solve_modes_on(
+            A, B, n_modes, points, edges, tets, tet_edges, free_edges,
+            constrained, verbose=verbose, spd_ordering=spd_ordering,
+            backend=resolved,
+        )
+    try:
+        return _solve_modes_on(
+            A, B, n_modes, points, edges, tets, tet_edges, free_edges,
+            constrained, verbose=verbose, spd_ordering=spd_ordering,
+            backend=resolved,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if not BACKEND.names_an_out_of_memory(exc):
+            raise
+        # Free the device before building anything on the CPU. The failed
+        # factorisation may still be registered, and on the Jetson device memory
+        # IS system RAM, so holding it would make the CPU solve compete with a
+        # reservation we are no longer using.
+        freed = BACKEND.release_gpu_memory()
+        if cpu_fits is not None and not cpu_fits():
+            # Refuse before starting rather than after the CPU worker has spent
+            # its memory. The message names the GPU as the cause, because that is
+            # what happened; the CPU is only where it could not be retried.
+            #
+            # NOTE ON WHERE THIS GOES: nowhere it can be read. The token
+            # ``termination_message`` writes is only consulted for CLUSTER rows;
+            # ``web/app.py`` skips every jetson row before that point (the
+            # lease owns it). On the Jetson this is therefore a TERMINAL
+            # failure: the worker marks the row failed with the owner message,
+            # which is why that message must say the machine was busy rather
+            # than promise another attempt. Re-queueing deliberately would need
+            # a bounded attempt count this change does not add.
+            raise BACKEND.FullOnBothProcessors(
+                f"the GPU ran out of memory solving this problem ({exc}), and "
+                f"the same problem is too large to retry on the CPU. Reduce the "
+                f"mesh size or request fewer modes."
+            ) from exc
+        if verbose:
+            print(
+                f"GPU out of memory during the solve ({exc}); released {freed} "
+                f"factorisation(s) and retrying the same problem on the CPU.",
+                flush=True,
+            )
+        try:
+            return _solve_modes_on(
+                A, B, n_modes, points, edges, tets, tet_edges, free_edges,
+                constrained, verbose=verbose, spd_ordering=spd_ordering,
+                backend=BACKEND.CPU,
+            )
+        except Exception as exc2:  # noqa: BLE001
+            # A second out-of-memory failure raises from here: there is nowhere
+            # left to go, and looping would only burn the job's timeout.
+            if not BACKEND.names_an_out_of_memory(exc2):
+                raise
+            # Both processors ran out of memory. Name BOTH, and keep the GPU
+            # error as the cause: `cpu_fits` only prices the assembled system
+            # against the worker's cap, so it said "this should fit" and the
+            # CPU then could not hold it. Reporting the CPU's message alone
+            # would tell the owner the object was too big for us without ever
+            # saying the GPU had failed too, which is the part they were never
+            # told and the reason their earlier attempt died.
+            raise BACKEND.FullOnBothProcessors(
+                f"the GPU ran out of memory solving this problem ({exc}), and "
+                f"the retry on the CPU also ran out of memory ({exc2}). Reduce "
+                f"the mesh size or request fewer modes."
+            ) from exc
+
+
+def _solve_modes_on(
+    A: sparse.spmatrix,
+    B: sparse.spmatrix,
+    n_modes: int,
+    points: np.ndarray,
+    edges: np.ndarray,
+    tets: np.ndarray,
+    tet_edges: np.ndarray,
+    free_edges: np.ndarray,
+    constrained: np.ndarray,
+    verbose: bool = True,
+    spd_ordering: bool = True,
+    backend: str | None = None,
 ):
     """Solve for the lowest ``n_modes`` physical eigenvalues of ``A x = k^2 B x``.
 

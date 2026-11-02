@@ -693,3 +693,254 @@ def test_release_gpu_memory_is_a_no_op_without_the_cuda_stack(monkeypatch):
     monkeypatch.setitem(sys.modules, "cupy", None)
     B._GPU_FACTORS.clear()
     assert B.release_gpu_memory() == 0
+
+
+# --------------------------------------------------------------------------
+# GPU out of memory: retry on the CPU, and never hide the reason
+# --------------------------------------------------------------------------
+# The Jetson ran out of device memory on a real job and the owner was told
+# "this object could not be solved for the requested number of modes", which
+# blamed the object. Device memory there IS system RAM, so the same problem can
+# often be solved on the CPU: the fix is a retry, not a failure.
+#
+# The fixtures below are the TWO failures observed on the Jetson, verbatim from
+# the recorded logs. They differ in shape as well as wording -- one is a cuDSS
+# status wrapped as the cause, the other is the driver's own message -- and the
+# classifier has to recognise both.
+
+#: cuDSS's own alloc status, as it arrives wrapped by mse_eigen: the status NAME
+#: is all the wrapper carries, so this is the shape the cause chain must be
+#: walked for.
+OBSERVED_CUDSS_OOM = "ALLOC_FAILED (2)"
+#: The same event via the CUDA driver, already in the EigenError's own message.
+OBSERVED_CUDA_OOM = "cudaErrorMemoryAllocation: out of memory"
+
+
+def _oom(message=OBSERVED_CUDA_OOM):
+    """The error a full device raises, as ``EigenError`` carries it.
+
+    ``EigenError(...) from exc`` is how ``_solve_modes_on`` wraps every cuDSS
+    status, so the original failure is the CAUSE and the wrapper repeats only
+    the status. Both are covered: ``message`` alone is the driver shape, and
+    passing ``from_cause`` adds the cuDSS shape underneath.
+    """
+    return EIG.EigenError(f"could not factor A + sB: {message}")
+
+
+def _oom_from_cudss_status():
+    """The cuDSS shape: ``EigenError`` wrapping a ``cuDSSError`` carrying the status."""
+    try:
+        try:
+            raise RuntimeError(OBSERVED_CUDSS_OOM)
+        except RuntimeError as cause:
+            raise EIG.EigenError(f"could not factor A + sB: {cause}") from cause
+    except EIG.EigenError as wrapped:
+        return wrapped
+
+
+def test_a_gpu_out_of_memory_retries_the_same_problem_on_the_cpu(monkeypatch):
+    """The whole point of the row: an OOM is retryable, not fatal.
+
+    The GPU factor raises on K, which is the large one and therefore what
+    actually fills the device. The CPU factor succeeds, so the job completes
+    and is recorded as having run on the CPU -- not as a GPU run that silently
+    produced CPU numbers.
+    """
+    points, tets, edges, tet_edges, free, constrained, A_free, B_free = _box_matrices()
+
+    class StubFactor:
+        def __init__(self, matrix):
+            self.dense = np.linalg.inv(matrix.toarray())
+
+        def solve(self, x):
+            return self.dense @ np.asarray(x, dtype=np.float64)
+
+    seen = []
+
+    def stub_factor(matrix, *, label, spd_lu, backend=None):
+        seen.append((label, backend))
+        if backend == B.GPU:
+            raise _oom()
+        return StubFactor(matrix)
+
+    real_factor = EIG.BACKEND.factor
+    EIG.BACKEND.factor = stub_factor
+    try:
+        values, _, _ = EIG.solve_modes(
+            A_free, B_free, 4, points,
+            edges=edges, tets=tets, tet_edges=tet_edges,
+            free_edges=free, constrained=constrained, verbose=False,
+            backend=B.GPU,
+        )
+    finally:
+        EIG.BACKEND.factor = real_factor
+
+    assert EIG.LAST_BACKEND == B.CPU, (
+        "the retry must be recorded as a CPU run, so the job page does not "
+        "claim GPU numbers that came from the CPU"
+    )
+    assert np.all(np.asarray(values) > 0), values
+    assert (("K", B.GPU) in seen), ("the GPU attempt must have been made", seen)
+    assert (("K", B.CPU) in seen), ("the CPU retry must have been made", seen)
+
+
+def test_a_cudss_alloc_failed_status_also_retries(monkeypatch):
+    """The other observed shape: a cuDSS status under an EigenError wrapper.
+
+    This is the one that needs the cause chain walked. ``EigenError: could not
+    factor A + sB: ALLOC_FAILED (2)`` is what the Jetson logged; the status is
+    in the wrapper's message AND in the ``cuDSSError`` beneath it, and neither
+    the exception type nor the wrapper alone can say what happened.
+    """
+    points, tets, edges, tet_edges, free, constrained, A_free, B_free = _box_matrices()
+
+    class StubFactor:
+        def __init__(self, matrix):
+            self.dense = np.linalg.inv(matrix.toarray())
+
+        def solve(self, x):
+            return self.dense @ np.asarray(x, dtype=np.float64)
+
+    seen = []
+
+    def stub_factor(matrix, *, label, spd_lu, backend=None):
+        seen.append((label, backend))
+        if backend == B.GPU:
+            raise _oom_from_cudss_status()
+        return StubFactor(matrix)
+
+    real_factor = EIG.BACKEND.factor
+    EIG.BACKEND.factor = stub_factor
+    try:
+        values, _, _ = EIG.solve_modes(
+            A_free, B_free, 4, points,
+            edges=edges, tets=tets, tet_edges=tet_edges,
+            free_edges=free, constrained=constrained, verbose=False,
+            backend=B.GPU,
+        )
+    finally:
+        EIG.BACKEND.factor = real_factor
+
+    assert EIG.LAST_BACKEND == B.CPU
+    assert np.all(np.asarray(values) > 0), values
+    assert (("K", B.CPU) in seen), ("the cuDSS ALLOC_FAILED shape must retry too", seen)
+
+
+def test_a_gpu_failure_that_is_not_out_of_memory_does_not_retry(monkeypatch):
+    """A real solve failure must still fail.
+
+    Retrying everything would turn a genuine numerical problem into a long CPU
+    run that fails the same way, and would hide the GPU error from the log.
+    """
+    points, tets, edges, tet_edges, free, constrained, A_free, B_free = _box_matrices()
+
+    calls = []
+
+    def stub_factor(matrix, *, label, spd_lu, backend=None):
+        calls.append((label, backend))
+        raise EIG.EigenError("CUDA_ERROR_ILLEGAL_INSTRUCTION")
+
+    real_factor = EIG.BACKEND.factor
+    EIG.BACKEND.factor = stub_factor
+    try:
+        with pytest.raises(EIG.EigenError):
+            EIG.solve_modes(
+                A_free, B_free, 4, points,
+                edges=edges, tets=tets, tet_edges=tet_edges,
+                free_edges=free, constrained=constrained, verbose=False,
+                backend=B.GPU,
+            )
+    finally:
+        EIG.BACKEND.factor = real_factor
+
+    assert all(b == B.GPU for _, b in calls), (
+        "no CPU attempt may be made for a non-OOM failure", calls
+    )
+
+
+def test_a_gpu_oom_on_a_problem_the_cpu_cannot_hold_is_refused_before_the_cpu_runs(
+    monkeypatch,
+):
+    """Refused, not attempted.
+
+    Filling the CPU worker's memory to discover the same thing costs the whole
+    job and can take the node down with it. ``cpu_fits`` is asked first.
+    """
+    points, tets, edges, tet_edges, free, constrained, A_free, B_free = _box_matrices()
+
+    calls = []
+
+    def stub_factor(matrix, *, label, spd_lu, backend=None):
+        calls.append((label, backend))
+        raise _oom()
+
+    real_factor = EIG.BACKEND.factor
+    EIG.BACKEND.factor = stub_factor
+    try:
+        with pytest.raises(B.FullOnBothProcessors) as caught:
+            EIG.solve_modes(
+                A_free, B_free, 4, points,
+                edges=edges, tets=tets, tet_edges=tet_edges,
+                free_edges=free, constrained=constrained, verbose=False,
+                backend=B.GPU,
+                cpu_fits=lambda: False,
+            )
+    finally:
+        EIG.BACKEND.factor = real_factor
+
+    assert not any(b == B.CPU for _, b in calls), (
+        "the CPU must not be attempted when cpu_fits says it cannot hold it",
+        calls,
+    )
+    assert "out of memory" in str(caught.value).lower()
+
+
+def test_both_processors_running_out_names_both(monkeypatch):
+    """The CPU's message alone is not the truth.
+
+    ``cpu_fits`` prices the assembled system against the worker's cap. When it
+    says yes and the CPU then cannot hold it, reporting only the CPU's error
+    tells the owner the object was too big for us and never that the GPU also
+    failed -- which is the part they were not told and the reason the first
+    attempt died.
+    """
+    points, tets, edges, tet_edges, free, constrained, A_free, B_free = _box_matrices()
+
+    def stub_factor(matrix, *, label, spd_lu, backend=None):
+        raise _oom("out of memory on CPU: failed to allocate")
+
+    real_factor = EIG.BACKEND.factor
+    EIG.BACKEND.factor = stub_factor
+    try:
+        with pytest.raises(B.FullOnBothProcessors) as caught:
+            EIG.solve_modes(
+                A_free, B_free, 4, points,
+                edges=edges, tets=tets, tet_edges=tet_edges,
+                free_edges=free, constrained=constrained, verbose=False,
+                backend=B.GPU,
+                cpu_fits=lambda: True,
+            )
+    finally:
+        EIG.BACKEND.factor = real_factor
+
+    text = str(caught.value).lower()
+    assert "gpu" in text, text
+    assert "cpu" in text, text
+    assert caught.value.__cause__ is not None, (
+        "the GPU error must stay as the cause, not be replaced by the CPU's"
+    )
+
+
+def test_the_owner_is_told_the_gpu_ran_out_of_memory(monkeypatch):
+    """The user-facing sentence, at the tip, for an OOM that could not be retried."""
+    import mse_maxwell_solver as SOLVER
+
+    exc = _oom()
+    message = SOLVER.owner_message(exc)
+    assert "memory" in message.lower(), message
+    assert "graphics processor" in message.lower() or "gpu" in message.lower() or (
+        "gpu's memory" in message.lower()
+    ), message
+    assert "too complex" not in message.lower(), (
+        "an OOM is not a statement about the object's difficulty", message
+    )

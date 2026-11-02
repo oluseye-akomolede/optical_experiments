@@ -34,6 +34,7 @@ import numpy as np  # noqa: E402  (must follow the thread caps)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import mse_backend as BACKEND  # noqa: E402
 import mse_common  # noqa: E402
 import mse_db  # noqa: E402
 import mse_eigen as EIG  # noqa: E402
@@ -95,8 +96,14 @@ def set_max_tets(limit: int | None) -> None:
     global _MAX_TETS_OVERRIDE
     _MAX_TETS_OVERRIDE = None if limit is None else max(1, int(limit))
 
-class TooBigForProcessor(Exception):
+class TooBigForProcessor(BACKEND.FullOnBothProcessors):
     """This job is fine but this machine is not -- re-route it, do not fail it.
+
+    A subclass of the backend-level refusal for the same situation reached the
+    other way: there, the GPU failed and the CPU could not hold the retry; here,
+    the mesh is simply over this machine's cap from the start. Both mean
+    "re-route it", and every handler that catches one should catch the other,
+    which is why the app-facing type sits underneath.
 
     Distinct from :class:`mse_meshing.MeshingError` on purpose. A job over the
     *cluster's* limit has a home on the GPU, so the app re-queues it there; a
@@ -398,6 +405,14 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
     #       No backend can do it. Raise MeshingError, which the owner sees as a
     #       plain "too detailed" message -- there is no point re-routing.
     #
+    #   the GPU's FREE memory is exhausted, but the CPU may hold it
+    #       Handled in `mse_eigen`, not here: it retries on the CPU, and only
+    #       raises (a subclass of) FullOnBothProcessors when `cpu_fits` says
+    #       the CPU cannot hold the problem either. That case is TERMINAL on a
+    #       Jetson row -- the app skips jetson rows before reading any re-route
+    #       token -- and the owner is told the machine's processor was busy.
+    #       No automatic retry is promised, because none happens.
+    #
     # Without this the estimate is load-bearing on its own, and a job that
     # under-estimated its way onto the CPU would be killed by the memory limit
     # with a message that says nothing about why.
@@ -446,6 +461,11 @@ def solve(job_id: str, units: str, n_index: float, n_modes: int,
         edges=edges, tets=tets, tet_edges=tet_edges,
         free_edges=free_edges, constrained=constrained, verbose=verbose,
         backend=backend,
+        # The same count the gate above already measured. Handing it down means
+        # a GPU out-of-memory on an over-cap problem is refused before a CPU
+        # solve is started, instead of being found by filling the CPU worker's
+        # memory with work the gate was always going to refuse.
+        cpu_fits=lambda: n_tets_actual <= cpu_max_tets(),
     )
     residual_note = (
         f", worst refined residual {EIG.LAST_WORST_RESIDUAL:.2e}"
@@ -630,7 +650,10 @@ def termination_message(exc: BaseException, limit: int = 4096) -> str | None:
     silently truncates over it; truncating here means the token is never the
     part that gets cut.
     """
-    if not isinstance(exc, TooBigForProcessor):
+    # The BASE type, so both routes to "re-route it, this machine is too small"
+    # carry the token: a mesh over this machine's cap before the solve starts,
+    # and a GPU out-of-memory whose CPU retry the same cap rules out.
+    if not isinstance(exc, BACKEND.FullOnBothProcessors):
         return None
     return f"{REROUTE_TOKEN}: {exc}"[:limit]
 
@@ -652,11 +675,11 @@ def _write_termination_log(text: str, path: str = "/dev/termination-log") -> boo
 #: The words that mean "the GPU ran and said no to THIS job". Spelled the ways
 #: cuDSS (CUDSS_STATUS_ALLOC_FAILED), nvmath's prose and the driver say it.
 #: Shared by both ``_names_*`` helpers below so the two cannot disagree about
-#: which side of the line an allocation failure falls on.
-ALLOC_FAILURE_WORDS = (
-    "alloc_failed", "alloc failed", "allocation failed", "allocation_failed",
-    "out of memory", "outofmemory", "insufficient memory",
-)
+#: which side of the line an allocation failure falls on. DEFINED in
+#: ``mse_backend`` and read from there, not retyped: ``mse_eigen`` uses the same
+#: list to decide whether to retry the solve on the CPU, so a copy here would
+#: let the retry and the owner's message disagree about what an OOM is.
+ALLOC_FAILURE_WORDS = BACKEND.OOM_WORDS
 #: The words that mean "the GPU would not come up" -- the opposite verdict.
 GPU_INIT_WORDS = (
     "initializ", "initialis",
@@ -664,6 +687,24 @@ GPU_INIT_WORDS = (
     "device not found", "driver",
     "context creation", "context init",
     "nvrtc", "cuda_driver",
+)
+#: The words that mean the CUDA maths library itself would not LOAD -- a broken
+#: install, not a statement about the object.
+#:
+#: Measured on the Jetson (job e9423834, 2026-11-02): the chain was
+#: ``NvMapMemAllocInternalTagged: ... error 12`` (the unified-memory carve-out
+#: was exhausted, so the loader could not map the library) followed by
+#: ``DynamicLibNotFoundError: Failure finding "libcudss.so.0"``, wrapped by
+#: ``mse_eigen`` as ``EigenError("could not factor A + sB: ...")``. Neither the
+#: memory words nor the GPU-init words matched, so the owner was told to "try a
+#: simpler object" -- advice that cannot work, because NO object size makes a
+#: missing library appear.
+LIBRARY_LOAD_WORDS = (
+    "dynamiclibnotfound",
+    "failure finding",
+    "no such file: libcudss",
+    "libcudss.so",
+    "error while loading shared libraries",
 )
 
 
@@ -687,6 +728,29 @@ def _names_an_allocation_failure(exc: BaseException) -> bool:
         depth += 1
         text = f"{type(node).__name__}: {node}".lower()
         if any(word in text for word in ALLOC_FAILURE_WORDS):
+            return True
+        node = node.__cause__ or node.__context__
+    return False
+
+
+def _names_a_library_load_failure(exc: BaseException) -> bool:
+    """Could this ``EigenError`` mean the CUDA maths library would not load?
+
+    Same chain walk as the other two recognisers and for the same reason: the
+    type is always ``EigenError``. Checked BEFORE the GPU-init words, because
+    the ``DynamicLibNotFoundError`` cause also contains "cuda" in its
+    qualified name and would otherwise be read as "the GPU is absent" -- the
+    owner would be told to retry a run that can never succeed until we fix the
+    image.
+    """
+    seen: set[int] = set()
+    node: BaseException | None = exc
+    depth = 0
+    while node is not None and depth < 10 and id(node) not in seen:
+        seen.add(id(node))
+        depth += 1
+        text = f"{type(node).__name__}: {node}".lower()
+        if any(word in text for word in LIBRARY_LOAD_WORDS):
             return True
         node = node.__cause__ or node.__context__
     return False
@@ -733,6 +797,21 @@ def owner_message(exc: BaseException) -> str:
     """
     if isinstance(exc, (MESH.MeshingError, FLD.SamplingError)):
         return str(exc)
+    if isinstance(exc, BACKEND.FullOnBothProcessors) and not isinstance(
+            exc, TooBigForProcessor):
+        # The GPU ran out of memory and the CPU could not hold the same
+        # problem. It must be told plainly and must NOT fall through to the
+        # apology below: "contact support" leaves the owner with no idea that
+        # the machine was simply busy.
+        #
+        # No re-queue is promised. On the Jetson the row is failed by the
+        # worker, not re-routed (the app skips jetson rows before it ever reads
+        # a re-route token), so a sentence about queueing would be false.
+        return (
+            "The solver machine's graphics processor was busy and the job was "
+            "too large to run on its main processor instead. Please try again "
+            "later."
+        )
     if isinstance(exc, TooBigForProcessor):
         # Reached only when nothing re-routed it. The owner cannot act on a
         # routing failure, so they get the same plain "too detailed" answer they
@@ -745,6 +824,18 @@ def owner_message(exc: BaseException) -> str:
     if isinstance(exc, ValueError):
         return str(exc)
     if isinstance(exc, EIG.EigenError):
+        if _names_a_library_load_failure(exc):
+            # The solver's CUDA library did not load (job e9423834). Measured
+            # cause there: the board's memory carve-out was exhausted, so the
+            # loader could not map libcudss. Either way the owner cannot act on
+            # it and the object is not at fault, so the generic sentence below
+            # would send them off to simplify an object that is fine.
+            return (
+                "Our solver could not start its maths library on this machine "
+                "for this run. This is a problem on our side, not with your "
+                "object -- please try again later, and contact support if it "
+                "keeps happening."
+            )
         if _names_an_allocation_failure(exc):
             # ALLOC_FAILED is not a verdict about the object's difficulty, and
             # the generic EigenError text below would be a LIE about it: the

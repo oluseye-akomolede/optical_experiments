@@ -747,6 +747,38 @@ def test_owner_messages_are_plain_english():
             assert jargon not in message, f"{jargon!r} leaked into {message!r}"
 
 
+def test_a_problem_too_big_for_both_processors_gets_the_busy_machine_message():
+    """The owner reads that the MACHINE was busy, not that we are stumped.
+
+    ``FullOnBothProcessors`` is raised when the GPU ran out of memory and the
+    CPU could not hold the same problem. ``TooBigForProcessor`` inherits from
+    it, so a branch on the subclass alone lets the base type fall through every
+    isinstance test to the generic "contact support" apology -- the wrong
+    message for the one case this change exists to explain.
+
+    Asks ``owner_message`` for the sentence, because ``pytest.raises`` alone
+    would pass with the generic text in place.
+    """
+    import mse_backend as B
+    import mse_maxwell_solver as SOL
+
+    message = SOL.owner_message(
+        B.FullOnBothProcessors("the GPU ran out of memory and the CPU cannot hold it"))
+    lowered = message.lower()
+    assert "busy" in lowered, message
+    assert "try again later" in lowered, message
+    assert "contact support" not in lowered, (
+        "the both-processors-full case fell through to the generic apology")
+    assert "too complex" not in lowered and "simpler object" not in lowered, (
+        f"the owner was told the object is at fault: {message!r}")
+
+    # The subclass keeps its own, more specific sentence: it is a different
+    # situation ("over this machine's cap"), not the fallback-refusal one.
+    too_big = SOL.owner_message(
+        SOL.TooBigForProcessor("mesh over this machine's cap"))
+    assert "too large to solve with the processors available" in too_big, too_big
+
+
 def test_local_store_refuses_to_escape_its_root(tmp_path):
     """The path stand-in for the bucket must not be a traversal hole."""
     import mse_storage as STORE

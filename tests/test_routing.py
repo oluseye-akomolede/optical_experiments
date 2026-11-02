@@ -338,6 +338,40 @@ def test_the_solver_writes_the_token_only_for_the_reroutable_outcome():
     assert SOLVER.termination_message(RuntimeError("nope")) is None
 
 
+def test_a_gpu_oom_the_cpu_cannot_take_reroutes_only_a_cluster_row():
+    """What the both-processors-full refusal does, stated honestly.
+
+    It is raised at backend level (``mse_eigen`` must not import the solver),
+    so its type is ``FullOnBothProcessors`` and NOT ``TooBigForProcessor``.
+    The token check tests the BASE type, so this refusal does carry the
+    re-route token -- which matters for a CLUSTER row, where the app reads it
+    and moves the job.
+
+    On a Jetson row it carries the token and nothing reads it: the app skips
+    jetson rows before checking for one. So the row is failed by the worker,
+    and the owner's text is the busy-machine message, not an apology. This
+    test pins both halves so neither is assumed from the other.
+    """
+    import mse_backend as B
+    import mse_maxwell_solver as SOLVER
+
+    refusal = B.FullOnBothProcessors(
+        "the GPU ran out of memory solving this problem (ALLOC_FAILED (2)), "
+        "and the same problem is too large to retry on the CPU."
+    )
+    assert not isinstance(refusal, SOLVER.TooBigForProcessor), (
+        "the backend cannot raise the solver's subclass, so this test only "
+        "means something if the token check does NOT rely on it"
+    )
+    message = SOLVER.termination_message(refusal)
+    assert message is not None, "a cluster row must be able to re-route this"
+    assert message.startswith(SOLVER.REROUTE_TOKEN)
+    # The half that actually bit the Jetson: the text the owner reads.
+    owner_text = SOLVER.owner_message(refusal)
+    assert "try a simpler object" not in owner_text.lower()
+    assert "busy" in owner_text.lower()
+
+
 def test_the_termination_message_is_truncated_below_the_kubernetes_cap():
     """Kubernetes keeps 4 KiB of the message and cuts the rest. Truncating
     ourselves means the token is never the part that gets cut."""
