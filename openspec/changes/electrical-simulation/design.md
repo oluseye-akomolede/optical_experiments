@@ -206,13 +206,13 @@ an equal-area cylinder (R_eq = √(A/π) = 218 nm), about 1.15/h² triangle node
 | D3 3-D | 20 / 30 | 5.7 × 10⁵ | ≥ 14 GiB | 0.8 GiB | **marginal**: direct is near the 16 GiB container; resolves only N ≲ 10¹⁶ |
 | D3 3-D | 10 / 20 | 7.7 × 10⁵ | ≥ 21 GiB | 1.1 GiB | direct does not fit |
 | D3 3-D | 5 / 10 | 2.5 × 10⁶ | ≥ 103 GiB | 3.5 GiB | direct does not fit (N ≈ 10¹⁷) |
-| D3 3-D | 2 / 10 | 1.9 × 10⁷ | ≥ 1.5 TiB | 26 GiB | **does not fit** (N ≈ 10¹⁸) |
+| D3 3-D | 2 / 10 | 1.86 × 10⁷ | ≥ 1.45 TiB | 26 GiB | **does not fit** (N ≈ 10¹⁸) |
 
 Worked D3 2/10: junctions 2 × 100 × 1.49 × 10⁵ = 2.98 × 10⁷ nm³, /8 × 1.54 = 5.75 × 10⁶
 nodes; bulk (2.23 × 10⁸ − 2.98 × 10⁷)/10³ × 1.54 = 3.0 × 10⁵; oxide (a 10 nm side shell,
 6R × 10 × 1500 = 2.15 × 10⁷ nm³, plus the buffer under the wire, 1.8 × 10⁶ nm³, at a 6 nm
 edge) 2.33 × 10⁷/216 × 1.54 = 1.7 × 10⁵; total
-6.2 × 10⁶ nodes, 1.86 × 10⁷ unknowns. LU: 9 × 10⁹ × 6.21^{4/3} × 15.6 B = 1.6 TB.
+6.2 × 10⁶ nodes, 1.86 × 10⁷ unknowns. LU: 9 × 10⁹ × 6.21^{4/3} × 15.6 B = 1.60 × 10¹² B ≈ 1.45 TiB (the table row uses these unrounded figures).
 
 The AMG column assumes an iterative solver converges on coupled drift-diffusion Newton
 steps. That is not routine, and whether DEVSIM offers one is (unsure). The LU column is the
