@@ -47,6 +47,22 @@ carry a caveat that carriers were not solved.
 - **WHEN** `analysis = "drift-diffusion"` and no part carries doping
 - **THEN** the job fails with a message naming the missing doping, before any solve
 
+### Requirement: The quantum-dot analysis SHALL be an optional add-on, never a precondition
+The device analysis SHALL run from `parts`, `contacts` and `voltages_v` alone. The quantum-dot
+add-on — the Stark sweep `E_X(V)`, the electron-hole overlap and dipole, the link into the
+Purcell runs, and the photon timing — SHALL run only when the request's `dot` is non-null, and
+its outputs SHALL be written only then. A request without `dot` SHALL be accepted and solved as
+the device alone; it SHALL NOT be refused for lacking a dot, a spectrum or a doping profile.
+
+#### Scenario: A request with no dot is solved as a device
+- **WHEN** an `elec` request has `dot = null`
+- **THEN** the job solves and reports the device, and writes no `stark.json`
+
+#### Scenario: A dot request adds the analysis without changing the device solve
+- **WHEN** two requests differ only in `dot`
+- **THEN** their device outputs (potential, contacts' currents) agree, and only the dotted one
+  carries the add-on's outputs
+
 ### Requirement: Multi-terminal biasing SHALL sweep one terminal at a time
 `contacts` SHALL map each contact part name to either a fixed voltage in `voltages_v` or
 `ground`. Exactly one contact SHALL be the swept terminal; every other contact SHALL be fixed.
@@ -69,12 +85,14 @@ is fixed.
 An `elec` job SHALL be stored in the jobs table with `kind = 'elec'` and its request in an
 `elecs` JSON column, NULL for every other kind. The request keys SHALL be exactly the worker's
 `ELEC_REQUEST_KEYS` list: `parts` (per uploaded part: `name`, `material` or `eps_static`, and
-for a semiconductor its carrier parameters; `doping_cm3` optional; `contact` optional — the
-voltage in `voltages_v` or `ground`), `contacts` (contact part name → the swept terminal or a
-fixed voltage or `ground`), `voltages_v` (the sweep of the single swept terminal, at most 41
+for a semiconductor its carrier parameters; `doping_cm3` optional), `contacts` (contact part
+name → the swept terminal or a fixed voltage or `ground`; a part named here is a contact and
+needs no material of its own), `voltages_v` (the sweep of the single swept terminal, at most 41
 values), `pulse` (null, or a step/pulse waveform), `dot` (null, or the add-on's dot: centre in
 the upload's units, material and dipole orientation) and `spectrum` (null, or the stored name
-of an attached `purcell_spectrum.json`). Every key SHALL be present. The worker SHALL refuse a
+of an attached `purcell_spectrum.json`). Every key SHALL be present. Contact-ness SHALL have
+exactly one home, `contacts`; a part listed there that also carries a material, and a part
+listed in both a material form and `contacts`, SHALL be refused naming the part. The worker SHALL refuse a
 missing key, naming every missing key, and an `elecs` that is not an object. Keys outside the
 list SHALL be ignored. The column SHALL be added idempotently by `db/001_schema.sql` and
 dropped by a rollback script of its own.

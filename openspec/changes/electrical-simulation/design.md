@@ -1,7 +1,26 @@
 # Design — electrical-simulation
 
-Revised on 2026-11-01 after the owner's answers (`tasks.md` 0.1). The superconductor track
-moved, unchanged, to the separate change `superconductor-models`.
+Revised on 2026-11-01 after the owner's answers (`tasks.md` 0.1), and again on 2026-11-02
+after the owner widened it to a general-purpose solver (`tasks.md` 0.3). The superconductor
+track moved, unchanged, to the separate change `superconductor-models`; "loss" moved to
+`optical-loss`.
+
+**The shape, after 2026-11-02: the job is general and paper 1 is a fixture.** The device
+below is the first validation bench, not the limit of what the request can describe. Any
+number of parts and contacts, materials from the shipped library (task 2.2) with per-part
+overrides, electrostatics and drift-diffusion in an axisymmetric cylinder form or in 3-D.
+Paper 1 is one entry in the bench set, alongside a parallel-plate capacitor and a
+multi-terminal stack (`electrostatics` spec), because generality must be tested by something
+that is not the wire.
+
+**Two forms, and why.** A round device can be solved as a 2-D (r, z) mesh of an equal-area
+cylinder, each node and edge weighted by 2πr, which is far cheaper than 3-D for the same
+resolution. The form is offered only when the uploaded cross-section is round to within 2 %
+(circumradius vs inradius), refused at upload otherwise with both figures named. Everything
+else is 3-D. A 3-D run is admitted only when its own priced estimate fits the Job (task 2.5):
+the estimate comes from the node and edge counts of the mesh that geometry would build, so two
+devices that differ only in size get different answers. §5 below prices that mesh; it is the
+method the check uses, not a table the check reads.
 
 The rule throughout: start with the simplest model that gives a useful number. Check it
 against an answer we did not compute ourselves, and move up a rung only when an owner question
@@ -9,7 +28,8 @@ needs it. Every model has an answer key (exact or published) and a mutation that
 its check fail. Citations marked **(unsure)** are from memory. They must be checked against
 the source before any code or test quotes a number from them, and the task that adds such a
 test fetches the source first. **Every compute figure here is an estimate** until a bench
-measures it.
+measures it. The materials library obeys the same rule with no exceptions: a library value
+ships only after it is read from its cited source (task 0.2, 2.2).
 
 ## 0. The device and what exists
 

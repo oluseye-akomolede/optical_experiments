@@ -47,6 +47,26 @@ electrode's nodes and return the Maxwell capacitance matrix in farads.
 - **WHEN** `capacitance_matrix` is computed for three or more electrodes
 - **THEN** C is symmetric within 1e-6 relative and each row sums to ≤ 0 off-diagonal
 
+### Requirement: Generality SHALL be tested on devices that are not a wire
+The benches SHALL include at least two devices whose geometry is not the paper-1 wire: a
+**parallel-plate capacitor** whose capacitance is C = ε₀ε_r A/d within 2 %, and a
+**multi-terminal MOS-like stack** (a substrate, an oxide, two top electrodes at different
+voltages) whose capacitance matrix is checked against the two-terminal series/parallel
+closed forms and whose three-electrode symmetry is checked. Paper 1 SHALL be one fixture
+among these, not the only one.
+
+#### Scenario: Parallel plates match the closed form
+- **WHEN** a parallel-plate capacitor with known area and gap is solved at two dielectric
+  constants
+- **THEN** its capacitance is ε₀ε_r A/d within 2 %, and the ratio of the two runs is the ratio
+  of the dielectric constants
+
+#### Scenario: A three-terminal stack has the right cross-couplings
+- **WHEN** a substrate and two top electrodes are solved with the substrate grounded
+- **THEN** the capacitance matrix matches the closed forms, C is symmetric, and the coupling
+  between the two top electrodes is positive and smaller than either's coupling to ground
+
+
 ### Requirement: Electrostatics SHALL refuse a mesh over the admission budget before factorising
 `solve` SHALL take `budget=None` (bytes). With `None` it SHALL read the machine's admission
 budget at call time (`admission_budget()`, as the time-domain `check_limits` does), not a fixed
