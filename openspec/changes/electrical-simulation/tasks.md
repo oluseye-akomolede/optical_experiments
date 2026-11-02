@@ -84,9 +84,17 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       (task 2.4). These are recorded as design in `design.md`.
 
 ## 1. Phase 1: electrostatics and the Stark shift
-- [ ] 1.1 `tetrahedralize(..., sizing=None)`: a per-part target edge built into a `-m`
+- [x] 1.1 `tetrahedralize(..., sizing=None)`: a per-part target edge built into a `-m`
       background mesh. The default path stays byte-for-byte today's; the maxwell-solver tests
       stay green. Test that the graded mesh's edge in each part is within its target.
+      **Fix (reviewer): the override test never reached the guard.** The first fixture
+      (n=1.5 core, 4 modes) gave the core a 0.617 mm optical allowance against a 0.273 mm
+      achieved edge, so deleting the override changed nothing and the test still passed 10/10.
+      Rebuilt on a fine-optics fixture (n=3.5 core, 16 modes): deleting the override makes the
+      guard REFUSE, naming the core at 1.642× its optical allowance (needs 0.1665 mm, achieved
+      0.2734 mm); with the override present the same build is ACCEPTED at 1.094× its caller
+      allowance (0.25 mm). The test now asserts that inequality against the plan the build
+      used, so it fails if the fixture stops reaching the line.
 - [ ] 1.2 P1 assembly with per-part ε_s; one-tet element matrix against the closed form;
       row sums 0.
 - [ ] 1.3 Electrode Dirichlet reduction, direct solve through `mse_backend.factor`, input

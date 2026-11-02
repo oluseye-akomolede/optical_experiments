@@ -519,6 +519,7 @@ def tetrahedralize(
     materials: dict | None = None,
     parts=None,
     graded: bool | None = None,
+    sizing: dict | None = None,
 ):
     """Tetrahedralize and return ``(points_m, tets, region_of_tet)`` in metres.
 
@@ -543,6 +544,23 @@ def tetrahedralize(
     ``min_feature_m`` is the owner's declared smallest feature in METRES --
     converted once at the upload form from its own nm/um/mm selector, never
     from the object's units. It lowers the target edge and never raises it.
+
+    ``sizing`` is a CALLER-SUPPLIED per-part target edge, ``{part name: edge
+    in METRES}``, and ``None`` (the default) is byte-for-byte the path
+    described below. It exists because the optical rule below derives every
+    region's edge from REFRACTIVE INDEX (``h * n_wall / n_r``), which the
+    electrical solver does not have: its resolution requirement is a skin depth
+    and a dielectric permittivity. Given ``sizing``, each named part's target
+    IS that part's own requirement -- it both sets the graded target and
+    REPLACES the optical ``own_edge_units`` the resolution guard judges that
+    region against, because for an electrical mesh the optical number is not
+    the requirement and holding a region to it would either refuse a mesh the
+    caller asked for (when the caller's edge is coarser) or silently accept a
+    coarser mesh than the physics needs. A part ``sizing`` does not name is
+    REFUSED rather than defaulted: a defaulted region is solved at an edge
+    nobody chose, which is the silent-wrong-answer shape this module refuses
+    elsewhere. ``sizing`` needs a multi-part upload; with one part there is no
+    per-part anything, and it is refused rather than ignored.
     ``scale`` multiplies every vertex before anything is measured, so the
     volume, the surface edge and the target edge all describe the object the
     solver was actually asked to solve.
@@ -689,11 +707,24 @@ def tetrahedralize(
     want_graded = graded_meshing() if graded is None else bool(graded)
     graded = False
     multi = parts is not None and getattr(parts, "is_multi", False)
+    if sizing is not None:
+        # Checked before the multi-part branch so a one-part upload is REFUSED
+        # rather than falling through to a path that would ignore the argument.
+        if not multi:
+            raise MeshingError(
+                "sizing= names a target edge per part, so it needs a "
+                "multi-part upload; this one has a single part."
+            )
     if multi:
         region_plan = _region_plan(parts, materials, edge_units, units, verbose,
                                    graded=want_graded)
         edge_units = region_plan["h_min_units"]
         graded = region_plan["graded"]
+        if sizing is not None:
+            _apply_caller_sizing(region_plan, sizing, parts, unit_scale_m,
+                                 verbose)
+            edge_units = region_plan["h_min_units"]
+            graded = region_plan["graded"]
 
     maxvolume = target_maxvolume(surface, edge_units)
 
@@ -1217,6 +1248,94 @@ def _add_graded_keys(plan, parts, materials, edge_units, units, verbose):
             print(
                 f"[mse] graded region {rid}: edge "
                 f"{edge_m[rid] / scale:.4g} {units}{note}",
+                flush=True,
+            )
+
+
+def _apply_caller_sizing(plan: dict, sizing: dict, parts, unit_scale_m: float,
+                         verbose: bool = False) -> None:
+    """Lay a CALLER-SUPPLIED per-part target edge over ``plan``, in place.
+
+    ``sizing`` is ``{part name: edge in METRES}``. It overwrites, for every
+    region whose part it names:
+
+        edge_m            the graded target -- what the sizing field builds to
+        own_edge_units    the requirement the resolution GUARD reads
+        h_min_m / h_min_units / coarse_edge_m / fine_region / coarse_region /
+        graded            derived again from the new ``edge_m``
+
+    The product's optical keys (``unclamped_m``, ``thickness_m``, ``clamped``)
+    are recomputed as "not clamped", because the thickness clamp is a property
+    of the optical grading law -- it pulls a coarse region toward the finest
+    edge using a wall thickness, and a caller who states a skin-depth target
+    has already decided that region's edge. Leaving a stale ``clamped`` flag
+    from the optical pass would report a clamp that did not happen.
+
+    REFUSALS, all before any mesh is built:
+
+    * a part named in ``sizing`` that is not a part of this upload -- a typo
+      would otherwise be silently dropped, and the region it meant would be
+      meshed at the optical edge;
+    * a part of this upload that ``sizing`` does not name -- see the
+      ``tetrahedralize`` docstring;
+    * a non-positive or non-finite edge -- ``target_maxvolume`` would divide by
+      zero, and a NaN would reach TetGen as a metric value.
+    """
+    names = list(parts.names)
+    unknown = sorted(set(sizing) - set(names))
+    if unknown:
+        raise MeshingError(
+            f"sizing= names part(s) {unknown} that this upload does not have "
+            f"(its parts are {sorted(names)})."
+        )  # noqa: E501
+    missing = sorted(set(names) - set(sizing))
+    if missing:
+        raise MeshingError(
+            f"sizing= does not name part(s) {missing}; every part needs its "
+            f"own target edge, and a defaulted region would be meshed at an "
+            f"edge nobody chose."
+        )
+
+    edge_m = {}
+    for part_index, region_id in enumerate(parts.region_of_part):
+        h_m = float(sizing[names[part_index]])
+        if not np.isfinite(h_m) or h_m <= 0.0:
+            raise MeshingError(
+                f"sizing= gives part {names[part_index]!r} an edge of {h_m!r}; "
+                f"a target edge must be a positive, finite length in metres."
+            )
+        edge_m[int(region_id)] = h_m
+
+    h_min_m = min(edge_m.values())
+    coarse_edge_m = max(edge_m.values())
+    plan.update(
+        edge_m=edge_m,
+        unclamped_m=dict(edge_m),
+        thickness_m={r: float("inf") for r in edge_m},
+        clamped={r: False for r in edge_m},
+        fine_region=int(min(edge_m, key=edge_m.get)),
+        coarse_region=int(max(edge_m, key=edge_m.get)),
+        h_min_m=h_min_m,
+        coarse_edge_m=coarse_edge_m,
+        # The SAME collapse test ``_add_graded_keys`` uses: a plan whose edges
+        # all land on one edge meshes uniformly, and saying it is graded would
+        # send the build down the sizing-field arm for a mesh with no field.
+        graded=bool((coarse_edge_m - h_min_m) > 1e-9 * max(h_min_m, 1.0)),
+        h_min_units=h_min_m / unit_scale_m,
+    )
+    # The per-region GUARD reads ``shared[rid]["own_edge_units"]``. For an
+    # electrical mesh the caller's edge IS that region's requirement, so the
+    # optical one must go -- see the ``tetrahedralize`` docstring for both
+    # failure directions if it stayed.
+    for region_id in edge_m:
+        plan["shared"][region_id]["own_edge_units"] = (
+            edge_m[region_id] / unit_scale_m
+        )
+    if verbose:
+        for rid in sorted(edge_m):
+            print(
+                f"[mse] caller sizing region {rid}: edge "
+                f"{edge_m[rid] / unit_scale_m:.4g} (from sizing=)",
                 flush=True,
             )
 
