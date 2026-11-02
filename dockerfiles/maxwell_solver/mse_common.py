@@ -600,12 +600,14 @@ def estimate_tets_by_region(parts, materials, edge_units: float,
 
 # --- GRADED overlay (OpenSpec change ``per-region-mesh-grading``) -----------
 #
-# Everything below is OPT-IN. The product's rule is the uniform plan above:
-# ``region_plan`` meshes every region at ``h_min`` and the per-region guard
-# reads ``own_edge_units``. The overlay is built ON TOP of that plan -- it adds
-# keys to it and replaces none -- and only the mesher's ``grading=True`` path
-# and the grading benches read the added keys. Making grading the product's
-# default (tasks.md step 3) is NO GO, so no product caller reaches this code.
+# Everything below is the GRADED overlay, which is the product's rule for a
+# multi-part upload since ``graded-meshing-default`` (``graded_meshing_enabled``
+# at the end of this block is its switch). The uniform plan above stays the
+# one-part path and the ``MSE_GRADED_MESHING=0`` rollback: ``region_plan``
+# meshes every region at ``h_min`` and the per-region guard reads
+# ``own_edge_units``. The overlay is built ON TOP of that plan -- it adds keys
+# to it and replaces none -- and the mesher's graded path, this module's
+# ``estimate_tets_graded`` and the grading benches read the added keys.
 
 #: The thickness clamp. A graded region's target is delivered by TetGen's
 #: sizing field, and a target that approaches the region's own thickness makes
@@ -707,6 +709,32 @@ def graded_region_edges(h: float, n_wall: float, materials: dict, parts,
     return out
 
 
+#: The environment variable that turns per-region grading OFF (OpenSpec change
+#: ``graded-meshing-default``): its rollback switch. Grading is ON unless this
+#: is one of the explicit off spellings.
+GRADED_MESHING_ENV = "MSE_GRADED_MESHING"
+
+#: The spellings of ``MSE_GRADED_MESHING`` that mean OFF. Everything else,
+#: including unset, means ON -- a value nobody intended must not quietly change
+#: which mesh the product builds.
+GRADED_MESHING_OFF_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def graded_meshing_enabled(environ=None) -> bool:
+    """Whether a multi-part upload is meshed per-region -- THE product switch.
+
+    Lives here, in the module BOTH images carry (``mse_meshing``, which the
+    solver's mesher uses, and ``web/meshing.py``, which prices and routes the
+    upload), so the estimate cannot price a different mesh than the mesher
+    builds. The mesher's ``mse_meshing.graded_meshing()`` reads it and adds its
+    module-flag test seam on top; a product route never bypasses either.
+    """
+    if environ is None:
+        environ = os.environ
+    raw = environ.get(GRADED_MESHING_ENV, "")
+    return str(raw).strip().lower() not in GRADED_MESHING_OFF_VALUES
+
+
 def graded_region_plan(parts, materials, edge_m: float, units: str,
                        n_wall: float | None = None) -> dict:
     """:func:`region_plan` with the GRADED keys laid over it.
@@ -749,8 +777,15 @@ def estimate_tets_graded(parts, materials, edge_m: float,
 
     Same law and margin as :func:`estimate_tets_by_region` (``margin *
     TETS_PER_UNIT_VOLUME * sum_r V_r / h_r^3``); only the edges differ, so
-    where every region lands on one edge it is that function's number. Not on
-    any product route: the product meshes uniformly, so it prices uniformly.
+    where every region lands on one edge it is that function's number.
+
+    This IS the product's estimate for a multi-part upload since
+    ``graded-meshing-default`` (the mesher grades those uploads), called from
+    ``web.meshing.estimate_tets``; ``estimate_tets_by_region`` is what prices a
+    multi-part upload with grading switched OFF. The two must stay told apart by
+    the same switch that picks the mesher's path -- pricing a graded run with
+    the uniform sum under-counts its coarse regions (the sizing field refines
+    them past their targets), and the estimate is what routes the job.
     """
     plan = graded_region_plan(parts, materials, edge_m, units)
     if not plan:

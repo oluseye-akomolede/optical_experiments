@@ -258,6 +258,52 @@ def test_the_mode_count_choice_reaches_the_job(tmp_path):
     assert job["n_modes"] == 40
 
 
+def test_the_grading_switch_reaches_the_solver_job():
+    """The Job is TOLD which mesher the app priced, BOTH ways.
+
+    The app prices the upload with ``mse_common.graded_meshing_enabled`` and the
+    Job meshes with the same accessor -- but only if the setting crosses the pod
+    boundary. A Job pod starts from the image default, so a rollback
+    (``MSE_GRADED_MESHING=0``) reaching only the web pod would leave the solver
+    grading a mesh the app priced uniformly: one mesh priced, another built.
+    Both directions are pinned here because the ON side is the one nobody would
+    notice had gone missing.
+    """
+    kwargs = dict(job_id="grading-switch", units="mm", n_index=1.0, n_modes=5,
+                  solver_image="img", pull_secret="pull", namespace="ns")
+
+    def _value(manifest):
+        (container,) = manifest["spec"]["template"]["spec"]["containers"]
+        (entry,) = [e for e in container["env"]
+                    if e["name"] == JOBS.COMMON.GRADED_MESHING_ENV]
+        return entry["value"]
+
+    assert _value(JOBS.build_job_manifest(graded_meshing=True, **kwargs)) == "1"
+    assert _value(JOBS.build_job_manifest(graded_meshing=False, **kwargs)) == "0"
+
+
+def test_the_web_app_forwards_its_own_grading_setting(monkeypatch):
+    """The app does not guess: it sends what it priced with.
+
+    ``estimate_tets`` reads ``mse_common.graded_meshing_enabled()`` and the
+    ``manifest`` wrapper reads the same accessor at Job-build time. If those two
+    ever read different values, an upload is priced against one mesh and solved
+    against another. Pinning the environment and asserting the forwarded value
+    is what holds them to one answer.
+    """
+    monkeypatch.setenv("MSE_GRADED_MESHING", "0")
+    monkeypatch.setattr(JOBS.COMMON, "graded_meshing_enabled", lambda: False)
+    jobs = JOBS.K8sJobLauncher(namespace="ns", image="img",
+                               pull_secret="pull")
+    manifest = jobs.manifest("web-forward", units="mm", n_index=1.0, n_modes=5)
+    (container,) = manifest["spec"]["template"]["spec"]["containers"]
+    (entry,) = [e for e in container["env"]
+                if e["name"] == JOBS.COMMON.GRADED_MESHING_ENV]
+    assert entry["value"] == "0", (
+        "the app priced with grading OFF but told the Job to grade"
+    )
+
+
 # ---------------------------------------------------------------------------
 # The reroute signal, end to end
 # ---------------------------------------------------------------------------
@@ -1823,8 +1869,18 @@ def test_the_wall_region_volume_excludes_its_children():
     )
 
 
-def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
-    """The estimate and the mesher must agree, in one length space.
+def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds(monkeypatch):
+    """The UNIFORM model against the real mesher -- run with grading OFF.
+
+    Everything below this test's fixture is the uniform rule: one edge for the
+    whole cavity, the estimate IS the one-part law at ``h_min``. That rule is
+    still buildable (``MSE_GRADED_MESHING=0``) and still what TetGen sees then,
+    so this test pins it on the rollback side, with the switch forced OFF so the
+    numbers do not depend on the environment pytest happened to inherit.
+
+    The graded side is a DIFFERENT claim -- the estimate is the mesher's own
+    graded plan, not the ``h_min`` law -- and it is pinned by
+    ``test_the_graded_estimate_is_the_meshers_own_plan``.
 
     This is the row's own trap. The app's estimate ROUTES the job -- cluster
     (slow, cheap) vs Jetson (fast, scarce) -- and the mesher builds the mesh.
@@ -1842,6 +1898,7 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
     second assertion is exempt from TetGen's judgement: it is the law itself,
     and it is the one that stays true whatever the mesher delivers.
     """
+    monkeypatch.setenv("MSE_GRADED_MESHING", "0")
     parts, merged = _nested_parts()
     materials = {"wall": 1.0, "core": 2.0}
 
@@ -1967,6 +2024,49 @@ def test_the_multipart_estimate_is_pinned_to_the_mesh_the_solver_builds():
         f"the estimate ({estimate:,}) is not int({exact_multi:.4f}) = "
         f"{int(exact_multi):,}; the branch is not computing the one-part formula "
         f"at h_min on the filled volume"
+    )
+
+
+def test_the_graded_estimate_is_the_meshers_own_plan(monkeypatch):
+    """With grading ON the route prices the plan the mesher actually enumerates.
+
+    This is the product rule since graded-meshing-default, and it is a different
+    claim from the uniform test above: not "the estimate is the law at h_min",
+    but "the estimate is the count the mesher's own sizing field will deliver".
+    A route that kept pricing the uniform mesh while the mesher graded would
+    under-count every nested upload -- pricing a mesh nobody builds, which is
+    the bug this change exists to fix.
+
+    The two sides must differ on this fixture, or the test cannot tell which
+    rule the route used: uniform on a nested core is strictly cheaper than
+    graded (measured 62,519 vs 15,791 on the two-region family).
+    """
+    monkeypatch.setenv("MSE_GRADED_MESHING", "1")
+    parts, merged = _nested_parts()
+    materials = {"wall": 1.0, "core": 2.0}
+
+    estimate = MESH.estimate_tets(merged, 3, "mm", parts=parts,
+                                  materials=materials)
+
+    edge_units = COMMON.effective_edge_m(
+        merged, n_modes=3, units="mm", parts=parts, materials=materials)
+    graded = COMMON.estimate_tets_graded(
+        parts, materials, edge_units, merged, "mm", MESH.EST_TETS_MARGIN)
+    uniform = COMMON.estimate_tets_by_region(
+        parts, materials, edge_units, merged, "mm", MESH.EST_TETS_MARGIN)
+
+    assert estimate == graded, (
+        f"the route estimated {estimate:,} but the mesher's graded plan is "
+        f"{graded:,}; the upload is priced against a mesh the solver will not "
+        f"build"
+    )
+    assert graded != uniform, (
+        f"the graded plan ({graded:,}) equals the uniform sum ({uniform:,}) on "
+        f"a nested fixture, so this test cannot tell which rule the route used "
+        f"-- fix the fixture before trusting it. NOTE the direction is NOT "
+        f"assumed: graded is BELOW uniform here ({graded:,} < {uniform:,}), "
+        f"because the sizing field caps the core's refinement instead of "
+        f"applying h_min to every region."
     )
 
 
@@ -2675,13 +2775,19 @@ def test_a_nanometre_multipart_upload_is_not_refused_by_a_unit_bug(tmp_path):
     # And the estimate must be the SAME as the mm case's, because it is the
     # same object. Computed here from the app's own stored value rather than
     # re-derived, so a drift between the two paths is visible.
+    #
+    # Through ``estimate_tets``, the same entry the route prices with -- NOT
+    # the per-region estimator directly. The route stores whatever rule the
+    # switch selects, so asking a DIFFERENT rule here would compare two estimators
+    # and read a "unit bug" that does not exist (measured: with grading OFF both
+    # spellings give 62,519; with it ON both give 16,358). Both sides of this
+    # assertion therefore go through ``estimate_tets`` with the switch exactly as
+    # the POST saw it.
     parts_mm, merged_mm = _nested_parts()
-    edge_mm = COMMON.effective_edge_m(
-        merged_mm, n_modes=10, units="mm",
-        parts=parts_mm, materials={"wall": 1.0, "core": 2.0})
-    est_mm = COMMON.estimate_tets_by_region(
-        parts_mm, {"wall": 1.0, "core": 2.0}, edge_mm, merged_mm, "mm",
-        MESH.EST_TETS_MARGIN)
+    est_mm = MESH.estimate_tets(
+        merged_mm, 10, "mm", parts=parts_mm,
+        materials={"wall": 1.0, "core": 2.0}, margin=MESH.EST_TETS_MARGIN
+    )
 
     assert job["est_tets"] == pytest.approx(est_mm, rel=1e-6), (
         f"the nm upload estimated {job['est_tets']:,} where the identical mm "

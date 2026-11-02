@@ -55,7 +55,8 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
                        cpu_max_tets: int | None = None,
                        min_feature_m: float | None = None,
                        scale: float = 1.0,
-                       materials: dict | None = None):
+                       materials: dict | None = None,
+                       graded_meshing: bool = True):
     """Return the ``batch/v1`` Job manifest that solves one upload.
 
     Pure: no environment lookups, no cluster calls, no time.
@@ -82,6 +83,18 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
         # default that agrees with the image is a default that hides a mistake,
         # and the backend is the first thing to check when a run is slow.
         {"name": "MSE_SOLVER_BACKEND", "value": "cpu"},
+        # The per-region grading switch, forwarded so the Job meshes the mesh the
+        # app just priced. The app reads it from ITS environment (the same
+        # accessor the solver uses, ``mse_common.graded_meshing_enabled``) and
+        # sends the resulting setting explicitly: a Job pod starts from the
+        # image's default, so leaving it off would let a rollback reach the web
+        # pod while the solver kept grading -- the estimate would price one mesh
+        # and the Job build another, which is the one failure this switch exists
+        # to prevent.
+        {
+            "name": COMMON.GRADED_MESHING_ENV,
+            "value": "1" if graded_meshing else "0",
+        },
     ]
     if max_tets is not None:
         # The solver's ABSOLUTE cap, sent explicitly. Its own default is the
@@ -220,6 +233,10 @@ class K8sJobLauncher:
             max_tets=self.max_tets,
             cpu_max_tets=self.cpu_max_tets,
             min_feature_m=min_feature_m, scale=scale, materials=materials,
+            # Read here, at the impure boundary, so ``build_job_manifest`` stays
+            # pure: this is the app's own setting, the one ``estimate_tets``
+            # priced the upload with.
+            graded_meshing=COMMON.graded_meshing_enabled(),
         )
 
     # -- cluster state -----------------------------------------------------

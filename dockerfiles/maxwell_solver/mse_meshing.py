@@ -53,17 +53,43 @@ from mse_common import (  # noqa: F401
     target_maxvolume,
     unit_scale,
 )
-from mse_common import graded_region_plan  # noqa: E402 - the opt-in overlay
+from mse_common import (  # noqa: E402 - the grading overlay and its switch
+    graded_meshing_enabled,
+    graded_region_plan,
+)
 
-#: OPT-IN per-region grading (OpenSpec change ``per-region-mesh-grading``).
-#: False is the product's rule: every region of a multi-part upload is meshed at
-#: ``h_min``, the finest region's edge. True grades the mesh with TetGen's
-#: sizing field (``-m``): each region at its own edge, clamped under its
-#: thickness and floored at ``h_min``. ``tetrahedralize(graded=None)`` reads
-#: this flag; the grading benches set it for their graded side. Making grading
-#: the product default is tasks.md step 3, which is NO GO -- so nothing on a
-#: product route sets it.
-GRADED_MESHING: bool = False
+#: PER-REGION GRADING, THE PRODUCT RULE (OpenSpec change
+#: ``graded-meshing-default``; owner, 2026-11-02: "4 yes"). True grades a
+#: multi-part upload with TetGen's sizing field (``-m``): each region at its own
+#: edge, clamped under its thickness and floored at ``h_min``. A one-part
+#: upload, and a multi-part upload whose regions all land on one edge, mesh
+#: exactly as they did when this was False -- they never enter the graded path.
+#:
+#: ``MSE_GRADED_MESHING=0`` turns grading OFF for every multi-part upload,
+#: which is the rollback: the uniform-at-``h_min`` plan, the uniform estimate
+#: and the old ``modes.json`` mesh block all come back with the one variable,
+#: because the web estimate and the route read THIS SAME accessor (see
+#: :func:`graded_meshing`). A deploy must set that variable on BOTH the web app
+#: and the solver Job, or the estimate and the mesh disagree -- which is the
+#: one bug this change exists to avoid. This module flag is the tier-1 test
+#: seam (``tetrahedralize(graded=None)`` reads :func:`graded_meshing`); a
+#: product route never sets this flag. ``None`` -- "ask the environment" -- is
+#: the shipped value; a test assigns True/False to pin the setting for its own
+#: duration.
+GRADED_MESHING: bool | None = None
+
+
+def graded_meshing() -> bool:
+    """Whether a multi-part upload is meshed graded -- THE product rule.
+
+    Adds one thing to :func:`mse_common.graded_meshing_enabled`: the module
+    flag ``GRADED_MESHING``, a tier-1 TEST SEAM. Assigned a bool, it pins the
+    setting for the duration of a test; left at ``None`` (the shipped value) the
+    environment decides. Nothing on a product route assigns it.
+    """
+    if GRADED_MESHING is not None:
+        return bool(GRADED_MESHING)
+    return graded_meshing_enabled()
 
 #: The point-data array name TetGen's public sizing-field route reads from a
 #: background ``UnstructuredGrid`` (tetgen 0.6+: ``tetrahedralize(bgmesh=...)``
@@ -496,10 +522,10 @@ def tetrahedralize(
 ):
     """Tetrahedralize and return ``(points_m, tets, region_of_tet)`` in metres.
 
-    ``graded`` (None = the module's ``GRADED_MESHING``, which is False) opts a
-    multi-part upload into per-region grading; see ``GRADED_MESHING``. A
-    one-part upload, and a multi-part upload whose regions all land on one
-    edge, mesh exactly as before whatever it says.
+    ``graded`` (None = :func:`graded_meshing`, i.e. the product rule, which is
+    ON unless ``MSE_GRADED_MESHING`` says otherwise) grades a multi-part upload
+    per region. A one-part upload, and a multi-part upload whose regions all
+    land on one edge, mesh exactly as before whatever it says.
 
     Resolution is driven by TetGen's ``maxvolume`` -- **which only takes effect
     together with ``fixedvolume=True``**. Without ``fixedvolume`` the Python
@@ -660,7 +686,7 @@ def tetrahedralize(
     # at the wall's edge, and the one-part path (which never reaches here) is
     # untouched.
     region_plan = None
-    want_graded = GRADED_MESHING if graded is None else bool(graded)
+    want_graded = graded_meshing() if graded is None else bool(graded)
     graded = False
     multi = parts is not None and getattr(parts, "is_multi", False)
     if multi:
@@ -1123,7 +1149,7 @@ def _region_plan(parts, materials, edge_units: float, units: str,
             )
     # The report keys a uniform plan also carries, so ``_mesh_report`` reads
     # one shape: every region's target IS ``h_min`` and nothing is clamped.
-    # The opt-in overlay overwrites them when grading is asked for.
+    # The grading overlay overwrites them when grading is asked for.
     h_min_m = h_min_units * unit_scale(units)
     own = {int(r): float(i["own_edge_units"]) for r, i in shared.items()}
     plan = {

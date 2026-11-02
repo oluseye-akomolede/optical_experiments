@@ -321,7 +321,10 @@ class FakeTwoRegionTetGen(FakeTetGen):
 
     def tetrahedralize(self, order=1, mindihedral=20, minratio=2.0,
                        maxvolume=None, fixedvolume=False, regionattrib=False,
-                       docheck=False):
+                       docheck=False, metric=False, bgmesh=None):
+        # ``metric``/``bgmesh`` (the sizing-field branch's keywords) are
+        # accepted and not read: grading is decided by WHICH branch calls this,
+        # and the switch's effect is read as the region verdict that follows.
         type(self).calls.append(float(maxvolume))
         n = len(_CUBE_POINTS)
         self.node = np.vstack([
@@ -1174,10 +1177,11 @@ def test_the_region_attribute_array_is_tet_indexed_and_names_the_regions():
 # and a mis-shaped background grid either raises inside tetgen or, worse,
 # loads something that grades nothing.
 # ---------------------------------------------------------------------------
-# The graded path is OPT-IN (``mse_meshing.GRADED_MESHING``, default False):
-# the product still meshes a multi-material upload uniformly at h_min, because
-# making grading the product rule is tasks.md step 3, which is NO GO. The tests
-# below exercise the opt-in path, so they switch it on themselves.
+# The graded path is the PRODUCT RULE since ``graded-meshing-default``
+# (``MSE_GRADED_MESHING`` unset means ON). The tests below pin it through the
+# module flag rather than the environment, so they read the same setting however
+# the suite is invoked -- and, being explicit, they still pass a deploy that
+# rolls grading back with ``MSE_GRADED_MESHING=0``.
 @pytest.fixture
 def graded_meshing_on(monkeypatch):
     monkeypatch.setattr(MESH, "GRADED_MESHING", True)
@@ -1985,9 +1989,12 @@ def test_the_graded_estimate_lands_on_the_mesh_the_mesher_builds():
         import mse_parts as PARTS
 
         merged = PARTS.merged_surface(parts)
-        # The product's routing entry (``web.meshing.estimate_tets``) prices the
-        # UNIFORM mesh the product builds; a graded build is priced by the
-        # overlay's estimator, at the same base edge and the same margin.
+        # The routing entry (``web.meshing.estimate_tets``) now prices the
+        # GRADED mesh for a multi-part upload, so for these graded fixtures it
+        # is this same ``estimate_tets_graded`` call -- see
+        # ``test_grading_moves_the_estimate_with_the_mesh`` in
+        # test_estimate_families. This test calls the estimator directly because
+        # it needs ``min_feature_m`` pinned per fixture.
         h_base = COMMON.effective_edge_m(
             merged, n_modes=2, units="mm", min_feature_m=min_feature_m,
             parts=parts, materials=materials)
