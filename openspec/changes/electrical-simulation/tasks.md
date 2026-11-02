@@ -25,18 +25,23 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       absorption at the emission wavelength; the Finley 2004 article number; DEVSIM's
       aarch64 wheels, mesh import route, cylindrical option and linear solvers; Sesame's
       venue and dimensionality. No library number ships from memory.
-- [x] 0.3 Questions answered by the owner on 2026-11-02 (Slack), which this revision
-      implements:
-      1 = **general purpose**: a library of common electrical materials (Si, GaAs, InP,
-      SiC, SiO₂, Al₂O₃, HfO₂, Au, Ag, air), any number of parts and contacts, and 1-D,
-      2-D and 3-D.
-      2 = **all design options**: axisymmetric for round devices (a cylinder form) and
-      3-D for everything else.
-      3 = **3-D size is our problem**: the solver must refuse a run that does not fit,
-      before it starts, and never retry it at a smaller resolution.
-      "Loss" was not needed: it is a separate change (`optical-loss`).
-      Junction-resolving 3-D memory is therefore NOT an owner question; the solver's own
-      array-priced estimate decides (task 2.4).
+- [x] 0.3 The owner's answers, in their own words (Slack, 2026-11-02). Only two messages
+      were sent: 13:19Z, *"Your questions about p-I-n diodes make me think that you're not
+      creating a general-purpose electrical simulation ability for our solver. If you are,
+      then please enlighten me."* and 13:33Z, *"General ok a ok b yes"*, answering the
+      lead's three options:
+      - **general ok** = a general electrical job: any parts and materials, optional
+        doping, any number of contacts; the QD analysis is an optional add-on and paper 1
+        is validation.
+      - **a ok** = 3-D current flow ships with a pre-run size check that refuses runs that
+        will not fit the quota, plus a faster 2-D option for round shapes; no quota increase
+        is asked for.
+      - **b yes** = "try loss" means optical absorption by metal contacts — so loss is
+        **in scope for this change**, not deferred.
+      Design choices made in service of those answers, and NOT owner statements: the
+      shipped materials library and its contents; the axisymmetric form being a cylinder;
+      the 3-D estimate being priced from the device's own arrays and never retried coarser
+      (task 2.4). These are recorded as design in `design.md`.
 
 ## 1. Phase 1: electrostatics and the Stark shift
 - [ ] 1.1 `tetrahedralize(..., sizing=None)`: a per-part target edge built into a `-m`
@@ -87,9 +92,11 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
 ## 3. Phase 3: coupling into the Purcell runs, and loss
 - [ ] 3.1 The paper-1 bench writes `purcell_spectrum.json` from the F it already prints.
 - [ ] 3.2 `emitter_coupling.purcell_at`, `rate` and `timing` with their checks.
-- [ ] 3.3 `scripts/contact_loss_bench.py`: the weak-film inverse-Q check and its mutation,
-      the far-contact check, then the paper-1 wire with and without the contact (tier 2,
-      one run at a time). Report ΔQ, ΔF and the Q_fca estimate.
+- [ ] 3.3 `scripts/contact_loss_bench.py` (`optical-loss`, in scope per "b yes"): it takes any
+      named absorber part, not only paper 1's gate. The weak-film inverse-Q check and its
+      mutation, the far-conductor check, the two-part check, then the paper-1 wire with and
+      without its contact as one fixture (tier 2, one run at a time). Report ΔQ, ΔF and the
+      Q_fca estimate; skip Q_fca when the device has no doped segment.
 
 ## 4. Phase 4: web app
 - [ ] 4.1 `elecs` column, the `elec` kind in the app's and worker's kind lists, the request

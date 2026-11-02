@@ -2,8 +2,9 @@
 
 Revised on 2026-11-01 after the owner's answers (`tasks.md` 0.1), and again on 2026-11-02
 after the owner widened it to a general-purpose solver (`tasks.md` 0.3). The superconductor
-track moved, unchanged, to the separate change `superconductor-models`; "loss" moved to
-`optical-loss`.
+track moved, unchanged, to the separate change `superconductor-models`. "Loss" ("b yes" on
+2026-11-02) is **in this change**: optical absorption by conductor parts in a cavity, its own
+`optical-loss` capability, with paper 1 as one fixture and any conductor part in scope.
 
 **The shape, after 2026-11-02: the job is general and paper 1 is a fixture.** The device
 below is the first validation bench, not the limit of what the request can describe. Any
@@ -146,18 +147,21 @@ fallback, and only if aarch64 wheels exist.
   electro-optic effect is ignored as far smaller than the Stark shift. Q1/Q5 and FDTD share
   geometry, not fields.
 
-## 4. "Try loss" (owner Q6) for this device
+## 4. "Try loss" (owner Q6, answered "b yes" on 2026-11-02)
 
 Q6 asked whether the first device depends more on loss or on inductance. That question was
 written for superconducting wires. For device c, inductance does not matter (no
 superconductor, sub-ns electrical edges on a µm-scale device), and the loss that matters is
-the **optical loss the electrical contacts add to the cavity**:
+the **optical loss a conductor part adds to the cavity**. The owner answered "b yes", so this
+is **in scope for this change** (its own `optical-loss` capability). The bench takes any
+conductor part of the upload, not only a contact; paper 1's gate is one fixture.
 
-1. **Contact metal (the main term).** A top contact or gate electrode next to a mode with
-   Q ≈ 214 (our clean paper-1 ring-down) absorbs light and lowers Q and F. The check uses the
-   existing paper-1 Purcell bench twice: once without the contact, once with it, with the
-   contact as a dispersive metal, the same path as the gold mirror. The result is ΔQ and
-   ΔF (or ΔF at λ_X). This decides whether the contact is a usable design.
+1. **Conductor parts (the main term).** A top contact, gate electrode or any other conductor
+   next to a mode with Q ≈ 214 (our clean paper-1 ring-down) absorbs light and lowers Q and F.
+   The check runs the Purcell bench twice: once without the absorber, once with it, with the
+   absorber as a dispersive metal (the same path as the gold mirror) or as a weakly absorbing
+   dielectric. The result is ΔQ and ΔF (or ΔF at λ_X). This decides whether a conductor
+   placement is a usable design.
 2. **Free-carrier absorption in the doped segments (P device).**
    Q_fca ≈ 2πn_g/(λα) = 2π·3.5/(900 nm · α). With α = 10–30 cm⁻¹ at 10¹⁸ cm⁻³
    **(unsure: fetch an InP free-carrier absorption value)**, Q_fca ≈ 8 × 10³ – 2.4 × 10⁴.
@@ -165,7 +169,8 @@ the **optical loss the electrical contacts add to the cavity**:
    coupling prints this estimate rather than running it.
 3. **Electrical loss** (series resistance, RC) appears only through timing (§3).
 
-This reading is ours. The proposal asks the owner to confirm it (owner question 3).
+This reading was ours, put to the owner as question 3; the owner answered "b yes" on
+2026-11-02, which puts it in this change.
 
 ## 5. Pricing "full 3-D" (estimates)
 

@@ -23,13 +23,19 @@ Then, on this revision's shape (13:33Z): *"General ok, a ok, b yes"* — approvi
 request shape, the pre-run 3-D size check with a faster axisymmetric 2-D option, and
 "try loss" as optical absorption by metal contact parts.
 
-The owner then answered the questions this revision put to them (Slack, 2026-11-02 13:33Z,
-recorded in `tasks.md` 0.3): (1) general purpose, including **a library of common electrical
-materials** rather than a wire made of one; (2) **all design options** — an axisymmetric
-cylinder form for round devices and 3-D for everything else; (3) 3-D **size is the solver's
-problem**: it must refuse a run that does not fit *before* it starts, priced from the device's
-own arrays, and never quietly retry it coarser. "Loss" was not needed here; it is its own
-change (`optical-loss`).
+The owner's 13:33Z message answered the lead's three options and nothing more: **general** =
+a general electrical job (any parts, materials, optional doping, multi-contact, with the QD
+analysis as an optional add-on and paper 1 as validation); **a** = 3-D current flow ships with
+a pre-run size check that refuses runs that will not fit the quota, plus a faster 2-D option
+for round shapes, no quota increase; **b** = "try loss" is optical absorption by metal
+contacts. The owner did not name the material list, did not ask for a 1-D form, and did not
+say loss was out of scope — **b yes puts loss in this change.**
+
+What is recorded here as design, not as an owner answer: the **shipped library** of common
+electrical materials (that is how this revision makes "any device" true without the uploader
+typing in physics), the axisymmetric form being a cylinder, and the pre-run estimate being
+priced from the device's own mesh arrays. These are the lead's and builder's choices in
+service of the owner's "general ok" and "a ok"; they are marked as design in `design.md`.
 
 So the job is general: upload any device, any number of parts, any number of contacts. Each
 part is a material from the shipped library — or the same material with its parameters
@@ -63,7 +69,8 @@ mutation that must make that check fail (see `design.md`).
   electron-hole overlap and the dipole, reads F at the Stark-tuned energy from an existing
   Purcell spectrum and convolves injection with decay for photon timing. The loss requirement
   is general: the optical absorption that **any** conductor part adds to the cavity (Q and F
-  with vs without it), which is how this change reads the owner's "try loss".
+  with vs without it). The owner answered "b yes" to "try loss", so this ships **in this
+  change** as its own `optical-loss` capability, with paper 1's gate as one fixture.
 - **Phase 4, web app (tier 3):** a new job kind `elec` (`electrical-jobs`, new). It has an
   upload arm, a bounded worker run, flat result files and a result page with the voltage
   sweep, the I-V, the timing and the field/potential/charge maps (reusing the mode viewer).
@@ -93,20 +100,24 @@ rather than only paper 1.
   the estimate and the limit, and the axisymmetric form is the faster option for round
   devices. No quota increase is requested.
 
-## Questions for the owner — all answered
+## Questions the owner answered on 2026-11-02
+
+The owner's words were *"General ok a ok b yes"* (13:33Z), answering the lead's three options.
 
 1. Junction-resolving 3-D drift-diffusion needs about 100 GiB or more (estimate), far above
-   our 18 GiB. **Answered 2026-11-02, "a":** ship the 3-D path with a pre-run size check that
-   refuses runs that will not fit (naming the estimate and the limit), plus a faster
-   axisymmetric 2-D option for round devices. No quota increase. **Refined 2026-11-02,
-   "3-D size is our problem":** the estimate must be priced from the device's own mesh arrays,
-   never from a table of typical sizes, and a refused run is never retried coarser.
-2. Which contact? **Superseded by the general request shape:** the job accepts any number of
-   contacts, so the question of one fixed contact no longer gates the build. Paper 1's gate
-   and p-i-n variants are two validation fixtures among others.
-3. Our reading of "try loss". **Answered 2026-11-02, "b yes":** optical absorption by metal
-   contact parts in the cavity — Q and F with and without the metal, generalised to any
-   conductor part rather than only a gate. Now its own change, `optical-loss`.
-4. Which materials? **Answered 2026-11-02, "general ok":** a shipped library of common
-   electrical materials (Si, GaAs, InP, SiC, SiO₂, Al₂O₃, HfO₂, Au, Ag, air), each parameter
-   cited and overridable per part. The library's numbers are fetched, not remembered.
+   our 18 GiB. **Answered "a":** ship the 3-D path with a pre-run size check that refuses
+   runs that will not fit (naming the estimate and the limit), plus a faster axisymmetric 2-D
+   option for round devices. No quota increase. The estimate being priced from the device's
+   own mesh arrays, and a refused run never being retried coarser, are **our design choices**
+   in service of that answer, not the owner's words.
+2. Which contact? **Dissolved by "general ok":** the job accepts any number of contacts, so
+   the question of one fixed contact no longer gates the build. Paper 1's gate and p-i-n
+   variants are two validation fixtures among others.
+3. "Try loss". **Answered "b yes":** optical absorption by metal contacts — Q and F with and
+   without the metal, generalised to any conductor part rather than only a gate. **This is in
+   scope for this change** (see the `optical-loss` capability under `specs/`), with paper 1 as
+   one fixture among others.
+4. Which materials? **Not an owner answer.** "General ok" asks for a general job; the shipped
+   library (Si, GaAs, InP, SiC, SiO₂, Al₂O₃, HfO₂, Au, Ag, air) is **our design choice** for
+   how to make "any device" usable, recorded as design in `design.md`. Every number in it is
+   fetched from its cited source before it ships, never entered from memory.
