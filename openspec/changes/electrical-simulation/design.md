@@ -105,6 +105,31 @@ Why these and not more:
   uses an equal-area cylinder for the hexagon and resolves the junctions. The **coarse 3-D**
   form runs on the tet mesh as a cross-check, and is valid only where the Debye length is
   resolved.
+
+  **The 2πr question, settled (2026-11-02, task 0.2).** DEVSIM does the axisymmetric case
+  natively: it ships `cylindrical_node_volume`, `cylindrical_edge_couple` and
+  `cylindrical_surface_area`, which supply the 2πr weighting of the weak form, selected by
+  `raxis_variable` (here `x`, the radial coordinate) and `raxis_zero`. There is no custom
+  model to write and no FE assembly to build. The weighted values live in a **separate
+  model**: after `cylindrical_edge_couple`, `EdgeCouple` keeps its Cartesian values
+  (identical arrays before and after the call) and `CylindricalEdgeCouple` carries the
+  cylindrical ones. So the build must name the `Cylindrical*` models in its equations —
+  naming `EdgeCouple` there would silently solve the Cartesian problem. Measured on devsim
+  2.11.2, not read from the docs: before and after the call `EdgeCouple` reads [0.125,
+  0.25, …, 0.125] on a radial strip, unchanged, while `CylindricalEdgeCouple` reads [0.44,
+  0.98, …, 0.74] and rises with r (0.44 at r = 0.5, 1.96 at r = 1.0 for the same edge).
+  The model names created are `CylindricalNodeVolume`, `CylindricalEdgeCouple` and
+  `SurfaceArea` (the last keeps its plain name).
+  Two consequences for §5 and for 0.2's follow-on work:
+  - The cylindrical volume carries a first-order error, `1 + 1/(9·N_r)` on an
+    exactly uniform grid, falling as `1/N_r` (measured at N_r = 10, 20, 40: `N_r × error`
+    is 0.1111 at every one). It is a discretisation artefact that converges
+    away, not a wrong weight, but it is largest near the axis, so the radial grading should
+    put the finest cells at r = 0 (already §5's intent).
+  - The contact/mesh topology is fussier than the solver: a contact only exists once the
+    mesh extends past the device into a filler region, and regions whose nodes carry no
+    equation make the matrix singular. That is an implementation detail for the build, not a
+    limitation of the method, and it is recorded because it cost time to find.
 - L4 and L6 are left out. One exciton in an undoped segment needs no self-consistency.
   Leading-order selection rules put the heavy-hole dipole in the plane, perpendicular to the
   wire, which is the x/y dipole the paper-1 bench already drives. Reference for later:
@@ -114,7 +139,7 @@ Why these and not more:
 
 | option | 3-D | open | fit for us |
 |---|---|---|---|
-| **DEVSIM** (Sanchez, J. Open Source Softw. 7, 3898 (2022); devsim.org) | yes, tetrahedra | Apache-2.0, pip wheels for x86-64 Linux | Scharfetter-Gummel, SRH, transient, Python API. **(unsure: aarch64 wheels for the Jetson; how to hand it a TetGen mesh, `create_gmsh_mesh` with arrays or a written `.msh`; whether it has a cylindrical 2-D option; which linear solvers it ships: direct only, or an iterative one)** |
+| **DEVSIM** (Sanchez, J. Open Source Softw. 7, 3898 (2022); devsim.org) | yes, tetrahedra | Apache-2.0, pip wheels for x86-64 Linux | Scharfetter-Gummel, SRH, transient, Python API. **(unsure: aarch64 wheels for the Jetson; how to hand it a TetGen mesh, `create_gmsh_mesh` with arrays or a written `.msh`; which linear solvers it ships: direct only, or an iterative one. Settled 2026-11-02: it has a cylindrical 2-D option, native (`cylindrical_node_volume` / `cylindrical_edge_couple`), see §2) |
 | Sesame (NIST; Gaury et al. 2019 **(unsure of venue)**) | no (1-D/2-D, **unsure**) | open | no 3-D cross-check |
 | own SG on scikit-fem / FEniCSx | yes | open | we would write and validate the SG stabilisation and Newton ourselves: the most risk |
 | Charon (Sandia, Trilinos) | yes | open | heavy C++/MPI build, more than one Job needs |

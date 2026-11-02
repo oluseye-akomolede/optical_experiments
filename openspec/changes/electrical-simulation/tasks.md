@@ -35,6 +35,20 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       100 GiB, §5 — does not fit our quota), or a handwritten 2-D solver (scope this
       change currently does not carry). This is the one (unsure) that a headline owner
       deliverable rests on, so it is not left until the other fetches are done.
+      **ANSWERED 2026-11-02: yes, and it does not need a custom model.** DEVSIM 2.11.2
+      (PyPI, verified on this VM with `DEVSIM_MATH_LIBS=libblas.so.3:liblapack.so.3`)
+      ships `cylindrical_node_volume`, `cylindrical_edge_couple` and
+      `cylindrical_surface_area`, which apply the 2πr weight directly, with the radial
+      axis set by `raxis_variable` / `raxis_zero`. Measured, not read from the docs: on a
+      radial strip `EdgeCouple` keeps its Cartesian values after the call (identical arrays)
+      while `CylindricalEdgeCouple` scales with r, so the *coupling* — the term that would
+      have been wrong if only volumes were weighted — is genuinely cylindrical, and the
+      equations must name the `Cylindrical*` models or they silently solve Cartesian. The cylindrical
+      volume differs from the exact annulus by exactly `1 + 1/(9·N_r)` on a uniform grid
+      and converges at first order (checked at N_r = 10, 20, 40), so refine toward r = 0.
+      Evidence and the residual caveats (topology quirks; a full L5 not yet assembled;
+      the aarch64/Jetson and mesh-import questions above are still open) are in
+      `design.md` §2. The 3-D fallback is therefore not needed for the axisymmetric path.
 - [x] 0.3 The owner's answers, in their own words (Slack, 2026-11-02). Only two messages
       were sent: 13:19Z, *"Your questions about p-I-n diodes make me think that you're not
       creating a general-purpose electrical simulation ability for our solver. If you are,
