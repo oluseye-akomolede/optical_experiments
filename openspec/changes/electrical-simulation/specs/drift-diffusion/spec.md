@@ -4,12 +4,15 @@
 `drift_diffusion.solve(mesh, regions, doping, contacts, biases, form)` SHALL build a DEVSIM
 device and solve the coupled Poisson, electron-continuity and hole-continuity equations with
 Scharfetter-Gummel edge currents, Boltzmann statistics, Shockley-Read-Hall and radiative
-recombination, and ohmic contacts. `form` SHALL be `"axisymmetric"` (a 2-D (r, z) mesh of an
-equal-area cylinder, each node and edge weighted by 2πr) or `"3d"` (the tetrahedral mesh from
-`mse_meshing.tetrahedralize`). Material parameters (ε_s, n_i, mobilities, lifetimes, B) SHALL be
-inputs per region, each with its cited source recorded in the module. It SHALL return, per
-bias, the terminal currents, the potential and both carrier densities at every node, and the
-field at the dot position. It SHALL solve each bias by Newton from the previous one and raise
+recombination, and ohmic contacts. The regions and contacts SHALL be general: any number of
+doped semiconductor parts, any number of undoped semiconductor or insulator parts, and any
+number of ohmic contacts, each at a fixed bias or swept. `form` SHALL be `"axisymmetric"` (a
+2-D (r, z) mesh of an equal-area cylinder, each node and edge weighted by 2πr) or `"3d"` (the
+tetrahedral mesh from `mse_meshing.tetrahedralize`). Material parameters (ε_s, n_i,
+mobilities, lifetimes, B) SHALL come from the materials library or per-part overrides, each
+with its cited source recorded in the module. It SHALL return, per bias, the terminal
+currents, the potential and both carrier densities at every node, and the field sampled at
+any requested points. It SHALL solve each bias by Newton from the previous one and raise
 `RuntimeError` naming the bias when Newton does not converge.
 
 #### Scenario: The built-in potential of an abrupt junction
@@ -29,6 +32,45 @@ field at the dot position. It SHALL solve each bias by Newton from the previous 
 #### Scenario: Current is conserved
 - **WHEN** any bias is solved
 - **THEN** the currents of all contacts sum to zero within 1e-6 of the largest one
+
+#### Scenario: A multi-terminal device is accepted
+- **WHEN** a request carries three doped regions and four ohmic contacts
+- **THEN** `solve` returns the currents of all four at every bias
+
+### Requirement: The axisymmetric form SHALL be an option, and a non-round device SHALL be refused
+`form = "axisymmetric"` SHALL build the (r, z) mesh from an equal-area cylinder of the
+uploaded geometry's cross-section. It SHALL be offered when the device's cross-section is
+round to within a stated tolerance (the circumradius and inradius within 2 %), measured from
+the uploaded geometry. A non-round device SHALL be refused for the axisymmetric form with
+`ValueError` naming the measured ratio and the tolerance, and the message SHALL say that the
+3-D form is available. The refusal SHALL be at upload, not after a Job starts.
+
+#### Scenario: A hexagonal wire is refused as axisymmetric
+- **WHEN** a request asks for the axisymmetric form on a hexagonal cross-section
+- **THEN** the upload is refused, naming the circumradius/inradius ratio and the tolerance
+
+#### Scenario: A round pillar is accepted as axisymmetric
+- **WHEN** a request asks for the axisymmetric form on a circular cross-section
+- **THEN** the request is accepted and the (r, z) mesh is built
+
+### Requirement: The 3-D form SHALL be size-checked against the Job limit before it runs
+Before building the 3-D mesh, the worker SHALL estimate the run's memory from the mesh it
+would build — the node and edge counts of the actual geometry, at the requested edge lengths,
+through the allocator's own array sizes (node coordinates, tet connectivity, one scalar per
+node per unknown, the edge list and its couplings) — and SHALL refuse terminally, naming the
+estimate and the Job's memory limit and pointing at the axisymmetric form when the device is
+round, if the estimate exceeds that limit. The estimate SHALL NOT come from a table of typical
+device sizes. The message SHALL name the estimated figure, the limit and how to proceed.
+
+#### Scenario: A junction-resolving 3-D run is refused with both figures
+- **WHEN** a 3-D request's estimated memory exceeds the Job's 16 GiB
+- **THEN** the run is refused before meshing, naming the estimate, the limit, and the
+  axisymmetric alternative when the device is round
+
+#### Scenario: Two geometries of the same parts get different estimates
+- **WHEN** two requests differ only in the uploaded geometry's size
+- **THEN** their estimates differ, because each is priced from its own mesh's arrays
+
 
 ### Requirement: The mesh SHALL resolve the Debye length where carriers change, or the run SHALL be refused
 Before solving, `solve` SHALL compute the extrinsic Debye length L_D = √(ε_s ε₀ k_BT/(q²N)) at

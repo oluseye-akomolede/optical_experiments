@@ -25,7 +25,7 @@ spectrum whose `dipole` differs from the emitter's.
 `emitter_coupling.rate(V)` SHALL return Γ(V) = F(λ_X(V))·Γ₀·O(V)/O(0), where λ_X = hc/E_X from
 the Stark sweep, O is the electron-hole overlap and Γ₀ = n·ω³·|d|²/(3πε₀ħc³) is the rate of
 a dipole d in a homogeneous medium of index n. |d| at zero field and n are inputs with a cited
-source **(unsure: whether paper 1 states a lifetime or Γ₀; task 0.2)**.
+source, read from the paper before the value is written down.
 
 #### Scenario: The free rate in a homogeneous medium
 - **WHEN** Γ₀ is computed for given n, ω and |d|
@@ -48,26 +48,3 @@ and its 10–90 % rise time.
 - **WHEN** g(t) = a·e^{−at} with a ≠ Γ
 - **THEN** P(t) = aΓ/(a − Γ)·(e^{−Γt} − e^{−at}) within 1 %
 
-### Requirement: The coupling SHALL report the optical loss the contact metal adds to the cavity
-`scripts/contact_loss_bench.py` SHALL run the paper-1 Purcell bench twice with the same grid
-and source: once without the contact and once with the contact part as a dispersive metal
-(through the time-domain dispersive-metal path). It SHALL print, for each run, the ring-down Q
-(with the ring-down fit's own validity flag) and F at the cavity peak and at λ_X(0), then ΔQ
-and ΔF. It SHALL also print the free-carrier-absorption estimate Q_fca = 2πn_g/(λα) for the
-doped segments, labelled an estimate with its α source **(unsure: an InP free-carrier
-absorption value; task 0.2)**. It SHALL run at tier 2, one run at a time.
-
-#### Scenario: Loss adds as inverse Qs
-- **WHEN** a weakly absorbing dielectric film (small ε″, not a metal) is placed in the mode
-- **THEN** 1/Q_with − 1/Q_without matches the first-order absorption 1/Q_abs =
-  ∫ε″|E|²dV / ∫ε′|E|²dV over the unperturbed mode within 10 %
-
-#### Scenario: A contact far from the mode costs nothing
-- **WHEN** the contact is placed where the unperturbed mode's |E|² is below 1e-4 of its peak
-- **THEN** |ΔQ|/Q is below 2 %
-
-#### Scenario: A solver that drops the loss fails the loss check
-- **WHEN** the time-domain run drops the film's ε″ (the material is passed to the solver as
-  real ε′ only) while the first-order prediction still uses the configured ε″
-- **THEN** the inverse-Q check fails (ΔQ ≈ 0 against a nonzero prediction) and the bench
-  exits 1
