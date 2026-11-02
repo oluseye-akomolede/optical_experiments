@@ -46,9 +46,23 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       equations must name the `Cylindrical*` models or they silently solve Cartesian. The cylindrical
       volume differs from the exact annulus by exactly `1 + 1/(9·N_r)` on a uniform grid
       and converges at first order (checked at N_r = 10, 20, 40), so refine toward r = 0.
-      Evidence and the residual caveats (topology quirks; a full L5 not yet assembled;
-      the aarch64/Jetson and mesh-import questions above are still open) are in
-      `design.md` §2. The 3-D fallback is therefore not needed for the axisymmetric path.
+      Evidence and the residual caveat (topology quirks; a full L5 not yet assembled)
+      are in `design.md` §2. The 3-D fallback is therefore not needed for the axisymmetric path.
+      - **aarch64 (Jetson): answered, yes.** `pip install devsim==2.11.2` builds and imports
+        on the Orin (aarch64, Python 3.10.12) in a venv under `~/mse-bench`, and needs **no**
+        `DEVSIM_MATH_LIBS` — the aarch64 wheel bundles its own BLAS ("Skipping libblas.so",
+        UMFPACK 5.1 loaded). The cylindrical API then works there unchanged (a 6-node
+        axisymmetric strip returned cylindrical node volumes summing to 9.948377). This is
+        the opposite of the x86-64 wheel, which does need the system BLAS pointer.
+      - **mesh import: answered, yes.** `create_gmsh_mesh(file=…, mesh=…)` then
+        `add_gmsh_region(mesh=…, gmsh_name=<physical name>, region=…, material=…)`, then
+        `finalize_mesh` / `create_device`. A TetGen tetrahedral mesh loads directly: DEVSIM
+        derives its boundary triangles, lines and points from the tets, so no separate
+        surface file is needed. A 2-D triangle mesh loads the same way for the axisymmetric
+        path, with the cylindrical models applying on top of it. Two reader rules cost time
+        and are worth knowing: the physical number must be positive (tag 0 is rejected), and
+        the element line is `id type ntags element_index physical_number nodes…` — the
+        physical group sits in the tag block, not where Gmsh 2.2 puts it.
 - [x] 0.3 The owner's answers, in their own words (Slack, 2026-11-02). Only two messages
       were sent: 13:19Z, *"Your questions about p-I-n diodes make me think that you're not
       creating a general-purpose electrical simulation ability for our solver. If you are,

@@ -125,11 +125,24 @@ Why these and not more:
     exactly uniform grid, falling as `1/N_r` (measured at N_r = 10, 20, 40: `N_r × error`
     is 0.1111 at every one). It is a discretisation artefact that converges
     away, not a wrong weight, but it is largest near the axis, so the radial grading should
-    put the finest cells at r = 0 (already §5's intent).
+    put the finest cells at r = 0 (already §5's intent). `scripts/devsim_cylindrical_check.py`
+    prints this table (devsim node-volume sum against `π(r_out² − r_in²)h` = 9.424778 for the
+    r ∈ [1, 2], h = 1 annulus: 9.529498, 9.477138, 9.450958). The sum includes boundary nodes,
+    which carry partial volumes, so it is the region's total volume, not an interior average.
   - The contact/mesh topology is fussier than the solver: a contact only exists once the
     mesh extends past the device into a filler region, and regions whose nodes carry no
     equation make the matrix singular. That is an implementation detail for the build, not a
     limitation of the method, and it is recorded because it cost time to find.
+  - **Where the mesh comes from.** `create_gmsh_mesh` + `add_gmsh_region` load both a
+    TetGen tetrahedral mesh (3-D path; DEVSIM derives the boundary triangles, lines and
+    points from the tets, so no separate surface file) and a 2-D triangle mesh (axisymmetric
+    path, cylindrical models on top). The reader requires a positive physical number and
+    reads the element line as `id type ntags element_index physical_number nodes…`.
+  - **The Jetson runs it.** `devsim==2.11.2` installs and imports on the Orin (aarch64) with
+    no `DEVSIM_MATH_LIBS`, because the aarch64 wheel bundles its BLAS — the x86-64 wheel does
+    not, so the VM and the cluster workers need the system-library pointer and the Jetson
+    must not be given one. Checked that the cylindrical models work there, not that a solve
+    runs there.
 - L4 and L6 are left out. One exciton in an undoped segment needs no self-consistency.
   Leading-order selection rules put the heavy-hole dipole in the plane, perpendicular to the
   wire, which is the x/y dipole the paper-1 bench already drives. Reference for later:
