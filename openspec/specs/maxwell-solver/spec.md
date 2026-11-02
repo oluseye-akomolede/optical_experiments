@@ -276,7 +276,6 @@ and the achieved-edge check SHALL be made on the finest region's own tets.
 Source: `dockerfiles/maxwell_solver/mse_common.py`,
 `dockerfiles/maxwell_solver/mse_meshing.py`.
 
-#### Scenario: grading is off (the default)
 #### Scenario: a cavity whose core is denser than its wall, graded
 - **WHEN** grading is on and the regions do not all share one index
 - **THEN** the wall's elements are coarser than the core's
