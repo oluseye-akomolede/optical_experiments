@@ -140,8 +140,9 @@ Why these and not more:
     the element line is ordinary Gmsh 2.2: `id type ntags physical_number geometric_tag
     nodes…`, with `ntags = 2`, so the physical number is the first tag. (An earlier version
     of this note put a separate element index before the physical number and counted three
-    tags; that parses, but the reader takes `ilist[3]` as the physical number, so every
-    element lands in group 1 and region selection by name breaks silently.)
+    tags; that parses, but the reader takes `ilist[3]` as the physical number, so each
+    element lands in the group numbered by its own element index and region selection by
+    name breaks silently.)
   - **The Jetson runs it.** `devsim==2.11.2` installs and imports on the Orin (aarch64) with
     no `DEVSIM_MATH_LIBS`, because the aarch64 wheel bundles its BLAS — the x86-64 wheel does
     not, so the VM and the cluster workers need the system-library pointer and the Jetson
