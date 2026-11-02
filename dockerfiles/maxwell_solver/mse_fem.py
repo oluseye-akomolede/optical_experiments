@@ -64,6 +64,44 @@ def build_edges(tets: np.ndarray):
     return edges, tet_edges, signs
 
 
+def tet_geometry(points: np.ndarray, tets: np.ndarray):
+    """Signed volumes and barycentric gradients for every tet.
+
+    Returns ``(det_J, grads)`` with ``det_J`` ``(n_tets,)`` and ``grads``
+    ``(n_tets, 4, 3)`` = ``grad lambda_i``.
+
+    Shared with the scalar P1 assembly in :mod:`mse_electrostatics`, which needs
+    exactly these two quantities. It lives here rather than in that module
+    because the ``inv(J).T`` trap below is invisible on the right-angled
+    reference tet and would be re-introduced by any second copy of this code.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    tets = np.asarray(tets, dtype=np.int64)
+
+    xyz = points[tets]                               # (n_tets, 4, 3)
+    v0 = xyz[:, 0, :]
+    J = np.stack(
+        [xyz[:, 1, :] - v0, xyz[:, 2, :] - v0, xyz[:, 3, :] - v0], axis=2
+    )                                                # (n_tets, 3, 3), columns are edges
+
+    det_J = np.linalg.det(J)
+
+    # barycentric gradients: grad lambda_i for i = 0..3, shape (n_tets, 3, 4)
+    #
+    # lambda_i is affine in x, so grad(lambda) = J^-T @ grad_ref -- the TRANSPOSE
+    # of J, not J. Getting this wrong is invisible on the right-angled reference
+    # tet (where J = I) and only shows up on a general tet.
+    inv_J = np.linalg.inv(J)                         # (n_tets, 3, 3)
+    grad_ref = np.array(
+        [-1.0, -1.0, -1.0,
+          1.0,  0.0,  0.0,
+          0.0,  1.0,  0.0,
+          0.0,  0.0,  1.0], dtype=np.float64
+    ).reshape(4, 3)
+    grads = np.einsum("nji,aj->nai", inv_J, grad_ref)   # (n_tets, 4, 3)
+    return det_J, grads
+
+
 def element_matrices(
     points: np.ndarray,
     tets: np.ndarray,
@@ -98,28 +136,8 @@ def element_matrices(
     points = np.asarray(points, dtype=np.float64)
     tets = np.asarray(tets, dtype=np.int64)
 
-    xyz = points[tets]                               # (n_tets, 4, 3)
-    v0 = xyz[:, 0, :]
-    J = np.stack(
-        [xyz[:, 1, :] - v0, xyz[:, 2, :] - v0, xyz[:, 3, :] - v0], axis=2
-    )                                                # (n_tets, 3, 3), columns are edges
-
-    det_J = np.linalg.det(J)
+    det_J, grads = tet_geometry(points, tets)
     volumes = np.abs(det_J) / 6.0
-
-    # barycentric gradients: grad lambda_i for i = 0..3, shape (n_tets, 3, 4)
-    #
-    # lambda_i is affine in x, so grad(lambda) = J^-T @ grad_ref -- the TRANSPOSE
-    # of J, not J. Getting this wrong is invisible on the right-angled reference
-    # tet (where J = I) and only shows up on a general tet.
-    inv_J = np.linalg.inv(J)                         # (n_tets, 3, 3)
-    grad_ref = np.array(
-        [-1.0, -1.0, -1.0,
-          1.0,  0.0,  0.0,
-          0.0,  1.0,  0.0,
-          0.0,  0.0,  1.0], dtype=np.float64
-    ).reshape(4, 3)
-    grads = np.einsum("nji,aj->nai", inv_J, grad_ref)   # (n_tets, 4, 3)
 
     # curl of the reference basis functions is constant:
     #   curl N_a = 2 * grad lambda_i x grad lambda_j

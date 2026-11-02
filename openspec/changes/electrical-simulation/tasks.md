@@ -87,8 +87,16 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
 - [ ] 1.1 `tetrahedralize(..., sizing=None)`: a per-part target edge built into a `-m`
       background mesh. The default path stays byte-for-byte today's; the maxwell-solver tests
       stay green. Test that the graded mesh's edge in each part is within its target.
-- [ ] 1.2 P1 assembly with per-part ε_s; one-tet element matrix against the closed form;
-      row sums 0.
+- [x] 1.2 P1 assembly with per-part ε_s; one-tet element matrix against the closed form;
+      row sums 0. **Done** (`mse_electrostatics.py`: `check_tet_regions`, `eps_by_tet`,
+      `element_stiffness`, `assemble_stiffness`). The material is the TET's, from the mesh's
+      `region_of_tet`, not its nodes' — a node-derived part cannot represent a boundary that
+      runs through a shared face. `mse_fem.tet_geometry` was extracted to module level and is
+      now shared, so the `inv(J).T` trap has one home. Tests use relative tolerance: every
+      matrix entry is ~1e-11 (ε₀), so `np.allclose`'s default `atol=1e-8` called a 3.5%
+      difference equal — both the closed-form and assembled-matrix assertions pin `atol=0.0`.
+      Mutations checked: dropping `eps_tet` fails (a)+(d); dropping the transpose in
+      `tet_geometry` fails (a) only, which is why (a) has to exist.
 - [ ] 1.3 Electrode Dirichlet reduction, direct solve through `mse_backend.factor`, input
       refusals, the maximum-principle test.
 - [ ] 1.4 AMG-CG path (`pyamg`) with the checked residual; the direct-vs-AMG agreement test.
