@@ -285,13 +285,16 @@ def estimate_tets(surface, n_modes: int, units: str,
     ``PartSet`` and its name -> n table), and are ``None`` for the one-part
     upload that this function has always handled. With them the answer is the
     volume law summed over the plan's regions, each at the edge that region is
-    meshed to (see ``mse_common.estimate_tets_by_region``). On today's mesher
-    those edges are all the same ``h_min`` -- one cavity, one edge -- so this is
-    the same number the uniform calculation gives; it is written against the
-    plan so it follows the plan if that ever stops being true. The count is what
-    ROUTES the job, so the estimate and the mesh must be the same expression:
-    using the wall's edge alone would under-predict a job with a dense core and
-    send it to the GPU to die, which is what this branch exists to prevent.
+    meshed to -- and WHICH edges those are is decided by the mesher's own
+    switch, read through ``mse_common.graded_meshing_enabled`` (the accessor
+    ``mse_meshing.graded_meshing`` delegates to) so the two cannot disagree:
+    graded (the product rule since ``graded-meshing-default``) prices
+    each region at its own target edge and the sizing field's transition
+    (``mse_common.estimate_tets_graded``); with ``MSE_GRADED_MESHING=0`` every
+    region lands on ``h_min`` and it is ``estimate_tets_by_region``'s number.
+    The count is what ROUTES the job, so the estimate and the mesh must be the
+    same expression: pricing a graded run with the uniform sum under-counts its
+    coarse regions and can send a job to the GPU that does not fit it.
 
     NOTE ON THE CALLER: ``web/app.py``'s upload route parses the
     ``part_index.<name>`` fields and passes ``parts``/``materials`` in, so this
@@ -318,15 +321,22 @@ def estimate_tets(surface, n_modes: int, units: str,
         margin_value = EST_TETS_MARGIN if margin is None else float(margin)
         if materials and parts is not None and getattr(parts, "is_multi", False):
             # MULTI-PART: the volume law per region, at the edge each region is
-            # meshed to. The edges come from the shared region plan, so the
-            # estimate cannot describe a different mesh than the mesher builds,
-            # and ``filled_volume_m3`` per region is what is summed -- the wall's
-            # ENCLOSED volume double-counts everything nested in it, and the
-            # count is what ROUTES the job.
+            # meshed to. Which edges those are is the MESHER's own switch
+            # (COMMON.graded_meshing_enabled, the one accessor both images
+            # carry): graded prices each region at its own target edge and the
+            # sizing field's transition; with grading OFF every region lands on
+            # h_min. ``filled_volume_m3`` per region is what is summed -- the
+            # wall's ENCLOSED volume double-counts everything nested in it, and
+            # the count is what ROUTES the job, so pricing a graded run with the
+            # uniform sum would route it too small.
             edge_units = COMMON.effective_edge_m(
                 surface, n_modes=n_modes, units=units,
                 min_feature_m=min_feature_m, parts=parts, materials=materials,
             )
+            if COMMON.graded_meshing_enabled():
+                return COMMON.estimate_tets_graded(
+                    parts, materials, edge_units, surface, units, margin_value
+                )
             return COMMON.estimate_tets_by_region(
                 parts, materials, edge_units, surface, units, margin_value
             )

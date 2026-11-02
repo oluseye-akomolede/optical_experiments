@@ -98,19 +98,22 @@ for _d in (_BENCH_DIR, _SOLVER_DIR, _WEB_DIR):
 
 import run_multimaterial_bench as BENCH  # noqa: E402
 import sphere_dielectric as REF  # noqa: E402
-# The GRADED plan: main's product plan with the graded targets laid over it
-# (``edge_m`` per region). The product meshes uniformly, so this bench reads
-# the opt-in overlay, never a replaced ``region_plan``.
+# The GRADED plan: the product plan with the graded targets laid over it
+# (``edge_m`` per region). Grading is the product rule for a multi-part upload
+# since ``graded-meshing-default``, but the overlay function is still what makes
+# the targets explicit, so this bench reads it rather than inferring them.
 from mse_common import graded_region_plan as common_region_plan  # noqa: E402
 
 
 class _graded_meshing:
-    """Opt the PRODUCT mesher into grading for one block, then restore it.
+    """Pin the PRODUCT mesher's grading ON for one block, then restore it.
 
-    ``mse_meshing.GRADED_MESHING`` is False on every product route (tasks.md
-    step 3, making grading the product rule, is NO GO). The graded side of
-    this bench goes through the product's own ``solve`` entry point, which
-    reads the flag, so it is set here and put back whatever happens.
+    Grading is the product rule since ``graded-meshing-default``, so this bench
+    no longer needs to opt in -- it pins the flag explicitly so its graded
+    numbers stay graded if someone runs it with ``MSE_GRADED_MESHING=0``. The
+    graded side goes through the product's own ``solve`` entry point, which
+    reads :func:`mse_meshing.graded_meshing`, so it is set here and put back
+    whatever happens.
     """
 
     def __enter__(self):

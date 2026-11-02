@@ -86,15 +86,32 @@ _BUILT: dict[str, dict] = {}
 #: units (``built / volaw``, which the margin has to cover and does not). These
 #: are kept out of the at-or-above assertion and pinned one at a time.
 UNDER_READ_FAMILIES = {
-    # nested thin sheets: TetGen refines 3x below the requested edge (94.3% of
-    # the tetrahedra more than an octave finer), building ~9x the count the law
-    # predicts. The lead's parked mesher issue.
-    "three-region-shell-core": (0.15, 8.952),
+    # ``three-region-shell-core`` was here under the UNIFORM mesher: TetGen
+    # refined 3x below the requested edge, built ~9x the law, estimate read
+    # 0.15x. Since graded-meshing-default it is meshed GRADED and moved to the
+    # other side; its numbers are in GRADED_FAMILIES.
     # an icosphere with bumps at HALF the mode counts (a legitimate upload -- the
     # user picks the mode count): the surface's own facets floor the delivery at
     # 1.868x the law. The counterexample to the margin, and the worst over-read
     # in the other direction (mounting the same family the estimate reads 2.098x).
+    # ONE part, so grading does not touch it: these are today's numbers too.
     "one-part-bumpy-sphere": (0.72, 1.868),
+}
+
+#: The nested families re-measured under the GRADED mesher, the product rule
+#: since ``graded-meshing-default``. ``(est/built, built/law)``. The uniform
+#: entries above are kept because ``MSE_GRADED_MESHING=0`` still builds those.
+GRADED_FAMILIES = {
+    # The found-issue family, graded. The sizing field holds the refinement at
+    # the requested edges instead of 3x below them, so the delivery drops below
+    # the law rather than 9x above it (8.952 -> 0.287) and the estimate now
+    # reads ABOVE the real mesh (0.15 -> 1.177) -- one-sided on the cheap side,
+    # which is the direction the margin is for. The estimate itself moved
+    # 63,214 -> 15,791 on the same upload (both measured on 2026-11-02): the
+    # uniform plan meshes the coarse wall at the core's fine edge, so its sum
+    # prices ~4x a mesh nobody builds. That is the pricing bug this change
+    # exists to fix, not noise.
+    "three-region-shell-core": (1.177, 0.287),
 }
 
 
@@ -163,10 +180,26 @@ def _build_family(label):
     Cached: the 3-region fixture builds hundreds of thousands of tetrahedra and
     two tests ask for the same family, so the mesh is built once per run. The
     rows are read-only, which is what makes sharing them safe.
-    """
-    if label in _BUILT:
-        return _BUILT[label]
 
+    The cache key carries WHICH mesher built the row. ``web.meshing`` reads
+    grading from the environment, so a row built with grading ON and a row built
+    with it OFF are different meshes of the same fixture -- and the graded
+    estimate (15,791 on the nested fixture) is not the uniform one (63,214).
+    Keying on the label alone would hand whichever test ran first to both.
+    """
+    graded = bool(COMMON.graded_meshing_enabled())
+    key = (label, graded)
+    if key in _BUILT:
+        return _BUILT[key]
+
+    row = _build_row(label)
+    row["graded"] = graded
+    _BUILT[key] = row
+    return row
+
+
+def _build_row(label):
+    """Estimate and mesh one family; ``_build_family`` owns the cache."""
     import numpy as np
 
     n_modes, spec = FAMILIES[label]
@@ -181,26 +214,23 @@ def _build_family(label):
         h_m = COMMON.effective_edge_m(surface, n_modes=n_modes, units="mm")
         _points, tets, _regions = MESHSOLVER.tetrahedralize(
             surface, "mm", n_modes=n_modes, max_tets=MAX_TETS, verbose=False)
-        row = dict(n_modes=n_modes, est=est, built=int(np.asarray(tets).shape[0]),
-                   h_m=h_m, volume_m3=volume_m3)
-    else:
-        parts = PARTS.load_parts(surface_bytes, units="mm")
-        merged = PARTS.merged_surface(parts)
-        est = WEB.estimate_tets(merged, n_modes, "mm", margin=CFG.est_tets_margin(),
-                                parts=parts, materials=materials)
-        edge_m = COMMON.effective_edge_m(merged, n_modes=n_modes, units="mm",
-                                         parts=parts, materials=materials)
-        plan = COMMON.region_plan(parts, materials, edge_m, "mm")
-        h_m = min(float(info["edge_units"]) for info in plan.values())
-        volume_m3 = sum(float(info["filled_volume_m3"]) for info in plan.values())
-        _points, tets, _regions = MESHSOLVER.tetrahedralize(
-            merged, "mm", n_modes=n_modes, max_tets=MAX_TETS, verbose=False,
-            materials=materials, parts=parts)
-        row = dict(n_modes=n_modes, est=est, built=int(np.asarray(tets).shape[0]),
-                   h_m=h_m, volume_m3=volume_m3, parts=parts, materials=materials)
+        return dict(n_modes=n_modes, est=est, built=int(np.asarray(tets).shape[0]),
+                    h_m=h_m, volume_m3=volume_m3)
 
-    _BUILT[label] = row
-    return row
+    parts = PARTS.load_parts(surface_bytes, units="mm")
+    merged = PARTS.merged_surface(parts)
+    est = WEB.estimate_tets(merged, n_modes, "mm", margin=CFG.est_tets_margin(),
+                            parts=parts, materials=materials)
+    edge_m = COMMON.effective_edge_m(merged, n_modes=n_modes, units="mm",
+                                     parts=parts, materials=materials)
+    plan = COMMON.region_plan(parts, materials, edge_m, "mm")
+    h_m = min(float(info["edge_units"]) for info in plan.values())
+    volume_m3 = sum(float(info["filled_volume_m3"]) for info in plan.values())
+    _points, tets, _regions = MESHSOLVER.tetrahedralize(
+        merged, "mm", n_modes=n_modes, max_tets=MAX_TETS, verbose=False,
+        materials=materials, parts=parts)
+    return dict(n_modes=n_modes, est=est, built=int(np.asarray(tets).shape[0]),
+                h_m=h_m, volume_m3=volume_m3, parts=parts, materials=materials)
 
 
 def _built_over_law(row):
@@ -308,12 +338,18 @@ def test_the_over_refined_families_read_below_the_real_mesh(label, recorded):
     """The families the estimate misses on the LOW side, pinned with their numbers.
 
     Two mechanisms, one direction. The 3-region nested-thin-sheets fixture is the
-    mesher found issue: it asks for one edge, TetGen refines 3x below it and
-    builds ~9x the count the law predicts, so the estimate -- which can only read
-    the request -- reads ~0.15x of the real mesh. The bumpy sphere at half the
-    mode counts is the same direction from a different cause: the surface's own
-    facets floor the delivery at 1.868x the law, leaving the estimate at 0.72x,
-    which is the direct counterexample to ``EST_TETS_MARGIN``.
+    mesher found issue: under the UNIFORM mesher it asked for one edge, TetGen
+    refined 3x below it and built ~9x the count the law predicts, so the estimate
+    -- which can only read the request -- read ~0.15x of the real mesh. The bumpy
+    sphere at half the mode counts is the same direction from a different cause:
+    the surface's own facets floor the delivery at 1.868x the law, leaving the
+    estimate at 0.72x, which is the direct counterexample to ``EST_TETS_MARGIN``.
+
+    WHICH mesher built each family is the gate: the nested one is multi-part, so
+    grading (the product rule since ``graded-meshing-default``) now shapes it and
+    its numbers live in GRADED_FAMILIES; the bumpy sphere is one part, so grading
+    never touches it and these are the live numbers. Running with
+    ``MSE_GRADED_MESHING=0`` puts the nested family back under this test.
 
     Both recorded numbers are asserted -- the ratio AND the delivery in the
     margin's own units -- so neither can drift while the other is checked. A
@@ -322,7 +358,16 @@ def test_the_over_refined_families_read_below_the_real_mesh(label, recorded):
     longer exists.
     """
     ratio_recorded, delivery_recorded = recorded
-    row = _build_family(label)
+    # Pin the UNIFORM mesher for this test. The uniform record is what
+    # ``MSE_GRADED_MESHING=0`` builds, and it has to stay checked -- otherwise
+    # the rollback is an untested second code path rather than a rollback.
+    with pytest.MonkeyPatch.context() as off:
+        off.setattr(COMMON, "graded_meshing_enabled", lambda: False)
+        row = _build_family(label)
+    assert not row["graded"], (
+        f"{label} was built GRADED; the uniform record did not take. Its graded "
+        f"numbers are pinned by test_the_graded_families_read_against_the_real_mesh."
+    )
     ratio = row["est"] / row["built"]
     bv = _built_over_law(row)
 
@@ -353,6 +398,52 @@ def test_the_over_refined_families_read_below_the_real_mesh(label, recorded):
         f"{label}: the delivery ({bv:.3f}x the law) is now inside the margin "
         f"({CFG.EST_TETS_MARGIN}), so this family is no longer an under-read and "
         f"does not belong in UNDER_READ_FAMILIES"
+    )
+
+
+@pytest.mark.parametrize("label,recorded", sorted(GRADED_FAMILIES.items()),
+                         ids=[label for label, _ in sorted(GRADED_FAMILIES.items())])
+def test_the_graded_families_read_against_the_real_mesh(label, recorded):
+    """The same families under the GRADED mesher, pinned with their numbers.
+
+    This is the product rule since ``graded-meshing-default``, so these are the
+    numbers a real upload of this shape now gets. The sizing field holds each
+    region at the edge it was asked for, so the 3x-below-request refinement that
+    made the uniform mesher build 8.95x the law is gone: the delivery is 0.29x
+    the law and the estimate reads above the real mesh, which is the direction
+    ``EST_TETS_MARGIN`` is one-sided for.
+
+    Pinned as a pair for the same reason the uniform entry is: a mesher change
+    that moves either number reddens this, and that is the signal to re-measure
+    the sweep before trusting the margin on the graded path.
+    """
+    ratio_recorded, delivery_recorded = recorded
+    assert label in GRADED_FAMILIES, (
+        f"{label} has no GRADED_FAMILIES entry, so this test cannot pin it"
+    )
+    row = _build_family(label)
+    assert row["graded"], (
+        f"{label} is parametrized as a GRADED family but was built with grading "
+        f"OFF (MSE_GRADED_MESHING). Unset it, or run the uniform record."
+    )
+    ratio = row["est"] / row["built"]
+    bv = _built_over_law(row)
+    assert ratio == pytest.approx(ratio_recorded, abs=0.05), (
+        f"{label}: graded, the estimate reads {ratio:.3f}x the real mesh "
+        f"({row['est']:,} vs {row['built']:,}, delivered {bv:.2f}x the law), not "
+        f"the {ratio_recorded} recorded. Re-measure the sweep before trusting "
+        f"the margin on this path."
+    )
+    assert bv == pytest.approx(delivery_recorded, rel=0.05), (
+        f"{label}: graded, the delivery is {bv:.3f}x the law, not the "
+        f"{delivery_recorded} recorded."
+    )
+    # The change's whole point, asserted as a direction on the family the
+    # uniform mesher over-refined by ~9x: grading must land it BELOW the law.
+    assert bv < 1.0, (
+        f"{label}: graded, the delivery is {bv:.3f}x the law, not under it -- "
+        f"the sizing field is no longer holding the refinement at the requested "
+        f"edges, so the graded path is not doing what it is priced for"
     )
 
 
@@ -429,15 +520,22 @@ def test_the_constants_are_the_measured_numbers():
     )
 
 
-def test_the_two_estimate_paths_agree_on_a_nested_object():
-    """The multi-part sum against the one-part law at ``h_min``.
+def test_the_two_estimate_paths_agree_on_a_nested_object(monkeypatch):
+    """The multi-part sum against the one-part law at ``h_min``, grading OFF.
 
-    On today's mesher every region is meshed at the same edge, so the per-region
-    sum is the one-part expression on the filled volume -- algebraically, and to
-    within the float noise of summing before dividing rather than after. This
-    pins that the rewrite did not change the number it was always supposed to
-    give, which is what a routing change has to prove.
+    This is the uniformity that ``MSE_GRADED_MESHING=0`` buys: with grading off
+    every region is meshed at the same edge, so the per-region sum IS the
+    one-part expression on the filled volume -- algebraically, and to within the
+    float noise of summing before dividing rather than after. Pinning it on the
+    rollback side is what makes the switch a rollback rather than a second,
+    untested code path.
+
+    It is NOT asserted on the graded side, and that asymmetry is the change:
+    graded, each region is meshed at its own edge, so the sum differs from the
+    ``h_min`` law by construction. See
+    ``test_grading_moves_the_estimate_with_the_mesh``.
     """
+    monkeypatch.setattr(COMMON, "graded_meshing_enabled", lambda: False)
     row = _build_family("two-region-core")
     margin = CFG.est_tets_margin()
     one_part = int(margin * COMMON.TETS_PER_UNIT_VOLUME
@@ -445,6 +543,53 @@ def test_the_two_estimate_paths_agree_on_a_nested_object():
     assert abs(row["est"] - one_part) <= 1, (
         f"the multi-part estimate {row['est']:,} and the one-part law at h_min "
         f"{one_part:,} disagree by more than the float noise of the sum's order"
+    )
+
+
+def test_grading_moves_the_estimate_with_the_mesh():
+    """The graded estimate is the mesher's plan, and it is not the uniform sum.
+
+    Two facts, and the second is why the change exists. (1) With grading ON --
+    the product rule -- ``web.meshing.estimate_tets`` must return exactly
+    ``estimate_tets_graded`` on the same plan the mesher enumerates, so the
+    upload is priced against the mesh it will get. (2) On a nested fixture whose
+    core is finer than its wall, that number must be MATERIALLY DIFFERENT from
+    the uniform-at-``h_min`` sum -- whichever way the fixture goes.
+
+    It goes DOWN here, and that is the useful direction: the uniform plan meshes
+    the coarse wall at the core's fine edge, so its sum prices a mesh nobody
+    builds. Measured on ``two-region-core``: graded 4,907, uniform 18,755 (0.26x).
+    An earlier version of this test asserted graded was ABOVE uniform; that was
+    an assumption about fixture shape, and this fixture refutes it. What must
+    hold either way is that the two disagree by more than noise -- equal numbers
+    would mean the fixture stopped exercising grading.
+    """
+    row = _build_family("two-region-core")
+    parts = row["parts"]
+    materials = row["materials"]
+    margin = CFG.est_tets_margin()
+    edge_units = COMMON.effective_edge_m(
+        PARTS.merged_surface(parts), n_modes=row["n_modes"], units="mm",
+        parts=parts, materials=materials,
+    )
+    graded = COMMON.estimate_tets_graded(
+        parts, materials, edge_units, PARTS.merged_surface(parts), "mm", margin
+    )
+    # ``estimate_tets_by_region`` takes no switch -- it IS the uniform sum -- so
+    # this is the number grading is compared against, not a second switch path.
+    uniform = COMMON.estimate_tets_by_region(
+        parts, materials, edge_units, PARTS.merged_surface(parts), "mm", margin
+    )
+    assert row["est"] == graded, (
+        f"with grading ON the product estimate is {row['est']:,}, not the "
+        f"graded plan's {graded:,}: the route is pricing a different mesh than "
+        f"the mesher builds"
+    )
+    assert graded != uniform and abs(graded - uniform) > 0.05 * uniform, (
+        f"the graded estimate {graded:,} and the uniform sum {uniform:,} agree "
+        f"to within 5% on a nested fixture. If the regions have genuinely "
+        f"landed on one edge this fixture no longer exercises grading, and the "
+        f"switch's ON side is untested -- fix the fixture, not this assertion."
     )
 
 

@@ -378,9 +378,10 @@ def _run_case(label: str, n_core: float | None, *, n_modes: int, grid: int,
     materials = None if n_core is None else {"wall": 1.0, "core": float(n_core)}
 
     t0 = time.time()
-    # The graded side opts the product mesher into grading for this one solve
-    # (mse_meshing.GRADED_MESHING is False on every product route; making it
-    # the product rule is tasks.md step 3, NO GO). One part ignores the flag.
+    # Pin the graded side ON for this one solve (grading is the product rule
+    # since ``graded-meshing-default``; setting it here keeps the numbers
+    # graded even if someone runs this with ``MSE_GRADED_MESHING=0``). One part
+    # ignores the flag.
     was_graded = MESH.GRADED_MESHING
     MESH.GRADED_MESHING = True
     try:
