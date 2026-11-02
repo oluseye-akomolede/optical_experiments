@@ -25,7 +25,7 @@ spectrum whose `dipole` differs from the emitter's.
 `emitter_coupling.rate(V)` SHALL return Γ(V) = F(λ_X(V))·Γ₀·O(V)/O(0), where λ_X = hc/E_X from
 the Stark sweep, O is the electron-hole overlap and Γ₀ = n·ω³·|d|²/(3πε₀ħc³) is the rate of
 a dipole d in a homogeneous medium of index n. |d| at zero field and n are inputs with a cited
-source **(unsure: whether paper 1 states a lifetime or Γ₀; task 0.2)**.
+source, read from the paper before the value is written down.
 
 #### Scenario: The free rate in a homogeneous medium
 - **WHEN** Γ₀ is computed for given n, ω and |d|
@@ -54,8 +54,8 @@ and source: once without the contact and once with the contact part as a dispers
 (through the time-domain dispersive-metal path). It SHALL print, for each run, the ring-down Q
 (with the ring-down fit's own validity flag) and F at the cavity peak and at λ_X(0), then ΔQ
 and ΔF. It SHALL also print the free-carrier-absorption estimate Q_fca = 2πn_g/(λα) for the
-doped segments, labelled an estimate with its α source **(unsure: an InP free-carrier
-absorption value; task 0.2)**. It SHALL run at tier 2, one run at a time.
+doped segments, labelled an estimate with its cited α source. It SHALL run at tier 2, one run
+at a time.
 
 #### Scenario: Loss adds as inverse Qs
 - **WHEN** a weakly absorbing dielectric film (small ε″, not a metal) is placed in the mode

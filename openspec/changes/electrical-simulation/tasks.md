@@ -18,15 +18,25 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       6 = **"I'm not sure, try loss"**.
       These moved Phase 1, so the specs were revised before any code (this revision).
       Superconductors moved to the not-started change `superconductor-models`.
-- [ ] 0.2 Fetch every source marked **(unsure)** before a test quotes it, and correct
-      `design.md` where it is wrong: paper 1's dot material, size and lifetime/Γ₀; InP and
-      dot effective masses and ε_s (Vurgaftman 2001); InP n at the emission wavelength; an
-      InP free-carrier absorption value; the Finley 2004 article number; DEVSIM's aarch64
-      wheels, mesh import route, cylindrical option and linear solvers; Sesame's venue and
-      dimensionality.
-- [ ] 0.3 Ask the owner the three questions at the end of `proposal.md` (memory for
-      junction-resolving 3-D drift-diffusion; which contact; our reading of "loss"). Record
-      the answers here. Answer 2 decides whether Phase 2 is built at all.
+- [ ] 0.2 Fetch every source marked **(unsure)** before a test quotes it, read every value
+      the materials library will ship from its cited source, and correct `design.md` where
+      it is wrong: paper 1's dot material, size and lifetime/Γ₀; the effective masses and
+      ε_s of every library semiconductor (Vurgaftman 2001); InP n and free-carrier
+      absorption at the emission wavelength; the Finley 2004 article number; DEVSIM's
+      aarch64 wheels, mesh import route, cylindrical option and linear solvers; Sesame's
+      venue and dimensionality. No library number ships from memory.
+- [x] 0.3 Questions answered by the owner on 2026-11-02 (Slack), which this revision
+      implements:
+      1 = **general purpose**: a library of common electrical materials (Si, GaAs, InP,
+      SiC, SiO₂, Al₂O₃, HfO₂, Au, Ag, air), any number of parts and contacts, and 1-D,
+      2-D and 3-D.
+      2 = **all design options**: axisymmetric for round devices (a cylinder form) and
+      3-D for everything else.
+      3 = **3-D size is our problem**: the solver must refuse a run that does not fit,
+      before it starts, and never retry it at a smaller resolution.
+      "Loss" was not needed: it is a separate change (`optical-loss`).
+      Junction-resolving 3-D memory is therefore NOT an owner question; the solver's own
+      array-priced estimate decides (task 2.4).
 
 ## 1. Phase 1: electrostatics and the Stark shift
 - [ ] 1.1 `tetrahedralize(..., sizing=None)`: a per-part target edge built into a `-m`
@@ -51,16 +61,28 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
 - [ ] 1.10 The paper-1 gate sweep (tier 2): E_X(V) for the wire, recorded with its mesh
       counts and RSS.
 
-## 2. Phase 2: p-i-n drift-diffusion (only if owner answer 0.3-2 includes p-i-n)
+## 2. Phase 2: drift-diffusion (general parts, any contacts, both forms)
 - [ ] 2.1 Install DEVSIM in the solver image; a smoke that imports it and records its
       version. Confirm the mesh route (task 0.2).
-- [ ] 2.2 Axisymmetric (r, z) form with the 2πr weight; the abrupt-junction V_bi, depletion
+- [ ] 2.2 The materials library with cited sources per parameter, and the per-part override
+      path. Its test checks a sampled subset against the cited sources and refuses an
+      uncited entry.
+- [ ] 2.3 Axisymmetric (r, z) form with the 2πr weight; the abrupt-junction V_bi, depletion
       width and cylinder-area checks.
-- [ ] 2.3 Ideal-diode slope, current conservation and the Debye-length refusal.
-- [ ] 2.4 Coarse 3-D form on the tet mesh; the axisymmetric-vs-3-D agreement at
-      ≤ 10¹⁶ cm⁻³ (tier 2 or 3, measure RSS).
-- [ ] 2.5 Transient: charge balance and junction capacitance; g(t) at the dot.
-- [ ] 2.6 `scripts/dd_bench.py`. Prove the central-difference and dropped-2πr mutations.
+- [ ] 2.4 Ideal-diode slope, current conservation, the Debye-length refusal, and the
+      multi-terminal check (three doped regions, four ohmic contacts).
+- [ ] 2.5 The size check: price the 3-D run from the mesh it would build — node and edge
+      counts of the actual geometry through the allocator's array sizes — and refuse
+      terminally against the Job's 16 GiB, naming the estimate, the limit and the
+      axisymmetric form when the device is round. Two-geometry test proves the estimate is
+      the device's own. A native solve is never attempted to find out.
+- [ ] 2.6 The roundness check: circumradius/inradius within 2 % for the axisymmetric form,
+      measured from the uploaded geometry, refused at upload naming both figures.
+- [ ] 2.7 Coarse 3-D form on the tet mesh, admitted only when 2.5's estimate fits; the
+      axisymmetric-vs-3-D agreement at ≤ 10¹⁶ cm⁻³ (tier 2 or 3, measure RSS).
+- [ ] 2.8 Transient: charge balance and junction capacitance; g(t) at the dot.
+- [ ] 2.9 `scripts/dd_bench.py`. Prove the central-difference, dropped-2πr and
+      table-priced refusal mutations.
 
 ## 3. Phase 3: coupling into the Purcell runs, and loss
 - [ ] 3.1 The paper-1 bench writes `purcell_spectrum.json` from the F it already prints.
@@ -73,8 +95,9 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
 - [ ] 4.1 `elecs` column, the `elec` kind in the app's and worker's kind lists, the request
       keys and refusals.
 - [ ] 4.2 The upload arm and the posted-equals-read test.
-- [ ] 4.3 The launcher's electrical Job shape, the pricing refusal, the `pc` refusal test
-      updated for the second shape.
+- [ ] 4.3 The launcher's electrical Job shape (both forms), the pricing refusal, the `pc`
+      refusal test updated for the second shape, and the roundness refusal surfaced at
+      upload.
 - [ ] 4.4 Result files and the result page; the plotted-points test and its wrong-key
       mutation; a render check of a real finished `elec` job.
 
