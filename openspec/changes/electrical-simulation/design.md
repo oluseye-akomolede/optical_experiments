@@ -75,7 +75,7 @@ tasks 0.3) means both: G for the Stark sweep, and P for I-V and injection timing
   5 CPU / 18 GiB for the whole namespace including the web app, and no GPU. The Jetson Orin
   is tier 2.
 
-## 1. Physics ladder (device c)
+## 1. Physics ladder (the paper-1 device)
 
 | rung | model | gives | phase |
 |---|---|---|---|
