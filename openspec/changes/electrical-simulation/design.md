@@ -44,10 +44,10 @@ fetch from the paper, task 0.2)**. Paper 1 has no electrical contact, so one is 
 
 - **gate (G):** the gold mirror is the back electrode (it is already a conductor under the
   buffer), plus a top electrode. The wire is undoped. The field at the dot is set by V_G.
-  Electrostatics (Q1) alone gives the field.
+  Electrostatics (L1) alone gives the field.
 - **p-i-n (P):** a p-doped base, an intrinsic segment holding the dot and an n-doped top. One
   contact reaches the base through the oxide, and one sits on the top. This needs
-  drift-diffusion (Q5).
+  drift-diffusion (L5).
 
 The owner's "full electrical analysis" answer (2026-11-01, superseded 2026-11-02 by
 tasks 0.3) means both: G for the Stark sweep, and P for I-V and injection timing.
@@ -79,33 +79,33 @@ tasks 0.3) means both: G for the Stark sweep, and P for I-V and injection timing
 
 | rung | model | gives | phase |
 |---|---|---|---|
-| Q1 | 3-D electrostatics ∇·(ε₀ε_s∇φ) = 0, fixed-potential electrodes, no free carriers | field at the dot vs V_G; capacitances | 1 |
-| Q2 | perturbative Stark ΔE = −pF + βF² | E_X(V) from a fitted p, β | 1 (fit of Q3) |
-| Q3 | 3-D single-band effective mass (electron, heavy hole) in the Q1 field + first-order Coulomb | E_X(F), overlap, p, β, dipole orientation | 1 |
-| Q5 | drift-diffusion + Poisson + SRH/radiative recombination (DEVSIM) | I-V, the field at the dot under bias, carrier arrival after a pulse | 2 |
+| L1 | 3-D electrostatics ∇·(ε₀ε_s∇φ) = 0, fixed-potential electrodes, no free carriers | field at the dot vs V_G; capacitances | 1 |
+| L2 | perturbative Stark ΔE = −pF + βF² | E_X(V) from a fitted p, β | 1 (fit of L3) |
+| L3 | 3-D single-band effective mass (electron, heavy hole) in the L1 field + first-order Coulomb | E_X(F), overlap, p, β, dipole orientation | 1 |
+| L5 | drift-diffusion + Poisson + SRH/radiative recombination (DEVSIM) | I-V, the field at the dot under bias, carrier arrival after a pulse | 2 |
 | C  | coupling: F at E_X(V) from a Purcell spectrum; Γ = F·Γ₀·(overlap ratio); timing = g ⊛ Γe^{−Γt} | radiative rate and photon-timing distribution vs V | 3 |
 | L  | contact loss: the same Purcell run with and without the contact metal | ΔQ, ΔF from the contact ("try loss") | 3 |
-| Q4 | Schrödinger-Poisson | screening by charge in or near the dot | not planned |
-| Q6 | multi-band k.p + strain | fine structure, light-hole mixing | not planned |
+| L4 | Schrödinger-Poisson | screening by charge in or near the dot | not planned |
+| L6 | multi-band k.p + strain | fine structure, light-hole mixing | not planned |
 
 Why these and not more:
-- Undoped G needs only Q1. The dot's response is, to leading order, a dipole and a
-  polarisability (Q2). Measured curves are fitted to that form (Fry et al., Phys. Rev. Lett.
+- Undoped G needs only L1. The dot's response is, to leading order, a dipole and a
+  polarisability (L2). Measured curves are fitted to that form (Fry et al., Phys. Rev. Lett.
   84, 733 (2000); Finley et al., Phys. Rev. B 70, 201308(R) (2004) **(unsure of article
   number)**).
-- Q3 predicts p and β from geometry instead of quoting them. The owner asked for full 3-D
+- L3 predicts p and β from geometry instead of quoting them. The owner asked for full 3-D
   (2026-11-01, superseded 2026-11-02 by tasks 0.3), and a hexagonal wire is not axisymmetric,
-  so Q3 is 3-D. It runs on a uniform
-  Cartesian finite-difference box around the dot, with the Q1 field interpolated onto it.
+  so L3 is 3-D. It runs on a uniform
+  Cartesian finite-difference box around the dot, with the L1 field interpolated onto it.
   At 0.5 nm a 60 × 60 × 40 nm box is about 1.2 × 10⁶ unknowns, about 0.35 GiB (estimate; §5).
   Material parameters come from Vurgaftman, Meyer & Ram-Mohan, J. Appl. Phys. 89, 5815 (2001).
-- Q5 is the p-i-n half of "full electrical analysis", as in the first electrically driven
-  single-photon source (Yuan et al., Science 295, 102 (2002)). Full 3-D Q5 does not fit at
-  junction-resolving resolution (§5), so Q5 has two forms. The **axisymmetric** (r, z) form
+- L5 is the p-i-n half of "full electrical analysis", as in the first electrically driven
+  single-photon source (Yuan et al., Science 295, 102 (2002)). Full 3-D L5 does not fit at
+  junction-resolving resolution (§5), so L5 has two forms. The **axisymmetric** (r, z) form
   uses an equal-area cylinder for the hexagon and resolves the junctions. The **coarse 3-D**
   form runs on the tet mesh as a cross-check, and is valid only where the Debye length is
   resolved.
-- Q4 and Q6 are left out. One exciton in an undoped segment needs no self-consistency.
+- L4 and L6 are left out. One exciton in an undoped segment needs no self-consistency.
   Leading-order selection rules put the heavy-hole dipole in the plane, perpendicular to the
   wire, which is the x/y dipole the paper-1 bench already drives. Reference for later:
   Stier, Grundmann & Bimberg, Phys. Rev. B 59, 5688 (1999).
@@ -126,33 +126,41 @@ mesh, the fallback is to write a Gmsh `.msh` file. If it has no cylindrical opti
 axisymmetric form is a 2-D (r, z) mesh whose node volumes and edge couplings carry the 2πr
 weight, which DEVSIM's custom models allow **(unsure)**.
 
+**That (unsure) is the largest schedule risk in this design**, because "a ok" promises a
+cheaper 2-D form for round devices and this is the only way we have to build it. Task 0.2
+therefore resolves it before any other fetch, and says what happens if the answer is no: a
+junction-resolving 3-D only (about 100 GiB, §5 — beyond our quota) or a handwritten 2-D
+solver, which this change does not carry. Nothing downstream may quote the (unsure) as
+established until 0.2 lands.
+
 Cluster first. DEVSIM's x86-64 wheels run on the cluster workers. The Jetson is only a
 fallback, and only if aarch64 wheels exist.
 
 ## 3. Coupling into the Purcell runs
 
-- **Energy:** Q3 (or Q2's fit) gives E_X(V). The coupling reads a Purcell spectrum, which is
+- **Energy:** L3 (or L2's fit) gives E_X(V). The coupling reads a Purcell spectrum, which is
   pairs of wavelength (nm) and F from a paper-1 bench run, and interpolates F at
   λ_X(V) = hc/E_X(V). A λ_X outside the spectrum's range is refused, not extrapolated. The
   bench gains a small writer for this file (a task, not a spec change to unspecced code).
 - **Orientation:** in-plane (x/y) heavy-hole dipole. The Purcell spectrum must come from a
   run with the same dipole orientation, and the file records it.
 - **Strength:** Γ₀ = n·ω³·|d|²/(3πε₀ħc³) for a dipole d in a homogeneous medium of index n.
-  In the field, the oscillator strength scales by |⟨ψ_e|ψ_h⟩|²(V)/|⟨ψ_e|ψ_h⟩|²(0) (from Q3).
+  In the field, the oscillator strength scales by |⟨ψ_e|ψ_h⟩|²(V)/|⟨ψ_e|ψ_h⟩|²(0) (from L3).
   Then Γ(V) = F(λ_X(V))·Γ₀·(overlap ratio). The zero-field d is an input (from the paper or
   a measurement) **(unsure: does paper 1 state a lifetime or Γ₀? fetch)**.
-- **Timing:** Q5 gives the carrier arrival profile g(t) at the dot after a voltage step or
+- **Timing:** L5 gives the carrier arrival profile g(t) at the dot after a voltage step or
   pulse. The photon-emission density is (g ⊛ Γe^{−Γt})(t). The electrical RC of the contacts
-  (from Q1 capacitances and a series resistance from Q5's I-V) sets g's rise for the G
+  (from L1 capacitances and a series resistance from L5's I-V) sets g's rise for the G
   device.
 - **The static field and optics:** the gate field does not change the optical ε. The
-  electro-optic effect is ignored as far smaller than the Stark shift. Q1/Q5 and FDTD share
+  electro-optic effect is ignored as far smaller than the Stark shift. L1/L5 and FDTD share
   geometry, not fields.
 
-## 4. "Try loss" (owner Q6 on 2026-11-01; answered "b yes" on 2026-11-02)
+## 4. "Try loss" (item 3 of the owner round in `proposal.md`)
 
-Q6 asked whether the first device depends more on loss or on inductance. That question was
-written for superconducting wires. For the paper-1 device, inductance does not matter (no
+That question (item 3) asked whether the first device depends more on loss or on
+inductance. It was written for superconducting wires. For the paper-1 device, inductance does
+not matter (no
 superconductor, sub-ns electrical edges on a µm-scale device), and the loss that matters is
 the **optical loss a conductor part adds to the cavity**. The owner answered "b yes", so this
 is **in scope for this change** (its own `optical-loss` capability). The bench takes any
@@ -167,14 +175,17 @@ conductor part of the upload, not only a contact; paper 1's gate is one fixture.
 2. **Free-carrier absorption in the doped segments (P device).**
    Q_fca ≈ 2πn_g/(λα) = 2π·3.5/(900 nm · α). With α = 10–30 cm⁻¹ at 10¹⁸ cm⁻³
    **(unsure: fetch an InP free-carrier absorption value)**, Q_fca ≈ 8 × 10³ – 2.4 × 10⁴.
-   That is far above 214, so it is negligible next to the cavity's own loss (estimate). The
+   That is far above 214, so it is negligible next to the cavity's own loss (estimate). **The
+   conclusion inherits the (unsure):** the margin is 114× at the low end of the range, and
+   free-carrier absorption only rivals the cavity at α ≈ 1.1 × 10³ cm⁻¹ (38× the top of the
+   quoted range). A fetched value that large would make it its own printed term. The
    coupling prints this estimate rather than running it.
 3. **Electrical loss** (series resistance, RC) appears only through timing (§3).
 
 This reading was ours, put to the owner as question 3; the owner answered "b yes" on
 2026-11-02, which puts it in this change.
 
-## 5. Pricing "full 3-D" (estimates)
+## 5. What fits in 3-D, and at what resolution (estimates)
 
 Inputs: wire circumradius R = 239.4 nm, hex area (3√3/2)R² = 1.49 × 10⁵ nm², height
 1500 nm, wire volume 2.23 × 10⁸ nm³. Air 500 nm around and above: box side 2(R + 500)
@@ -207,6 +218,15 @@ Worked E2: wire (2.23 × 10⁸ − 4.19 × 10⁶)/10³ × 1.54 = 3.4 × 10⁵; d
 So **3-D electrostatics fits**, but only with the graded mesh (the `-m` sizing field). It
 needs AMG-CG (`pyamg`) once it is above about 5 × 10⁵ nodes. The gold mirror and the
 electrodes are held nodes, so they cost almost nothing to solve.
+
+That 5 × 10⁵ becomes a named constant (`AMG_NODE_CROSSOVER`, task 1.4), and it is **not**
+derived from the memory law:
+at 5 × 10⁵ nodes a direct LU is 10⁹ × 0.5^(4/3) × 15.6 B ≈ 5.8 GiB of 16 GiB, about a third
+of the container, so memory does not set it. It is an estimate of where the iterative solver
+stops being the slower choice. It sits between E1 (2.4 × 10⁵, 2.17 GiB direct) and E2
+(1.27 × 10⁶, 20 GiB direct), and task 1.4's direct-vs-AMG agreement test is the only place it
+gets exercised. Revisit it when task 2.6 replaces the per-node cost with a measured one; until
+then it is a named estimate, not a result.
 
 ### Stark (3-D effective mass, finite differences, 7-point, about 10 LOBPCG vectors)
 
@@ -264,7 +284,7 @@ quotas. The FDTD runs for contact loss (§4) are the existing paper-1 bench on t
 - Grading is an opt-in keyword on `tetrahedralize`, a per-part target edge built into a
   `-m` background sizing mesh. The default (None) is byte-for-byte today's path, so the
   `maxwell-solver` spec gets no delta.
-- Q3 uses its own Cartesian box, not the tet mesh. A uniform FD grid makes the exact checks
+- L3 uses its own Cartesian box, not the tet mesh. A uniform FD grid makes the exact checks
   (harmonic, Airy) clean, and LOBPCG on a 7-point operator is simple. The tet mesh's job is
   the field, which is interpolated onto the box.
 - `elec` jobs run on the cluster as a second Job shape (CPU only, ≤ 4 CPU / 16 GiB,
@@ -272,5 +292,3 @@ quotas. The FDTD runs for contact loss (§4) are the existing paper-1 bench on t
   "one Job shape" sentence in the live `photonic-bands` spec is modified to match.
 - Out of scope: strain, floating electrodes, a Purcell spec backfill, a GPU. (Loss is **in**
   scope — tasks 0.3, "b yes" — as the `optical-loss` capability.)
-</content>
-</invoke>

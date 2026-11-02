@@ -1,4 +1,4 @@
-# Tasks — electrical-simulation (device c: the electrically triggered paper-1 QD)
+# Tasks — electrical-simulation (general-purpose electrical solver; paper 1 is a bench)
 
 Every local run uses `nice -n 19` and `(ulimit -v 4194304; ...)` with tiny inputs, per the
 rig's tier-1 rule. Mid-size runs go to the Jetson (tier 2) one at a time; cluster runs are
@@ -7,9 +7,9 @@ Every bench check prints its value, reference and tolerance, and each mutation s
 proven red once (mutate, confirm exit 1, revert) before the check counts.
 
 ## 0. Owner decisions
-- [x] 0.1 **SUPERSEDED 2026-11-02 by 0.3 (owner chose a general solver; loss in scope)** —
-      kept verbatim because rev2 was built on this round. Questions sent; the owner
-      answered in Slack on 2026-11-01:
+- [x] 0.1 **SUPERSEDED 2026-11-02 by 0.3 (owner chose a general solver; loss in scope).
+      NOT the owner's current answers; kept verbatim only as the record rev2 was built on.**
+      Questions sent; the owner answered in Slack on 2026-11-01:
       1 = **c**: the first device is the paper-1 nanowire QD with a gate or p-i-n contact.
       2 = **full electrical analysis**: electrostatics, the Stark shift vs voltage and p-i-n
       injection / I-V (drift-diffusion), with emission energy, dipole and timing feeding the
@@ -27,6 +27,14 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       absorption at the emission wavelength; the Finley 2004 article number; DEVSIM's
       aarch64 wheels, mesh import route, cylindrical option and linear solvers; Sesame's
       venue and dimensionality. No library number ships from memory.
+      **Resolve this FIRST — it decides whether "a ok" has a cheap path at all:** can
+      DEVSIM's custom models carry the 2πr weight on node volumes and edge couplings in a
+      cylindrical (r, z) mesh (`design.md` §2)? If yes, record the call with a pointer to
+      its docs and release. If no, say so here and in `design.md`, and re-price the
+      fallback before any axisymmetric code is written: a junction-resolving 3-D only (about
+      100 GiB, §5 — does not fit our quota), or a handwritten 2-D solver (scope this
+      change currently does not carry). This is the one (unsure) that a headline owner
+      deliverable rests on, so it is not left until the other fetches are done.
 - [x] 0.3 The owner's answers, in their own words (Slack, 2026-11-02). Only two messages
       were sent: 13:19Z, *"Your questions about p-I-n diodes make me think that you're not
       creating a general-purpose electrical simulation ability for our solver. If you are,
@@ -54,6 +62,10 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
 - [ ] 1.3 Electrode Dirichlet reduction, direct solve through `mse_backend.factor`, input
       refusals, the maximum-principle test.
 - [ ] 1.4 AMG-CG path (`pyamg`) with the checked residual; the direct-vs-AMG agreement test.
+      The switch is `AMG_NODE_CROSSOVER` (5 × 10⁵ nodes, `design.md` §5), a named estimate
+      with its arithmetic beside it, not a derived limit — the task proves both paths agree
+      either side of it, and names it as the line to revisit when 2.6 measures the real
+      per-node cost.
 - [ ] 1.5 `field_at` and `capacitance_matrix` from the residual charge; three-electrode
       symmetry test.
 - [ ] 1.6 Bench fixtures (two-layer slab, concentric spheres, sphere between plates, the
@@ -92,8 +104,10 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       table-priced refusal mutations.
 
 ## 3. Phase 3: coupling into the Purcell runs, and loss
-- [ ] 3.1 The paper-1 bench writes `purcell_spectrum.json` from the F it already prints.
-- [ ] 3.2 `emitter_coupling.purcell_at`, `rate` and `timing` with their checks.
+- [ ] 3.1 The paper-1 bench writes `purcell_spectrum.npz` (via `np.savez`, as the bench already
+      does for its other records) from the F it already prints.
+- [ ] 3.2 `emitter_coupling.purcell_at`, `rate` and `timing` with their checks, reading back the
+      `.npz` 3.1 writes.
 - [ ] 3.3 `scripts/contact_loss_bench.py` (`optical-loss`, in scope per "b yes"): it takes any
       named absorber part, not only paper 1's gate. The weak-film inverse-Q check and its
       mutation, the far-conductor check, the two-part check, then the paper-1 wire with and
