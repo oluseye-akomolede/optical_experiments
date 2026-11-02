@@ -136,8 +136,12 @@ Why these and not more:
   - **Where the mesh comes from.** `create_gmsh_mesh` + `add_gmsh_region` load both a
     TetGen tetrahedral mesh (3-D path; DEVSIM derives the boundary triangles, lines and
     points from the tets, so no separate surface file) and a 2-D triangle mesh (axisymmetric
-    path, cylindrical models on top). The reader requires a positive physical number and
-    reads the element line as `id type ntags element_index physical_number nodes…`.
+    path, cylindrical models on top). The reader requires a positive physical number, and
+    the element line is ordinary Gmsh 2.2: `id type ntags physical_number geometric_tag
+    nodes…`, with `ntags = 2`, so the physical number is the first tag. (An earlier version
+    of this note put a separate element index before the physical number and counted three
+    tags; that parses, but the reader takes `ilist[3]` as the physical number, so every
+    element lands in group 1 and region selection by name breaks silently.)
   - **The Jetson runs it.** `devsim==2.11.2` installs and imports on the Orin (aarch64) with
     no `DEVSIM_MATH_LIBS`, because the aarch64 wheel bundles its BLAS — the x86-64 wheel does
     not, so the VM and the cluster workers need the system-library pointer and the Jetson

@@ -61,8 +61,10 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         surface file is needed. A 2-D triangle mesh loads the same way for the axisymmetric
         path, with the cylindrical models applying on top of it. Two reader rules cost time
         and are worth knowing: the physical number must be positive (tag 0 is rejected), and
-        the element line is `id type ntags element_index physical_number nodes…` — the
-        physical group sits in the tag block, not where Gmsh 2.2 puts it.
+        the element line is Gmsh 2.2 `id type ntags physical_number geometric_tag nodes…`
+        with `ntags = 2`. The reader takes `ilist[3]` as the physical number, so inserting a
+        separate element index before it puts every element in group 1 and breaks region
+        selection by name without an error.
 - [x] 0.3 The owner's answers, in their own words (Slack, 2026-11-02). Only two messages
       were sent: 13:19Z, *"Your questions about p-I-n diodes make me think that you're not
       creating a general-purpose electrical simulation ability for our solver. If you are,
