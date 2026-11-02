@@ -34,8 +34,9 @@ ships only after it is read from its cited source (task 0.2, 2.2).
 
 ## 0. The device and what exists
 
-**Device (owner Q1 = c, Q5 = paper 1 only).** This is the paper-1 nanowire quantum dot
-(arXiv 2601.04440) made electrically triggerable. The scene follows `scripts/paper1_nanowire.py`:
+**Device (paper 1 is the validation bench, not the scope).** The job accepts any device
+(tasks 0.3, "general ok"); the first thing built and checked against is the paper-1 nanowire
+quantum dot (arXiv 2601.04440) made electrically triggerable. The scene follows `scripts/paper1_nanowire.py`:
 a hexagonal InP prism about 1.5 µm tall (the bench scans 1375 to 1525 nm), with a circumradius
 of about 240 nm (420 nm × 1.14 / 2, so about 415 nm across the flats). It stands on a 12 nm
 SiO₂ buffer over a gold mirror. The paper-1 dot's material and size **(unsure: InAsP in InP?
@@ -48,8 +49,8 @@ fetch from the paper, task 0.2)**. Paper 1 has no electrical contact, so one is 
   contact reaches the base through the oxide, and one sits on the top. This needs
   drift-diffusion (Q5).
 
-The owner's Q2 answer, "full electrical analysis", means both: G for the Stark sweep, and P
-for I-V and injection timing. Which contact the real device uses is owner question 2.
+The owner's "full electrical analysis" answer (2026-11-01, superseded 2026-11-02 by
+tasks 0.3) means both: G for the Stark sweep, and P for I-V and injection timing.
 
 **What exists:**
 - `mse_meshing.tetrahedralize` returns `(points_m, tets, region_of_tet)` for a multi-part
@@ -93,7 +94,8 @@ Why these and not more:
   84, 733 (2000); Finley et al., Phys. Rev. B 70, 201308(R) (2004) **(unsure of article
   number)**).
 - Q3 predicts p and β from geometry instead of quoting them. The owner asked for full 3-D
-  (Q4 = full 3D), and a hexagonal wire is not axisymmetric, so Q3 is 3-D. It runs on a uniform
+  (2026-11-01, superseded 2026-11-02 by tasks 0.3), and a hexagonal wire is not axisymmetric,
+  so Q3 is 3-D. It runs on a uniform
   Cartesian finite-difference box around the dot, with the Q1 field interpolated onto it.
   At 0.5 nm a 60 × 60 × 40 nm box is about 1.2 × 10⁶ unknowns, about 0.35 GiB (estimate; §5).
   Material parameters come from Vurgaftman, Meyer & Ram-Mohan, J. Appl. Phys. 89, 5815 (2001).
@@ -147,10 +149,10 @@ fallback, and only if aarch64 wheels exist.
   electro-optic effect is ignored as far smaller than the Stark shift. Q1/Q5 and FDTD share
   geometry, not fields.
 
-## 4. "Try loss" (owner Q6, answered "b yes" on 2026-11-02)
+## 4. "Try loss" (owner Q6 on 2026-11-01; answered "b yes" on 2026-11-02)
 
 Q6 asked whether the first device depends more on loss or on inductance. That question was
-written for superconducting wires. For device c, inductance does not matter (no
+written for superconducting wires. For the paper-1 device, inductance does not matter (no
 superconductor, sub-ns electrical edges on a µm-scale device), and the loss that matters is
 the **optical loss a conductor part adds to the cavity**. The owner answered "b yes", so this
 is **in scope for this change** (its own `optical-loss` capability). The bench takes any
@@ -247,7 +249,8 @@ safer reading.
 axisymmetric (r, z) with junctions resolved, plus a coarse 3-D check (20/30 nm, ≲ 10¹⁶ cm⁻³)
 that is marginal on memory. Junction-resolving 3-D drift-diffusion needs about 100 GiB
 (10¹⁷ cm⁻³) to about 1.5 TiB (10¹⁸ cm⁻³) for a direct solve, or a GPU or iterative path that
-is not established. That is beyond our quota and becomes owner question 1; we do not raise
+is not established. That is beyond our quota, so 3-D current flow ships **with** the pre-run
+size check that refuses a device this change cannot fit (tasks 0.3, "a ok"); we do not raise
 quotas. The FDTD runs for contact loss (§4) are the existing paper-1 bench on the Jetson
 (tier 2), at its existing cost.
 
@@ -267,6 +270,7 @@ quotas. The FDTD runs for contact loss (§4) are the existing paper-1 bench on t
 - `elec` jobs run on the cluster as a second Job shape (CPU only, ≤ 4 CPU / 16 GiB,
   OMP/MKL/OPENBLAS threads = the CPU limit). The Jetson keeps `pc` and `td`. The launcher's
   "one Job shape" sentence in the live `photonic-bands` spec is modified to match.
-- Out of scope: Q4, Q6, strain, floating electrodes, a Purcell spec backfill, a GPU.
+- Out of scope: strain, floating electrodes, a Purcell spec backfill, a GPU. (Loss is **in**
+  scope — tasks 0.3, "b yes" — as the `optical-loss` capability.)
 </content>
 </invoke>

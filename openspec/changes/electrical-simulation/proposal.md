@@ -8,12 +8,13 @@ optics: FEM cavity modes (`maxwell-solver`) and FDTD with dispersive metals and 
 benches (`time-domain`). It has no static fields and no carriers.
 
 The owner then answered this change's questions (Slack, 2026-11-01; recorded in `tasks.md`
-0.1). The first device is the paper-1 nanowire quantum dot (arXiv 2601.04440: an InP wire on
-a gold mirror with a 12 nm SiO₂ buffer) with a gate or p-i-n contact. The owner wants the full
-electrical analysis (electrostatics, Stark shift vs voltage, p-i-n injection and I-V), in full
-3-D, with the emission energy, dipole and timing feeding the existing Purcell runs, and the
-results shown in the web app. Superconductors are not needed for paper 1. They move to their
-own not-started change, `superconductor-models`, for the "Majorana 2" paper the owner names
+0.1, **superseded 2026-11-02 by tasks 0.3**). That round picked the paper-1 nanowire quantum
+dot (arXiv 2601.04440: an InP wire on a gold mirror with a 12 nm SiO₂ buffer) with a gate or
+p-i-n contact as the *first device*. The owner wanted the full electrical analysis
+(electrostatics, Stark shift vs voltage, p-i-n injection and I-V), in full 3-D, with the
+emission energy, dipole and timing feeding the existing Purcell runs, and the results shown
+in the web app. Superconductors are not needed for paper 1. They move to their own
+not-started change, `superconductor-models`, for the "Majorana 2" paper the owner names
 next.
 
 **Revised 2026-11-02: this is a general-purpose electrical solver, not a paper-1 job.** The

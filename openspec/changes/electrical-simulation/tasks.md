@@ -7,7 +7,9 @@ Every bench check prints its value, reference and tolerance, and each mutation s
 proven red once (mutate, confirm exit 1, revert) before the check counts.
 
 ## 0. Owner decisions
-- [x] 0.1 Questions sent; the owner answered in Slack on 2026-11-01:
+- [x] 0.1 **SUPERSEDED 2026-11-02 by 0.3 (owner chose a general solver; loss in scope)** —
+      kept verbatim because rev2 was built on this round. Questions sent; the owner
+      answered in Slack on 2026-11-01:
       1 = **c**: the first device is the paper-1 nanowire QD with a gate or p-i-n contact.
       2 = **full electrical analysis**: electrostatics, the Stark shift vs voltage and p-i-n
       injection / I-V (drift-diffusion), with emission energy, dipole and timing feeding the
