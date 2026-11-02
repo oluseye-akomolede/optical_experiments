@@ -1072,6 +1072,83 @@ def test_the_achieve_path_stays_terminal_for_an_alloc_failure(tmp_path, server):
         "not tell us -- another process may be holding the memory")
 
 
+def test_a_row_failed_for_both_processors_reads_as_a_busy_machine(tmp_path, server):
+    """The STORED message, not just the mapping: this is what the owner sees.
+
+    On a Jetson row this is a terminal failure -- nothing reads a re-route
+    token for it -- so the sentence is the whole of what the owner gets.
+    """
+    from mse_backend import FullOnBothProcessors
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    def both_full(job, store_in, store_out, stage=None):
+        raise FullOnBothProcessors("the GPU ran out of memory; the CPU cannot hold it")
+
+    worker = make_worker(server, tmp_path, solve=both_full)
+    worker.claim_loop(max_jobs=1)
+    row = server.jobs_db.jobs[job["job_id"]]
+    message = (row["message"] or "").lower()
+    assert row["status"] == DB.FAILED, row["status"]
+    assert "busy" in message, row["message"]
+    assert "contact support" not in message, row["message"]
+    assert "simpler object" not in message, row["message"]
+
+
+def test_the_real_jetson_library_load_failure_does_not_blame_the_object(
+        tmp_path, server):
+    """Job e9423834's chain, verbatim, through the failure path the worker uses.
+
+    The GPU could not even load cuDSS (the board's memory carve-out was
+    exhausted first), and the owner's page said "try a simpler object". No
+    object size makes a missing library appear, so that advice was false --
+    and it sent them to do work that could not help.
+
+    Asserted through ``_owner_message``, because that is the mapping the
+    worker calls; calling ``owner_message`` directly would skip the part this
+    test is about.
+    """
+    from mse_eigen import EigenError
+    inner = RuntimeError(
+        'Failure finding "libcudss.so.0": No such file: libcudss.so.0, '
+        'No such file: libcudss.so.0')
+    inner.__cause__ = RuntimeError(
+        "NvMapMemAllocInternalTagged: 1075072515 error 12")
+    exc = EigenError('could not factor A + sB: Failure finding "libcudss.so.0"')
+    exc.__cause__ = inner
+
+    message = W._owner_message(exc)
+    assert "try a simpler object" not in message.lower(), message
+    assert "not with your object" in message, message
+
+    # Through the job row as well, so the stored text is what is checked.
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    def cannot_load_library(job, store_in, store_out, stage=None):
+        raise exc
+
+    worker = make_worker(server, tmp_path, solve=cannot_load_library)
+    worker.claim_loop(max_jobs=1)
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert "try a simpler object" not in (row["message"] or "").lower(), row["message"]
+
+
+def test_the_jetson_driver_allocator_oom_is_read_as_a_memory_failure():
+    """The first line of that same chain: the driver's own ENOMEM.
+
+    It is a real memory failure ("error 12" is ENOMEM on that board), and it
+    reaches the owner's mapping through the same chain walk.
+    """
+    from mse_backend import names_an_out_of_memory
+    assert names_an_out_of_memory(
+        RuntimeError("NvMapMemAllocInternalTagged: 1075072515 error 12"))
+    # The same tag with a different errno is NOT a memory failure: treating it
+    # as one would send the owner to "try again later" for a broken device.
+    assert not names_an_out_of_memory(
+        RuntimeError("NvMapMemAllocInternalTagged: 1075072515 error 22"))
+
+
 def test_the_chain_walk_terminates_on_a_cycle():
     """A self-referential chain must not hang the worker.
 

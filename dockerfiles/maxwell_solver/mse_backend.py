@@ -39,7 +39,9 @@ by name.
 
 from __future__ import annotations
 
+import errno
 import os
+import re
 
 import numpy as np
 from scipy import sparse
@@ -49,6 +51,68 @@ from scipy.sparse import linalg as spla
 CPU = "cpu"
 GPU = "gpu"
 BACKENDS = (CPU, GPU)
+
+#: The words that mean "the device ran this work and said no to THIS job".
+#: Spelled the ways cuDSS (``ALLOC_FAILED`` / ``CUDSS_STATUS_ALLOC_FAILED``),
+#: nvmath's prose and the CUDA driver say it. ONE list, because two callers need
+#: it and they must not disagree: ``mse_eigen`` decides whether to retry on the
+#: CPU, and ``mse_maxwell_solver.owner_message`` decides what to tell the owner.
+#: A disagreement would either retry a problem that cannot fit anywhere or
+#: blame the object for a busy machine.
+#:
+#: The first seven words are the ones this codebase has always used, and both
+#: Jetson failures recorded on 2026-11-02 matched them:
+#:
+#:     cuDSSError: ALLOC_FAILED (2)  ->  "could not factor A + sB: ALLOC_FAILED (2)"
+#:                                        (matches "alloc_failed")
+#:     "could not factor A + sB: cudaErrorMemoryAllocation: out of memory"
+#:                                        (matches "out of memory")
+#:
+#: The rest are DEFENSIVE, not measured: underscore spellings, an abbreviated
+#: ``out_of_mem``, the cuDSS enum name and the CUDA API name. No recorded failure
+#: needed them; they are here because an unrecognised OOM is a silently
+#: unretried job, and a redundant word costs nothing.
+OOM_WORDS = (
+    "alloc_failed", "alloc failed", "allocation failed", "allocation_failed",
+    "out of memory", "outofmemory", "insufficient memory",
+    # defensive: other spellings of the same event, none observed here yet
+    "out_of_memory", "out_of_mem", "cudss_status_alloc_failed",
+    "cudaerrormemoryallocation",
+)
+
+
+def names_an_out_of_memory(exc: BaseException) -> bool:
+    """Does this exception, or anything that caused it, say "out of memory"?
+
+    The type cannot answer it. ``mse_eigen`` wraps every cuDSS status as
+    ``EigenError(...) from exc``, so ``CUDSS_STATUS_ALLOC_FAILED`` and a
+    genuinely unsolvable problem arrive looking identical; the status NAME is
+    carried in the message, which is the only evidence there is.
+
+    Walks the chain because the word may sit either side of the re-raise: nvmath
+    puts the status in its own exception's message, and ``mse_eigen``'s wrapper
+    may or may not repeat it.
+    """
+    seen: set[int] = set()
+    node: BaseException | None = exc
+    depth = 0
+    while node is not None and depth < 10 and id(node) not in seen:
+        seen.add(id(node))
+        depth += 1
+        text = f"{type(node).__name__}: {node}".lower()
+        if any(word in text for word in OOM_WORDS):
+            return True
+        # The driver names its allocator but reports the reason as an errno:
+        # "NvMapMemAllocInternalTagged: 1075072515 error 12". The tag alone also
+        # appears for non-memory errors, so ENOMEM must be there too -- and it
+        # must be 12 exactly, not 12x, hence the digit check rather than a bare
+        # substring.
+        if "nvmapmemalloc" in text:
+            for match in re.finditer(r"error (\d+)", text):
+                if int(match.group(1)) == errno.ENOMEM:
+                    return True
+        node = node.__cause__ or node.__context__
+    return False
 
 #: environment variable that selects the backend
 BACKEND_ENV = "MSE_SOLVER_BACKEND"
@@ -74,6 +138,16 @@ _GPU_PACKAGES = (
 
 class BackendError(Exception):
     """The requested backend cannot be used, and falling back is not an option."""
+
+
+class FullOnBothProcessors(BackendError):
+    """The GPU ran out of memory and the CPU cannot hold the same problem.
+
+    Raised from ``mse_eigen``, which is where both halves are known: the GPU
+    failure is what it just caught, and ``cpu_fits`` is the caller's answer about
+    the CPU. It lives at backend level rather than in ``mse_maxwell_solver``
+    because the module that raises it must not import the solver.
+    """
 
 
 #: Every cuDSS factorisation currently holding device memory. Strong refs on
