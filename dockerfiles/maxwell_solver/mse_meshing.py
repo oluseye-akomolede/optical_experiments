@@ -756,7 +756,7 @@ def tetrahedralize(
     # factor, giving metres of an object this function never meshed.
     allowed_edge = MAX_EDGE_OVERSHOOT * edge_m
 
-    # OPT-IN grading only: the sizing field, a coarse background
+    # Grading (on by default; MSE_GRADED_MESHING=0 turns it off): the sizing field, a coarse background
     # tetrahedralization of the same PLC whose nodes carry per-region target
     # edges. Built ONCE -- it depends on the geometry and the plan, not on the
     # attempt (a graded mesh does not retry; see below). The acceptance test is
