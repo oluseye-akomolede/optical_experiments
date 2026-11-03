@@ -1,5 +1,9 @@
 # Owner-approved power cap for mode-search-engine (2026-09-26, set by control-operator).
-# Tracked here for reference; never raise it without the owner's OK (see escalation rule).
+# RAISED 2026-11-02 by owner decision: the owner asked for owner-uploaded solves to
+# run on a cluster RTX A4000 instead of the Jetson, so the GPU slot goes from 0 to 1.
+# In the same decision the owner chose ONE GPU card and ONE solve at a time, so
+# count/jobs.batch stays at 1 and the CPU/memory bounds tighten to what a single
+# solve needs. Still never raise it without the owner's OK (see escalation rule).
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -8,12 +12,12 @@ metadata:
 spec:
   hard:
     count/jobs.batch: '1'
-    limits.cpu: '5'
-    limits.memory: 18Gi
+    limits.cpu: '3'
+    limits.memory: 7Gi
     pods: '5'
-    requests.cpu: '5'
-    requests.memory: 18Gi
-    requests.nvidia.com/gpu: '0'
+    requests.cpu: '3'
+    requests.memory: 7Gi
+    requests.nvidia.com/gpu: '1'
 ---
 apiVersion: v1
 kind: LimitRange

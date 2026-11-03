@@ -72,8 +72,8 @@ MIN_MATERIAL_N = 1.0
 MODE_CHOICES = (10, 20, 40)
 
 #: settings for the solver Job (see the task-2 amendment)
-JOB_CPU = "4"
-JOB_MEMORY = "14Gi"
+JOB_CPU = "2.5"
+JOB_MEMORY = "6Gi"
 JOB_ACTIVE_DEADLINE_SECONDS = 1800
 JOB_TTL_SECONDS_AFTER_FINISHED = 30
 
@@ -314,8 +314,32 @@ def est_tets_margin() -> float:
 
 
 def gpu_min_tets() -> int:
-    """Estimate at or above which a job is queued for the Jetson."""
+    """Estimate at or above which a job is queued for a GPU machine.
+
+    Which GPU machine is a separate question -- see :func:`gpu_route`.
+    """
     return _positive_int("MSE_GPU_MIN_TETS", DEFAULT_GPU_MIN_TETS)
+
+
+#: Where a GPU-needing job runs.
+GPU_ROUTE_CLUSTER = "cluster"
+GPU_ROUTE_JETSON = "jetson"
+GPU_ROUTES = (GPU_ROUTE_CLUSTER, GPU_ROUTE_JETSON)
+
+
+def gpu_route() -> str:
+    """Where a GPU-needing job runs: ``cluster`` or ``jetson``.
+
+    ``cluster`` (the default) sends it to an A4000 Job, which is what the owner
+    asked for. ``jetson`` is the old behaviour, kept so a rollback is one
+    environment change rather than a revert.
+
+    An unrecognised value returns ``cluster``: a typo in a deployment
+    environment is a misconfiguration worth ignoring, not a reason to refuse
+    every upload -- the same policy as :func:`_positive_int`.
+    """
+    value = (os.environ.get("MSE_GPU_ROUTE") or "").strip().lower()
+    return value if value in GPU_ROUTES else GPU_ROUTE_CLUSTER
 
 
 def max_tets() -> int:

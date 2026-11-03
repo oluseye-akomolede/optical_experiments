@@ -653,7 +653,8 @@ def run_tick(store, jobs_db, launcher, log=print) -> dict:
                                job["n_modes"],
                                min_feature_m=job.get("min_feature_m"),
                                scale=job.get("scale", 1.0) or 1.0,
-                               kind=job.get("kind"))
+                               kind=job.get("kind"),
+                               gpu=job.get("target") in DB.GPU_TARGETS)
     except JOBS.QuotaExceeded:
         # The quota counts finished Jobs, so a 403 here is "wait", not "fail".
         result["waited"] = True
@@ -1123,7 +1124,15 @@ def _handle_upload(app, store, jobs_db):
         )
         return redirect(url_for("index"))
 
-    target = DB.JETSON if est_tets >= CFG.gpu_min_tets() else DB.CLUSTER
+    # Two questions, asked separately. "Does this need a GPU?" is a property of
+    # the problem (the estimate). "Which GPU machine?" is a property of the
+    # fleet, and now has two answers -- an A4000 Job or the Jetson worker -- so
+    # it is a setting rather than the else-branch of one comparison.
+    if est_tets >= CFG.gpu_min_tets():
+        target = DB.JETSON if CFG.gpu_route() == CFG.GPU_ROUTE_JETSON \
+            else DB.CLUSTER_GPU
+    else:
+        target = DB.CLUSTER
 
     job_id = uuid.uuid4()
     try:

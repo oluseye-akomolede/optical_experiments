@@ -246,15 +246,23 @@ class FakeDb:
     def list_modes(self, job_id):
         return self.modes.get(str(job_id), [])
 
-    def next_queued(self, target=DB.CLUSTER):
-        # Same WHERE clause as web/db.py's next_queued: queued, on THIS target,
-        # and a kind the cluster can actually run. The target term is what keeps
-        # a jetson row from occupying the cluster's single Job slot; the kind
-        # whitelist is what makes a pc or td row invisible to the cluster queue.
-        # A double that skipped either would let a test pass through a state
-        # production cannot reach -- fifteen did, until this matched.
+    def next_queued(self, targets=DB.CLUSTER_TARGETS):
+        # Same WHERE clause as web/db.py's next_queued: queued, on one of THESE
+        # targets, and a kind the cluster can actually run. The target term is
+        # what keeps a jetson row from occupying the cluster's single Job slot;
+        # the kind whitelist is what makes a pc or td row invisible to the
+        # cluster queue. A double that skipped either would let a test pass
+        # through a state production cannot reach -- fifteen did, until this
+        # matched.
+        #
+        # ``targets`` is a tuple because the real one now selects every Job
+        # target at once, so a cluster-gpu row shares the slot with a cluster
+        # one. Accepting a bare string keeps the old call sites working without
+        # branching on the type here.
+        if isinstance(targets, str):
+            targets = (targets,)
         for job in self.jobs.values():
-            if (job["status"] == DB.QUEUED and job["target"] == target
+            if (job["status"] == DB.QUEUED and job["target"] in targets
                     and job["kind"] == DB.CAVITY):
                 return job
         return None
@@ -373,6 +381,10 @@ class FakeLauncher:
         self.swallowed_403 = swallowed_403
         self.raise_on = raise_on
         self.created: list[dict] = []
+        #: The manifests the real builder would have produced, in launch order.
+        #: A test asserting the RESULT of routing (does the Job ask for a card?)
+        #: needs this; ``created`` only records the arguments.
+        self.manifests: list[dict] = []
         self.deleted: list[str] = []
         self.dry_run = False
 
@@ -403,12 +415,20 @@ class FakeLauncher:
         return {n: r for n, r in self.failed.items() if n in self.active}
 
     def create(self, job_id, units, n_index, n_modes,
-               min_feature_m=None, scale=1.0, kind=None):
+               min_feature_m=None, scale=1.0, kind=None, gpu=False):
         if self.quota_full:
             raise JOBS.QuotaExceeded("exceeded quota: count/jobs.batch")
         if self.fail_with is not None:
             raise self.fail_with
         name = JOBS.job_name(job_id)
+        # The manifest is built here, by the real builder, so a test can assert
+        # what the Job would actually have requested. ``gpu`` is forwarded for
+        # that reason: a fake that dropped it would let the tick look correct
+        # while the manifest it produced asked for no card.
+        manifest = JOBS.build_job_manifest(
+            job_id, units, n_index, n_modes, "img", "sec",
+            "ns", min_feature_m=min_feature_m, scale=scale, gpu=gpu)
+        self.manifests.append(manifest)
         self.created.append({"job_id": str(job_id), "units": units,
                              "n_index": n_index, "n_modes": n_modes,
                              "min_feature_m": min_feature_m, "scale": scale,
@@ -419,15 +439,17 @@ class FakeLauncher:
                              # passes it, and that is a coverage gap a fake
                              # without this parameter would hide.
                              "kind": kind,
+                             # The GPU flag the tick read off the row's target.
+                             # Recorded (and the manifest above built with it) so
+                             # a row routed to the A4000 cannot be launched as a
+                             # CPU Job without a test noticing.
+                             "gpu": gpu,
                              # recorded so a test can assert the OPTIONAL flag is
                              # absent, not merely falsy -- the real manifest omits
                              # --min-feature rather than passing a zero, and that
                              # distinction is what keeps 'auto' meaning 'no opinion'
-                             "args": list(JOBS.build_job_manifest(
-                                 job_id, units, n_index, n_modes, "img", "sec",
-                                 "ns", min_feature_m=min_feature_m,
-                                 scale=scale)["spec"]["template"]["spec"]
-                                 ["containers"][0]["args"]),
+                             "args": list(manifest["spec"]["template"]["spec"]
+                                          ["containers"][0]["args"]),
                              "name": name})
         self.active.append(name)
         return name
@@ -2998,3 +3020,117 @@ def test_the_app_serves_every_name_the_td_solve_writes(tmp_path):
     for name in (td.TRACE_NAME, td.SPECTRUM_NAME, td.FRAME_NAME.format(1),
                  td.FRAME_NAME.format(fdtd_max)):
         assert APP._safe_result_name(name), name
+
+
+# -- the A4000 route (owner, 2026-11-02) --------------------------------------
+#
+# The owner asked for owner-uploaded solves to run on a cluster RTX A4000
+# instead of the Jetson. These pin the two halves that can only be checked here:
+# that a GPU-needing upload lands on the A4000 target, and that when the A4000
+# runs out of memory the owner is not told the object was the problem.
+
+def upload_to_the_a4000(client, monkeypatch):
+    """Upload a row the routing sends to the cluster GPU.
+
+    ``MSE_GPU_MIN_TETS=1`` makes every upload GPU-needing, and the route
+    default is ``cluster``, so the row lands on ``cluster-gpu``. Setting the
+    threshold rather than the estimate keeps the fixture's mesh irrelevant to
+    what is being tested.
+    """
+    monkeypatch.setenv("MSE_GPU_MIN_TETS", "1")
+    monkeypatch.delenv("MSE_GPU_ROUTE", raising=False)
+    return upload(client)
+
+
+def test_a_gpu_upload_is_routed_to_the_a4000_by_default(tmp_path, monkeypatch):
+    """The owner's decision, at the one place the decision is made.
+
+    Default matters more than the option existing: this is what every upload
+    does with no environment set at all.
+    """
+    app, _store, db, _launcher = make_app(tmp_path)
+    upload_to_the_a4000(app.test_client(), monkeypatch)
+    (job,) = db.jobs.values()
+    assert job["target"] == DB.CLUSTER_GPU
+
+
+def test_the_route_setting_can_send_a_gpu_job_back_to_the_jetson(
+        tmp_path, monkeypatch):
+    """The rollback path: one environment change, not a revert.
+
+    Pinned because a rollback that silently does nothing is worse than none --
+    the operator would believe the Jetson was serving traffic again.
+    """
+    app, _store, db, _launcher = make_app(tmp_path)
+    monkeypatch.setenv("MSE_GPU_MIN_TETS", "1")
+    monkeypatch.setenv("MSE_GPU_ROUTE", "jetson")
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    assert job["target"] == DB.JETSON
+
+
+def test_a_cluster_gpu_row_is_launched_as_a_gpu_job(tmp_path, monkeypatch):
+    """The target must reach the manifest, or the row runs on the CPU.
+
+    Asserting the *manifest* rather than the target: the row's target is set at
+    upload time and would look right while the Job it produced still asked for
+    no card.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    upload_to_the_a4000(app.test_client(), monkeypatch)
+
+    APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    (manifest,) = launcher.manifests
+    resources = manifest["spec"]["template"]["spec"]["containers"][0]["resources"]
+    assert resources["limits"]["nvidia.com/gpu"] == 1, (
+        "a cluster-gpu row produced a Job with no GPU request; it would run "
+        "on the CPU while the page said it was on the A4000"
+    )
+    pod = manifest["spec"]["template"]["spec"]
+    assert pod["nodeSelector"] == {"nvidia.com/gpu.product": "NVIDIA-RTX-A4000"}
+
+
+def test_a_jetson_row_is_not_launched_by_the_cluster_launcher(
+        tmp_path, monkeypatch):
+    """The negative control for the test above.
+
+    Without this, ``next_queued`` returning everything would make the GPU test
+    pass while the cluster launcher had also started every Jetson row.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    monkeypatch.setenv("MSE_GPU_MIN_TETS", "1")
+    monkeypatch.setenv("MSE_GPU_ROUTE", "jetson")
+    upload(app.test_client())
+    (job,) = db.jobs.values()
+    assert job["target"] == DB.JETSON
+
+    APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    assert not launcher.manifests, (
+        "the cluster launcher started a jetson row; the target filter is gone"
+    )
+
+
+def test_an_a4000_out_of_memory_does_not_blame_the_object(tmp_path,
+                                                          monkeypatch):
+    """The A4000 is more likely to run out than the Jetson, not less.
+
+    A 16 GB card on a shared cluster is a tighter budget than the previous
+    host, so this is the failure the owner meets first. The message must say
+    the machine ran out -- not "try a simpler object", which sends an owner
+    whose object is fine off to redo it.
+    """
+    app, _store, db, launcher = make_app(tmp_path)
+    upload_to_the_a4000(app.test_client(), monkeypatch)
+    (job,) = db.jobs.values()
+    launcher.failed[job["k8s_job_name"]] = "OOMKilled"
+
+    APP.run_tick(None, db, launcher, log=lambda *a: None)
+
+    message = db.jobs[job["job_id"]]["message"]
+    assert "memory" in message.lower()
+    assert "simpler object" not in message.lower(), (
+        "an A4000 out-of-memory is a hardware limit, not a hint that the "
+        "object was badly chosen"
+    )

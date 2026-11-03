@@ -155,20 +155,24 @@ def _make(tmp_path, db=None, launcher=None):
     return app, store, jobs_db, launcher
 
 
-def test_a_ten_millimetre_box_goes_to_the_jetson_at_the_real_threshold(tmp_path):
+def test_a_ten_millimetre_box_goes_to_the_cluster_gpu_at_the_real_threshold(
+        tmp_path):
     """The box the app is most likely to see, at the threshold the lead set.
 
     It is worth having this one not monkeypatch anything: at 20 modes a 10 mm
     cube estimates at ~19.8k elements, over the 15k GPU threshold, so the
-    *default* configuration routes it to the Jetson. If someone later raises
-    MSE_GPU_MIN_TETS past this, this test says so rather than the change sliding
+    *default* configuration routes it to a GPU. Since the owner's 2026-11-02
+    decision the default GPU is the cluster's A4000, not the Jetson -- the
+    target changed, the threshold did not, and that is what this pins. If
+    someone later raises MSE_GPU_MIN_TETS past this, or quietly restores the
+    Jetson as the default, this test says so rather than the change sliding
     through.
     """
     _app, jobs_db, resp = _upload(tmp_path)
     assert resp.status_code == 302
     (job,) = jobs_db.jobs.values()
     assert job["est_tets"] > CFG.gpu_min_tets()
-    assert job["target"] == DB.JETSON
+    assert job["target"] == DB.CLUSTER_GPU
 
 
 def test_a_small_estimate_is_routed_to_the_cluster(tmp_path, monkeypatch):
@@ -3203,3 +3207,61 @@ def test_busy_past_the_wait_fails_the_job_readably(tmp_path, worker):
     assert row["status"] == DB.FAILED
     assert row["message"] == DB.BUSY_GAVE_UP_MESSAGE
     assert "60 minutes" in row["message"], "the owner is told how long it waited"
+
+
+
+
+# -- MSE_GPU_ROUTE (owner, 2026-11-02) ---------------------------------------
+#
+# One setting decides which machine serves a GPU-needing upload. These read it
+# through the ROUTING DECISION rather than through gpu_route() alone: a
+# function that parses the variable correctly proves nothing if the upload path
+# does not consult it.
+
+def _target_with_route(tmp_path, monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("MSE_GPU_ROUTE", raising=False)
+    else:
+        monkeypatch.setenv("MSE_GPU_ROUTE", value)
+    monkeypatch.setenv("MSE_GPU_MIN_TETS", "1")   # every upload needs the GPU
+    _app, jobs_db, resp = _upload(tmp_path)
+    assert resp.status_code == 302
+    (job,) = jobs_db.jobs.values()
+    return job["target"]
+
+
+def test_an_unset_route_sends_a_gpu_job_to_the_a4000(tmp_path, monkeypatch):
+    """The default. This is what runs with no environment set at all, which is
+    what the deployment does unless an operator deliberately changes it."""
+    assert _target_with_route(tmp_path, monkeypatch, None) == DB.CLUSTER_GPU
+
+
+def test_the_route_can_roll_back_to_the_jetson(tmp_path, monkeypatch):
+    """The rollback is the whole reason the setting exists: the owner's
+    fallback for a cluster GPU problem is one environment change."""
+    assert _target_with_route(tmp_path, monkeypatch, "jetson") == DB.JETSON
+
+
+def test_a_misspelled_route_is_the_default_not_a_refusal(tmp_path, monkeypatch):
+    """A typo must not take uploads down.
+
+    The alternative -- refusing every upload while an operator fixes a spelling
+    -- turns a harmless misconfiguration into an outage, and the owner would see
+    it as the app being broken. Unknown values therefore mean the default,
+    which is also what config.py documents.
+    """
+    assert _target_with_route(tmp_path, monkeypatch, "clustr") == DB.CLUSTER_GPU
+
+
+def test_the_route_does_not_move_a_job_that_needs_no_gpu(tmp_path, monkeypatch):
+    """The setting chooses BETWEEN GPU machines; it must not create a GPU job.
+
+    Without this, a route of ``jetson`` combined with a bug that ignored the
+    estimate would put every small upload on the Jetson's queue.
+    """
+    monkeypatch.setenv("MSE_GPU_ROUTE", "jetson")
+    monkeypatch.setenv("MSE_GPU_MIN_TETS", "1000000000")
+    _app, jobs_db, resp = _upload(tmp_path)
+    assert resp.status_code == 302
+    (job,) = jobs_db.jobs.values()
+    assert job["target"] == DB.CLUSTER

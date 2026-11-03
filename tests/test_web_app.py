@@ -106,10 +106,18 @@ def test_manifest_uses_exactly_the_named_secrets():
 
 def test_manifest_resources_are_guaranteed():
     """requests == limits, so the quota decides admission rather than the
-    scheduler."""
+    scheduler.
+
+    The numbers are read from the app's own configuration rather than retyped:
+    what this test is for is the EQUALITY (a Guaranteed pod), and hard-coding
+    the size here would make it fail for the harmless reason the quota moved
+    while still catching the real defect -- a request that is smaller than its
+    limit.
+    """
     resources = _manifest()["spec"]["template"]["spec"]["containers"][0]["resources"]
-    assert resources["requests"] == resources["limits"] == {"cpu": "4",
-                                                            "memory": "14Gi"}
+    assert resources["requests"] == resources["limits"]
+    assert resources["limits"] == {"cpu": CFG.JOB_CPU,
+                                   "memory": CFG.JOB_MEMORY}
 
 
 def test_manifest_retries_and_deadlines():
@@ -681,3 +689,78 @@ def test_the_launcher_still_accepts_a_cavity_job_and_a_nameless_one():
     # No kind at all is the same as kind=None: the existing callers do not pass
     # it, and a signature that broke them would be a change nobody asked for.
     assert launcher.create(JOB_ID, "mm", 1.0, 6)
+
+
+def _gpu_manifest():
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "web"))
+    import jobs
+    return jobs.build_job_manifest("j", "mm", 1.0, 20, "img", "sec", "ns",
+                                   gpu=True)
+
+
+def test_a_gpu_manifest_requests_and_limits_one_card():
+    """The GPU is requested as a first-class resource in both halves.
+
+    Both, not just one: the namespace quota counts ``requests``, so a limit
+    without a request would pass admission and then be scheduled onto a node
+    with no card -- and Requests==Limits is what makes the pod Guaranteed.
+    """
+    c = _gpu_manifest()["spec"]["template"]["spec"]["containers"][0]
+    assert c["resources"]["requests"]["nvidia.com/gpu"] == 1
+    assert c["resources"]["limits"]["nvidia.com/gpu"] == 1
+    assert c["resources"]["requests"] == c["resources"]["limits"]
+
+
+def test_the_gpu_manifest_names_the_a4000_node_and_the_cuda_backend():
+    """Pinned to the PRODUCT, not to "any GPU".
+
+    The manifest's memory price is the A4000's, so a job that landed on a
+    different card would be priced against the wrong machine. And the image
+    already forces the cpu backend for the CPU path, so the GPU manifest must
+    override it or the card goes unused.
+    """
+    spec = _gpu_manifest()["spec"]["template"]["spec"]
+    assert spec["nodeSelector"] == {"nvidia.com/gpu.product": "NVIDIA-RTX-A4000"}
+    env = {e["name"]: e["value"]
+           for e in spec["containers"][0]["env"]}
+    assert env["MSE_SOLVER_BACKEND"] == "cuda"
+
+
+def test_the_gpu_manifest_pins_thread_counts_to_the_cpu_limit():
+    """A cgroup limit does not change ``os.cpu_count()`` (measured, 2026-09-27).
+
+    Unset, OpenMP/BLAS starts one thread per HOST core and is throttled hard --
+    on a GPU job that starves the CPU stages around the solve. The value is the
+    integer part of the CPU limit: 2.5 vCPU cannot run 3 threads without
+    throttling, so it rounds down.
+    """
+    c = _gpu_manifest()["spec"]["template"]["spec"]["containers"][0]
+    names = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+             "NUMEXPR_NUM_THREADS")
+    env = {e["name"]: e["value"] for e in c["env"]}
+    for name in names:
+        assert name in env, f"{name} unset: BLAS will start one thread per host core"
+        assert env[name] == str(int(float(c["resources"]["limits"]["cpu"])))
+    # And the CPU-only boundary must NOT ride along: it describes a machine
+    # this Job is not running on.
+    assert "MSE_CPU_MAX_TETS" not in env
+
+
+def test_a_cpu_manifest_is_unchanged_by_the_gpu_support():
+    """The CPU Job keeps no card, no nodeSelector and the cpu backend.
+
+    The negative control for the three tests above: if ``gpu`` defaulted wrong,
+    or the GPU branch ran for the CPU path, the cluster's CPU queue would start
+    asking for cards the quota refuses.
+    """
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "web"))
+    import jobs
+    c = jobs.build_job_manifest("j", "mm", 1.0, 20, "img", "sec", "ns")[
+        "spec"]["template"]["spec"]["containers"][0]
+    assert "nvidia.com/gpu" not in c["resources"]["limits"]
+    assert "nodeSelector" not in jobs.build_job_manifest(
+        "j", "mm", 1.0, 20, "img", "sec", "ns")["spec"]["template"]["spec"]
+    env = {e["name"]: e["value"] for e in c["env"]}
+    assert env["MSE_SOLVER_BACKEND"] == "cpu"

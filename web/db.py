@@ -36,9 +36,27 @@ RESTORED = "restored"
 #: which machine a job is for. ``cluster`` is a k8s Job (the pre-routing default,
 #: and what every existing row did); ``jetson`` waits for a GPU worker to claim
 #: it through the worker API.
+#:
+#: ``cluster-gpu`` is a k8s Job that requests one RTX A4000. It exists because
+#: the Jetson is an edge device with one small GPU, while the cluster has idle
+#: A4000s (owner, 2026-11-02). It shares the ``cluster`` launcher and differs
+#: only in the manifest it asks for.
+#:
+#: The column stores a plain string, so adding a value needs no migration and
+#: every existing row keeps meaning what it meant.
 CLUSTER = "cluster"
 JETSON = "jetson"
-TARGETS = (CLUSTER, JETSON)
+CLUSTER_GPU = "cluster-gpu"
+TARGETS = (CLUSTER, JETSON, CLUSTER_GPU)
+
+#: The two targets that are k8s Jobs in this namespace, and so are launched and
+#: reaped by the cluster machinery rather than claimed by the Jetson worker.
+#: Named as a set so a new Job target cannot be forgotten at one of the several
+#: ``== CLUSTER`` call sites. See :data:`GPU_TARGETS`.
+CLUSTER_TARGETS = (CLUSTER, CLUSTER_GPU)
+
+#: Targets that occupy the single GPU quota slot.
+GPU_TARGETS = (CLUSTER_GPU,)
 
 #: What KIND of solve a job is. ``cavity`` is the 3-D vector solver this table
 #: has always held and is the DEFAULT on the column, so every row written before
@@ -634,13 +652,18 @@ class JobStore:
         ]
 
     # -- the queue ---------------------------------------------------------
-    def next_queued(self, target: str = CLUSTER) -> dict | None:
-        """Oldest upload still waiting for the Job slot on ``target``.
+    def next_queued(self, targets=CLUSTER_TARGETS) -> dict | None:
+        """Oldest upload still waiting for the Job slot on any of ``targets``.
 
-        Filtered by target: the namespace admits exactly one ``batch/v1`` Job, so
-        a jetson row reaching the launcher would occupy that slot while the app
-        waited for a GPU worker that is not coming. Jetson rows are claimed by
-        the worker API instead -- see ``claim_jetson``.
+        Defaults to every target that IS a k8s Job here, so a ``cluster-gpu``
+        row is picked up by the same slot as a ``cluster`` one. That is
+        deliberate: the namespace admits exactly one ``batch/v1`` Job including
+        finished ones, so the two Job targets share the slot rather than each
+        getting one.
+
+        Filtered by target: a jetson row reaching the launcher would occupy that
+        slot while the app waited for a GPU worker that is not coming. Jetson
+        rows are claimed by the worker API instead -- see ``claim_jetson``.
 
         Filtered by kind as well, and this is not belt-and-braces. The cluster
         has no pc or td solver: ``launcher.create`` refuses any kind but cavity,
@@ -650,13 +673,15 @@ class JobStore:
         target the row carries. It is a WHITELIST (``kind = 'cavity'``), so a
         kind added later is invisible here until a cluster solver exists for it.
         """
+        if isinstance(targets, str):
+            targets = (targets,)
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT job_id, original_filename, units, n_index, n_modes, est_tets, "
-                "min_feature_m, scale, materials, kind "
-                "FROM mse.jobs WHERE status = %s AND target = %s AND kind = %s "
+                "min_feature_m, scale, materials, kind, target "
+                "FROM mse.jobs WHERE status = %s AND target = ANY(%s) AND kind = %s "
                 "ORDER BY created_at LIMIT 1",
-                (QUEUED, target, CAVITY),
+                (QUEUED, list(targets), CAVITY),
             )
             row = cur.fetchone()
         if not row:
@@ -664,7 +689,7 @@ class JobStore:
         return {"job_id": str(row[0]), "original_filename": row[1],
                 "units": row[2], "n_index": row[3], "n_modes": row[4],
                 "est_tets": row[5], "min_feature_m": row[6], "scale": row[7],
-                "materials": row[8], "kind": row[9]}
+                "materials": row[8], "kind": row[9], "target": row[10]}
 
     def jetson_waiting(self, older_than_seconds: float) -> list[dict]:
         """Jetson rows nobody has claimed for longer than the wait window.
