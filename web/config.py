@@ -163,7 +163,7 @@ DEFAULT_GPU_MIN_TETS = 15_000
 #:
 #: Every test passed, because the tests put ``dockerfiles/maxwell_solver`` on
 #: ``sys.path``; nothing in the suite started the web IMAGE. ``mse_common`` is
-#: the part both images share and imports only numpy, so both can have it. If
+#: the part both images share and imports only the standard library and numpy, so both can have it. If
 #: the module cannot be found the app FAILS TO IMPORT rather than falling back
 #: to a restated number -- a silent fallback is the defect this import removes.
 def _common_dir() -> str:

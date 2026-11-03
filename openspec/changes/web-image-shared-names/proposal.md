@@ -27,7 +27,7 @@ docstring warns about, one level up.
 ## What changes
 
 1. `mse_common` defines `CPU`, `GPU` and `BACKENDS`. It is the one module both
-   images already COPY, and it imports only numpy.
+   images already COPY, and it imports only the standard library and numpy.
 2. `mse_backend` **re-exports** them (`from mse_common import ...`). Every
    existing `mse_backend.GPU` / `mse_backend.BACKENDS` caller is unchanged, and
    there remains exactly one definition.

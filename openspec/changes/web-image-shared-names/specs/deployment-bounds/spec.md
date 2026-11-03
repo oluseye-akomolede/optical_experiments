@@ -16,7 +16,7 @@ The web deployment SHALL run within `cpu: 500m` / `memory: 1Gi` limits and
 Every module a web module imports SHALL be either standard library, a pinned
 web requirement, or a file the web Dockerfile COPYs. A name that both images
 need SHALL be defined in `mse_common`, which both Dockerfiles COPY and which
-imports only numpy — never in a solver module that imports the heavy stack. In
+imports only the standard library and numpy — never in a solver module that imports the heavy stack. In
 particular the web image SHALL NOT ship `mse_backend.py`, which imports scipy
 at module level.
 
