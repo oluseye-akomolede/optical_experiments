@@ -1,39 +1,40 @@
 # GPU dependencies for the MSE Maxwell solver, installed ON TOP of
 # requirements.txt in ./Dockerfile.gpu. Nothing here belongs in the CPU image.
 #
-# These are the three the solver's GPU path actually imports -- the same set
-# mse_backend._missing_gpu_package() probes, and that probe (not this comment)
-# is what the image build enforces:
-#     import cupy as cp
-#     import cupyx.scipy.sparse as csp
-#     import nvmath
-# cuDSS is reached THROUGH nvmath (nvmath.sparse.advanced.DirectSolver), not
-# imported directly, so it arrives as an nvmath dependency rather than a pin
-# here. Pinning it separately would create the second source of truth for a
-# library version that this repo's own history blames for machine-specific
-# failures.
+# The solver's GPU path imports three packages (cupy, cupyx.scipy.sparse,
+# nvmath), but that is NOT the set the build must guarantee: cuDSS is reached
+# through nvmath (nvmath.sparse.advanced.DirectSolver) and is absent unless it
+# is asked for, so a probe that only imports those three passes on an image
+# that cannot factorise anything. The build probe therefore also loads the
+# cuDSS shared library -- see the PROBE step in Dockerfile.gpu.
 
-# cupy for the CUDA 12 runtime the A4000 nodes report (nvidia.com/cuda.runtime-version.full=12.7,
-# driver 565.57.01). Not the [ctk] extra: that installs a second, version-
-# drifting copy of the whole CUDA toolkit, which is why the paper1 bench image
-# settled on the plain form. Same pin it measured.
+# cupy for the CUDA 12 runtime the A4000 nodes report. Not the [ctk] extra:
+# that installs a second, version-drifting copy of the whole CUDA toolkit.
+# Same pin the paper1 bench image measured.
 cupy-cuda12x==14.2.0
 
-# nvmath-python: the DirectSolver the GPU factorisation calls.
+# nvmath-python: the DirectSolver the GPU factorisation calls. 0.9.0 is what
+# the Jetson worker's venv runs (read there by the lead, 2026-11-03); it is
+# also the version whose tear-down (solver.free()) _CudssFactor.close() is
+# written against.
 #
-# VERSION NOT YET PINNED, deliberately, and this file will not build until it
-# is. The repo records "nvmath 0.9.0" in mse_backend._CudssFactor.close()'s
-# docstring (as the version whose tear-down is solver.free()), but that is a
-# docstring, not a measurement of what the Jetson GPU venv actually runs --
-# and the Jetson's pip freeze is not in the tree. The lead owns that machine
-# and can read it:
+# Pinned WITHOUT the [cu12] extra on purpose. The extra would pull cuDSS, but
+# it also pulls nvidia-cuda-runtime-cu12 and cublas/cufft/cusolver/cusparse,
+# i.e. a second CUDA runtime and solver set beside the base image's own CUDA
+# 12.6. The extra is a convenience for a machine with no CUDA at all; this
+# image has one, and two of them is how a build gets quiet version skew.
+nvmath-python==0.9.0
+
+# cuDSS, pinned explicitly because nothing else installs it.
 #
-#     ssh jetson '~/mse-bench/gpu-venv/bin/pip freeze | grep -i nvmath'
-#
-# Pin that exact version here. Guessing it would repeat the failure this whole
-# row exists to fix: a value typed from memory that nothing verifies, shipping
-# as a confident-looking image.
-nvmath-python==PIN-FROM-JETSON
+# PyPI's requires_dist for nvmath-python 0.9.0 mentions cuDSS only as
+#     nvidia-cudss-cu12==0.7.*; extra == "cu12"
+# so a plain `pip install nvmath-python==0.9.0` installs NO cuDSS at all, and
+# the first DirectSolver.factorize() is where that surfaces -- on the A4000,
+# after the image has been built, pushed and deployed. 0.7.1.6 is the newest
+# 0.7.1 wheel on PyPI; the Jetson runs the 0.7.1 line as a tarball at
+# ~/cudss-0.7.1/lib, which is why that line and not 1.0.0.35.
+nvidia-cudss-cu12==0.7.1.6
 
 # numpy/scipy come from requirements.txt, pinned there; cupy-cuda12x requires a
 # compatible numpy and pip resolves against the already-installed one, so they

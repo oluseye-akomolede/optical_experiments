@@ -91,12 +91,35 @@ every routing test above would have passed by launching nothing.
       a CUDA 12.6.3 base matching the A4000 nodes, with a BUILD-TIME probe that
       calls the solver's own `mse_backend._missing_gpu_package()` so a GPU image
       missing the stack cannot reach Harbor.
-- [ ] 4b.5 **Blocker on 5.1:** `nvmath-python` is not pinned in
-      `requirements-gpu.txt` (placeholder `PIN-FROM-JETSON`), because no nvmath
-      version is recorded in this repo -- the only mention is a docstring, and
-      the Jetson's `pip freeze` is not in the tree. The image will not build
-      until the lead reads it on the Jetson and fills it in. Guessing would
-      repeat exactly the failure this row fixes.
+- [x] 4b.5 `nvmath-python==0.9.0` **and** `nvidia-cudss-cu12==0.7.1.6` both
+      pinned explicitly, read from the Jetson by the lead (04:18Z). The `cu12`
+      extra is deliberately NOT used: it also drags in nvidia-cuda-runtime-cu12
+      beside the base image's own CUDA 12.6.
+- [x] 4b.6 `dockerfiles/maxwell_solver/gpu_stack_probe.py`, run by the build:
+      the solver's own import probe, then a `ctypes` load of the cuDSS shared
+      object. Loading needs no GPU, so a stackless image fails at BUILD time.
+- [x] 4b.7 Probe mutation-checked in both directions on the dev VM: with the
+      cuDSS distribution absent it refuses with the "pin it" message; with
+      0.7.1.6 installed it locates the library and tries to load it.
+
+**Measured fact that broke the first probe:** `nvidia-cudss-cu12` 0.7.1.6 is
+DATA-ONLY -- it installs `nvidia/cu12/lib/libcudss.so.0` and no importable
+`nvidia.cudss` package, so `find_spec("nvidia.cudss")` fails on a correct
+install and the first probe would have refused a good image. The probe now
+locates the library through the `nvidia-cudss-cu12` DISTRIBUTION instead. The
+wheel also does not declare its `libcublas.so.12` dependency (the CUDA base
+supplies it); because the probe actually LOADS the library, that class of miss
+fails the build -- and did, locally, which is how the dependency was found.
+
+**A second probe bug, caught by the first real image build.**
+`import_probe()` asked `mse_backend._missing_gpu_package()` and treated any
+non-empty return as a failure. But that helper returns the string `"the CUDA
+stack"` as a LABEL for an error message when NOTHING is missing, so the probe
+refused a correct image, with the self-contradicting line "the CUDA stack is not
+importable". It now imports `mse_backend._GPU_PACKAGES` one name at a time and
+reports the name that actually failed; both directions are tested on the dev VM.
+The lesson generalises: a helper whose "nothing wrong" case shares a type with
+its "something wrong" case cannot be used as a boolean.
 
 **Done notes (4b).** The old test asserted `== "cuda"`: it encoded the bug
 rather than catching it, so it was replaced by a membership check against
