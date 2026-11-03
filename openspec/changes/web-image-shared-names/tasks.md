@@ -29,7 +29,7 @@
       on the fix. The `[jobs]` case is the specific red.
 - [x] 3.4 `test_web_app.py`, `test_backend.py`, `test_worker.py`,
       `test_web_imports.py`: 160 passed.
-- [ ] 3.5 Rebuild the GPU image and confirm the probe still prints
+- [x] 3.5 Rebuild the GPU image and confirm the probe still prints
       `GPU STACK IMPORTS OK` + `cuDSS LOADS OK` and `pip show cuda-bindings`
       reports 12.x.
 
