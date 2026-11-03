@@ -189,8 +189,24 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       - Reviewer note 1 (1.3): the `skip` guard cannot be reached through `solve`, so it is
         tested by calling `assemble_stiffness` directly rather than dropped — the assembler
         is a public entry point.
-- [ ] 1.5 `field_at` and `capacitance_matrix` from the residual charge; three-electrode
+- [x] 1.5 `field_at` and `capacitance_matrix` from the residual charge; three-electrode
       symmetry test.
+      - Done. Three-electrode stack with two gaps 3x apart, checked against the exact
+        series capacitances, plus a two-plate plate value pinned as measured (1.700e-12 F)
+        and its mesh independence. `field_at` checked against -V/d with its SIGN asserted,
+        and refused both outside the mesh and inside a held electrode.
+      - The three-electrode test caught two real bugs and one process failure:
+        `_electrode_charge` negated `K phi` and its docstring asserted that negation was
+        the charge (a global sign error every symmetric fixture hides), and the
+        `_barycentric` constant `c` contracted against a TRANSPOSED gradient, which
+        broadcast a tet-by-tet matrix instead of testing any point.
+      - The process failure is the one worth recording: the task said "symmetry test", and
+        a transposed `C` IS symmetric, so writing `C[j, i]` instead of `C[i, j]` passed
+        the whole 45-test suite FOUR times. No mesh in these fixtures can break reciprocity
+        (measured max |C - C^T| = 0.0), so the orientation is unpinnable through `solve`.
+        Fixed by splitting `assemble_capacitance` out and pinning the convention on
+        deliberately non-symmetric charge maps. The task's "symmetry test" wording would
+        have shipped the bug; a symmetry property cannot test an index convention.
 - [ ] 1.6 Bench fixtures (two-layer slab, concentric spheres, sphere between plates, the
       paper-1 wire with a top electrode) and `scripts/electrostatics_bench.py`. Prove the
       ε_s-ignored mutation.

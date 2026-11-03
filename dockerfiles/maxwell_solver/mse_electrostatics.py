@@ -87,6 +87,14 @@ AMG_RESIDUAL_SLACK = 10.0
 #: failure ``mse_backend.selected_backend`` refuses for the same reason.
 METHODS = ("auto", "direct", "amg")
 
+#: Relative size below which a barycentric coordinate counts as "on the face".
+#: A point EXACTLY on a shared face is ambiguous -- both tets contain it -- and
+#: :func:`field_at` must choose one. Face-coincident points are common rather
+#: than pathological: an axis-aligned device puts electrode faces and sample
+#: points on node planes. The tie-break is deterministic (the lowest tet index
+#: whose weight is >= -this) so two calls on the same point agree to the bit.
+BARY_EPS = 1e-9
+
 
 def check_tet_regions(region_of_tet: np.ndarray, parts) -> np.ndarray:
     """Validate the mesh's own per-tet region ids, and return them as an array.
@@ -492,6 +500,209 @@ def solve(
         "n_free": int(free.sum()),
         "method": solved_by,
         "residual": residual,
+        # The mesh and the inputs :func:`field_at` and :func:`_electrode_charge`
+        # need. Carried here rather than passed alongside, because a solution
+        # read with a DIFFERENT mesh is a silent wrong answer (the potential is
+        # indexed by node, so a reordered mesh maps voltages to the wrong nodes).
+        "points_m": points_m,
+        "tets": tets,
+        "parts": list(parts),
+        "region_of_tet": tet_part,
+        "eps_static": dict(eps_static),
+        "tet_part_name": [parts[int(i)] for i in tet_part],
     }
 
 
+
+
+def _barycentric(points: np.ndarray, tets: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """Barycentric coordinates of ``p`` in every tet, ``(n_tets, 4)``.
+
+    ``lambda_a = p . grad(lambda_a) + c_a``, and ``grad(lambda_a)`` already
+    satisfies ``sum_a lambda_a = 1``, so the affine constant ``c_a`` is
+    ``delta_a0 - p0 . grad(lambda_a)`` for any node ``p0`` of the tet -- node 0
+    is as good as any and costs one row.
+    """
+    _, grads = mse_fem.tet_geometry(points, tets)
+    # grads is (n_tets, 4, 3), one gradient per SHAPE FUNCTION (lambda_a) per
+    # tet. transposing to (n_tets, 3, 4) is what contracts the coordinate axis
+    # with ``p`` and leaves the four lambda values: without it the einsum above
+    # silently broadcast the tet axis into the node axis and returned a
+    # (n_tets, n_tets, 4) array. ``c`` is derived the same way, then the two are
+    # summed with ``p`` on the coordinate axis only.
+    # grads is (n_tets, 4, 3): contract the COORDINATE axis with p0 and the
+    # result is (n_tets, 4), one constant per shape function. It previously
+    # contracted against ``grads.transpose(0, 2, 1)``, whose rows are indexed by
+    # shape function and columns by coordinate, so p0 (3 long) broadcast against
+    # the shape-function axis and produced (n_tets, n_tets, 4) -- a tet-by-tet
+    # matrix that no point was ever tested against.
+    c = np.array([1.0, 0.0, 0.0, 0.0]) - np.einsum(
+        "nk,nak->na", points[tets][:, 0, :], grads)
+    return np.einsum("nak,k->na", grads, p) + c
+
+
+def field_at(solution: dict, point_m) -> np.ndarray:
+    """E = -grad(phi) in V/m at ``point_m``, in the tet that contains it.
+
+    ``phi`` is piecewise linear on the mesh, so ``grad(phi)`` is constant per
+    element: ``sum_a phi_a grad(lambda_a)`` over the containing tet. No
+    smoothing is done and none should be -- a caller that wants a field
+    across a material interface is asking for two values, and gets the one on
+    the side of the point it asked about.
+
+    Refuses a point outside the mesh and a point inside an electrode part. The
+    second is not pedantry: ``phi`` there is the imposed constant, so the
+    piecewise-linear ``grad`` is 0 and the caller would receive E = 0 with no
+    sign that the field was merely not computed. The electrode boundary layer
+    is exactly where a device's field lives, so that silent zero is the most
+    misleading answer this function could give.
+
+    ``solution`` is a :func:`solve` result; ``tets`` and ``points_m`` are read
+    from it, which is why ``solve`` carries them.
+    """
+    p = np.asarray(point_m, dtype=np.float64).reshape(-1)
+    if p.shape != (3,):
+        raise ValueError(f"point_m must be a 3-vector, got shape {np.shape(point_m)}")
+
+    points = solution["points_m"]
+    tets = solution["tets"]
+    lam = _barycentric(points, tets, p)
+    inside = np.all(lam >= -BARY_EPS, axis=1)
+    if not inside.any():
+        raise ValueError(
+            f"point {p.tolist()} is outside this mesh; "
+            f"field_at only samples where the solution exists"
+        )
+    # A point ON an electrode boundary lies in several tets at once -- some
+    # electrode, some not -- so taking the lowest-index containing tet made the
+    # answer depend on the mesh's numbering: a point on the gap-side face of an
+    # electrode was refused about half the time, and the two answers differed
+    # in kind (a field vs an exception), not just in value. Prefer a
+    # non-electrode tet; refuse only when EVERY containing tet is an electrode,
+    # which is the honest reading of "strictly inside the electrode".
+    containing = np.flatnonzero(inside)
+    tet_part_name = solution["tet_part_name"]   # a LIST, not an array
+    is_electrode = np.array([tet_part_name[int(t)] in solution["electrodes"]
+                             for t in containing], dtype=bool)
+    non_electrode = containing[~is_electrode]
+    if non_electrode.size == 0:
+        raise ValueError(
+            f"point {p.tolist()} is inside electrode "
+            f"{tet_part_name[int(containing[0])]!r}, where the potential is held constant; the field "
+            f"there is not computed, so returning 0 would be a zero dressed up "
+            f"as an answer"
+        )
+    tet = int(non_electrode[0])
+
+    _, grads = mse_fem.tet_geometry(points, tets[tet:tet + 1])
+    return -(solution["phi"][tets[tet]] @ grads[0])
+
+
+def capacitance_matrix(
+    points_m: np.ndarray,
+    tets: np.ndarray,
+    parts: list[str],
+    region_of_tet: np.ndarray,
+    eps_static: dict[str, float],
+    electrodes: dict[str, float],
+    *,
+    backend: str | None = None,
+    method: str = "auto",
+) -> tuple[np.ndarray, list[str]]:
+    """The Maxwell capacitance matrix in farads, and the electrode order.
+
+    ``C_ij = dQ_i / dV_j``: each electrode's charge is read from the assembled
+    residual ``K phi`` restricted to that electrode's nodes, with electrode
+    ``j`` at 1 V and every other at 0 V.
+
+    **Read from the residual, not from the surface.** Summing ``K phi`` over a
+    disjoint set of NODES gives exactly the flux a Gaussian surface around that
+    electrode would, because every assembled row sums to zero. It is neither
+    easier nor harder than an edge-based flux, but it is the definition the
+    spec names and it keeps the answer tied to the matrix that was actually
+    solved.
+
+    The matrix is returned in the order of ``electrodes``. Rows are NOT
+    normalised by sign: with ``K phi`` built for ``phi_j = 1``, a row's
+    self-entry is positive and its couplings negative, which is the physical
+    Maxwell matrix. Symmetry of the returned matrix is a consequence, not an
+    assumption -- :func:`solve` runs ``K_ff`` SPD, and the same ``K`` is used
+    for every driven electrode, so ``C`` is symmetric in exact arithmetic and
+    the tests measure how far from it we are.
+    """
+    names = list(electrodes)
+    if len(names) < 1:
+        raise ValueError("capacitance_matrix needs at least one electrode")
+    columns = []
+    for driven in names:
+        volts = {name: (1.0 if name == driven else 0.0) for name in names}
+        result = solve(points_m, tets, parts, region_of_tet, eps_static, volts,
+                       backend=backend, method=method)
+        columns.append(_electrode_charge(result))
+    return assemble_capacitance(columns, names), names
+
+
+def assemble_capacitance(columns: list[dict[str, float]],
+                         names: list[str]) -> np.ndarray:
+    """Build ``C`` from one charge map per driven electrode.
+
+    Split out from :func:`capacitance_matrix` because the ORIENTATION is not
+    observable from any solve this module can run: every fixture these tests
+    build is reciprocal, so ``C`` comes out exactly symmetric (measured max
+    ``|C - C^T|`` of 0.0) and writing the drive into the row index instead of
+    the column produces a numerically identical matrix. Transposing the write
+    survived the whole test suite four times before this function existed.
+
+    With the assembly separate, the convention is testable directly: a drive
+    map that is deliberately NOT symmetric pins which index the drive occupies,
+    and nothing about float symmetry is involved.
+    """
+    if len(columns) != len(names):
+        raise ValueError(
+            f"assemble_capacitance needs one charge map per electrode: "
+            f"{len(columns)} maps for {len(names)} electrodes"
+        )
+    n = len(names)
+    C = np.zeros((n, n), dtype=np.float64)
+    for j in range(n):
+        charges = columns[j]
+        # ``charges`` is already Maxwell-signed (see _electrode_charge). The
+        # drive, j, belongs in the COLUMN: C[i, j] is the charge on electrode i
+        # when j is driven.
+        for i, name in enumerate(names):
+            C[i, j] = charges[name]
+    return C
+
+
+def _electrode_charge(solution: dict) -> dict[str, float]:
+    """``(K phi)`` summed over each electrode's nodes, in coulombs.
+
+    The sign, from the DERIVATION: ``K_ab = integral(eps0 * eps * grad(lam_a)
+    . grad(lam_b))`` is the weak form of ``-div(eps0 * eps * grad(phi))``, and
+    integrate-by-parts moves the divergence onto the test function, leaving a
+    boundary flux with a MINUS sign. So ``(K phi)_a`` is minus the outward flux
+    through that node's control volume, i.e. PLUS the charge stored on it. In
+    the driven-at-1 V convention that makes the driven electrode's own entry
+    positive and its neighbours' negative, which is a capacitor.
+
+    Corroborated, not established, by measurement: on the three-plate stack
+    with p0 driven at 1 V, ``p0`` sums to +2.83e-13 C and its neighbour to
+    -2.83e-13 C, which is a positive electrode and its induced
+    negative partner. An earlier version of this function negated that sum and
+    its docstring asserted the negation was the charge; both were wrong by a
+    global sign, which every symmetric fixture hides (``-C`` is as symmetric as
+    ``C``) and only the asymmetric one exposed.
+
+    The FULL assembled matrix is used, not ``K_ff``: the electrode rows are the
+    ones carrying the charge, so the assembly here deliberately does not skip
+    them. (``solve`` skips them because they are Dirichlet rows there; a
+    residual read needs them, and re-assembling is cheap next to the solve.)
+    """
+    K, _ = assemble_stiffness(
+        solution["points_m"], solution["tets"], solution["parts"],
+        solution["eps_static"], solution["region_of_tet"],
+        n_points=solution["phi"].shape[0],
+    )
+    residual = K @ solution["phi"]
+    return {name: float(residual[nodes].sum())
+            for name, nodes in solution["electrodes"].items()}

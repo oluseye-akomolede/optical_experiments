@@ -45,7 +45,25 @@ electrode's nodes and return the Maxwell capacitance matrix in farads.
 
 #### Scenario: The capacitance matrix is symmetric
 - **WHEN** `capacitance_matrix` is computed for three or more electrodes
-- **THEN** C is symmetric within 1e-6 relative and each row sums to ≤ 0 off-diagonal
+- **THEN** C = Cᵀ within 1e-6 relative; C[i][i] > 0; and C[i][j] ≤ 0 for i ≠ j.
+  C[i][j] is the charge induced on electrode `i` when electrode `j` is driven at
+  1 V, so driving puts POSITIVE charge on the driven electrode.
+
+#### Scenario: The rows sum to zero only when every held surface is in C
+The zero-flux outer boundary makes the total charge zero by Gauss's law, so a row's
+sum reports where the driven electrode's charge WENT, and that depends on whether
+every surface held at a fixed potential is one of C's electrodes:
+- **WHEN** every fixed-potential surface is an electrode of `capacitance_matrix`
+  **THEN** each row of C sums to 0 to round-off (pinned within 1e-9 on the
+  earthed two-plate fixture, measured ~1e-20)
+- **WHEN** a surface is held at a fixed potential but is NOT one of C's electrodes
+  (e.g. a grounded substrate the call does not name)
+  **THEN** the charge that left for that surface is not in any row, so every row
+  sums to ≥ 0 rather than 0. This is the honest statement of the property: the
+  unconditional "each row sums to ≤ 0" this scenario used to assert was garbled
+  and did not describe any physical quantity. The ≥ 0 case is NOT yet pinned by
+  a test — no fixture here holds a surface the call omits — and is stated as an
+  unimplemented check rather than a measured one.
 
 ### Requirement: Generality SHALL be tested on devices that are not a wire
 The benches SHALL include at least two devices whose geometry is not the paper-1 wire: a
