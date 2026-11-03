@@ -25,8 +25,19 @@ from pathlib import Path
 _COMMON_ROOT = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
 if str(_COMMON_ROOT) not in sys.path:
     sys.path.insert(0, str(_COMMON_ROOT))
-import mse_backend  # noqa: E402  # the backend NAMES, never retyped
-import mse_common as COMMON  # noqa: E402
+import mse_common as COMMON  # noqa: E402  # also the backend NAMES, never retyped
+
+#: The GPU backend name, taken from the module BOTH images ship.
+#:
+#: This line used to read ``import mse_backend``, to avoid retyping the literal
+#: ``"cuda"`` (which was wrong -- ``mse_backend`` accepts only cpu and gpu). The
+#: literal was indeed wrong, but ``mse_backend`` imports scipy at module level
+#: and the web image has no scipy, so the deployed image crashlooped at import:
+#: ``ModuleNotFoundError: No module named 'mse_backend'`` (mse-web 072ed7a,
+#: rolled back; Recreate strategy meant the site was down until the rollback).
+#: The names now live in ``mse_common``, which both images COPY. Copying
+#: ``mse_backend.py`` into the web image is NOT a fix: it would drag in scipy.
+_GPU_BACKEND = COMMON.GPU
 
 #: label values must be DNS-1123-ish; a job id is a uuid but be defensive
 _UNSAFE = re.compile(r"[^a-z0-9.-]")
@@ -151,12 +162,13 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
         args += ["--materials-from", _MATERIALS_OBJECT]
     if gpu:
         # The same CLI, run against the GPU backend. The NAME comes from
-        # mse_backend.BACKENDS, never a typed literal: this line said "cuda"
-        # once, while mse_backend accepts only "cpu" and "gpu", so every A4000
+        # mse_common.BACKENDS, never a typed literal: this line said "cuda"
+        # once, while the solver accepts only "cpu" and "gpu", so every A4000
         # job died at backend selection and no test noticed -- the tests never
         # compared this value with the set the solver actually accepts.
+        # mse_common, not mse_backend: the web image does not ship mse_backend.
         env = [e for e in env if e["name"] != "MSE_SOLVER_BACKEND"]
-        env.append({"name": "MSE_SOLVER_BACKEND", "value": mse_backend.GPU})
+        env.append({"name": "MSE_SOLVER_BACKEND", "value": _GPU_BACKEND})
         # MSE_CPU_MAX_TETS describes the CPU machine. The solver only consults it
         # on the cpu backend, so leaving it would be harmless -- but it would
         # name a limit for a machine this Job is not running on, and a reader

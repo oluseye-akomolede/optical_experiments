@@ -44,6 +44,26 @@ import os
 
 import numpy as np
 
+#: The two solver backend NAMES, and the tuple that validates them.
+#:
+#: These live here, not in :mod:`mse_backend`, because the WEB image needs the
+#: names and must not import the backend module. ``mse_backend`` imports scipy
+#: at module level (for the SuperLU factorisations), and the web image has no
+#: scipy -- so ``web/jobs.py`` could only name a backend by either retyping a
+#: literal or importing a module the web image does not ship. Retyping the
+#: literal is exactly the bug this name replaced: the manifest said ``"cuda"``
+#: while the solver accepted only ``"cpu"`` and ``"gpu"``, and every A4000 job
+#: died at backend selection. Importing ``mse_backend`` from ``web/jobs.py``
+#: fixed the literal and crashlooped the deployed image instead (mse-web
+#: 072ed7a, rolled back): ``ModuleNotFoundError: No module named 'mse_backend'``.
+#:
+#: So the names are defined ONCE, in the one module both images already import.
+#: ``mse_backend`` re-exports them (a binding, not a copy), so every existing
+#: ``mse_backend.GPU`` / ``mse_backend.BACKENDS`` caller is unchanged.
+CPU = "cpu"
+GPU = "gpu"
+BACKENDS = (CPU, GPU)
+
 #: unit name -> metres per unit
 #:
 #: ``um`` and ``nm`` are here because optical structures are routinely specified
