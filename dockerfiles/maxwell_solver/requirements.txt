@@ -14,6 +14,8 @@
 # transitive set is not frozen into a shape that breaks on a platform change.
 numpy==2.5.3
 scipy==1.18.1
+# The electrostatic AMG-CG path (mse_electrostatics.amg_solve, meshes over the crossover).
+pyamg==5.4.1
 trimesh==5.1.0
 tetgen==0.8.4
 pyvista==0.49.0
