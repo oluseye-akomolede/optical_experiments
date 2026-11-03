@@ -121,6 +121,14 @@ reports the name that actually failed; both directions are tested on the dev VM.
 The lesson generalises: a helper whose "nothing wrong" case shares a type with
 its "something wrong" case cannot be used as a boolean.
 
+**The corrected probe passed a real image build** (openrig VM, repo-root build
+context): `GPU STACK IMPORTS OK`, then `cuDSS LOADS OK: libcudss.so.0`, image
+tagged, exit 0. That is the probe's first clean run on the image it guards --
+before it, the only observed run was the buggy one that refused a good build.
+One build-context trap found on the way: the COPY paths are repo-root-relative,
+so passing `dockerfiles/maxwell_solver/` as the context fails; it must be the
+repo root.
+
 **Done notes (4b).** The old test asserted `== "cuda"`: it encoded the bug
 rather than catching it, so it was replaced by a membership check against
 `mse_backend.BACKENDS`. A first attempt made `_launcher` read the GPU image
