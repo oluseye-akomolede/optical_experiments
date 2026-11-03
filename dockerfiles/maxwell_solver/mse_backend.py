@@ -47,10 +47,14 @@ import numpy as np
 from scipy import sparse
 from scipy.sparse import linalg as spla
 
-#: the two backend names, in the order they are reported to the operator
-CPU = "cpu"
-GPU = "gpu"
-BACKENDS = (CPU, GPU)
+#: the two backend names, in the order they are reported to the operator.
+#:
+#: RE-EXPORTED, not defined here. They live in :mod:`mse_common` because the web
+#: image needs the names and must not import this module (this one imports scipy
+#: at module level). Defining them twice would be two sources of truth for the
+#: set that validates ``MSE_SOLVER_BACKEND`` -- and the web image's copy is the
+#: one that would silently drift from the solver's.
+from mse_common import BACKENDS, CPU, GPU  # noqa: F401  (re-exported for callers)
 
 #: The words that mean "the device ran this work and said no to THIS job".
 #: Spelled the ways cuDSS (``ALLOC_FAILED`` / ``CUDSS_STATUS_ALLOC_FAILED``),

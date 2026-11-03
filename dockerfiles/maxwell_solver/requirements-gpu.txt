@@ -36,6 +36,26 @@ nvmath-python==0.9.0
 # ~/cudss-0.7.1/lib, which is why that line and not 1.0.0.35.
 nvidia-cudss-cu12==0.7.1.6
 
+# cuda-bindings, pinned to the CUDA 12.x line.
+#
+# The A4000 smoke Job warned at import time:
+#   "cuda-bindings was built for CUDA major version 13, but the NVIDIA driver
+#    only supports up to CUDA 12"
+# The solve was still exact (relative residual 1.0e-16 at n=20000), but that is
+# luck, not a contract: an unpinned cuda-bindings floats onto the 13.x wheels as
+# they publish, and the NEXT rebuild would get a different binding library
+# against the same 12.6 driver. Pinning makes a rebuild reproducible.
+#
+# 12.9.9 is what the Jetson's gpu-venv and harness-venv actually run (read there
+# 2026-11-03), so the A4000 and the Jetson use one binding library rather than
+# two. Checked to resolve TOGETHER with the rest of this file, not in isolation:
+# a --dry-run of these requirements against requirements.txt picks
+#   cuda-bindings 12.9.9, cuda-core 0.7.0, cuda-pathfinder 1.8.5,
+#   cuda-toolkit 12.9.2.0, nvmath-python 0.9.0, cupy-cuda12x 14.2.0
+# with no conflict. The "built for CUDA 13" warning came from cuda-bindings
+# riding in transitively at whatever version pip chose; this pin is the fix.
+cuda-bindings==12.9.9
+
 # numpy/scipy come from requirements.txt, pinned there; cupy-cuda12x requires a
 # compatible numpy and pip resolves against the already-installed one, so they
 # are not restated here.
