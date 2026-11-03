@@ -224,16 +224,23 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
 
       **Review round (1.6 fixes).** The reviewer found that `SPHERE_N_R` was chosen
       because it passed, not because it converged, and that the comments were prose
-      rather than measurements. Both correct. `--sweep` now runs the tables, and they
-      are in the commit message: against the meshed reference the capacitance error
-      falls 2.91e-03 (n_r=8) -> 7.05e-05 (48) -> 4.15e-07 (128) at order ~2, so n_r=48
-      is where the radial error drops below the angular floor and is now the scored
-      resolution. `rel_ideal` sits at 7.22e-02 at EVERY n_r and never converges: the
-      conductor shell faces are pinned at `r_in+t_shell` with `t_shell` independent of
-      n_r, so that gap is geometry, not discretisation. It is reported, never scored.
+      rather than measurements. Both correct. `--sweep` now runs three tables; reproduce
+      them with `python electrostatics_bench.py --sweep` (they are printed, not stored).
+      The honest order estimate is the JOINT sweep (both resolutions refined together):
+      capacitance error 6.75e-04 (n_r 16, theta/phi 8/16) -> 1.69e-05 (96, 24/48) at an
+      observed order of 2.06-2.08, and the scored mesh (n_r=48, 16/32) sits at 7.05e-05.
+      Neither one-dimensional table supports an order claim. Radial-only goes 7.05e-05
+      (48) -> 4.15e-07 (128), ~170x for a 2.7x change in h: not order 2, almost certainly
+      radial against angular error cancelling, so 4e-7 is not the mesh's accuracy.
+      Angular-only RISES, 6.09e-06 at 6/12 -> 7.80e-05 at 24/48; 6/12 is an accidental
+      cancellation, not a floor, and at the scored 16/32 the angular error is comparable
+      to the radial one and of opposite sign. `rel_ideal` is 7.53e-02 at n_r=8 and
+      7.22e-02 for n_r >= 16, and never converges: the conductor shell faces are pinned
+      at `r_in+t_shell` with `t_shell` independent of n_r, so that gap is geometry, not
+      discretisation. It is reported, never scored.
       `TOL_SHELL` is 5e-4 (7x the floor, 3.3x below the weakest 1% perturbation).
-      `TOL_PHI_SHELL` is 2e-3 and is a SANITY CHECK, not an eps detector -- all four
-      perturbations move phi by only 0.1x-0.2x of it, and a test freezes that so it
+      `TOL_PHI_SHELL` is 5e-3 and is a SANITY CHECK, not an eps detector -- all four
+      perturbations move phi by only 0.2x-0.4x of it, and a test freezes that so it
       cannot later be claimed as coverage. `perturbation_table()` scores all four
       against references rebuilt from UNPERTURBED eps, closing the circularity that
       made the first bench blind to a wrong eps.

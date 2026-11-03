@@ -51,16 +51,26 @@ from mse_bench_fixtures import (
 #: feels safe". Every number below is a row of the convergence table, and the
 #: table is reproduced by ``--sweep`` so a future change can re-derive them.
 #:
-#: SHELL CAPACITANCE converges. Against the FIXED meshed reference (the
-#: conductor shell faces are at r_in + t_shell and r_out - t_shell, and t_shell
-#: is a constant, so C_meshed does NOT move with n_r) the error falls from
-#: 2.9e-03 to 4.2e-07 as n_r goes 8 -> 128, always from ABOVE, at an observed
-#: order of 2.0 -- which is the O(h^2) an energy-based P1 capacitance is
-#: expected to show. An earlier version of this comment claimed the error was
-#: FLAT and that no resolution removed it. That was measured with the ANGULAR
-#: resolution alone: with the radial layers fixed the error is indeed flat
-#: (7.29e-02 at 6/12, 7.29e-02 at 24/48), because the radial error is then the
-#: floor. Refining the radial layers is what makes it converge.
+#: SHELL CAPACITANCE converges, but only when BOTH resolutions are refined
+#: together. Refined together (n_r 16 -> 96 with theta/phi 8/16 -> 24/48) the
+#: error falls 6.75e-04 -> 1.69e-05 at an observed order of 2.06-2.08, which is
+#: the O(h^2) an energy-based P1 capacitance is expected to show. Against the
+#: FIXED meshed reference (conductor shell faces at r_in + t_shell and
+#: r_out - t_shell, with t_shell a constant, so C_meshed does NOT move with
+#: n_r) the error at the scored mesh is 7.05e-05.
+#:
+#: Do NOT read either one-dimensional sweep as a convergence order.
+#:   * Radial only: 7.05e-05 at n_r=48 to 4.15e-07 at n_r=128. That is ~170x for
+#:     a 2.7x change in h, so it is nowhere near order 2 -- it is almost
+#:     certainly the radial and angular errors CANCELLING as the radial one
+#:     crosses the fixed angular one. 4.15e-07 is not the mesh's accuracy.
+#:   * Angular only (n_r fixed at 48): the error RISES, 6.09e-06 at 6/12 ->
+#:     7.80e-05 at 24/48. The small value at 6/12 is an accidental cancellation
+#:     of angular against radial error, NOT a floor. At the scored 16/32 the
+#:     angular error is comparable to the radial one and of OPPOSITE SIGN, which
+#:     is why the joint sweep is the only honest order estimate.
+#: An earlier version of this comment read the angular sweep alone, called the
+#: 6/12 value a floor, and claimed no refinement removed it. Both wrong.
 #:
 #: At the scored mesh (n_r = 48, theta/phi 16/32) the floor is 7.05e-05.
 #: A 1% error in eps_a scores 8.2e-03 or 8.3e-03 (either direction); 1% in
@@ -74,7 +84,7 @@ TOL_SHELL = 5e-4
 #: tolerance is set to say so rather than to pretend otherwise. Measured on
 #: the four perturbations (``--perturb``): a 1% eps error moves the capacitance
 #: by 16.5x to 3.3x the shell tolerance, but moves this potential by only
-#: 0.1x to 0.2x of a 1e-2 bound -- it does not clear it in ANY of the four
+#: 0.2x to 0.4x of this bound -- it does not clear it in ANY of the four
 #: cases. Giving it a bound tight enough to catch eps would mean a bound below
 #: the mesh's own floor (6.5e-04 at n_r=48), i.e. a band around the solver's
 #: output, which is precisely what a tolerance must not be.
@@ -87,10 +97,13 @@ TOL_SHELL = 5e-4
 #: and the absolute level wrong.
 TOL_PHI_SHELL = 5e-3
 
-#: Resolution for the scored runs. THETA/PHI must be high enough that the
-#: angular error is below the radial floor at n_r = 48 (measured: at n_r 48 the
-#: error is 6.5e-4 at 6/12 and 7.8e-5 at 24/48, so 16/32 is past the knee);
-#: n_r = 48 sets the floor the tolerances above are built on.
+#: Resolution for the scored runs. Set from the JOINT sweep, not from either
+#: one-dimensional table: with n_r = 48 and theta/phi 16/32 the total error is
+#: 7.05e-05, which sets the floor the tolerances above are built on. Note the
+#: angular-only table does not establish this -- at n_r 48 its error RISES from
+#: 6.1e-06 at 6/12 to 7.8e-05 at 24/48, so 16/32 is not "past a knee", it is
+#: where the angular and radial errors happen to be of similar size and
+#: opposite sign at this n_r.
 SPHERE_N_THETA = 16
 SPHERE_N_PHI = 32
 SPHERE_N_R = 48

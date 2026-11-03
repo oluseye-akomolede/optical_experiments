@@ -63,7 +63,7 @@ def test_a_one_percent_eps_error_in_either_shell_either_direction_fails(
     The tolerance is built from the measured table (``bench.perturbation_table``)
     rather than picked, and this test is what holds it to that: the weakest of
     the four (eps_b, -1%) scores 3.3x the shell tolerance, and the mesh's own
-    floor is 0.1x it. What the CAPACITANCE cannot do is noted in the phi test
+    floor (7.05e-05) is 0.14x it. What the CAPACITANCE cannot do is noted in the phi test
     below, where the limitation is asserted rather than glossed.
     """
     real = F.concentric_spheres
@@ -83,7 +83,7 @@ def test_the_interface_potential_is_a_sanity_check_not_an_eps_detector():
     """Spell out what the phi tolerance does NOT catch, so nobody claims more.
 
     Measured: every 1% eps perturbation moves the interface potential by
-    0.1x-0.2x of TOL_PHI_SHELL. It is kept as a scored quantity because a
+    0.2x-0.4x of TOL_PHI_SHELL. It is kept as a scored quantity because a
     wrong voltage, a swapped electrode or a level-vs-field error would show up
     in it, and because capacitance cannot see the absolute potential at all --
     but it is not the eps detector, and this test freezes that fact.
