@@ -82,6 +82,11 @@ AMG_RTOL = 1e-12
 #: the tolerance actually asked for.
 AMG_RESIDUAL_SLACK = 10.0
 
+#: The values :func:`solve` accepts for ``method``. A typo must be refused, not
+#: silently treated as ``auto`` -- that would be the "the setting was ignored"
+#: failure ``mse_backend.selected_backend`` refuses for the same reason.
+METHODS = ("auto", "direct", "amg")
+
 
 def check_tet_regions(region_of_tet: np.ndarray, parts) -> np.ndarray:
     """Validate the mesh's own per-tet region ids, and return them as an array.
@@ -389,9 +394,23 @@ def solve(
     A zero-normal-field (natural) condition holds on the outer boundary -- it is
     the boundary term's absence, so nothing is imposed there.
 
+    ``method`` picks the solver for the reduced system:
+
+    ``"auto"`` (default)  direct below :data:`AMG_NODE_CROSSOVER` nodes, AMG-CG above
+    ``"direct"``          always the factorisation -- ignores the crossover
+    ``"amg"``             always AMG-CG, whatever the mesh size
+
+    ``"direct"`` exists because the crossover is a NAMED ESTIMATE and the only
+    way to prove the two paths agree EITHER SIDE of it is to ask for each one on
+    a mesh small enough for tier-1 tests. Without it the agreement test could
+    only ever compare AMG against a direct answer on meshes above 5 x 10**5 nodes,
+    which no tier-1 test can build.
+
     Returns a dict with ``phi`` (the ``(n_points,)`` nodal potential in volts),
     ``free`` (the boolean mask of solved nodes), ``electrodes`` (the part ->
-    node indices mapping used), ``backend`` and ``n_free``.
+    node indices mapping used), ``backend``, ``n_free``, ``method`` (the path
+    actually taken) and ``residual`` (the AMG path's checked relative residual,
+    or ``None`` for the direct one, which is exact).
 
     Refusals, all ``ValueError`` before factorising: the ones in
     :func:`electrode_nodes` and :func:`eps_by_tet`, plus an empty or unknown
@@ -403,6 +422,11 @@ def solve(
     tets = np.asarray(tets, dtype=np.int64)
     n_points = int(points_m.shape[0])
 
+    if method not in METHODS:
+        raise ValueError(
+            f"method={method!r} is not a known solve method; use one of "
+            f"{', '.join(METHODS)}"
+        )
     if not electrodes:
         raise ValueError(
             "no electrode: the problem needs at least one part held at a "
@@ -458,6 +482,7 @@ def solve(
             lu = BACKEND.factor(K_ff, label="K_ff", spd_lu=SPD_LU, backend=backend)
             phi[free] = np.asarray(lu.solve(np.asarray(rhs).ravel()), dtype=np.float64)
             solved_by = "direct"
+
 
     return {
         "phi": phi,

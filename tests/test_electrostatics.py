@@ -654,6 +654,58 @@ def test_the_crossover_sends_a_small_mesh_to_the_direct_path():
     assert result["residual"] is None
 
 
+def test_a_mesh_over_the_crossover_takes_the_amg_path_unasked(monkeypatch):
+    """method="auto" switches by NODE COUNT, and the switch is exercised.
+
+    The previous test proves auto stays DIRECT below the crossover; nothing
+    proved it ever goes the other way, so the comparison could have been
+    written ``<`` instead of ``>=``, or dropped entirely, with every test still
+    green. The crossover is lowered below this fixture's free-node count rather
+    than building a 5 x 10**5-node mesh, which tier 1 cannot.
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain(6, 4, 4)
+    volts, eps = {"left": 0.0, "right": 1.0}, {"gap": gap_eps}
+
+    def _nodes_free(monkeypatch_crossover):
+        monkeypatch.setattr(E, "AMG_NODE_CROSSOVER", monkeypatch_crossover)
+        return E.solve(points, tets, parts, region_of_tet, eps, volts)
+
+    always = _nodes_free(E.AMG_NODE_CROSSOVER)      # the real constant: direct
+    assert always["method"] == "direct"
+    eager = _nodes_free(always["n_free"])           # exactly at the line: >= means AMG
+    assert eager["method"] == "amg"
+    assert eager["residual"] is not None
+    assert eager["n_free"] == always["n_free"]
+
+    # The two paths must still agree where the switch happened, so this is a
+    # routing test and not a licence for AMG to be worse above the line.
+    assert np.abs(eager["phi"] - always["phi"]).max() < 1e-12
+
+
+def test_an_unknown_method_is_refused(monkeypatch):
+    """A typo must not be silently read as "auto".
+
+    Without this, ``method="amg "`` (a stray space, an f-string, a config
+    default) would fall through to the direct path and behave plausibly while
+    the caller believed it had asked for AMG -- the same class of quiet setting
+    mismatch as MSE_SOLVER_BACKEND=cuda on the A4000 Job.
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain(4, 3, 3)
+
+    # Any fall-through would call the AMG path (crossover forced to 0) AND the
+    # factorisation (crossover forced huge); forbidding both makes "it was
+    # treated as auto" impossible to pass by luck.
+    def _forbidden(*a, **kw):
+        raise AssertionError("an unknown method reached a solver")
+
+    monkeypatch.setattr(E, "AMG_NODE_CROSSOVER", 0)
+    monkeypatch.setattr(E, "amg_solve", _forbidden)
+    monkeypatch.setattr(E.BACKEND, "factor", _forbidden)
+    with pytest.raises(ValueError, match="not a known solve method"):
+        E.solve(points, tets, parts, region_of_tet, {"gap": gap_eps},
+                {"left": 0.0, "right": 1.0}, method="AMG")
+
+
 def test_the_amg_path_actually_uses_the_amg_preconditioner():
     """AMG is used, not merely the CG it accelerates.
 

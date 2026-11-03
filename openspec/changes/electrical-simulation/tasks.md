@@ -142,17 +142,53 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       passed"; those were read before 1.4 added tests to the same file and can no
       longer be reproduced. On the 1.4 tree the file runs 37 and the six affected
       suites 138 passed / 6 skipped. The measurements below are unchanged; only
-      the totals moved.
+      the totals moved. (Re-measured at 1.4's completion, after two more tests
+      joined the file: `pytest tests/test_electrostatics.py` 39, and
+      `pytest tests/test_electrostatics.py tests/test_solver_sizing.py
+      tests/test_maxwell_solver.py` 78 passed / 6 skipped. Suite composition
+      differs from the reviewer's six, which is why the second figure is not
+      140; the three named above are the ones this branch can run locally in
+      under a minute.)
       Five mutations, `__pycache__` cleared between mutate and restore each time:
       eps_tet dropped -> red; skip dropped -> survives (above); shared-node refusal dropped
       -> red; eps<1 refusal dropped -> red; electrode exemption dropped -> red (8 failures).
       The first attempt at the interface test had the fixture wrong (electrodes at slabs
       0.083 wide, so the linear answer spans the GAP not the box) and the code was right.
-- [ ] 1.4 AMG-CG path (`pyamg`) with the checked residual; the direct-vs-AMG agreement test.
+- [x] 1.4 AMG-CG path (`pyamg`) with the checked residual; the direct-vs-AMG agreement test.
       The switch is `AMG_NODE_CROSSOVER` (5 × 10⁵ nodes, `design.md` §5), a named estimate
       with its arithmetic beside it, not a derived limit — the task proves both paths agree
       either side of it, and names it as the line to revisit when 2.6 measures the real
       per-node cost.
+      **Done.** `amg_solve` (smoothed aggregation + CG) and `solve(..., method="auto" |
+      "direct" | "amg")`. `solve` returns `method` and `residual` too.
+      - *The residual is recomputed against `A` and `b`, never read from pyamg's
+        `residuals` list.* That list is relative to pyamg's own initial residual, so it
+        answers "how much did I improve" while the caller needs "is the answer right".
+        Measured consequence: pyamg warns "Indefinite matrix detected in CG, aborting" on a
+        reduced operator it dislikes and returns **x = 0 with relative residual 1.0** — a
+        silent wrong answer. The checked residual turns that into a refusal, pinned by a test.
+      - *`AMG_RTOL` is 1e-12, and it was measured, not chosen.* 1e-10 was the first value;
+        the direct path is exact to 1.2e-15 on the contact-chain fixture, so all the
+        difference is AMG's, and at 1e-10 AMG's error against a known-linear answer reached
+        6.4e-11 — too close to the bound to assert against. At 1e-12 it is 1.9e-13. The
+        agreement test's tolerance is `AMG_RTOL` and its docstring says where it came from.
+      - *`method="direct"` exists so the crossover can be proven either side.* Tier 1 cannot
+        build a 5 × 10⁵-node mesh, so without it the agreement test could only compare AMG
+        with direct above the line. An unknown `method` is REFUSED rather than treated as
+        `auto` — a silent fallthrough is the same failure as `MSE_SOLVER_BACKEND=cuda`.
+      - *Crossover routing tested in both directions.* Below: `auto` is direct. Above:
+        `auto` is AMG (by lowering the constant under a small fixture, since the real one is
+        unreachable in tier 1). Mutating `>=` to `>` fails the at-the-line test; deleting the
+        auto clause fails it; neither red before these tests existed.
+      - *Five mutations, `__pycache__` cleared between mutate and restore:* crossover `>=` ->
+        `>` red; auto clause deleted red; method validation deleted red; AMG setup replaced
+        by plain scipy CG red; checked residual loosened to `rtol * 1e12` red (2 tests).
+        The plain-CG one is the one that mattered: it left EVERY other AMG test green,
+        because plain CG converges on these fixtures too, so a test spying on
+        `smoothed_aggregation_solver` was added to see the preconditioner at all.
+      - Reviewer note 1 (1.3): the `skip` guard cannot be reached through `solve`, so it is
+        tested by calling `assemble_stiffness` directly rather than dropped — the assembler
+        is a public entry point.
 - [ ] 1.5 `field_at` and `capacitance_matrix` from the residual charge; three-electrode
       symmetry test.
 - [ ] 1.6 Bench fixtures (two-layer slab, concentric spheres, sphere between plates, the
