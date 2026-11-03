@@ -11,7 +11,8 @@ the owner with an honest message.
 ### Requirement: A GPU job is a bounded Kubernetes Job on one A4000
 
 A GPU solve SHALL run as a `batch/v1` Job in namespace `mode-search-engine`,
-pinned by `nodeSelector` to `nvidia.com/gpu.product: NVIDIA-RTX-A4000`, and
+pinned by `nodeSelector` to `kubernetes.io/hostname: sigma-worker2` (sigma-worker1's
+A4000s belong to the hcm team, owner 2026-10-16) and `nvidia.com/gpu.product: NVIDIA-RTX-A4000`, and
 SHALL request exactly one GPU with `requests` equal to `limits`.
 
 Because the quota is `requests.nvidia.com/gpu: '1'` and `count/jobs.batch: '1'`,
@@ -26,8 +27,8 @@ cluster and not left occupying the single GPU slot indefinitely.
 - **THEN** its container requests `nvidia.com/gpu: 1`
 - **AND** `requests` and `limits` are equal for cpu, memory and the GPU
 - **AND** `activeDeadlineSeconds` is a positive integer
-- **AND** the pod's `nodeSelector` carries `nvidia.com/gpu.product:
-  NVIDIA-RTX-A4000`
+- **AND** the pod's `nodeSelector` carries `kubernetes.io/hostname: sigma-worker2` and
+  `nvidia.com/gpu.product: NVIDIA-RTX-A4000`
 
 #### Scenario: thread counts match the CPU limit
 - **WHEN** the GPU Job manifest is built

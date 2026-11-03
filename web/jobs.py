@@ -64,7 +64,8 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
                        materials: dict | None = None,
                        graded_meshing: bool = True,
                        gpu: bool = False,
-                       gpu_product: str = "NVIDIA-RTX-A4000"):
+                       gpu_product: str = "NVIDIA-RTX-A4000",
+                       gpu_node: str = "sigma-worker2"):
     """Return the ``batch/v1`` Job manifest that solves one upload.
 
     Pure: no environment lookups, no cluster calls, no time.
@@ -206,8 +207,10 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
         # Pin the card rather than "any GPU": the quota counts GPUs, but a node
         # could carry a different model, and the manifest's memory price is the
         # A4000's. The selector names the product, not the node, so a relabelled
-        # node cannot silently match.
-        pod_spec["nodeSelector"] = {"nvidia.com/gpu.product": gpu_product}
+        # node cannot silently match. The node is pinned too (owner, 2026-10-16):
+        # sigma-worker1's two A4000s belong to the hcm team; ours is sigma-worker2.
+        pod_spec["nodeSelector"] = {"kubernetes.io/hostname": gpu_node,
+                                    "nvidia.com/gpu.product": gpu_product}
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",

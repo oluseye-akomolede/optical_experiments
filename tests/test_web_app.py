@@ -732,7 +732,9 @@ def test_the_gpu_manifest_names_the_a4000_node_and_a_backend_the_solver_accepts(
     import mse_backend
 
     spec = _gpu_manifest()["spec"]["template"]["spec"]
-    assert spec["nodeSelector"] == {"nvidia.com/gpu.product": "NVIDIA-RTX-A4000"}
+    # sigma-worker1's A4000s belong to the hcm team (owner, 2026-10-16): pin our node.
+    assert spec["nodeSelector"] == {"kubernetes.io/hostname": "sigma-worker2",
+                                    "nvidia.com/gpu.product": "NVIDIA-RTX-A4000"}
     env = {e["name"]: e["value"]
            for e in spec["containers"][0]["env"]}
     assert env["MSE_SOLVER_BACKEND"] in mse_backend.BACKENDS, (
