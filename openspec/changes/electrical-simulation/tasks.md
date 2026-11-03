@@ -117,8 +117,32 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       everywhere → 0.5000; both red 4/4, restore green 18/18. The docstring no longer claims
       "the whole of the multi-material physics": exact for a conforming interface, not handled
       for a tet spanning two materials, and `check_tet_regions` does not detect one.
-- [ ] 1.3 Electrode Dirichlet reduction, direct solve through `mse_backend.factor`, input
+- [x] 1.3 Electrode Dirichlet reduction, direct solve through `mse_backend.factor`, input
       refusals, the maximum-principle test.
+      **Done.** `mse_electrostatics.solve(points_m, tets, parts, region_of_tet, eps_static,
+      electrodes)` returns `phi`/`free`/`electrodes`/`backend`/`n_free`. A contact is a PART:
+      every node of every tet in it is held, including nodes shared with the driven material,
+      which is what puts the value at the contact rather than one element away. The reduced
+      system is `K_ff phi_f = -K_fe phi_e` solved through `BACKEND.factor(..., spd_lu=SPD_LU)`
+      (never `spsolve`), so the backend seam and its refusal behaviour are shared with the
+      eigen path. Refusals all precede factorising: no electrode; an electrode that is not a
+      part; a non-finite potential; two electrodes sharing a node at different volts; an
+      assembled part with no eps_static; eps_static < 1 (the shape of an optical index in a
+      permittivity slot). A floating dielectric is solved, not refused. Measured on the
+      two-layer block: interface potential exact to 2.2e-16 on a 2-D free-node set; maximum
+      principle holds at -2 V / +5 V.
+      **`skip` is a refusal contract, not a physics knob.** Measured: assembling the held
+      parts' tets versus excluding them changes the matrix by 8.4e-12 over 352 entries and
+      changes `phi` by exactly 0.0 — the fixed rows and columns are dropped from `K_ff` and
+      the fixed values overwritten either way. The M2 mutation (do not exclude) therefore
+      SURVIVES, correctly: it removes nothing the answer can see. `skip` is kept because an
+      electrode part has no permittivity to supply, and a test pins the 0.0 agreement so a
+      later reader neither deletes it nor defends it with a test that cannot fail.
+      Five mutations, `__pycache__` cleared between mutate and restore each time:
+      eps_tet dropped -> red; skip dropped -> survives (above); shared-node refusal dropped
+      -> red; eps<1 refusal dropped -> red; electrode exemption dropped -> red (8 failures).
+      The first attempt at the interface test had the fixture wrong (electrodes at slabs
+      0.083 wide, so the linear answer spans the GAP not the box) and the code was right.
 - [ ] 1.4 AMG-CG path (`pyamg`) with the checked residual; the direct-vs-AMG agreement test.
       The switch is `AMG_NODE_CROSSOVER` (5 × 10⁵ nodes, `design.md` §5), a named estimate
       with its arithmetic beside it, not a derived limit — the task proves both paths agree

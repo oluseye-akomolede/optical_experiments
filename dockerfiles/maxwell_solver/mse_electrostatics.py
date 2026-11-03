@@ -43,10 +43,21 @@ from __future__ import annotations
 import numpy as np
 from scipy import sparse
 
+import mse_backend as BACKEND
 import mse_fem
 
 #: vacuum permittivity, F/m (CODATA), applied to the relative input
 EPS0 = 8.8541878128e-12
+
+#: SuperLU keywords for a symmetric positive-definite matrix. The reduced
+#: system after a Dirichlet elimination is SPD for a well-posed device, so the
+#: symmetric mode is both faster and a check in itself. Same dict as
+#: :mod:`mse_eigen` builds, for the same reason.
+SPD_LU = {
+    "permc_spec": "MMD_AT_PLUS_A",
+    "diag_pivot_thresh": 0.0,
+    "options": {"SymmetricMode": True},
+}
 
 
 def check_tet_regions(region_of_tet: np.ndarray, parts) -> np.ndarray:
@@ -85,7 +96,10 @@ def check_tet_regions(region_of_tet: np.ndarray, parts) -> np.ndarray:
 
 
 def eps_by_tet(
-    parts: list[str], eps_static: dict[str, float], tet_part: np.ndarray
+    parts: list[str],
+    eps_static: dict[str, float],
+    tet_part: np.ndarray,
+    allow_missing=frozenset(),
 ) -> np.ndarray:
     """Per-tet relative permittivity from the caller's per-part table.
 
@@ -95,21 +109,32 @@ def eps_by_tet(
     dropped silently), and a non-positive or non-finite value (zero makes the
     matrix singular and a negative makes it indefinite -- neither is a device
     anyone can build).
+
+    ``allow_missing`` names parts that may omit ``eps_static`` -- the held
+    electrodes, whose tets contribute no stiffness row. Their entries are set
+    to NaN so that using one where a permittivity is required is a loud
+    failure rather than a silent zero.
     """
-    missing = [p for p in parts if p not in eps_static]
-    if missing:
-        raise ValueError(
-            f"no eps_static for part(s): {', '.join(missing)}; every part needs "
-            "its own static permittivity"
-        )
+    # Unknown names FIRST: a typo like "gap " alongside a real "gap" would
+    # otherwise be reported as a missing permittivity for "gap", pointing the
+    # caller at the wrong line.
     unknown = [p for p in eps_static if p not in parts]
     if unknown:
         raise ValueError(
             f"eps_static names part(s) that do not exist: {', '.join(unknown)}; "
             f"this mesh has {', '.join(parts)}"
         )
+    missing = [p for p in parts if p not in eps_static and p not in allow_missing]
+    if missing:
+        raise ValueError(
+            f"no eps_static for part(s): {', '.join(missing)}; every part needs "
+            "its own static permittivity"
+        )
     values = np.empty(len(parts), dtype=np.float64)
     for i, p in enumerate(parts):
+        if p not in eps_static:
+            values[i] = np.nan      # a held electrode: never assembled
+            continue
         v = float(eps_static[p])
         if not np.isfinite(v):
             raise ValueError(f"eps_static for part {p!r} is not finite: {eps_static[p]!r}")
@@ -160,12 +185,19 @@ def assemble_stiffness(
     eps_static: dict[str, float],
     region_of_tet: np.ndarray,
     n_points: int | None = None,
+    skip: set[str] | None = None,
 ):
     """Assemble the global sparse P1 stiffness matrix.
 
     ``region_of_tet`` is the per-tet part index the MESHER returned (TetGen
     region attributes), not anything derived from node membership -- see
     :func:`check_tet_regions`.
+
+    ``skip`` names parts whose tets are NOT assembled -- the electrodes, whose
+    nodes are held at a fixed potential and so contribute a boundary condition
+    rather than a stiffness row. Those parts need no ``eps_static``, and their
+    tets are left out of the matrix; they contribute ``(0, 0)`` entries, which
+    :meth:`~scipy.sparse.csr_matrix.eliminate_zeros` drops.
 
     Returns ``(K, tet_part)`` with ``K`` a ``(n_points, n_points)`` CSR matrix.
 
@@ -176,10 +208,29 @@ def assemble_stiffness(
     """
     points = np.asarray(points, dtype=np.float64)
     tets = np.asarray(tets, dtype=np.int64)
+    skip = set() if skip is None else set(skip)
+    missing = [p for p in skip if p not in parts]
+    if missing:
+        raise ValueError(
+            f"skip names part(s) {', '.join(missing)} that are not in this mesh"
+        )
 
     tet_part = check_tet_regions(region_of_tet, parts)
-    eps_tet = eps_by_tet(parts, eps_static, tet_part)
+    # Parts not skipped need their eps_static; the skipped ones never enter the
+    # matrix, so requiring a permittivity for a held electrode would refuse a
+    # device that is perfectly well posed.
+    # Pass the caller's table through unchanged: filtering it to the parts
+    # before eps_by_tet would silently drop a MISSPELLED key ("coret"), which
+    # is exactly the typo that refusal exists to catch.
+    eps_tet = eps_by_tet(parts, eps_static, tet_part, allow_missing=skip)
     K_elem, _ = element_stiffness(points, tets, eps_tet)
+    if skip:
+        # The held tets carry NaN eps and so NaN matrices; zeroing the whole
+        # element (rather than only the NaN entries) keeps the sum exact and
+        # leaves their nodes' rows to the other tets, which is the boundary
+        # condition: an electrode node's value is imposed, not solved.
+        held_tets = np.isin(tet_part, [i for i, p in enumerate(parts) if p in skip])
+        K_elem[held_tets] = 0.0
 
     if n_points is None:
         n_points = int(points.shape[0])
@@ -197,3 +248,151 @@ def assemble_stiffness(
     K.sum_duplicates()
     K.eliminate_zeros()
     return K, tet_part
+
+
+def electrode_nodes(
+    tets: np.ndarray, parts: list[str], tet_part: np.ndarray, electrodes: dict[str, float]
+) -> dict[str, np.ndarray]:
+    """The node indices each electrode part occupies, validated.
+
+    An electrode is a PART: every node of every tet in that part is held at its
+    potential. A node on the boundary between an electrode and the material it
+    drives therefore belongs to both, and is counted as electrode -- which is
+    what makes the Dirichlet value apply at the contact rather than one element
+    away from it.
+
+    Refuses before any matrix work: an electrode naming a part this mesh does
+    not have (a typo would otherwise clamp nothing and return a plausible
+    field), a non-finite potential, and two electrodes that share a node at
+    different potentials (no single value can be imposed there, and picking one
+    would silently short them together).
+    """
+    parts = list(parts)
+    unknown = [p for p in electrodes if p not in parts]
+    if unknown:
+        raise ValueError(
+            f"electrode(s) {', '.join(unknown)} are not parts of this mesh; it "
+            f"has {', '.join(parts)}"
+        )
+    for p, v in electrodes.items():
+        if not np.isfinite(v):
+            raise ValueError(f"electrode {p!r} has a non-finite potential: {v!r}")
+
+    tets = np.asarray(tets, dtype=np.int64)
+    tet_part = np.asarray(tet_part, dtype=np.int64)
+    by_part: dict[str, np.ndarray] = {}
+    for i, p in enumerate(parts):
+        if p not in electrodes:
+            continue
+        nodes = np.unique(tets[tet_part == i])
+        if nodes.size == 0:
+            raise ValueError(
+                f"electrode part {p!r} has no nodes; a contact with no nodes "
+                "cannot be held at a potential"
+            )
+        by_part[p] = nodes
+
+    names = list(by_part)
+    for j, q in enumerate(names):
+        for r in names[j + 1:]:
+            shared = np.intersect1d(by_part[q], by_part[r], assume_unique=True)
+            if shared.size and electrodes[q] != electrodes[r]:
+                raise ValueError(
+                    f"electrodes {q!r} ({electrodes[q]!r} V) and {r!r} "
+                    f"({electrodes[r]!r} V) share {shared.size} node(s); two "
+                    "potentials cannot be imposed on one node"
+                )
+    return by_part
+
+
+def solve(
+    points_m: np.ndarray,
+    tets: np.ndarray,
+    parts: list[str],
+    region_of_tet: np.ndarray,
+    eps_static: dict[str, float],
+    electrodes: dict[str, float],
+    *,
+    backend: str | None = None,
+):
+    """Solve the electrostatic problem with the electrodes held at fixed volts.
+
+    ``electrodes`` maps a part label to its potential in volts; every node of
+    that part is a Dirichlet value. The remaining ("free") nodes are solved from
+    the reduced system ``K_ff phi_f = -K_fe phi_e``, which is what imposing
+    ``phi_e`` on the full system amounts to.
+
+    A zero-normal-field (natural) condition holds on the outer boundary -- it is
+    the boundary term's absence, so nothing is imposed there.
+
+    Returns a dict with ``phi`` (the ``(n_points,)`` nodal potential in volts),
+    ``free`` (the boolean mask of solved nodes), ``electrodes`` (the part ->
+    node indices mapping used), ``backend`` and ``n_free``.
+
+    Refusals, all ``ValueError`` before factorising: the ones in
+    :func:`electrode_nodes` and :func:`eps_by_tet`, plus an empty or unknown
+    electrode set and an ``eps_static`` < 1 -- a relative permittivity below
+    vacuum is not a material, and it is the shape of an index accidentally
+    passed where a permittivity belongs.
+    """
+    points_m = np.asarray(points_m, dtype=np.float64)
+    tets = np.asarray(tets, dtype=np.int64)
+    n_points = int(points_m.shape[0])
+
+    if not electrodes:
+        raise ValueError(
+            "no electrode: the problem needs at least one part held at a "
+            "potential, otherwise the solution is arbitrary up to a constant "
+            "and the reduced system is singular"
+        )
+    # Validate the contacts BEFORE any permittivity or matrix work, so every
+    # electrode problem is reported as itself. Otherwise a NaN voltage is
+    # reported as the gap's missing eps_static, which points at the wrong line.
+    unknown_electrodes = [p for p in electrodes if p not in parts]
+    if unknown_electrodes:
+        raise ValueError(
+            f"electrode(s) {', '.join(unknown_electrodes)} are not parts of this "
+            f"mesh; it has {', '.join(parts)}"
+        )
+    for p, v in electrodes.items():
+        if not np.isfinite(v):
+            raise ValueError(f"electrode {p!r} has a non-finite potential: {v!r}")
+    # An electrode is held, not assembled, so its own eps_static is not needed.
+    # Every OTHER part is, which is what eps_by_tet below checks.
+    assembled = {p: v for p, v in eps_static.items() if p not in electrodes}
+    for p, v in assembled.items():
+        if float(v) < 1.0:
+            raise ValueError(
+                f"eps_static for part {p!r} is {v!r}; a relative permittivity "
+                "below 1 is not a material (is an optical index here?)"
+            )
+
+    tet_part = check_tet_regions(region_of_tet, parts)
+    K, _ = assemble_stiffness(points_m, tets, parts, eps_static, tet_part,
+                              n_points=n_points, skip=set(electrodes))
+
+    held = electrode_nodes(tets, parts, tet_part, electrodes)
+    phi_e = np.zeros(n_points, dtype=np.float64)
+    fixed = np.zeros(n_points, dtype=bool)
+    for part, nodes in held.items():
+        phi_e[nodes] = electrodes[part]
+        fixed[nodes] = True
+    free = ~fixed
+
+    phi = phi_e.copy()
+    if free.any():
+        # K_fe phi_e: the held values' pull on the free rows.
+        rhs = -(K[free][:, fixed] @ phi_e[fixed])
+        K_ff = K[free][:, free].tocsc()
+        lu = BACKEND.factor(K_ff, label="K_ff", spd_lu=SPD_LU, backend=backend)
+        phi[free] = np.asarray(lu.solve(np.asarray(rhs).ravel()), dtype=np.float64)
+
+    return {
+        "phi": phi,
+        "free": free,
+        "electrodes": held,
+        "backend": backend or BACKEND.selected_backend(),
+        "n_free": int(free.sum()),
+    }
+
+

@@ -359,3 +359,179 @@ def test_the_layered_interface_sits_at_eps_b_over_the_sum(eps_a, eps_b):
         assert np.allclose(phi[at_x], expected, rtol=1e-12, atol=0.0), (
             f"x={x}: phi {np.unique(phi[at_x])} != exact {expected}"
         )
+
+
+# --- task 1.3: electrode Dirichlet reduction and the direct solve ------------
+#
+# The layered chain above pins the ASSEMBLY with voltages imposed by x-plane.
+# These pin SOLVE: the same physics reached through parts, which is how the
+# product states a contact -- an electrode is a part, and every node of that
+# part is held. The known answer is therefore the same closed form: three
+# layers in series (electrode, gap, electrode), phi linear between the contacts.
+
+def _contact_chain(nx=4, ny=3, nz=3, gap_eps=2.0):
+    """A bar of ``nx`` cubes: the first and last slabs are electrodes.
+
+    Returns (points, tets, parts, region_of_tet). Part 0 "left" and part 2
+    "right" are the contacts; part 1 "gap" is the dielectric between them. The
+    contact is a whole slab of elements, so its nodes are a face, which is what
+    the mesher produces for a part boundary.
+    """
+    points, tets = _structured_cube_chain(nx, ny, nz)
+    cx = points[tets][:, :, 0].mean(axis=1)
+    # The contacts are the OUTER QUARTER at each end, not a single slab: with
+    # nx=4 that puts each contact face on a node plane (x=0.25, 0.75) and makes
+    # the gap contain real interior nodes. A one-slab contact leaves the
+    # electrode tets far from the interface, and then a mutation that wrongly
+    # assembles them is numerically invisible -- measured: it passed 29/29.
+    region_of_tet = np.where(cx < 0.25, 0, np.where(cx > 0.75, 2, 1))
+    return points, tets, ["left", "gap", "right"], region_of_tet, gap_eps
+
+
+def test_solve_holds_each_electrode_part_and_solves_the_gap():
+    """Two contacts at 0 V and 1 V: the gap's potential is linear in x.
+
+    Known answer: with a single uniform dielectric between two plane contacts
+    the potential is exactly linear, so every node at x must read x -- not
+    merely be bounded by [0, 1]. A solve that dropped the Dirichlet terms, or
+    reduced the wrong block, would bend this curve.
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain()
+    result = E.solve(points, tets, parts, region_of_tet,
+                     {"gap": gap_eps}, {"left": 0.0, "right": 1.0})
+
+    # The contacts are SLABS, not planes: every node in x in [0, 1/nx] is held
+    # at 0 V and every node in [1 - 1/nx, 1] at 1 V. The field therefore runs
+    # only across the gap between the INNER faces, and the potential is
+    # constant (not linear) inside each contact slab. Asserting globally
+    # linear-in-x would be testing the wrong device -- and did, until the
+    # fixture was read: it caught x-quantised values, not a solver error.
+    x = points[:, 0]
+    x_lo, x_hi = 0.25, 0.75
+    expected = np.clip((x - x_lo) / (x_hi - x_lo), 0.0, 1.0)
+    phi = result["phi"]
+    assert np.allclose(phi, expected, rtol=0.0, atol=1e-12), (
+        f"worst deviation from the piecewise answer: "
+        f"{np.abs(phi - expected).max():.3e}"
+    )
+    # The contact slabs really are held, not merely close.
+    assert np.allclose(phi[x <= x_lo], 0.0, rtol=0.0, atol=0.0)
+    assert np.allclose(phi[x >= x_hi], 1.0, rtol=0.0, atol=0.0)
+    assert result["electrodes"]["left"].size and result["electrodes"]["right"].size
+    assert result["n_free"] == int((~result["free"]).size - (~result["free"]).sum())
+
+
+def test_solve_imposes_the_voltage_not_a_fitted_one():
+    """The same bar at 0 V and 3 V gives 3x the potential everywhere.
+
+    A solve that imposed the electrodes only approximately (or let them float)
+    would not scale exactly, because the boundary values are the only source
+    of the field.
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain()
+    one = E.solve(points, tets, parts, region_of_tet, {"gap": gap_eps},
+                  {"left": 0.0, "right": 1.0})["phi"]
+    three = E.solve(points, tets, parts, region_of_tet, {"gap": gap_eps},
+                    {"left": 0.0, "right": 3.0})["phi"]
+    assert np.allclose(three, 3.0 * one, rtol=1e-13, atol=0.0)
+
+
+def test_the_maximum_principle_holds():
+    """No interior node exceeds the contacts' voltage range.
+
+    The discrete maximum principle follows from K being an M-matrix (positive
+    diagonal, non-positive off-diagonal, zero row sums); it is checked rather
+    than assumed, because an assembly with a sign error can still be SPD and
+    yet oscillate.
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain()
+    phi = E.solve(points, tets, parts, region_of_tet, {"gap": gap_eps},
+                  {"left": -2.0, "right": 5.0})["phi"]
+    assert phi.min() >= -2.0 - 1e-9 * 7.0
+    assert phi.max() <= 5.0 + 1e-9 * 7.0
+
+
+def test_a_floating_part_is_solved_not_refused():
+    """A dielectric touching no electrode is a valid device (its potential is
+    set by its neighbours), so it must solve rather than be refused."""
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain()
+    result = E.solve(points, tets, parts, region_of_tet, {"gap": gap_eps},
+                     {"left": 0.0, "right": 1.0})
+    assert np.isfinite(result["phi"]).all()
+    assert result["free"].any()
+
+
+def test_one_electrode_is_enough():
+    """One contact at 1 V and a natural outer boundary is well posed."""
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain()
+    result = E.solve(points, tets, parts, region_of_tet,
+                     {"gap": gap_eps, "right": gap_eps}, {"left": 1.0})
+    assert np.allclose(result["phi"], 1.0, rtol=0.0, atol=1e-12), (
+        "with one contact and no other source the whole device is at that potential"
+    )
+
+
+def test_an_electrode_needs_no_permittivity():
+    """A held part is not assembled, so it needs no eps_static.
+
+    Requiring one would refuse a device that is perfectly well posed, and would
+    also tempt a caller to invent a number for a conductor.
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain()
+    E.solve(points, tets, parts, region_of_tet, {"gap": gap_eps},
+            {"left": 0.0, "right": 1.0})     # no eps_static for "left"/"right"
+
+
+@pytest.mark.parametrize("electrodes, match", [
+    ({}, "no electrode"),
+    ({"nowhere": 0.0}, "not parts of this mesh"),
+    ({"left": float("nan")}, "non-finite"),
+])
+def test_a_bad_electrode_set_is_refused(electrodes, match):
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain()
+    # The electrode voltage is read before any permittivity is, so a NaN is
+    # reported as a NaN rather than as the gap's missing eps_static.
+    with pytest.raises(ValueError, match=match):
+        E.solve(points, tets, parts, region_of_tet, {"gap": gap_eps}, electrodes)
+
+
+def test_two_electrodes_sharing_a_node_at_different_volts_are_refused():
+    """No single value can be imposed on a shared node, and picking one would
+    silently short the two contacts together."""
+    points, tets = _structured_cube_chain(2, 1, 1)
+    parts = ["a", "b"]
+    # Both parts must OCCUPY tets, or check_tet_regions refuses first and the
+    # shared-node guard is never reached. Split by cube column: the shared face
+    # at x=0.5 then has nodes belonging to both.
+    cx = points[tets][:, :, 0].mean(axis=1)
+    region_of_tet = (cx > 0.5).astype(np.int64)
+    with pytest.raises(ValueError, match="share"):
+        E.solve(points, tets, parts, region_of_tet, {}, {"a": 0.0, "b": 1.0})
+
+
+def test_a_permittivity_below_vacuum_is_refused():
+    """eps_s < 1 is the shape of an optical index passed as a permittivity."""
+    points, tets, parts, region_of_tet, _ = _contact_chain()
+    with pytest.raises(ValueError, match="below 1"):
+        E.solve(points, tets, parts, region_of_tet, {"gap": 0.5},
+                {"left": 0.0, "right": 1.0})
+
+
+def test_skipping_a_held_part_changes_nothing_the_solve_can_see():
+    """``skip`` exists for the REFUSAL contract, not to change the answer.
+
+    A held part's rows and columns are either dropped from the reduced system
+    or overwritten by the imposed value, so the two assemblies give the same
+    potential -- measured: the matrices differ by 8.4e-12 over 352 entries and
+    phi agrees to 0.0. This test says so explicitly, because a future reader
+    will otherwise assume ``skip`` is load-bearing for correctness and either
+    remove it (losing the "a contact needs no permittivity" contract) or
+    defend it with a test that cannot fail.
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain()
+    without = E.solve(points, tets, parts, region_of_tet, {"gap": gap_eps},
+                      {"left": 0.0, "right": 1.0})["phi"]
+    with_eps = E.solve(points, tets, parts, region_of_tet,
+                       {"gap": gap_eps, "left": 1.0, "right": 1.0},
+                       {"left": 0.0, "right": 1.0})["phi"]
+    assert np.array_equal(without, with_eps)
