@@ -143,3 +143,9 @@ boundary where the Job is created.
 - [ ] 5.2 Smoke a SMALL mesh on the A4000 and read the log; verify a real pod
       starts (a server dry-run is not admissibility).
 - [ ] 5.3 Rollback: `MSE_GPU_ROUTE=jetson` and re-apply the quota at 0.
+
+**Lead's red-path check (2026-11-03, merged image).** In the built image, run as root
+(as the image's own user, `pip uninstall` is refused and the package silently stays, so
+a non-root mutation proves nothing): with `nvidia-cudss-cu12` uninstalled the probe exits 1
+with "no nvidia-cudss-cu12 distribution ..."; with `nvmath-python` uninstalled it fails with
+"'nvmath' is not importable". The intact image prints both OK lines and exits 0.
