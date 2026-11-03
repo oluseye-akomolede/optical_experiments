@@ -47,30 +47,53 @@ from mse_bench_fixtures import (
 #: Relative tolerances. The slab is a structured box with node planes ON every
 #: interface, so its answer is exact to round-off and the bound is tight.
 #:
-#: The shells need a tolerance chosen from MEASUREMENT, not from "a few percent
-#: feels safe". Two numbers decide it, both measured on this fixture:
+#: The shells need tolerances chosen from MEASUREMENT, not from "a few percent
+#: feels safe". Every number below is a row of the convergence table, and the
+#: table is reproduced by ``--sweep`` so a future change can re-derive them.
 #:
-#:   mesh floor    the solver sits 4.36e-04 from the meshed reference and the
-#:                 error is FLAT under refinement (4.0e-4 at 8x16, 4.6e-4 at
-#:                 24x48). It is the theta staircase discretising a 1/r
-#:                 profile, not a convergence gap, so no resolution removes it.
-#:   sensitivity   1% too much eps in shell_a moves the score to 8.4e-03; 1%
-#:                 in shell_b to 2.5e-03.
+#: SHELL CAPACITANCE converges. Against the FIXED meshed reference (the
+#: conductor shell faces are at r_in + t_shell and r_out - t_shell, and t_shell
+#: is a constant, so C_meshed does NOT move with n_r) the error falls from
+#: 2.9e-03 to 4.2e-07 as n_r goes 8 -> 128, always from ABOVE, at an observed
+#: order of 2.0 -- which is the O(h^2) an energy-based P1 capacitance is
+#: expected to show. An earlier version of this comment claimed the error was
+#: FLAT and that no resolution removed it. That was measured with the ANGULAR
+#: resolution alone: with the radial layers fixed the error is indeed flat
+#: (7.29e-02 at 6/12, 7.29e-02 at 24/48), because the radial error is then the
+#: floor. Refining the radial layers is what makes it converge.
 #:
-#: A 2e-2 bound -- the first version here -- cleared the floor by 46x and was
-#: too slack to notice a 10% eps error (it scored 1.7e-02 and PASSED). 2e-3
-#: sits 4.6x above the floor and below BOTH 1% sensitivities, so the smallest
-#: perturbation worth calling a bug fails, and the mesh's own error does not.
-#: The slack between floor and bound (4.6x) is the margin a refactor has to
-#: work with; if a future change lands nearer the floor, tighten the mesh, do
-#: not widen the bound.
+#: At the scored mesh (n_r = 48, theta/phi 16/32) the floor is 7.05e-05.
+#: A 1% error in eps_a scores 8.2e-03 or 8.3e-03 (either direction); 1% in
+#: eps_b scores 1.66e-03 or 1.78e-03. TOL_SHELL = 5e-04 sits 7.1x above the
+#: floor and 3.3x below the WEAKEST of those four, so a 1% eps error in either
+#: shell, in either direction, fails -- and the mesh's own error does not.
 TOL_SLAB = 1e-9
-TOL_SHELL = 2e-3
+TOL_SHELL = 5e-4
 
-#: Resolution for the scored runs: the coarsest that converges. Higher costs
-#: time without changing a verdict.
-SPHERE_N_THETA = 12
-SPHERE_N_PHI = 24
+#: The interface potential is a SANITY CHECK, NOT A DETECTOR, and this
+#: tolerance is set to say so rather than to pretend otherwise. Measured on
+#: the four perturbations (``--perturb``): a 1% eps error moves the capacitance
+#: by 16.5x to 3.3x the shell tolerance, but moves this potential by only
+#: 0.1x to 0.2x of a 1e-2 bound -- it does not clear it in ANY of the four
+#: cases. Giving it a bound tight enough to catch eps would mean a bound below
+#: the mesh's own floor (6.5e-04 at n_r=48), i.e. a band around the solver's
+#: output, which is precisely what a tolerance must not be.
+#:
+#: So it is scored at a loose bound that catches gross breakage only -- a
+#: wrong voltage, a swapped electrode, a solve that returns a level rather
+#: than a field -- and the eps mutation is proved by the CAPACITANCE, which
+#: does discriminate. It earns its place because it is the only direct check
+#: on the potential: capacitance cannot see a solve that gets the field right
+#: and the absolute level wrong.
+TOL_PHI_SHELL = 5e-3
+
+#: Resolution for the scored runs. THETA/PHI must be high enough that the
+#: angular error is below the radial floor at n_r = 48 (measured: at n_r 48 the
+#: error is 6.5e-4 at 6/12 and 7.8e-5 at 24/48, so 16/32 is past the knee);
+#: n_r = 48 sets the floor the tolerances above are built on.
+SPHERE_N_THETA = 16
+SPHERE_N_PHI = 32
+SPHERE_N_R = 48
 
 
 class Result:
@@ -203,7 +226,7 @@ def run_slab() -> list[Result]:
 def run_shells() -> list[Result]:
     problem, expected = _fixture_with_trusted_eps(
         concentric_spheres, EPS_A_BENCH, EPS_B_BENCH,
-        n_theta=SPHERE_N_THETA, n_phi=SPHERE_N_PHI,
+        n_theta=SPHERE_N_THETA, n_phi=SPHERE_N_PHI, n_r=SPHERE_N_R,
     )
     out = [
         # Scored against the MESHED reference, for the reason in the module
@@ -212,7 +235,7 @@ def run_shells() -> list[Result]:
                _capacitance(problem), expected["C_meshed"], TOL_SHELL, "F"),
         Result("shells interface potential",
                _potential_at(problem, expected["r_mid"]),
-               expected["phi_rmid"], 5e-2),
+               expected["phi_rmid"], TOL_PHI_SHELL),
     ]
     return out
 
@@ -221,7 +244,7 @@ def context_lines() -> list[str]:
     """Unscored numbers that explain the scored ones."""
     problem, expected = _fixture_with_trusted_eps(
         concentric_spheres, EPS_A_BENCH, EPS_B_BENCH,
-        n_theta=SPHERE_N_THETA, n_phi=SPHERE_N_PHI,
+        n_theta=SPHERE_N_THETA, n_phi=SPHERE_N_PHI, n_r=SPHERE_N_R,
     )
     measured = _capacitance(problem)
     ideal = expected["C"]
@@ -251,6 +274,131 @@ def context_lines() -> list[str]:
 _METHOD = "direct"
 
 
+def _shells_measured(n_theta, n_phi, n_r):
+    """(capacitance, interface potential) for one resolution, against references.
+
+    Returns the signed errors against BOTH references -- the meshed one the
+    bench scores and the idealised one it prints -- because the difference
+    between them is what caught an earlier wrong comment: the meshed reference
+    moves with the mesh only through the shells' radii, which are fixed, so a
+    converging solver converges on it and does NOT converge on the idealised
+    one (the staircase shell faces are a fixed offset).
+    """
+    problem, expected = _fixture_with_trusted_eps(
+        concentric_spheres, EPS_A_BENCH, EPS_B_BENCH,
+        n_theta=n_theta, n_phi=n_phi, n_r=n_r,
+    )
+    cap = _capacitance(problem)
+    phi = _potential_at(problem, expected["r_mid"])
+    return {
+        "cap_meshed": (cap - expected["C_meshed"]) / expected["C_meshed"],
+        "cap_ideal": (cap - expected["C"]) / expected["C"],
+        "phi_meshed": phi - expected["phi_rmid"],
+    }
+
+
+def convergence_table() -> str:
+    """The table TOL_SHELL and TOL_PHI_SHELL are built from. ``--sweep``.
+
+    Three sweeps, because the ORDER only shows up in one of them:
+
+      * radial alone   -- theta/phi held at the scored value, n_r refined. This
+        is the one that converges: an earlier comment read the angular sweep,
+        saw a flat error, and concluded nothing converged.
+      * angular alone  -- n_r held at the scored value. Flat, because at a
+        fixed radial floor the angular error is already below it.
+      * both           -- the observed order, ~2.0 as expected for energy-based
+        P1, so the errors above are discretisation and not bookkeeping.
+
+    The last row is the scored resolution and its numbers are the floor the
+    tolerances clear.
+    """
+    lines = [
+        "radial refinement only (theta/phi fixed at the scored resolution)",
+        f"  {'n_r':>5}{'cap err(meshed)':>18}{'cap err(ideal)':>17}{'phi err':>12}",
+    ]
+    for n_r in (8, 16, 24, 32, 48, 64, 96, 128):
+        e = _shells_measured(SPHERE_N_THETA, SPHERE_N_PHI, n_r)
+        lines.append(f"  {n_r:>5}{e['cap_meshed']:>18.2e}"
+                     f"{e['cap_ideal']:>17.2e}{e['phi_meshed']:>12.2e}")
+
+    lines.append("")
+    lines.append("angular refinement only (n_r fixed at the scored resolution)")
+    lines.append(f"  {'th/phi':>8}{'cap err(meshed)':>18}{'phi err':>12}")
+    for nt, nph in ((6, 12), (12, 24), (16, 32), (24, 48)):
+        e = _shells_measured(nt, nph, SPHERE_N_R)
+        lines.append(f"  {f'{nt}/{nph}':>8}{e['cap_meshed']:>18.2e}"
+                     f"{e['phi_meshed']:>12.2e}")
+
+    lines.append("")
+    lines.append("both refined together (observed order)")
+    lines.append(f"  {'n_r':>5}{'th/phi':>8}{'cap err(meshed)':>18}{'order':>8}")
+    prev = None
+    for (nt, nph), n_r in (((8, 16), 16), ((12, 24), 32), ((16, 32), 48),
+                           ((24, 48), 96)):
+        e = _shells_measured(nt, nph, n_r)
+        err = abs(e["cap_meshed"])
+        order = "" if prev in (None, 0.0) else f"{__import__('math').log2(prev / err):.2f}"
+        lines.append(f"  {n_r:>5}{f'{nt}/{nph}':>8}{e['cap_meshed']:>18.2e}"
+                     f"{order:>8}")
+        prev = err
+    return "\n".join(lines)
+
+
+def perturbation_table() -> str:
+    """What a 1% eps error scores, in both shells and both directions. ``--perturb``.
+
+    This is the sensitivity half of TOL_SHELL. It is a TABLE, not a prose claim,
+    because the first version of this bench passed a 10% eps error: the
+    reference was derived from the same fixture invocation as the solve, so
+    mutating eps scaled both sides and the score did not move at all. Every row
+    here must clear TOL_SHELL for the tolerance to mean anything.
+    """
+    base = _shells_measured(SPHERE_N_THETA, SPHERE_N_PHI, SPHERE_N_R)
+    # The unperturbed reference, built once. Every perturbed row is scored
+    # against THESE numbers, never against its own fixture's reference.
+    base_problem, base_expected = _fixture_with_trusted_eps(
+        concentric_spheres, EPS_A_BENCH, EPS_B_BENCH,
+        n_theta=SPHERE_N_THETA, n_phi=SPHERE_N_PHI, n_r=SPHERE_N_R,
+    )
+    base_c = base_expected["C_meshed"]
+    base_phi = base_expected["phi_rmid"]
+    base_r_mid = base_expected["r_mid"]
+    lines = [
+        f"scored resolution n_r={SPHERE_N_R}, theta/phi={SPHERE_N_THETA}/{SPHERE_N_PHI}",
+        f"  TOL_SHELL={TOL_SHELL:.1e}  TOL_PHI_SHELL={TOL_PHI_SHELL:.1e}",
+        f"  {'case':>14}{'cap err':>12}{'vs TOL':>10}{'phi err':>12}{'vs TOL':>10}",
+    ]
+
+    def row(name, cap, phi):
+        return (f"  {name:>14}{cap:>12.2e}{cap / TOL_SHELL:>10.1f}x"
+                f"{phi:>12.2e}{abs(phi) / TOL_PHI_SHELL:>10.1f}x")
+
+    lines.append(row("baseline", base["cap_meshed"], base["phi_meshed"]))
+    for shell in ("a", "b"):
+        for sign in (1.01, 0.99):
+            # THE SOLVE IS PERTURBED; THE REFERENCE IS NOT. The fixture is
+            # rebuilt with one eps moved by 1%, but only its PROBLEM is used --
+            # the reference dict is discarded and the score is judged against
+            # the unperturbed `base` fixture's closed form. Scoring against the
+            # perturbed fixture's own reference would rescale both sides and
+            # report ~0, which is exactly how an earlier version of this bench
+            # passed a 10% eps error.
+            eps_a, eps_b = EPS_A_BENCH, EPS_B_BENCH
+            if shell == "a":
+                eps_a *= sign
+            else:
+                eps_b *= sign
+            problem, _ = _fixture_with_trusted_eps(
+                concentric_spheres, eps_a, eps_b,
+                n_theta=SPHERE_N_THETA, n_phi=SPHERE_N_PHI, n_r=SPHERE_N_R,
+            )
+            cap = (_capacitance(problem) - base_c) / base_c
+            phi = _potential_at(problem, base_r_mid) - base_phi
+            lines.append(row(f"eps_{shell} x{sign}", cap, phi))
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     global _METHOD
     ap = argparse.ArgumentParser(description=__doc__,
@@ -259,8 +407,21 @@ def main(argv=None) -> int:
                     help="print the numbers, never exit non-zero")
     ap.add_argument("--method", default="direct", choices=("direct", "amg"),
                     help="linear solver behind the Dirichlet reduction")
+    ap.add_argument("--sweep", action="store_true",
+                    help="print the convergence table the tolerances are built "
+                         "from, then exit; re-derive them before changing one")
+    ap.add_argument("--perturb", action="store_true",
+                    help="print what a 1%% eps error in each shell scores, then "
+                         "exit; this is the sensitivity half of the tolerances")
     args = ap.parse_args(argv)
     _METHOD = args.method
+
+    if args.sweep:
+        print(convergence_table())
+        return 0
+    if args.perturb:
+        print(perturbation_table())
+        return 0
 
     results = run_slab() + run_shells()
     print(f"electrostatics bench -- linear method: {_METHOD}")

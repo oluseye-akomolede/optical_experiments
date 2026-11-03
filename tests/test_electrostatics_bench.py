@@ -53,6 +53,56 @@ def test_bench_fails_on_wrong_eps_reaching_the_solver(monkeypatch):
     assert bench.main([]) == 1
 
 
+@pytest.mark.parametrize("shell,sign", [
+    ("shell_a", 1.01), ("shell_a", 0.99), ("shell_b", 1.01), ("shell_b", 0.99),
+])
+def test_a_one_percent_eps_error_in_either_shell_either_direction_fails(
+        monkeypatch, shell, sign):
+    """The reviewer's acceptance criterion: all four perturbations must FAIL.
+
+    The tolerance is built from the measured table (``bench.perturbation_table``)
+    rather than picked, and this test is what holds it to that: the weakest of
+    the four (eps_b, -1%) scores 3.3x the shell tolerance, and the mesh's own
+    floor is 0.1x it. What the CAPACITANCE cannot do is noted in the phi test
+    below, where the limitation is asserted rather than glossed.
+    """
+    real = F.concentric_spheres
+
+    def wrong_eps(**kw):
+        problem, expected = real(**kw)
+        problem["eps_static"][shell] *= sign
+        return problem, expected
+
+    monkeypatch.setattr(bench, "concentric_spheres", wrong_eps)
+    monkeypatch.setattr(bench, "_fixture_with_trusted_eps",
+                        lambda b, a, c, **kw: b(**kw))
+    assert bench.main([]) == 1
+
+
+def test_the_interface_potential_is_a_sanity_check_not_an_eps_detector():
+    """Spell out what the phi tolerance does NOT catch, so nobody claims more.
+
+    Measured: every 1% eps perturbation moves the interface potential by
+    0.1x-0.2x of TOL_PHI_SHELL. It is kept as a scored quantity because a
+    wrong voltage, a swapped electrode or a level-vs-field error would show up
+    in it, and because capacitance cannot see the absolute potential at all --
+    but it is not the eps detector, and this test freezes that fact.
+    """
+    table = bench.perturbation_table()
+    rows = [ln for ln in table.splitlines() if "eps_" in ln]
+    assert len(rows) == 4, table
+    for ln in rows:
+        # Columns: case, cap err, cap-vs-TOL, phi err, phi-vs-TOL. The "vs TOL"
+        # columns are SIGNED -- a negative score is over tolerance in the other
+        # direction, which is just as much a detection -- so compare magnitude.
+        cap_vs_tol, phi_vs_tol = ln.split()[3], ln.split()[4]
+        assert abs(float(cap_vs_tol.rstrip("x"))) >= 3.0, (
+            f"capacitance must catch it: {ln}")
+        assert abs(float(phi_vs_tol.rstrip("x"))) < 1.0, (
+            f"the phi tolerance is claimed to be a sanity check only, but this "
+            f"row clears it -- tighten or loosen deliberately: {ln}")
+
+
 def test_trusted_eps_guard_refuses_a_fixture_that_rewrote_its_table(monkeypatch):
     real = F.concentric_spheres
 
