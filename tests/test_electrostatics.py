@@ -535,3 +535,207 @@ def test_skipping_a_held_part_changes_nothing_the_solve_can_see():
                        {"gap": gap_eps, "left": 1.0, "right": 1.0},
                        {"left": 0.0, "right": 1.0})["phi"]
     assert np.array_equal(without, with_eps)
+
+
+# --- AMG-CG (task 1.4) -------------------------------------------------------
+#
+# The switch is AMG_NODE_CROSSOVER, a named estimate in design.md §5. These
+# tests force each path with method= rather than build a 5e5-node mesh: the
+# point is that the two paths agree, and a mesh large enough to cross the
+# constant naturally cannot run inside tier 1.
+
+
+def _exact_contact_bar(points):
+    """The known answer for _contact_chain: linear between the contact faces.
+
+    The contacts occupy x < 0.25 and x > 0.75, so the driven region is the gap
+    between those two planes, where a uniform dielectric gives exactly
+    phi = (x - 0.25) / 0.5.
+    """
+    return (points[:, 0] - 0.25) / 0.5
+
+
+def test_the_amg_and_direct_paths_agree_on_the_exact_fixture():
+    """AMG-CG and the direct LU give the same potential, to AMG's own tolerance.
+
+    The bound is 1e-12 and it comes from AMG_RTOL, not from taste: the direct
+    path is exact to machine precision (measured 1e-15 on this fixture), so the
+    whole discrepancy is AMG's and asking for more than its rtol would be
+    asking the iterative solver for accuracy it was never told to reach.
+    Measured at nx=12: direct 1.2e-15, AMG 1.9e-13 against a reference with no
+    discretisation error to hide behind (the answer is exactly linear).
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain(12, 6, 6)
+    volts = {"left": 0.0, "right": 1.0}
+    eps = {"gap": gap_eps}
+    direct = E.solve(points, tets, parts, region_of_tet, eps, volts, method="direct")
+    amg = E.solve(points, tets, parts, region_of_tet, eps, volts, method="amg")
+
+    assert direct["method"] == "direct" and amg["method"] == "amg"
+    assert direct["n_free"] == amg["n_free"] > 100
+
+    exact = _exact_contact_bar(points)
+    free = direct["free"]
+    # Both paths carry the same error against the known answer; neither is
+    # merely agreeing with the other's mistake.
+    assert np.abs(direct["phi"][free] - exact[free]).max() < 1e-12, "direct"
+    assert np.abs(amg["phi"][free] - exact[free]).max() < 1e-12, "amg"
+    assert np.abs(direct["phi"] - amg["phi"]).max() < 1e-12
+
+
+def test_the_amg_residual_is_checked_against_the_true_system():
+    """The reported residual is measured on A and b, and is small.
+
+    pyamg's own ``residuals`` list is relative to its internal initial residual,
+    which answers a different question. This pins that the number ``solve``
+    reports is the real one: recomputed here from the returned phi.
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain(8, 4, 4)
+    volts = {"left": 0.0, "right": 1.0}
+    result = E.solve(points, tets, parts, region_of_tet, {"gap": gap_eps}, volts,
+                     method="amg")
+    assert result["method"] == "amg"
+    assert result["residual"] is not None and result["residual"] < E.AMG_RTOL * 10
+
+    # Recompute the residual independently from the assembled system.
+    K, _ = E.assemble_stiffness(points, tets, parts, {"gap": gap_eps,
+                                                      "left": 1.0, "right": 1.0},
+                                region_of_tet, skip={"left", "right"})
+    free = result["free"]
+    fixed = ~free
+    phi = result["phi"]
+    rhs = -(K[free][:, fixed] @ phi[fixed])
+    res = K[free][:, free] @ phi[free] - rhs
+    rel = np.linalg.norm(res) / np.linalg.norm(rhs)
+    assert rel < 1e-10, f"recomputed relative residual {rel:.2e}"
+
+
+def test_a_non_converging_amg_solve_raises_rather_than_returning_half_an_answer(monkeypatch):
+    """A solver that stops early must produce an error, not a quiet answer.
+
+    The row's requirement is that a half-converged potential is never returned
+    silently. The mutation is a pyamg solver that returns its starting guess:
+    the checked residual on the true system then fails the tolerance and
+    :func:`amg_solve` raises.
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain(6, 4, 4)
+
+    class _Lazy:
+        def solve(self, b, **kw):
+            return np.zeros_like(b)
+
+    import pyamg
+
+    monkeypatch.setattr(pyamg, "smoothed_aggregation_solver", lambda A, **kw: _Lazy())
+    # A tiny maxiter is irrelevant here: _Lazy never iterates. Build the real
+    # reduced operator so the residual is measured on a real matrix.
+    K, _ = E.assemble_stiffness(points, tets, parts, {"gap": gap_eps,
+                                                      "left": 1.0, "right": 1.0},
+                                region_of_tet, skip={"left", "right"})
+    free = np.ones(K.shape[0], dtype=bool)
+    free[:1] = False
+    K_ff = K[free][:, free].tocsc()
+    b = np.ones(int(free.sum()))
+    with pytest.raises(RuntimeError, match="did not converge"):
+        E.amg_solve(K_ff, b)
+
+
+def test_the_crossover_sends_a_small_mesh_to_the_direct_path():
+    """Below AMG_NODE_CROSSOVER, method="auto" takes the exact path.
+
+    The direct solve is exact to machine precision and needs no iteration, so
+    the default must not spend it on a mesh that fits easily.
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain(6, 4, 4)
+    result = E.solve(points, tets, parts, region_of_tet, {"gap": gap_eps},
+                     {"left": 0.0, "right": 1.0})
+    assert result["n_free"] < E.AMG_NODE_CROSSOVER
+    assert result["method"] == "direct"
+    assert result["residual"] is None
+
+
+def test_the_amg_path_actually_uses_the_amg_preconditioner():
+    """AMG is used, not merely the CG it accelerates.
+
+    Measured why this test has to exist: replacing the AMG setup with plain
+    scipy CG leaves EVERY other AMG test green, because plain CG converges on
+    these fixtures too. Agreement and residual tests therefore cannot tell a
+    preconditioned solve from an unpreconditioned one, and without this test
+    deleting the preconditioner would break nothing.
+
+    It asserts the call, not the iterations: on a system small enough for tier
+    1 the iteration counts do not separate the two, and a test that quoted them
+    would be quoting the fixture's shape.
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain(8, 4, 4)
+    calls = []
+
+    import pyamg
+
+    real = pyamg.smoothed_aggregation_solver
+
+    def spy(A, **kw):
+        calls.append(A.shape)
+        return real(A, **kw)
+
+    pyamg.smoothed_aggregation_solver = spy
+    try:
+        result = E.solve(points, tets, parts, region_of_tet, {"gap": gap_eps},
+                         {"left": 0.0, "right": 1.0}, method="amg")
+    finally:
+        pyamg.smoothed_aggregation_solver = real
+
+    assert result["method"] == "amg"
+    assert len(calls) == 1, f"expected one AMG setup, saw {calls}"
+    assert calls[0][0] == result["n_free"], (
+        "AMG was built for the wrong system: "
+        f"{calls[0][0]} rows for {result['n_free']} free nodes"
+    )
+
+
+def test_a_pyamg_that_aborts_still_fails_the_checked_residual():
+    """pyamg can return a zero vector after detecting an indefinite matrix.
+
+    Measured: on a reduced operator it dislikes, pyamg warns "Indefinite matrix
+    detected in CG, aborting" and returns x = 0 with relative residual 1.0 --
+    a silent wrong answer. The checked residual is what turns that into a
+    refused solve, so this pins the behaviour rather than trusting the solver.
+    """
+    import pyamg
+
+    class _Aborting:
+        def solve(self, b, **kw):
+            return np.zeros_like(b)
+
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain(6, 4, 4)
+    K, _ = E.assemble_stiffness(points, tets, parts,
+                                {"gap": gap_eps, "left": 1.0, "right": 1.0},
+                                region_of_tet, skip={"left", "right"})
+    free = np.ones(K.shape[0], dtype=bool)
+    free[:1] = False
+    K_ff = K[free][:, free].tocsc()
+
+    real = pyamg.smoothed_aggregation_solver
+    pyamg.smoothed_aggregation_solver = lambda A, **kw: _Aborting()
+    try:
+        with pytest.raises(RuntimeError, match="did not converge"):
+            E.amg_solve(K_ff, np.ones(int(free.sum())))
+    finally:
+        pyamg.smoothed_aggregation_solver = real
+
+
+def test_skip_naming_a_part_outside_the_mesh_is_refused():
+    """The skip guard is unreachable through ``solve``, so test it directly.
+
+    ``solve`` checks every electrode is a part before it calls the assembler, so
+    ``skip`` can never name an unknown part through that door -- the guard is
+    dead code from ``solve``'s point of view. The reviewer's note on 1.3 asked
+    for it to be either tested directly or dropped; this is the direct test,
+    chosen because the assembler is a public entry point that a caller can
+    reach without going through ``solve``.
+    """
+    points, tets = _structured_cube_chain(2, 2, 2)
+    region_of_tet = np.zeros(tets.shape[0], dtype=np.int64)
+    with pytest.raises(ValueError, match="skip names part"):
+        E.assemble_stiffness(points, tets, ["a"], {"a": 2.0}, region_of_tet,
+                             skip={"nope"})
