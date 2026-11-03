@@ -210,6 +210,40 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
 - [ ] 1.6 Bench fixtures (two-layer slab, concentric spheres, sphere between plates, the
       paper-1 wire with a top electrode) and `scripts/electrostatics_bench.py`. Prove the
       ε_s-ignored mutation.
+      **Partially done, deliberately left unticked.** Built and proven: two-layer slab,
+      concentric spheres, sphere between plates; the bench and its fixtures live in
+      `dockerfiles/maxwell_solver/` beside the solver they exercise (not `scripts/`, so they
+      import with the rest of the package and run from a container). Fixtures are in
+      `mse_bench_fixtures.py`, the runner in `electrostatics_bench.py`, tests in
+      `tests/test_electrostatics_bench.py`. NOT done: the paper-1 wire with a top electrode.
+
+      **The ε_s-ignored mutation is proven.** In `element_stiffness`, dropping the
+      `eps_tet` factor turns all three scored quantities red (slab 5.86e-01, shells
+      capacitance 6.02e-01, shells interface 9.97e-01), and a 1% error in one shell's eps
+      scores 8.98e-03 against a 2e-3 tolerance. Both are now tests, not one-off runs.
+
+      **Review round (1.6 fixes).** The reviewer found that `SPHERE_N_R` was chosen
+      because it passed, not because it converged, and that the comments were prose
+      rather than measurements. Both correct. `--sweep` now runs three tables; reproduce
+      them with `python electrostatics_bench.py --sweep` (they are printed, not stored).
+      The honest order estimate is the JOINT sweep (both resolutions refined together):
+      capacitance error 6.75e-04 (n_r 16, theta/phi 8/16) -> 1.69e-05 (96, 24/48) at an
+      observed order of 2.06-2.08, and the scored mesh (n_r=48, 16/32) sits at 7.05e-05.
+      Neither one-dimensional table supports an order claim. Radial-only goes 7.05e-05
+      (48) -> 4.15e-07 (128), ~170x for a 2.7x change in h: not order 2, almost certainly
+      radial against angular error cancelling, so 4e-7 is not the mesh's accuracy.
+      Angular-only RISES, 6.09e-06 at 6/12 -> 7.80e-05 at 24/48; 6/12 is an accidental
+      cancellation, not a floor, and at the scored 16/32 the angular error is comparable
+      to the radial one and of opposite sign. `rel_ideal` is 7.53e-02 at n_r=8 and
+      7.22e-02 for n_r >= 16, and never converges: the conductor shell faces are pinned
+      at `r_in+t_shell` with `t_shell` independent of n_r, so that gap is geometry, not
+      discretisation. It is reported, never scored.
+      `TOL_SHELL` is 5e-4 (7x the floor, 3.3x below the weakest 1% perturbation).
+      `TOL_PHI_SHELL` is 5e-3 and is a SANITY CHECK, not an eps detector -- all four
+      perturbations move phi by only 0.2x-0.4x of it, and a test freezes that so it
+      cannot later be claimed as coverage. `perturbation_table()` scores all four
+      against references rebuilt from UNPERTURBED eps, closing the circularity that
+      made the first bench blind to a wrong eps.
 - [ ] 1.7 Measure the per-node memory of both solve paths from the bench RSS, replace the
       `design.md` §5 estimates with the measured figures, and wire `budget=` refusals.
 - [ ] 1.8 `stark.py`: the 7-point effective-mass operator on a Cartesian box, LOBPCG, the
