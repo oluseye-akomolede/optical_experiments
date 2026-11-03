@@ -138,6 +138,11 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       SURVIVES, correctly: it removes nothing the answer can see. `skip` is kept because an
       electrode part has no permittivity to supply, and a test pins the 0.0 agreement so a
       later reader neither deletes it nor defends it with a test that cannot fail.
+      **Count correction (reviewer).** The 1.3 handoff quoted "30 tests / 77
+      passed"; those were read before 1.4 added tests to the same file and can no
+      longer be reproduced. On the 1.4 tree the file runs 37 and the six affected
+      suites 138 passed / 6 skipped. The measurements below are unchanged; only
+      the totals moved.
       Five mutations, `__pycache__` cleared between mutate and restore each time:
       eps_tet dropped -> red; skip dropped -> survives (above); shared-node refusal dropped
       -> red; eps<1 refusal dropped -> red; electrode exemption dropped -> red (8 failures).
