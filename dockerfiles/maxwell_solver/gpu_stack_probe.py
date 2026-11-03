@@ -7,7 +7,7 @@ broken image cannot reach Harbor and cannot be deployed to the A4000.
 Why this file exists rather than two ``python -c`` lines in the Dockerfile: the
 permission string is long enough to be unreadable when backslash-continued, and
 Docker's line continuation cannot carry a multi-line Python literal. As a
-checked-in script it is also runnable (and mutation-tested) outside a build.
+checked-in script it is also runnable outside a build (the lead's red-path check is in tasks.md).
 
 Why an import check is not enough
 ---------------------------------
@@ -94,8 +94,6 @@ def cudss_probe() -> str:
     # dependency it needs is missing, which is the other half of the check.
     ctypes.CDLL(str(libs[0]))
     return libs[0].name
-    ctypes.CDLL(libs[0])  # raises OSError if a dependency it needs is missing
-    return libs[0].rsplit("/", 1)[-1]
 
 
 def main() -> int:
