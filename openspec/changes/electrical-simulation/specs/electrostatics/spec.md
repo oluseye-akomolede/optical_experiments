@@ -43,9 +43,21 @@ electrode's nodes and return the Maxwell capacitance matrix in farads.
 - **WHEN** a sphere of ε_s ∈ {4, 12.9} sits centred between distant plates that apply E₀
 - **THEN** the field at the sphere centre is 3E₀/(ε_s + 2) within 5 %
 
-#### Scenario: The capacitance matrix is symmetric
+#### Scenario: The capacitance matrix is symmetric and row-conserving
 - **WHEN** `capacitance_matrix` is computed for three or more electrodes
-- **THEN** C is symmetric within 1e-6 relative and each row sums to ≤ 0 off-diagonal
+- **THEN** C = Cᵀ within 1e-6 relative, and for the Maxwell matrix L = −C (with
+  C[i][i] > 0 and C[i][j] ≤ 0) every row of L sums to zero within 1e-9 — the charge
+  leaving a driven electrode must all arrive on the others, so the diagonal alone is
+  the self-capacitance. The sign convention is fixed: driving electrode `j` at 1 V puts
+  POSITIVE charge Q_j on it, and C[i][j] is the charge induced on electrode `i`.
+
+#### Scenario: The transpose cannot hide behind symmetry
+- **WHEN** `assemble_capacitance` is given a charge map that is deliberately NOT
+  symmetric (electrode 0 the only one driven, with unequal charges on 1 and 2)
+- **THEN** `C[i][j]` holds `charge[i]` for drive `j`; returning the transpose turns
+  this red. A solved three-electrode reciprocal network has C = Cᵀ to the last bit, so
+  no `capacitance_matrix` fixture can catch a transposed index — measured max
+  |C − Cᵀ| = 0.0 — and the symmetry scenario above CANNOT substitute for this one.
 
 ### Requirement: Generality SHALL be tested on devices that are not a wire
 The benches SHALL include at least two devices whose geometry is not the paper-1 wire: a
