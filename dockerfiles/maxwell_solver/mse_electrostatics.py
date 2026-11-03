@@ -11,11 +11,23 @@ so each tet contributes the 4x4 matrix
 
     K_ij = eps_static * eps0 * vol * (grad lambda_i . grad lambda_j)
 
-with ``grad lambda_i`` the constant barycentric gradients. That is the whole of
-the multi-material physics: the material enters only as a per-tet scalar, so a
-mesh whose tets carry a part index assembles with one broadcast -- the same
-shape :func:`mse_fem.element_matrices` takes as its ``eps_by_tet`` array
-argument (an array there, a table-to-array helper here).
+with ``grad lambda_i`` the constant barycentric gradients. The material enters
+only as a per-tet scalar, so a mesh whose tets carry a part index assembles with
+one broadcast -- the same shape :func:`mse_fem.element_matrices` takes as its
+``eps_by_tet`` array argument (an array there, a table-to-array helper here).
+
+What this is exact for: a CONFORMING interface, i.e. one that lies on element
+faces. There P1 with per-element ``eps`` reproduces the piecewise-linear layered
+solution exactly -- measured at 2e-15 on a structured chain with a 1:2 contrast
+and 3e-15 with 1:4 -- and refinement changes nothing, which is why the test pins
+the exact values rather than a convergence rate. The mesher places part
+boundaries on faces, so this is the case the product hits.
+
+What it does NOT handle: a tet that SPANS two materials. Its single ``eps``
+value is then wrong for part of its volume, and :func:`check_tet_regions` does
+not detect such a tet -- it trusts the per-tet region index the mesher supplied.
+A mesh whose interface cuts through elements needs either a mesher that snaps
+the interface to faces, or an element that integrates ``eps`` over sub-regions.
 
 This module is the SCALAR problem and does not touch :mod:`mse_fem`'s edge
 elements; it shares only :func:`mse_fem.tet_geometry`, so the barycentric

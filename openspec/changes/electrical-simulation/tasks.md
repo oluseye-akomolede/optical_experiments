@@ -93,10 +93,22 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       `region_of_tet`, not its nodes' — a node-derived part cannot represent a boundary that
       runs through a shared face. `mse_fem.tet_geometry` was extracted to module level and is
       now shared, so the `inv(J).T` trap has one home. Tests use relative tolerance: every
-      matrix entry is ~1e-11 (ε₀), so `np.allclose`'s default `atol=1e-8` called a 3.5%
-      difference equal — both the closed-form and assembled-matrix assertions pin `atol=0.0`.
+      matrix entry is ~1e-11 (ε₀), i.e. far below `np.allclose`'s default `atol=1e-8`, so an
+      absolute floor that large would make every comparison vacuous — both the closed-form and
+      assembled-matrix assertions pin `atol=0.0`. (An earlier note here claimed the default
+      masked a live "3.5% difference"; that figure was never reproduced and is withdrawn — the
+      default is a trap for future mismatches, not a present error.)
       Mutations checked: dropping `eps_tet` fails (a)+(d); dropping the transpose in
       `tet_geometry` fails (a) only, which is why (a) has to exist.
+      **Interface physics (reviewer ruling).** The "solved 2× wrong" finding was a
+      layers-swapped exact column, not an assembly bug. Added the test that pins the closed
+      form: a 1:2 layered block, interface on a node plane, φ = ε_b/(ε_a+ε_b) = 0.6667 exact
+      to 2.1e-15 at every node; parametrised over 1:2, 2:1, 1:4, 4:1 so a swapped fixture lands
+      on 1/3 or 1/5. Asserted that no tet spans the interface — that conforming property is
+      what makes it exact. Mutations (cache cleared first): swap layers → 0.3333; one ε
+      everywhere → 0.5000; both red 4/4, restore green 18/18. The docstring no longer claims
+      "the whole of the multi-material physics": exact for a conforming interface, not handled
+      for a tet spanning two materials, and `check_tet_regions` does not detect one.
 - [ ] 1.3 Electrode Dirichlet reduction, direct solve through `mse_backend.factor`, input
       refusals, the maximum-principle test.
 - [ ] 1.4 AMG-CG path (`pyamg`) with the checked residual; the direct-vs-AMG agreement test.

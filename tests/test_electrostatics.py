@@ -96,8 +96,10 @@ def test_the_closed_form_check_would_see_a_transpose_error():
     assert not np.allclose(grads_right[0], grads_wrong), "the fixture cannot tell them apart"
     wrong = 12.5 * E.EPS0 * abs(det_J[0]) / 6.0 * (grads_wrong @ grads_wrong.T)
     # Relative, no absolute floor. EPS0 is ~8.9e-12, so every entry here is
-    # ~1e-11 and np.allclose's default atol=1e-8 calls a 3.5% difference equal --
-    # the guard would pass on the bug it exists to catch.
+    # ~1e-11, far below np.allclose's default atol=1e-8: an absolute floor that
+    # large would call ANY two entries equal and the guard could never fail. The
+    # default is a trap for future mismatches at this scale, not a live 3.5%
+    # error -- on this fixture the two matrices differ by ~1e-13 absolute.
     assert not np.allclose(K_elem[0], wrong, rtol=1e-12, atol=0.0), (
         "a transposed gradient gives the same element matrix, so (a) would pass "
         "on the bug"
@@ -244,4 +246,116 @@ def test_a_part_with_no_tets_is_refused():
     with pytest.raises(ValueError, match="have no tets"):
         E.assemble_stiffness(
             points, tets, parts, {"core": 12.5, "shell": 3.9}, all_core
+        )
+
+
+# --- the interface physics ---------------------------------------------------
+#
+# A layered block is the one case where the exact answer is known in closed form,
+# so it is the only test that pins the ASSEMBLY rather than an invariant (row
+# sums, symmetry) the assembly could satisfy while still being wrong. Two layers
+# in series, eps_a below x=0.5 and eps_b above, 0 V at x=0 and 1 V at x=1.
+#
+# Flux continuity eps_a*E_a = eps_b*E_b with E_a*d_a + E_b*d_b = 1 over equal
+# thicknesses gives E_a = 2*E_b, so phi jumps to eps_b/(eps_a+eps_b) at the
+# interface (NOT eps_a/(eps_a+eps_b) -- that is the layers-swapped answer).
+#
+# The mesh must be STRUCTURED, with the interface on a node plane. A Delaunay
+# tetrahedralization of a regular grid produces flat (zero-volume) tets there
+# and the matrix goes singular; and any tet SPANNING the interface would carry
+# one eps for two materials, which this assembly does not model (see the module
+# docstring). Zero tets cross the plane here -- asserted below, because that
+# property is what makes the exact answer exact rather than approximate.
+
+_CUBE_TETS = np.array(
+    [(0, 1, 3, 7), (0, 1, 5, 7), (0, 2, 3, 7), (0, 2, 6, 7), (0, 4, 5, 7), (0, 4, 6, 7)]
+)
+
+
+def _structured_cube_chain(nx=8, ny=2, nz=2):
+    """An nx x ny x nz block of cubes, each split into 6 tets about one diagonal."""
+    xs, ys, zs = (np.linspace(0.0, 1.0, n + 1) for n in (nx, ny, nz))
+
+    def node(i, j, k):
+        return (i * (ny + 1) + j) * (nz + 1) + k
+
+    points = np.array(
+        [[xs[i], ys[j], zs[k]] for i in range(nx + 1) for j in range(ny + 1) for k in range(nz + 1)]
+    )
+    tets = []
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                corner = {
+                    (a, b, c): node(i + a, j + b, k + c)
+                    for a in (0, 1) for b in (0, 1) for c in (0, 1)
+                }
+                for t in _CUBE_TETS:
+                    bits = [tuple(int(v) for v in np.unravel_index(u, (2, 2, 2))) for u in t]
+                    tets.append([corner[b] for b in bits])
+    return points, np.array(tets)
+
+
+def _solve_layers(eps_a, eps_b):
+    """Solve the layered block; return (points, phi, region_of_tet)."""
+    points, tets = _structured_cube_chain()
+    centroids_x = points[tets][:, :, 0].mean(axis=1)
+    region_of_tet = (centroids_x > 0.5).astype(np.int64)      # 0 = "a", 1 = "b"
+    K, _ = E.assemble_stiffness(
+        points, tets, ["a", "b"], {"a": eps_a, "b": eps_b}, region_of_tet
+    )
+    K = K.toarray()
+    fixed = {}
+    for n, (x, _, _) in enumerate(points):
+        if abs(x) < 1e-12:
+            fixed[n] = 0.0
+        elif abs(x - 1.0) < 1e-12:
+            fixed[n] = 1.0
+    free = [n for n in range(len(points)) if n not in fixed]
+    phi = np.zeros(len(points))
+    for n, v in fixed.items():
+        phi[n] = v
+    phi[free] = np.linalg.solve(
+        K[np.ix_(free, free)], -K[np.ix_(free, list(fixed))] @ np.array(list(fixed.values()))
+    )
+    return points, phi, region_of_tet, tets
+
+
+def _exact_phi(x, interface):
+    """Piecewise-linear solution: linear to the interface, linear after it."""
+    return interface * (x / 0.5) if x <= 0.5 else interface + (1.0 - interface) * ((x - 0.5) / 0.5)
+
+
+@pytest.mark.parametrize("eps_a,eps_b", [(1.0, 2.0), (2.0, 1.0), (1.0, 4.0), (4.0, 1.0)])
+def test_the_layered_interface_sits_at_eps_b_over_the_sum(eps_a, eps_b):
+    """The assembly reproduces the exact layered solution, not just its invariants.
+
+    The contrast is asymmetric under swapping (1 vs 2, 1 vs 4), so a fixture that
+    swapped the layers would land on 1/3 or 1/5 and this would see it. A
+    symmetric contrast (2 vs 2) would give 0.5 either way and prove nothing about
+    the interface.
+    """
+    points, phi, region_of_tet, tets = _solve_layers(eps_a, eps_b)
+
+    # The exactness claim only holds for a conforming interface. If this ever
+    # trips, the fixture stopped being the case the module documents.
+    lo, hi = points[tets][:, :, 0].min(axis=1), points[tets][:, :, 0].max(axis=1)
+    assert not np.any((lo < 0.5) & (hi > 0.5)), (
+        "a tet spans the interface; the exact layered answer does not apply here"
+    )
+
+    interface = eps_b / (eps_a + eps_b)
+    assert interface != 0.5, "a symmetric contrast cannot distinguish the two layers"
+
+    plane = np.isclose(points[:, 0], 0.5)
+    # No absolute floor: atol=1e-8 would make every assertion below vacuous.
+    assert np.allclose(phi[plane], interface, rtol=1e-12, atol=0.0), (
+        f"interface phi is {np.unique(phi[plane])}, expected eps_b/(eps_a+eps_b)={interface}"
+    )
+
+    for x in np.unique(points[:, 0]):
+        at_x = np.isclose(points[:, 0], x)
+        expected = _exact_phi(x, interface)
+        assert np.allclose(phi[at_x], expected, rtol=1e-12, atol=0.0), (
+            f"x={x}: phi {np.unique(phi[at_x])} != exact {expected}"
         )
