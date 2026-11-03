@@ -964,6 +964,31 @@ def test_capacitance_matrix_two_plates_is_stable_and_signed():
             assert C[0, 1] == pytest.approx(first, rel=1e-6)
 
 
+def test_field_at_on_an_electrode_face_reads_the_gap_not_the_electrode():
+    """A point ON the electrode/gap interface must answer, not refuse.
+
+    The reviewer's reproducer. A point lying exactly on the bottom plate's
+    gap-side face is contained by BOTH plate tets and gap tets, so taking the
+    lowest-index containing tet (the old code) made the answer depend on the
+    mesh's numbering: sometimes a field, sometimes a ValueError -- two kinds of
+    answer to one question. Reverting to ``np.flatnonzero(inside)[0]`` turns
+    this red.
+    """
+    points, tets, parts, region_of_tet, z0, z1 = _plate_capacitor(1.0)
+    sol = E.solve(points, tets, parts, region_of_tet,
+                  {"gap": 1.0, "bottom": 1.0, "top": 1.0},
+                  {"bottom": 0.0, "top": 1.0}, method="direct")
+    # On the bottom plate's upper face == the gap's lower node plane.
+    on_face = np.array([0.0, 0.0, z0])
+    E_z = E.field_at(sol, on_face)[2]
+    # The gap field, -dV/dz; the plate itself holds no field at all.
+    assert E_z == pytest.approx(-1.0 / (z1 - z0), rel=1e-6)
+
+    # Strictly inside the plate, every containing tet is an electrode: refused.
+    with pytest.raises(ValueError, match="inside electrode 'bottom'"):
+        E.field_at(sol, np.array([0.0, 0.0, z0 / 2]))
+
+
 def test_capacitance_matrix_needs_an_electrode():
     points, tets, parts, region_of_tet, _, _ = _plate_capacitor(1.0)
     with pytest.raises(ValueError, match="at least one electrode"):

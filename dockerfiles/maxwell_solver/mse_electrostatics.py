@@ -573,14 +573,26 @@ def field_at(solution: dict, point_m) -> np.ndarray:
             f"point {p.tolist()} is outside this mesh; "
             f"field_at only samples where the solution exists"
         )
-    tet = int(np.flatnonzero(inside)[0])
-    if solution["tet_part_name"][tet] in solution["electrodes"]:
+    # A point ON an electrode boundary lies in several tets at once -- some
+    # electrode, some not -- so taking the lowest-index containing tet made the
+    # answer depend on the mesh's numbering: a point on the gap-side face of an
+    # electrode was refused about half the time, and the two answers differed
+    # in kind (a field vs an exception), not just in value. Prefer a
+    # non-electrode tet; refuse only when EVERY containing tet is an electrode,
+    # which is the honest reading of "strictly inside the electrode".
+    containing = np.flatnonzero(inside)
+    tet_part_name = solution["tet_part_name"]   # a LIST, not an array
+    is_electrode = np.array([tet_part_name[int(t)] in solution["electrodes"]
+                             for t in containing], dtype=bool)
+    non_electrode = containing[~is_electrode]
+    if non_electrode.size == 0:
         raise ValueError(
             f"point {p.tolist()} is inside electrode "
-            f"{solution['tet_part_name'][tet]!r}, where the potential is held "
-            f"constant; the field there is not computed, so returning 0 would "
-            f"be a zero dressed up as an answer"
+            f"{tet_part_name[int(containing[0])]!r}, where the potential is held constant; the field "
+            f"there is not computed, so returning 0 would be a zero dressed up "
+            f"as an answer"
         )
+    tet = int(non_electrode[0])
 
     _, grads = mse_fem.tet_geometry(points, tets[tet:tet + 1])
     return -(solution["phi"][tets[tet]] @ grads[0])
@@ -665,11 +677,17 @@ def assemble_capacitance(columns: list[dict[str, float]],
 def _electrode_charge(solution: dict) -> dict[str, float]:
     """``(K phi)`` summed over each electrode's nodes, in coulombs.
 
-    The sign, established by measurement rather than by the sentence that used
-    to be here: ``K`` is ``-div(G grad)``, so ``K phi`` is the NEGATIVE of the
-    outward flux, i.e. PLUS the charge the electrode holds. Measured on the
-    three-plate stack with p0 driven at 1 V: ``p0`` sums to +2.83e-13 C and its
-    neighbour to -2.83e-13 C, which is a positive electrode and its induced
+    The sign, from the DERIVATION: ``K_ab = integral(eps0 * eps * grad(lam_a)
+    . grad(lam_b))`` is the weak form of ``-div(eps0 * eps * grad(phi))``, and
+    integrate-by-parts moves the divergence onto the test function, leaving a
+    boundary flux with a MINUS sign. So ``(K phi)_a`` is minus the outward flux
+    through that node's control volume, i.e. PLUS the charge stored on it. In
+    the driven-at-1 V convention that makes the driven electrode's own entry
+    positive and its neighbours' negative, which is a capacitor.
+
+    Corroborated, not established, by measurement: on the three-plate stack
+    with p0 driven at 1 V, ``p0`` sums to +2.83e-13 C and its neighbour to
+    -2.83e-13 C, which is a positive electrode and its induced
     negative partner. An earlier version of this function negated that sum and
     its docstring asserted the negation was the charge; both were wrong by a
     global sign, which every symmetric fixture hides (``-C`` is as symmetric as
