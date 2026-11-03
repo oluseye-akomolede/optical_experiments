@@ -59,6 +59,34 @@ SPD_LU = {
     "options": {"SymmetricMode": True},
 }
 
+#: Node count above which :func:`solve` switches from the direct factorisation
+#: to AMG-preconditioned CG. This is a NAMED ESTIMATE, not a derived limit:
+#: ``design.md`` §5 puts it between the E1 and E2 bench meshes and says the
+#: memory law does not set it (at 5e5 nodes a direct LU is about a third of the
+#: container). Task 1.7 replaces it with a measured per-node cost.
+AMG_NODE_CROSSOVER = 5 * 10**5
+
+#: Relative residual AMG-CG must reach before its answer is accepted.
+#:
+#: 1e-12, not 1e-10: the direct path is exact to machine precision (~1e-15
+#: measured on the contact chain), so the agreement test compares AMG against a
+#: near-exact reference and every bit of the difference is AMG's. Measured at
+#: rtol=1e-10 the AMG error against the exact answer reached 6.4e-11 -- too
+#: close to the tolerance to assert against, and needlessly loose when the
+#: alternative is exact.
+AMG_RTOL = 1e-12
+
+#: Factor by which the relative residual may exceed :data:`AMG_RTOL` before
+#: the solve is reported as not converged. A bare ``>= rtol`` test would refuse
+#: an answer that already meets the requested accuracy, so the check is against
+#: the tolerance actually asked for.
+AMG_RESIDUAL_SLACK = 10.0
+
+#: The values :func:`solve` accepts for ``method``. A typo must be refused, not
+#: silently treated as ``auto`` -- that would be the "the setting was ignored"
+#: failure ``mse_backend.selected_backend`` refuses for the same reason.
+METHODS = ("auto", "direct", "amg")
+
 
 def check_tet_regions(region_of_tet: np.ndarray, parts) -> np.ndarray:
     """Validate the mesh's own per-tet region ids, and return them as an array.
@@ -305,6 +333,46 @@ def electrode_nodes(
     return by_part
 
 
+def amg_solve(A, b, *, rtol: float = AMG_RTOL, maxiter: int = 500):
+    """Solve ``A x = b`` by AMG-preconditioned CG, verifying the residual.
+
+    ``A`` is the SPD reduced stiffness. The residual is recomputed against
+    ``A`` and ``b`` AFTER pyamg returns, rather than read off pyamg's own
+    ``residuals`` list: that list is relative to pyamg's internal initial
+    residual, so it answers "how much did I improve" while this asks "is the
+    answer right". They differ whenever the preconditioned system is badly
+    scaled, which a permittivity jump of 1:12 makes likely.
+
+    Raises :class:`RuntimeError` if the checked relative residual exceeds
+    ``rtol`` -- a half-converged answer is never returned silently.
+    """
+    try:
+        import pyamg
+    except ImportError as exc:  # pragma: no cover - environment, not logic
+        raise RuntimeError(
+            "the AMG path needs pyamg; install it or stay under "
+            f"{AMG_NODE_CROSSOVER} nodes for the direct solve"
+        ) from exc
+
+    A = sparse.csr_matrix(A)
+    ml = pyamg.smoothed_aggregation_solver(A)
+    x = ml.solve(b, tol=rtol, accel="cg", maxiter=maxiter)
+
+    scale = np.linalg.norm(b)
+    # A zero right-hand side has a zero exact answer, so there is nothing to
+    # converge to; measure the residual against the operator scale instead of
+    # dividing by zero.
+    denom = scale if scale > 0 else np.linalg.norm(np.asarray(A.diagonal()))
+    residual = np.linalg.norm(b - A @ x) / denom if denom > 0 else 0.0
+    if not residual <= rtol * AMG_RESIDUAL_SLACK:
+        raise RuntimeError(
+            f"AMG-CG did not converge: relative residual {residual:.3e} against "
+            f"rtol {rtol:.1e} (maxiter {maxiter}). Refusing to return a "
+            "half-converged potential."
+        )
+    return x, float(residual)
+
+
 def solve(
     points_m: np.ndarray,
     tets: np.ndarray,
@@ -314,6 +382,7 @@ def solve(
     electrodes: dict[str, float],
     *,
     backend: str | None = None,
+    method: str = "auto",
 ):
     """Solve the electrostatic problem with the electrodes held at fixed volts.
 
@@ -325,9 +394,23 @@ def solve(
     A zero-normal-field (natural) condition holds on the outer boundary -- it is
     the boundary term's absence, so nothing is imposed there.
 
+    ``method`` picks the solver for the reduced system:
+
+    ``"auto"`` (default)  direct below :data:`AMG_NODE_CROSSOVER` nodes, AMG-CG above
+    ``"direct"``          always the factorisation -- ignores the crossover
+    ``"amg"``             always AMG-CG, whatever the mesh size
+
+    ``"direct"`` exists because the crossover is a NAMED ESTIMATE and the only
+    way to prove the two paths agree EITHER SIDE of it is to ask for each one on
+    a mesh small enough for tier-1 tests. Without it the agreement test could
+    only ever compare AMG against a direct answer on meshes above 5 x 10**5 nodes,
+    which no tier-1 test can build.
+
     Returns a dict with ``phi`` (the ``(n_points,)`` nodal potential in volts),
     ``free`` (the boolean mask of solved nodes), ``electrodes`` (the part ->
-    node indices mapping used), ``backend`` and ``n_free``.
+    node indices mapping used), ``backend``, ``n_free``, ``method`` (the path
+    actually taken) and ``residual`` (the AMG path's checked relative residual,
+    or ``None`` for the direct one, which is exact).
 
     Refusals, all ``ValueError`` before factorising: the ones in
     :func:`electrode_nodes` and :func:`eps_by_tet`, plus an empty or unknown
@@ -339,6 +422,11 @@ def solve(
     tets = np.asarray(tets, dtype=np.int64)
     n_points = int(points_m.shape[0])
 
+    if method not in METHODS:
+        raise ValueError(
+            f"method={method!r} is not a known solve method; use one of "
+            f"{', '.join(METHODS)}"
+        )
     if not electrodes:
         raise ValueError(
             "no electrode: the problem needs at least one part held at a "
@@ -380,12 +468,21 @@ def solve(
     free = ~fixed
 
     phi = phi_e.copy()
+    residual = None
+    solved_by = "direct"
     if free.any():
         # K_fe phi_e: the held values' pull on the free rows.
         rhs = -(K[free][:, fixed] @ phi_e[fixed])
         K_ff = K[free][:, free].tocsc()
-        lu = BACKEND.factor(K_ff, label="K_ff", spd_lu=SPD_LU, backend=backend)
-        phi[free] = np.asarray(lu.solve(np.asarray(rhs).ravel()), dtype=np.float64)
+        use_amg = method == "amg" or (method == "auto" and K_ff.shape[0] >= AMG_NODE_CROSSOVER)
+        if use_amg:
+            phi[free], residual = amg_solve(K_ff, np.asarray(rhs).ravel())
+            solved_by = "amg"
+        else:
+            lu = BACKEND.factor(K_ff, label="K_ff", spd_lu=SPD_LU, backend=backend)
+            phi[free] = np.asarray(lu.solve(np.asarray(rhs).ravel()), dtype=np.float64)
+            solved_by = "direct"
+
 
     return {
         "phi": phi,
@@ -393,6 +490,8 @@ def solve(
         "electrodes": held,
         "backend": backend or BACKEND.selected_backend(),
         "n_free": int(free.sum()),
+        "method": solved_by,
+        "residual": residual,
     }
 
 
