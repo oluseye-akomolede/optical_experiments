@@ -791,3 +791,232 @@ def test_skip_naming_a_part_outside_the_mesh_is_refused():
     with pytest.raises(ValueError, match="skip names part"):
         E.assemble_stiffness(points, tets, ["a"], {"a": 2.0}, region_of_tet,
                              skip={"nope"})
+
+
+# ---------------------------------------------------------------------------
+# 1.5 field_at and capacitance_matrix
+#
+# Units: the fixtures above are 1 m cubes so their potentials read cleanly.
+# The capacitor fixtures below are built at DEVICE scale instead -- a plate pair
+# 200 µm on a side with a 20 µm gap. That is not decoration: the spec's accuracy
+# bounds assume fringing is small, and fringing is measured in ABSOLUTE length,
+# so the same geometry at 1 m is a different (much worse) device. Sampling is
+# deliberately inside materials and away from faces, never on one.
+# ---------------------------------------------------------------------------
+
+_PLATE = 200e-6      # plate side, m
+_GAP_H = 20e-6       # plate separation, m
+
+
+def _graded_z_chain(widths_z, side, n_side):
+    """A box split into cubes in X/Y and into ``widths_z`` layers in Z.
+
+    Reuses ``_CUBE_TETS``' six-tet split, so interfaces land on element faces
+    exactly as the mesher places a part boundary.
+    """
+    zs = np.concatenate([[0.0], np.cumsum(widths_z)])
+    xs = np.linspace(0.0, side, n_side + 1)
+    nz = zs.size
+
+    def node(i, j, k):
+        return (i * (n_side + 1) + j) * nz + k
+
+    points = np.array(
+        [[xs[i], xs[j], zs[k]] for i in range(n_side + 1)
+         for j in range(n_side + 1) for k in range(nz)]
+    )
+    tets = []
+    for i in range(n_side):
+        for j in range(n_side):
+            for k in range(nz - 1):
+                corner = {(a, b, c): node(i + a, j + b, k + c)
+                          for a in (0, 1) for b in (0, 1) for c in (0, 1)}
+                for t in _CUBE_TETS:
+                    bits = [tuple(int(v) for v in np.unravel_index(u, (2, 2, 2))) for u in t]
+                    tets.append([corner[b] for b in bits])
+    return points, np.array(tets), zs
+
+
+def _plate_capacitor(eps, n_gap=6, n_plate=1, n_side=6):
+    """Bottom plate | ``eps`` dielectric | top plate, with open air at the sides.
+
+    The lateral box is 2 * _PLATE so the fringing field has somewhere to go. The
+    plates are ONE layer thick on purpose: with a thicker plate the fringing
+    that leaves through the box's open sides still has to cross plate material,
+    and the measured error stops being a clean function of the lateral extent.
+    """
+    widths_z = [_PLATE / n_plate, _GAP_H / n_gap, _PLATE / n_plate]
+    points, tets, zs = _graded_z_chain(widths_z, 2 * _PLATE, 2 * n_side)
+    cz = points[tets][:, :, 2].mean(axis=1)
+    region_of_tet = np.where(cz < zs[1], 0, np.where(cz > zs[2], 2, 1)).astype(np.int64)
+    return points, tets, ["bottom", "gap", "top"], region_of_tet, zs[1], zs[2]
+
+
+def _three_plate_stack(eps, widths, n_side=6):
+    """plate | dielectric | plate | dielectric | plate, of unequal thickness.
+
+    Three electrodes and two gaps of DIFFERENT thickness, so the exact
+    capacitance matrix is asymmetric: C(bottom, middle) and C(middle, top) are
+    the two gap capacitances, and they differ. A two-electrode fixture cannot
+    see a transposed matrix at all -- C and C^T are the same object there --
+    which is how an earlier ``capacitance_matrix`` returned C^T unnoticed.
+    """
+    points, tets, zs = _graded_z_chain(widths, 2 * _PLATE, 2 * n_side)
+    cz = points[tets][:, :, 2].mean(axis=1)
+    layer = np.searchsorted(zs[1:-1], cz, side="right")
+    return points, tets, ["p0", "d0", "p1", "d1", "p2"], layer.astype(np.int64), zs
+
+
+def test_assemble_capacitance_puts_the_drive_in_the_column():
+    """C[i, j] is the charge on i with j driven -- pinned on a NON-symmetric input.
+
+    WHY THIS EXISTS. The obvious way to catch a transposed matrix is an
+    asymmetric mesh, but these fixtures cannot produce one: they are series
+    chains, and a Maxwell capacitance matrix is symmetric by reciprocity unless
+    the electrodes form a loop. Measured max |C - C^T| is exactly 0.0, so
+    writing C[j, i] instead of C[i, j] yields a bit-identical matrix and
+    survived the entire suite four times. Recomputing charges through
+    ``solve`` does not help either: the recomputation is symmetric the same way.
+
+    So the convention is pinned on charge maps that are deliberately NOT
+    symmetric -- which is what they would be for a device whose electrodes form
+    a loop, the case the real solver must also get right.
+    """
+    names = ["A", "B", "C"]
+    columns = [
+        {"A": 10.0, "B": -7.0, "C": -3.0},
+        {"A": -2.0, "B": 5.0, "C": -3.0},
+        {"A": -1.0, "B": -4.0, "C": 5.0},
+    ]
+    C = E.assemble_capacitance(columns, names)
+    for j, driven in enumerate(names):
+        for i, name in enumerate(names):
+            assert C[i, j] == columns[j][name], (
+                f"C[{i}][{j}] must be the charge on {name!r} with {driven!r} "
+                f"driven ({columns[j][name]!r}), got {C[i, j]!r}"
+            )
+    assert not np.array_equal(C, C.T)
+
+
+def test_capacitance_matrix_columns_match_a_driven_solve():
+    """End to end: each matrix column is the charge map a driven solve reports."""
+    eps = 4.0
+    gaps = (_GAP_H, 3 * _GAP_H)
+    widths = [_PLATE, gaps[0], _PLATE, gaps[1], _PLATE]
+    points, tets, parts, region_of_tet, _ = _three_plate_stack(eps, widths)
+    eps_static = {"d0": eps, "d1": eps, "p0": eps, "p1": eps, "p2": eps}
+    C, names = E.capacitance_matrix(points, tets, parts, region_of_tet,
+                                    eps_static, {"p0": 0.0, "p1": 0.0, "p2": 0.0},
+                                    method="direct")
+    assert names == ["p0", "p1", "p2"]
+    for j, driven in enumerate(names):
+        drive = {name: (1.0 if name == driven else 0.0) for name in names}
+        result = E.solve(points, tets, parts, region_of_tet, eps_static, drive,
+                         method="direct")
+        charge = E._electrode_charge(result)
+        for i, name in enumerate(names):
+            assert C[i, j] == pytest.approx(charge[name], rel=1e-9, abs=1e-24)
+    # The two gaps differ by 3x, so the couplings must too.
+    assert C[0, 1] / C[1, 2] == pytest.approx(3.0, rel=0.05)
+    assert C[0, 0] > 0 > C[0, 1]
+
+
+def test_capacitance_matrix_two_plates_is_stable_and_signed():
+    """The measured pair capacitance, its sign, and that refinement does not move it.
+
+    WHAT THIS PINS, and what it deliberately does not. The fixture is a 400 um
+    box holding two 200 um-square plates across a 3.33 um gap (_GAP_H / n_gap,
+    NOT _GAP_H -- the gap is subdivided so interfaces land on element faces). At
+    that aspect ratio the field is mostly fringing, so the measured pair
+    capacitance is 1.700e-12 F, roughly 36x the idealised eps0*eps*A/d of the
+    nominal gap. That ratio is a property of the fixture, not of the solver, and
+    asserting an analytic value here would be pinning my own geometry twice --
+    which is exactly how an earlier version of this test ended up "confirming"
+    a plate area that was off by 4x and a gap that was off by 6x.
+
+    So the physics is checked where it IS analytic: row sums vanish for an
+    earthed pair, the diagonal is positive and the coupling negative, and the
+    two plates agree. What is pinned numerically is MESH INDEPENDENCE, which is
+    the property that would break if the assembly were subtly wrong.
+    """
+    eps = 4.0
+    first = None
+    for n_side in (6, 12):
+        points, tets, parts, region_of_tet, z0, z1 = _plate_capacitor(eps, n_side=n_side)
+        eps_static = {"gap": eps, "bottom": eps, "top": eps}
+        C, names = E.capacitance_matrix(points, tets, parts, region_of_tet,
+                                        eps_static, {"bottom": 0.0, "top": 0.0},
+                                        method="direct")
+        assert names == ["bottom", "top"]
+        assert C[0, 0] > 0 > C[0, 1]            # a capacitor, not an inductor
+        assert C[0, 0] == pytest.approx(C[1, 1], rel=1e-9)
+        assert C[0, 1] == pytest.approx(C[1, 0], rel=1e-9)
+        assert abs(C.sum(axis=1)).max() < 1e-20  # earthed pair: rows cancel
+        assert z1 > z0
+        if first is None:
+            first = C[0, 1]
+            # Measured on this fixture at 200 um plates / 3.33 um gap.
+            assert -C[0, 1] == pytest.approx(1.7000e-12, rel=1e-3)
+        else:
+            # Refining every cell edge together leaves the fringing fraction
+            # alone, so the value must not move. It does not: this is the
+            # assertion that would fail on a cell-size-dependent assembly.
+            assert C[0, 1] == pytest.approx(first, rel=1e-6)
+
+
+def test_capacitance_matrix_needs_an_electrode():
+    points, tets, parts, region_of_tet, _, _ = _plate_capacitor(1.0)
+    with pytest.raises(ValueError, match="at least one electrode"):
+        E.capacitance_matrix(points, tets, parts, region_of_tet,
+                             {"gap": 1.0, "bottom": 1.0, "top": 1.0}, {})
+
+
+def test_field_at_matches_a_uniform_field():
+    """E = -grad(phi) in the gap, against -dV/d: the sign is the whole test.
+
+    The gap's field is V/d pointing from the top plate (z high) down to the
+    bottom, so E_z is NEGATIVE, ~-V/d. Reversing the gradient's sign would make
+    every component positive and the solver would still report a plausible
+    magnitude, which is why the direction is asserted and not just |E|.
+
+    Sampled at several points, one ``field_at`` call each (it takes a single
+    3-vector), and all off the box's lateral centre line so the fringing field
+    is not what is being measured.
+    """
+    eps = 1.0
+    points, tets, parts, region_of_tet, z0, z1 = _plate_capacitor(eps)
+    volts = {"bottom": 0.0, "top": 1.0}
+    eps_static = {"gap": eps, "bottom": eps, "top": eps}
+    result = E.solve(points, tets, parts, region_of_tet, eps_static, volts,
+                     method="direct")
+    mid = 0.5 * (z0 + z1)
+    # Coordinates are METRES: the box is 2*_PLATE = 400 um wide, so these sit
+    # well inside it and away from the open sides where fringing dominates.
+    probes = [[1e-4, 1e-4, mid], [2e-4, 1.5e-4, mid], [1.5e-4, 2.5e-4, mid]]
+    got = np.array([E.field_at(result, p) for p in probes])
+
+    assert got.shape == (3, 3)
+    # Away from the fringing edges the field is the uniform V/d, pointing down.
+    assert got[:, 2] == pytest.approx(-1.0 / (z1 - z0), rel=0.02)
+    assert np.abs(got[:, :2]).max() < 0.02 * abs(got[0, 2])
+
+
+def test_field_at_refuses_a_point_outside_the_mesh():
+    """A point in no element has no field; extrapolating would invent one."""
+    points, tets, parts, region_of_tet, _, _ = _plate_capacitor(1.0)
+    eps_static = {"gap": 1.0, "bottom": 1.0, "top": 1.0}
+    result = E.solve(points, tets, parts, region_of_tet, eps_static,
+                     {"bottom": 0.0, "top": 1.0}, method="direct")
+    with pytest.raises(ValueError, match="outside"):
+        E.field_at(result, [-5.0, -5.0, -5.0])  # metres: far outside a 400 um box
+
+
+def test_field_at_refuses_a_point_inside_an_electrode():
+    """In the held part grad(phi) is 0, and E=0 would be a zero disguised as data."""
+    points, tets, parts, region_of_tet, z0, _ = _plate_capacitor(1.0)
+    eps_static = {"gap": 1.0, "bottom": 1.0, "top": 1.0}
+    result = E.solve(points, tets, parts, region_of_tet, eps_static,
+                     {"bottom": 0.0, "top": 1.0}, method="direct")
+    # Half a plate thickness in from the bottom face, at the centre of the box.
+    with pytest.raises(ValueError, match="electrode"):
+        E.field_at(result, [1e-4, 1e-4, 0.5 * z0])
