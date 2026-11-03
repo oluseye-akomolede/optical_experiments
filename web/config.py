@@ -20,6 +20,10 @@ NAMESPACE = os.environ.get("MSE_NAMESPACE", "mode-search-engine")
 #: manifests/mse/deployment.yaml); ``solver_image()`` raises if it is not.
 DEFAULT_SOLVER_IMAGE = None
 
+#: The CUDA-stack solver image for cluster GPU solves. Same policy: no default,
+#: because the CPU image would be a silently wrong answer.
+DEFAULT_GPU_SOLVER_IMAGE = None
+
 #: secret used to pull that image (the Harbor project is private)
 DEFAULT_PULL_SECRET = "mse-harbor-pull"
 
@@ -278,6 +282,29 @@ def solver_image() -> str:
             "Set it in the Deployment (see manifests/mse/deployment.yaml). It "
             "is not defaulted on purpose: the old default was the scalar "
             "solver, which would return wrong modes silently."
+        )
+    return image
+
+
+def gpu_solver_image() -> str:
+    """Image reference for a cluster GPU solve.
+
+    A SEPARATE image from :func:`solver_image`, and it never falls back to it.
+    The CPU image is ``python:3.12-slim`` with no CUDA stack, so running a GPU
+    backend on it fails at import (``_gpu_factor`` raises ``BackendError``);
+    falling back would turn a missing setting into a job that dies after it has
+    already taken the quota slot. Raising here names the misconfiguration
+    instead, and only when the cluster route is actually in use -- a Jetson
+    deployment never reads this.
+    """
+    image = os.environ.get("MSE_SOLVER_GPU_IMAGE") or DEFAULT_GPU_SOLVER_IMAGE
+    if not image:
+        raise ConfigError(
+            "MSE_GPU_ROUTE=cluster but MSE_SOLVER_GPU_IMAGE is not set, so "
+            "there is no CUDA solver image to run. Set it in the Deployment "
+            "(see manifests/mse/deployment.yaml). It is not defaulted to "
+            "MSE_SOLVER_IMAGE on purpose: that image has no CUDA stack, and "
+            "every GPU job would die at backend selection."
         )
     return image
 

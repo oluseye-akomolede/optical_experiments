@@ -61,6 +61,14 @@ spec:
           env:
             - name: MSE_SOLVER_IMAGE
               value: harbor.arcadia-ecs.local/mode-search-engine/mse-maxwell-solver:968fa24
+            # The CUDA-stack image for cluster GPU solves. SEPARATE from
+            # MSE_SOLVER_IMAGE on purpose: that one is python:3.12-slim with no
+            # CUDA, so a GPU job launched on it dies at backend selection after
+            # it has already taken the quota slot. Required whenever
+            # MSE_GPU_ROUTE is cluster (the default); the app refuses to start a
+            # GPU job without it rather than falling back.
+            - name: MSE_SOLVER_GPU_IMAGE
+              value: harbor.arcadia-ecs.local/mode-search-engine/mse-maxwell-solver-gpu:PLACEHOLDER
             - name: MSE_PULL_SECRET
               value: mse-harbor-pull
             - name: MSE_BUCKET

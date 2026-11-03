@@ -25,6 +25,7 @@ from pathlib import Path
 _COMMON_ROOT = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
 if str(_COMMON_ROOT) not in sys.path:
     sys.path.insert(0, str(_COMMON_ROOT))
+import mse_backend  # noqa: E402  # the backend NAMES, never retyped
 import mse_common as COMMON  # noqa: E402
 
 #: label values must be DNS-1123-ish; a job id is a uuid but be defensive
@@ -148,11 +149,13 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
     if materials is not None:
         args += ["--materials-from", _MATERIALS_OBJECT]
     if gpu:
-        # The GPU route runs the SAME image and the same CLI; only the backend
-        # differs. The image is built with the CUDA stack, so the CPU-only value
-        # the CPU path forces would throw away the card -- say cuda explicitly.
+        # The same CLI, run against the GPU backend. The NAME comes from
+        # mse_backend.BACKENDS, never a typed literal: this line said "cuda"
+        # once, while mse_backend accepts only "cpu" and "gpu", so every A4000
+        # job died at backend selection and no test noticed -- the tests never
+        # compared this value with the set the solver actually accepts.
         env = [e for e in env if e["name"] != "MSE_SOLVER_BACKEND"]
-        env.append({"name": "MSE_SOLVER_BACKEND", "value": "cuda"})
+        env.append({"name": "MSE_SOLVER_BACKEND", "value": mse_backend.GPU})
         # MSE_CPU_MAX_TETS describes the CPU machine. The solver only consults it
         # on the cpu backend, so leaving it would be harmless -- but it would
         # name a limit for a machine this Job is not running on, and a reader
@@ -232,6 +235,7 @@ class K8sJobLauncher:
     """
 
     def __init__(self, namespace: str, image: str, pull_secret: str,
+                 gpu_image: str | None = None,
                  cpu: str = "4", memory: str = "14Gi",
                  active_deadline_seconds: int = 1800,
                  ttl_seconds_after_finished: int = 30, dry_run: bool = False,
@@ -239,6 +243,10 @@ class K8sJobLauncher:
                  cpu_max_tets: int | None = None):
         self.namespace = namespace
         self.image = image
+        # Required for a GPU job and never substituted for ``image``: the CPU
+        # image has no CUDA stack. A GPU job with no gpu_image is a refusal,
+        # not a degraded run.
+        self.gpu_image = gpu_image
         self.pull_secret = pull_secret
         self.cpu = cpu
         self.memory = memory
@@ -268,8 +276,16 @@ class K8sJobLauncher:
                  scale: float = 1.0,
                  materials: dict | None = None,
                  gpu: bool = False) -> dict:
+        if gpu and not self.gpu_image:
+            raise ValueError(
+                "a GPU job needs a CUDA solver image (gpu_image), and there is "
+                "none configured. Refusing rather than launching the CPU image, "
+                "which has no CUDA stack and would die after taking the quota "
+                "slot. Set MSE_SOLVER_GPU_IMAGE in the Deployment."
+            )
         return build_job_manifest(
-            job_id, units, n_index, n_modes, self.image, self.pull_secret,
+            job_id, units, n_index, n_modes,
+            self.gpu_image if gpu else self.image, self.pull_secret,
             self.namespace, cpu=self.cpu, memory=self.memory,
             active_deadline_seconds=self.active_deadline_seconds,
             ttl_seconds_after_finished=self.ttl_seconds_after_finished,

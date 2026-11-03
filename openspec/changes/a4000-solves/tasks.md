@@ -77,6 +77,35 @@ The `FakeDb`/`FakeLauncher` doubles were corrected to the real signatures --
 a fake `next_queued(target=str)` would never return a `cluster-gpu` row, so
 every routing test above would have passed by launching nothing.
 
+## 4b. The two blockers the lead found before deploy
+
+- [x] 4b.1 `MSE_SOLVER_BACKEND` comes from `mse_backend.GPU`, not a literal.
+      The test compares it with `mse_backend.BACKENDS`; mutating back to
+      `"cuda"` turns it red.
+- [x] 4b.2 A separate `MSE_SOLVER_GPU_IMAGE`, used for GPU jobs and never
+      falling back to `MSE_SOLVER_IMAGE`; a GPU job with no CUDA image is
+      refused before the Job is created. The app still starts without it.
+- [x] 4b.3 The false comment ("The image is built with the CUDA stack") is
+      gone.
+- [x] 4b.4 `dockerfiles/maxwell_solver/Dockerfile.gpu` + `requirements-gpu.txt`:
+      a CUDA 12.6.3 base matching the A4000 nodes, with a BUILD-TIME probe that
+      calls the solver's own `mse_backend._missing_gpu_package()` so a GPU image
+      missing the stack cannot reach Harbor.
+- [ ] 4b.5 **Blocker on 5.1:** `nvmath-python` is not pinned in
+      `requirements-gpu.txt` (placeholder `PIN-FROM-JETSON`), because no nvmath
+      version is recorded in this repo -- the only mention is a docstring, and
+      the Jetson's `pip freeze` is not in the tree. The image will not build
+      until the lead reads it on the Jetson and fills it in. Guessing would
+      repeat exactly the failure this row fixes.
+
+**Done notes (4b).** The old test asserted `== "cuda"`: it encoded the bug
+rather than catching it, so it was replaced by a membership check against
+`mse_backend.BACKENDS`. A first attempt made `_launcher` read the GPU image
+strictly, which failed an existing test that builds the app without one --
+that was a real deployment risk (a missing GPU setting would stop the site
+starting) and the read was made lenient, with the refusal left at the launch
+boundary where the Job is created.
+
 ## 5. Deployment (the lead, not this seat)
 
 - [ ] 5.1 Raise the live quota 0 -> 1 and apply the Job manifest.

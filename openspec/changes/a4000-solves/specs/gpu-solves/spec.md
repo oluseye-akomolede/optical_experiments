@@ -35,6 +35,28 @@ cluster and not left occupying the single GPU slot indefinitely.
   `NUMEXPR_NUM_THREADS` equal the container's CPU limit
 - **AND** they are not left unset
 
+#### Scenario: the backend name is one the solver accepts
+- **WHEN** the GPU Job manifest is built
+- **THEN** `MSE_SOLVER_BACKEND` is a member of `mse_backend.BACKENDS`
+- **AND** it is not `mse_backend.CPU`
+
+The value SHALL be taken from `mse_backend`, never written as a literal. A
+literal agreed with the test that checked it and disagreed with the solver: the
+manifest said `cuda`, the solver accepts only `cpu` and `gpu`, and every A4000
+job died at backend selection while the suite stayed green.
+
+#### Scenario: the GPU Job runs a CUDA-capable image
+- **WHEN** a GPU Job is launched
+- **THEN** its container image is `MSE_SOLVER_GPU_IMAGE`
+- **AND** that is a separate setting from `MSE_SOLVER_IMAGE`, which is the CPU
+  image and has no CUDA stack
+
+`MSE_SOLVER_GPU_IMAGE` SHALL NOT fall back to `MSE_SOLVER_IMAGE`. Launching a
+GPU job with no CUDA image SHALL be refused before the Job is created, rather
+than run on the CPU image and fail at import after taking the single GPU slot.
+The app SHALL still start when the setting is absent, so that a missing GPU
+setting cannot take the site down for CPU solves that would have worked.
+
 ### Requirement: The GPU route is chosen by a setting, and the Jetson stays reachable
 
 The environment variable `MSE_GPU_ROUTE` SHALL select where a GPU-needing job

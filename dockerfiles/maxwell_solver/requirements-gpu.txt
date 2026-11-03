@@ -1,0 +1,40 @@
+# GPU dependencies for the MSE Maxwell solver, installed ON TOP of
+# requirements.txt in ./Dockerfile.gpu. Nothing here belongs in the CPU image.
+#
+# These are the three the solver's GPU path actually imports -- the same set
+# mse_backend._missing_gpu_package() probes, and that probe (not this comment)
+# is what the image build enforces:
+#     import cupy as cp
+#     import cupyx.scipy.sparse as csp
+#     import nvmath
+# cuDSS is reached THROUGH nvmath (nvmath.sparse.advanced.DirectSolver), not
+# imported directly, so it arrives as an nvmath dependency rather than a pin
+# here. Pinning it separately would create the second source of truth for a
+# library version that this repo's own history blames for machine-specific
+# failures.
+
+# cupy for the CUDA 12 runtime the A4000 nodes report (nvidia.com/cuda.runtime-version.full=12.7,
+# driver 565.57.01). Not the [ctk] extra: that installs a second, version-
+# drifting copy of the whole CUDA toolkit, which is why the paper1 bench image
+# settled on the plain form. Same pin it measured.
+cupy-cuda12x==14.2.0
+
+# nvmath-python: the DirectSolver the GPU factorisation calls.
+#
+# VERSION NOT YET PINNED, deliberately, and this file will not build until it
+# is. The repo records "nvmath 0.9.0" in mse_backend._CudssFactor.close()'s
+# docstring (as the version whose tear-down is solver.free()), but that is a
+# docstring, not a measurement of what the Jetson GPU venv actually runs --
+# and the Jetson's pip freeze is not in the tree. The lead owns that machine
+# and can read it:
+#
+#     ssh jetson '~/mse-bench/gpu-venv/bin/pip freeze | grep -i nvmath'
+#
+# Pin that exact version here. Guessing it would repeat the failure this whole
+# row exists to fix: a value typed from memory that nothing verifies, shipping
+# as a confident-looking image.
+nvmath-python==PIN-FROM-JETSON
+
+# numpy/scipy come from requirements.txt, pinned there; cupy-cuda12x requires a
+# compatible numpy and pip resolves against the already-installed one, so they
+# are not restated here.

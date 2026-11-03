@@ -712,19 +712,37 @@ def test_a_gpu_manifest_requests_and_limits_one_card():
     assert c["resources"]["requests"] == c["resources"]["limits"]
 
 
-def test_the_gpu_manifest_names_the_a4000_node_and_the_cuda_backend():
+def test_the_gpu_manifest_names_the_a4000_node_and_a_backend_the_solver_accepts():
     """Pinned to the PRODUCT, not to "any GPU".
 
     The manifest's memory price is the A4000's, so a job that landed on a
     different card would be priced against the wrong machine. And the image
     already forces the cpu backend for the CPU path, so the GPU manifest must
     override it or the card goes unused.
+
+    The backend is checked against ``mse_backend.BACKENDS``, NOT against a
+    literal. This test used to assert ``== "cuda"``: it passed, and every
+    A4000 job died at backend selection, because ``mse_backend`` accepts only
+    ``cpu`` and ``gpu``. A test that spells the expected value out by hand
+    agrees with whatever that value is -- including a value nothing accepts.
     """
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]
+                           / "dockerfiles" / "maxwell_solver"))
+    import mse_backend
+
     spec = _gpu_manifest()["spec"]["template"]["spec"]
     assert spec["nodeSelector"] == {"nvidia.com/gpu.product": "NVIDIA-RTX-A4000"}
     env = {e["name"]: e["value"]
            for e in spec["containers"][0]["env"]}
-    assert env["MSE_SOLVER_BACKEND"] == "cuda"
+    assert env["MSE_SOLVER_BACKEND"] in mse_backend.BACKENDS, (
+        f"the GPU job names backend {env['MSE_SOLVER_BACKEND']!r}, which the "
+        f"solver does not accept (it has {mse_backend.BACKENDS}). Every job "
+        f"would die at backend selection."
+    )
+    assert env["MSE_SOLVER_BACKEND"] != mse_backend.CPU, (
+        "the GPU job must not name the cpu backend -- the card would go unused"
+    )
 
 
 def test_the_gpu_manifest_pins_thread_counts_to_the_cpu_limit():
@@ -765,3 +783,49 @@ def test_a_cpu_manifest_is_unchanged_by_the_gpu_support():
         "j", "mm", 1.0, 20, "img", "sec", "ns")["spec"]["template"]["spec"]
     env = {e["name"]: e["value"] for e in c["env"]}
     assert env["MSE_SOLVER_BACKEND"] == "cpu"
+
+
+def test_a_gpu_job_refuses_rather_than_launching_the_cpu_image():
+    """No CUDA image configured is a refusal, not a degraded run.
+
+    The CPU image is ``python:3.12-slim`` with no CUDA stack, so a GPU backend
+    on it dies at import -- after the Job has taken the quota slot and the
+    owner is watching it. Refusing before the Job exists is the honest
+    ordering; falling back to ``image`` would hide the misconfiguration until
+    runtime.
+    """
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "web"))
+    import jobs
+
+    launcher = jobs.K8sJobLauncher(namespace="ns", image="cpu-img",
+                                   pull_secret="sec", dry_run=True)
+    try:
+        launcher.manifest("j", "mm", 1.0, 20, gpu=True)
+    except ValueError as exc:
+        assert "gpu_image" in str(exc), exc
+    else:
+        raise AssertionError(
+            "a GPU job with no CUDA image was launched on the CPU image"
+        )
+
+
+def test_a_gpu_job_uses_the_gpu_image_and_a_cpu_job_uses_the_cpu_image():
+    """The two images are separate settings and neither leaks into the other.
+
+    Folding them back into one would recreate the bug this row fixed: a GPU
+    job running an image with no CUDA stack.
+    """
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "web"))
+    import jobs
+
+    launcher = jobs.K8sJobLauncher(namespace="ns", image="cpu-img",
+                                   gpu_image="gpu-img",
+                                   pull_secret="sec", dry_run=True)
+    gpu_c = launcher.manifest("j", "mm", 1.0, 20,
+                              gpu=True)["spec"]["template"]["spec"]["containers"][0]
+    cpu_c = launcher.manifest("j", "mm", 1.0, 20,
+                              gpu=False)["spec"]["template"]["spec"]["containers"][0]
+    assert gpu_c["image"] == "gpu-img"
+    assert cpu_c["image"] == "cpu-img"
