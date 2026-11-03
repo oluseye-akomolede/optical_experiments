@@ -210,6 +210,17 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
 - [ ] 1.6 Bench fixtures (two-layer slab, concentric spheres, sphere between plates, the
       paper-1 wire with a top electrode) and `scripts/electrostatics_bench.py`. Prove the
       ε_s-ignored mutation.
+      **Partially done, deliberately left unticked.** Built and proven: two-layer slab,
+      concentric spheres, sphere between plates; the bench and its fixtures live in
+      `dockerfiles/maxwell_solver/` beside the solver they exercise (not `scripts/`, so they
+      import with the rest of the package and run from a container). Fixtures are in
+      `mse_bench_fixtures.py`, the runner in `electrostatics_bench.py`, tests in
+      `tests/test_electrostatics_bench.py`. NOT done: the paper-1 wire with a top electrode.
+
+      **The ε_s-ignored mutation is proven.** In `element_stiffness`, dropping the
+      `eps_tet` factor turns all three scored quantities red (slab 5.86e-01, shells
+      capacitance 6.02e-01, shells interface 9.97e-01), and a 1% error in one shell's eps
+      scores 8.98e-03 against a 2e-3 tolerance. Both are now tests, not one-off runs.
 - [ ] 1.7 Measure the per-node memory of both solve paths from the bench RSS, replace the
       `design.md` §5 estimates with the measured figures, and wire `budget=` refusals.
 - [ ] 1.8 `stark.py`: the 7-point effective-mass operator on a Cartesian box, LOBPCG, the
