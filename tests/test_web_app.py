@@ -732,8 +732,9 @@ def test_the_gpu_manifest_pins_thread_counts_to_the_cpu_limit():
 
     Unset, OpenMP/BLAS starts one thread per HOST core and is throttled hard --
     on a GPU job that starves the CPU stages around the solve. The value is the
-    integer part of the CPU limit: 2.5 vCPU cannot run 3 threads without
-    throttling, so it rounds down.
+    integer part of the CPU limit (4 vCPU -> 4), so the rounding never silently
+    oversubscribes. It is derived from the limit rather than hardcoded, so
+    changing the Job size cannot leave the threads behind.
     """
     c = _gpu_manifest()["spec"]["template"]["spec"]["containers"][0]
     names = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",

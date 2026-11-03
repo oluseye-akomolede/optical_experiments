@@ -53,7 +53,7 @@ def job_name(job_id) -> str:
 
 def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
                        solver_image: str, pull_secret: str, namespace: str,
-                       cpu: str = "2.5", memory: str = "6Gi",
+                       cpu: str = "4", memory: str = "14Gi",
                        active_deadline_seconds: int = 1800,
                        ttl_seconds_after_finished: int = 30,
                        max_tets: int | None = None,
@@ -160,9 +160,10 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
         env = [e for e in env if e["name"] != "MSE_CPU_MAX_TETS"]
         # Match the thread count to the CPU limit (measured: a cgroup limit does
         # not change os.cpu_count(), so an unset count starts one thread per HOST
-        # core and is throttled hard). The CPU path leaves these to the image;
-        # the GPU path names them because THIS is the manifest that sets the
-        # limit the image's default would then exceed.
+        # core and is throttled hard). The image already bakes in 4 for the same
+        # reason, and 4 is the Job size -- so this is a no-op today, and is
+        # derived from the limit rather than left to that coincidence: raising
+        # JOB_CPU without this would silently leave BLAS under-threaded.
         for var in _THREAD_ENV:
             env = [e for e in env if e["name"] != var]
             env.append({"name": var, "value": str(int(float(cpu)))})
@@ -231,7 +232,7 @@ class K8sJobLauncher:
     """
 
     def __init__(self, namespace: str, image: str, pull_secret: str,
-                 cpu: str = "2.5", memory: str = "6Gi",
+                 cpu: str = "4", memory: str = "14Gi",
                  active_deadline_seconds: int = 1800,
                  ttl_seconds_after_finished: int = 30, dry_run: bool = False,
                  max_tets: int | None = None,

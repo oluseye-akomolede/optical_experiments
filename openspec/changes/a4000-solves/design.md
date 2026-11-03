@@ -18,28 +18,24 @@ question now has two answers, so the first has to be asked separately.
 est_tets >= gpu_min_tets()          -> the GPU route
      MSE_GPU_ROUTE == "cluster"     -> cluster-gpu   (the A4000 Job)  [default]
      MSE_GPU_ROUTE == "jetson"      -> jetson        (the pull worker)
-     MSE_GPU_ROUTE == "fallback"    -> cluster-gpu, falling back to jetson
-                                       if the GPU quota has no free slot
 otherwise                            -> cluster       (the CPU Job)
 ```
 
 `MSE_GPU_ROUTE` is the single setting that moves the GPU route, and it is read
-from the environment like every other knob in `web/config.py`. Three values, not
-a boolean, because the honest requirements need a third state on rollout day:
+from the environment like every other knob in `web/config.py`. Two values:
 
 - **`cluster` (default).** Every GPU job asks the A4000 route. This is what the
   owner asked for.
 - **`jetson`.** The old behaviour, kept reachable so a rollback is one env
   change and not a revert.
-- **`fallback`.** Ask for the A4000, but if the A4000 quota slot is occupied,
-  route to the Jetson instead of failing. This is the transition state the row
-  implies ("The Jetson stays a backup route until the A4000 path has run real
-  uploads").
 
-The default is `cluster` rather than `fallback` deliberately. A silent fallback
-to the Jetson would make "the A4000 path works" unverifiable from the outside:
-every job would succeed somewhere and the owner would never learn which. The
-transition is a decision (set `fallback`), not a default that hides itself.
+A third `fallback` value ("ask for the A4000, else use the Jetson when the GPU
+quota slot is occupied") was drafted and dropped: nothing implemented it, and
+the routes it needs -- observing the quota slot at routing time, and a Jetson
+row that becomes a Job -- do not exist. A value the config accepts but no code
+honours is worse than its absence, because it reads as a working rollback. The
+Jetson stays reachable through `MSE_GPU_ROUTE=jetson`, which is a real
+rollback and is tested.
 
 ## Why one GPU, not up to three
 

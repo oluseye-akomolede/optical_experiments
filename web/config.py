@@ -71,9 +71,14 @@ MIN_MATERIAL_N = 1.0
 #: accidental extra zero here is a much bigger mistake than a typo elsewhere.
 MODE_CHOICES = (10, 20, 40)
 
-#: settings for the solver Job (see the task-2 amendment)
-JOB_CPU = "2.5"
-JOB_MEMORY = "6Gi"
+#: settings for the solver Job (see the task-2 amendment).
+#: 4 CPU / 14Gi, unchanged by the A4000 move: the GPU quota was raised 0 -> 1,
+#: which does not touch the CPU or memory bounds. Job 4 + app 0.5 = 4.5 <= the
+#: 5 CPU cap, and 14 + 1 = 15 <= 18Gi. Host RAM still holds the mesh and the
+#: assembly, so this size is what makes an upload that works today keep working
+#: on the GPU path.
+JOB_CPU = "4"
+JOB_MEMORY = "14Gi"
 JOB_ACTIVE_DEADLINE_SECONDS = 1800
 JOB_TTL_SECONDS_AFTER_FINISHED = 30
 

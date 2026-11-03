@@ -16,6 +16,16 @@ The GPU bound is **1**, not 3, because the owner chose one solve at a time on
 the A4000s. `count/jobs.batch: '1'` and the GPU bound therefore agree: a second
 GPU job cannot be admitted while the first exists.
 
+CPU and memory stay at **5 / 18Gi**. They are not coupled to the GPU count, and
+the owner's decision raised the card count only; tightening them would remove
+the headroom an app rollout needs while a solve runs. The GPU Job itself is
+`4` CPU / `14Gi`, so Job plus app is `4.5` CPU / `15Gi` -- inside the cap.
+
+A GPU Job SHALL be pinned to the A4000 by product, not by "any GPU":
+`nodeSelector: {nvidia.com/gpu.product: NVIDIA-RTX-A4000}`. The manifest's
+memory price is the A4000's, and the quota counts cards without naming a model,
+so without the selector a different card could be scheduled and priced wrongly.
+
 A workload SHALL NOT be raised above these bounds without the owner's decision
 (per the rig brief, raising quotas is an owner call). The GPU bound is raised
 0 -> 1 by the LEAD at deploy time, after the owner's recorded approval; no code

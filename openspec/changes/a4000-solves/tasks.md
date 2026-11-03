@@ -33,11 +33,14 @@ value. Unknown values still mean the default.
 **Done notes (2.x).** No new image was needed (2.2 was a check, not a build):
 the manifest sets `MSE_SOLVER_BACKEND=cuda` and strips the CPU-only
 `MSE_CPU_MAX_TETS`, which describes a machine the GPU Job is not running on.
-The raised GPU slot made the old 4 vCPU / 14Gi Job size invalid -- the app's own
-250m/512Mi is charged to the same quota -- so the Job is now 2.5 vCPU / 6Gi
-(`CFG.JOB_CPU`/`JOB_MEMORY`, and the launcher's defaults) inside a 3 CPU / 7Gi
-quota. Thread vars are the integer part of the CPU limit (2), because 2.5 vCPU
-cannot run 3 threads without throttling.
+The Job stays 4 vCPU / 14Gi, and the quota stays 5 CPU / 18Gi with only the GPU
+count raised 0 -> 1. An earlier version of this change shrank the Job to 2.5
+vCPU / 6Gi inside a 3 CPU / 7Gi quota, on the reasoning that 4/14Gi "only fitted
+because the GPU count was 0". That reason is false: CPU and memory quota do not
+depend on the GPU count. Job 4 + app 0.5 = 4.5 <= 5, and 14 + 1 = 15 <= 18Gi, so
+the original size was already admissible -- and 3/7Gi left no headroom for an
+app rollout beside a solve. Thread vars are the integer part of the CPU limit
+(4), derived from the manifest's own limit rather than hardcoded.
 
 ## 3. The honest failure
 
