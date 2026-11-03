@@ -1,0 +1,98 @@
+# MSE Maxwell solver, GPU variant: the same solver as ./Dockerfile, on a CUDA
+# base that can actually run the card.
+#
+# WHY A SECOND IMAGE AT ALL. ./Dockerfile is python:3.12-slim. It has no CUDA
+# runtime, no cupy, no nvmath, no cuDSS, so a Job that asks for the gpu backend
+# on it dies at backend selection (mse_backend._gpu_factor raises BackendError)
+# -- after the Job has already taken the namespace's single GPU slot. The web
+# app therefore refuses to launch a GPU job unless MSE_SOLVER_GPU_IMAGE is set;
+# this Dockerfile is what that setting should point at. Never point it at the
+# CPU image.
+#
+# THE BASE, pinned at or below what the A4000 nodes report: nvidia.com/cuda.runtime-version.full=12.7
+# with driver 565.57.01, so 12.6.3 is the newest tag at or under it. That is
+# the same reasoning and the same tag ./Dockerfile.bench-cuda settled on by
+# measurement -- reuse it rather than re-derive a second answer.
+#
+# THE -runtime VARIANT carries the math libraries (cuBLAS/cuSPARSE/cuSOLVER)
+# the factorisation links against, and deliberately not the Toolkit headers or
+# nvcc: nothing on the solver's GPU path compiles C at run time. cuDSS and
+# nvmath ship as wheels in requirements-gpu.txt, not through the base image,
+# because that is how the Jetson worker gets them and two sources of truth for
+# a library version is how a solve that works on one machine fails on another.
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DEFAULT_TIMEOUT=100 \
+    PIP_RETRIES=20 \
+    PIP_NO_CACHE_DIR=1 \
+    # The Job is allotted 4 CPUs (see web/jobs.py JOB_CPU). A cgroup limit
+    # does not change os.cpu_count(), so an unset count starts one thread per
+    # HOST core and is throttled hard (measured 2026-09-27). The launch
+    # manifest also sets these from its own CPU limit; both agree at 4.
+    OMP_NUM_THREADS=4 \
+    OPENBLAS_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4 \
+    NUMEXPR_NUM_THREADS=4
+
+# The CUDA runtime base is Ubuntu, which has no python3.12 by default; the
+# solver is written against 3.12 (the CPU image is python:3.12-slim, and
+# mse_common's typed syntax needs >=3.10 anyway). Take it from deadsnakes
+# rather than the 24.04 default 3.12 from apt, so the interpreter version is
+# pinned explicitly instead of drifting with the distro.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        gnupg \
+        curl \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3.12-venv \
+        python3.12-dev \
+        libgl1 \
+        libglx-mesa0 \
+        libxrender1 \
+        libxext6 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /opt/app
+
+COPY dockerfiles/maxwell_solver/requirements.txt /opt/app/requirements.txt
+COPY dockerfiles/maxwell_solver/requirements-gpu.txt /opt/app/requirements-gpu.txt
+RUN pip install --no-cache-dir -r /opt/app/requirements.txt \
+    && pip install --no-cache-dir -r /opt/app/requirements-gpu.txt
+
+COPY dockerfiles/maxwell_solver/ /opt/app/
+
+# THE CHECK, at build time, with no GPU present. This is the lesson
+# ./Dockerfile.bench-cuda paid for: `import cupy` needs neither a GPU nor the
+# CUDA headers, so it went green on an image whose first real kernel died. The
+# probe is the SOLVER'S OWN -- mse_backend._missing_gpu_package() -- not a list
+# retyped here. A retyped list is a second opinion: it would keep passing after
+# the solver started needing a package this file never learned about, and it is
+# exactly that kind of hand-copied check that let `MSE_SOLVER_BACKEND=cuda`
+# ship. If the solver needs a package the image lacks, this BUILD fails, so a
+# broken GPU image cannot reach Harbor.
+#
+# The import probe is NOT sufficient, and this is the whole of the lead's
+# finding on a5fdf5d: nvmath-python 0.9.0 declares cuDSS only under
+# `extra == "cu12"`, so a plain pin installs none. cupy, cupyx and nvmath all
+# import happily without cuDSS, so the import-only probe would go green, the
+# image would reach Harbor, and the first DirectSolver.factorize() on the A4000
+# would be the failure. The second step below therefore loads the cuDSS shared
+# object itself. Loading needs no GPU (it is dlopen, not a kernel), so this
+# still fails at BUILD time; only a real factorisation needs the card, and that
+# is the lead's bounded-Job smoke.
+RUN python /opt/app/gpu_stack_probe.py
+
+# Run unprivileged: the solver only reads storage and writes results. Same uid
+# as the CPU image so a PVC written by either is readable by the other.
+RUN useradd --create-home --uid 10001 mse
+USER 10001
+
+ENTRYPOINT ["python", "/opt/app/mse_maxwell_solver.py"]

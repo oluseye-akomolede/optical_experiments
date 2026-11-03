@@ -653,7 +653,8 @@ def run_tick(store, jobs_db, launcher, log=print) -> dict:
                                job["n_modes"],
                                min_feature_m=job.get("min_feature_m"),
                                scale=job.get("scale", 1.0) or 1.0,
-                               kind=job.get("kind"))
+                               kind=job.get("kind"),
+                               gpu=job.get("target") in DB.GPU_TARGETS)
     except JOBS.QuotaExceeded:
         # The quota counts finished Jobs, so a 403 here is "wait", not "fail".
         result["waited"] = True
@@ -1123,7 +1124,15 @@ def _handle_upload(app, store, jobs_db):
         )
         return redirect(url_for("index"))
 
-    target = DB.JETSON if est_tets >= CFG.gpu_min_tets() else DB.CLUSTER
+    # Two questions, asked separately. "Does this need a GPU?" is a property of
+    # the problem (the estimate). "Which GPU machine?" is a property of the
+    # fleet, and now has two answers -- an A4000 Job or the Jetson worker -- so
+    # it is a setting rather than the else-branch of one comparison.
+    if est_tets >= CFG.gpu_min_tets():
+        target = DB.JETSON if CFG.gpu_route() == CFG.GPU_ROUTE_JETSON \
+            else DB.CLUSTER_GPU
+    else:
+        target = DB.CLUSTER
 
     job_id = uuid.uuid4()
     try:
@@ -1578,8 +1587,25 @@ def _job_store(app):
 def _launcher(app):
     if app.config.get("MSE_JOB_LAUNCHER") is not None:
         return app.config["MSE_JOB_LAUNCHER"]
+    # Read only when the cluster route is actually in use: a Jetson deployment
+    # never reads MSE_SOLVER_GPU_IMAGE, so it must not be required there.
+    #
+    # A missing value must NOT stop the app from starting: CPU solves still
+    # work, and refusing to boot would take the whole site down over a setting
+    # only GPU jobs need. The refusal belongs at the GPU launch, which is where
+    # ``K8sJobLauncher`` raises -- so read it leniently here and let that
+    # boundary enforce it. (A strict read here failed an existing test that
+    # constructs the app with no GPU image, which is exactly the deployment
+    # the lenient read keeps working.)
+    gpu_image = None
+    if CFG.gpu_route() == CFG.GPU_ROUTE_CLUSTER:
+        try:
+            gpu_image = CFG.gpu_solver_image()
+        except CFG.ConfigError:
+            gpu_image = None
     return JOBS.K8sJobLauncher(
         namespace=CFG.NAMESPACE, image=CFG.solver_image(),
+        gpu_image=gpu_image,
         pull_secret=CFG.pull_secret(), cpu=CFG.JOB_CPU, memory=CFG.JOB_MEMORY,
         active_deadline_seconds=CFG.JOB_ACTIVE_DEADLINE_SECONDS,
         ttl_seconds_after_finished=CFG.JOB_TTL_SECONDS_AFTER_FINISHED,

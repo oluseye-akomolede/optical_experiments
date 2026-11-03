@@ -20,6 +20,10 @@ NAMESPACE = os.environ.get("MSE_NAMESPACE", "mode-search-engine")
 #: manifests/mse/deployment.yaml); ``solver_image()`` raises if it is not.
 DEFAULT_SOLVER_IMAGE = None
 
+#: The CUDA-stack solver image for cluster GPU solves. Same policy: no default,
+#: because the CPU image would be a silently wrong answer.
+DEFAULT_GPU_SOLVER_IMAGE = None
+
 #: secret used to pull that image (the Harbor project is private)
 DEFAULT_PULL_SECRET = "mse-harbor-pull"
 
@@ -71,7 +75,12 @@ MIN_MATERIAL_N = 1.0
 #: accidental extra zero here is a much bigger mistake than a typo elsewhere.
 MODE_CHOICES = (10, 20, 40)
 
-#: settings for the solver Job (see the task-2 amendment)
+#: settings for the solver Job (see the task-2 amendment).
+#: 4 CPU / 14Gi, unchanged by the A4000 move: the GPU quota was raised 0 -> 1,
+#: which does not touch the CPU or memory bounds. Job 4 + app 0.5 = 4.5 <= the
+#: 5 CPU cap, and 14 + 1 = 15 <= 18Gi. Host RAM still holds the mesh and the
+#: assembly, so this size is what makes an upload that works today keep working
+#: on the GPU path.
 JOB_CPU = "4"
 JOB_MEMORY = "14Gi"
 JOB_ACTIVE_DEADLINE_SECONDS = 1800
@@ -277,6 +286,29 @@ def solver_image() -> str:
     return image
 
 
+def gpu_solver_image() -> str:
+    """Image reference for a cluster GPU solve.
+
+    A SEPARATE image from :func:`solver_image`, and it never falls back to it.
+    The CPU image is ``python:3.12-slim`` with no CUDA stack, so running a GPU
+    backend on it fails at import (``_gpu_factor`` raises ``BackendError``);
+    falling back would turn a missing setting into a job that dies after it has
+    already taken the quota slot. Raising here names the misconfiguration
+    instead, and only when the cluster route is actually in use -- a Jetson
+    deployment never reads this.
+    """
+    image = os.environ.get("MSE_SOLVER_GPU_IMAGE") or DEFAULT_GPU_SOLVER_IMAGE
+    if not image:
+        raise ConfigError(
+            "MSE_GPU_ROUTE=cluster but MSE_SOLVER_GPU_IMAGE is not set, so "
+            "there is no CUDA solver image to run. Set it in the Deployment "
+            "(see manifests/mse/deployment.yaml). It is not defaulted to "
+            "MSE_SOLVER_IMAGE on purpose: that image has no CUDA stack, and "
+            "every GPU job would die at backend selection."
+        )
+    return image
+
+
 def pull_secret() -> str:
     """Name of the imagePullSecret; the Harbor project is private."""
     return os.environ.get("MSE_PULL_SECRET") or DEFAULT_PULL_SECRET
@@ -314,8 +346,32 @@ def est_tets_margin() -> float:
 
 
 def gpu_min_tets() -> int:
-    """Estimate at or above which a job is queued for the Jetson."""
+    """Estimate at or above which a job is queued for a GPU machine.
+
+    Which GPU machine is a separate question -- see :func:`gpu_route`.
+    """
     return _positive_int("MSE_GPU_MIN_TETS", DEFAULT_GPU_MIN_TETS)
+
+
+#: Where a GPU-needing job runs.
+GPU_ROUTE_CLUSTER = "cluster"
+GPU_ROUTE_JETSON = "jetson"
+GPU_ROUTES = (GPU_ROUTE_CLUSTER, GPU_ROUTE_JETSON)
+
+
+def gpu_route() -> str:
+    """Where a GPU-needing job runs: ``cluster`` or ``jetson``.
+
+    ``cluster`` (the default) sends it to an A4000 Job, which is what the owner
+    asked for. ``jetson`` is the old behaviour, kept so a rollback is one
+    environment change rather than a revert.
+
+    An unrecognised value returns ``cluster``: a typo in a deployment
+    environment is a misconfiguration worth ignoring, not a reason to refuse
+    every upload -- the same policy as :func:`_positive_int`.
+    """
+    value = (os.environ.get("MSE_GPU_ROUTE") or "").strip().lower()
+    return value if value in GPU_ROUTES else GPU_ROUTE_CLUSTER
 
 
 def max_tets() -> int:

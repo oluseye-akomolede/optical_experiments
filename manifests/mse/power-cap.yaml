@@ -1,5 +1,10 @@
 # Owner-approved power cap for mode-search-engine (2026-09-26, set by control-operator).
-# Tracked here for reference; never raise it without the owner's OK (see escalation rule).
+# CHANGED 2026-11-02 by owner decision, ONE field only: requests.nvidia.com/gpu 0 -> 1.
+# The owner asked for owner-uploaded solves to run on a cluster RTX A4000 instead of the
+# Jetson, and chose ONE GPU card and ONE solve at a time (count/jobs.batch stays 1).
+# CPU and memory stay 5 / 18Gi: they do not depend on the GPU count, the owner did not
+# ask to tighten them, and a 3/7Gi cap leaves no headroom for an app rollout beside a
+# solve. Never raise it without the owner's OK (see escalation rule).
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -13,7 +18,7 @@ spec:
     pods: '5'
     requests.cpu: '5'
     requests.memory: 18Gi
-    requests.nvidia.com/gpu: '0'
+    requests.nvidia.com/gpu: '1'
 ---
 apiVersion: v1
 kind: LimitRange
@@ -29,6 +34,10 @@ spec:
       cpu: 250m
       memory: 512Mi
     max:
+      # The solver Job requests 4 CPU / 14Gi, which sits AT the CPU ceiling and
+      # 2Gi under the memory one. Max is inclusive, so it is admitted -- but
+      # with no margin: a Job larger than 4 CPU needs this raised first, and
+      # that is an owner decision like the quota itself.
       cpu: '4'
       memory: 16Gi
     type: Container

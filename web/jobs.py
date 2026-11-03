@@ -25,6 +25,7 @@ from pathlib import Path
 _COMMON_ROOT = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
 if str(_COMMON_ROOT) not in sys.path:
     sys.path.insert(0, str(_COMMON_ROOT))
+import mse_backend  # noqa: E402  # the backend NAMES, never retyped
 import mse_common as COMMON  # noqa: E402
 
 #: label values must be DNS-1123-ish; a job id is a uuid but be defensive
@@ -38,6 +39,11 @@ DEFAULT_N_MODES = 20
 #: there is one spelling of it in the tree -- see the note in
 #: ``build_job_manifest`` for why it is a file and not an argument.
 _MATERIALS_OBJECT = "input.materials.json"
+
+#: The thread-count variables a numerically threaded container must set to its
+#: CPU limit, because a cgroup limit does not change ``os.cpu_count()``.
+_THREAD_ENV = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+               "NUMEXPR_NUM_THREADS")
 
 
 def job_name(job_id) -> str:
@@ -56,7 +62,9 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
                        min_feature_m: float | None = None,
                        scale: float = 1.0,
                        materials: dict | None = None,
-                       graded_meshing: bool = True):
+                       graded_meshing: bool = True,
+                       gpu: bool = False,
+                       gpu_product: str = "NVIDIA-RTX-A4000"):
     """Return the ``batch/v1`` Job manifest that solves one upload.
 
     Pure: no environment lookups, no cluster calls, no time.
@@ -140,6 +148,66 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
     # report it as success.
     if materials is not None:
         args += ["--materials-from", _MATERIALS_OBJECT]
+    if gpu:
+        # The same CLI, run against the GPU backend. The NAME comes from
+        # mse_backend.BACKENDS, never a typed literal: this line said "cuda"
+        # once, while mse_backend accepts only "cpu" and "gpu", so every A4000
+        # job died at backend selection and no test noticed -- the tests never
+        # compared this value with the set the solver actually accepts.
+        env = [e for e in env if e["name"] != "MSE_SOLVER_BACKEND"]
+        env.append({"name": "MSE_SOLVER_BACKEND", "value": mse_backend.GPU})
+        # MSE_CPU_MAX_TETS describes the CPU machine. The solver only consults it
+        # on the cpu backend, so leaving it would be harmless -- but it would
+        # name a limit for a machine this Job is not running on, and a reader
+        # would reasonably ask which of the two contradicting env vars wins.
+        env = [e for e in env if e["name"] != "MSE_CPU_MAX_TETS"]
+        # Match the thread count to the CPU limit (measured: a cgroup limit does
+        # not change os.cpu_count(), so an unset count starts one thread per HOST
+        # core and is throttled hard). The image already bakes in 4 for the same
+        # reason, and 4 is the Job size -- so this is a no-op today, and is
+        # derived from the limit rather than left to that coincidence: raising
+        # JOB_CPU without this would silently leave BLAS under-threaded.
+        for var in _THREAD_ENV:
+            env = [e for e in env if e["name"] != var]
+            env.append({"name": var, "value": str(int(float(cpu)))})
+
+    # requests == limits so the Job is Guaranteed and the quota, not the
+    # scheduler, decides admission. The GPU is requested as a first-class
+    # resource in both, which is what the namespace quota counts.
+    resources_res = {"cpu": cpu, "memory": memory}
+    if gpu:
+        resources_res["nvidia.com/gpu"] = 1
+
+    pod_spec = {
+        "restartPolicy": "Never",
+        # The solver only talks to MinIO and Postgres through env
+        # credentials; it never calls the Kubernetes API, so do not
+        # hand it a token that could be used to reach the cluster.
+        "automountServiceAccountToken": False,
+        "imagePullSecrets": [{"name": pull_secret}],
+        "containers": [
+            {
+                "name": "solver",
+                "image": solver_image,
+                "args": args,
+                "env": env,
+                "envFrom": [
+                    {"secretRef": {"name": "mse-minio"}},
+                    {"secretRef": {"name": "mse-db"}},
+                ],
+                "resources": {
+                    "requests": dict(resources_res),
+                    "limits": dict(resources_res),
+                },
+            }
+        ],
+    }
+    if gpu:
+        # Pin the card rather than "any GPU": the quota counts GPUs, but a node
+        # could carry a different model, and the manifest's memory price is the
+        # A4000's. The selector names the product, not the node, so a relabelled
+        # node cannot silently match.
+        pod_spec["nodeSelector"] = {"nvidia.com/gpu.product": gpu_product}
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -153,30 +221,7 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
             "backoffLimit": 0,
             "template": {
                 "metadata": {"labels": labels},
-                "spec": {
-                    "restartPolicy": "Never",
-                    # The solver only talks to MinIO and Postgres through env
-                    # credentials; it never calls the Kubernetes API, so do not
-                    # hand it a token that could be used to reach the cluster.
-                    "automountServiceAccountToken": False,
-                    "imagePullSecrets": [{"name": pull_secret}],
-                    "containers": [
-                        {
-                            "name": "solver",
-                            "image": solver_image,
-                            "args": args,
-                            "env": env,
-                            "envFrom": [
-                                {"secretRef": {"name": "mse-minio"}},
-                                {"secretRef": {"name": "mse-db"}},
-                            ],
-                            "resources": {
-                                "requests": {"cpu": cpu, "memory": memory},
-                                "limits": {"cpu": cpu, "memory": memory},
-                            },
-                        }
-                    ],
-                },
+                "spec": pod_spec,
             },
         },
     }
@@ -190,6 +235,7 @@ class K8sJobLauncher:
     """
 
     def __init__(self, namespace: str, image: str, pull_secret: str,
+                 gpu_image: str | None = None,
                  cpu: str = "4", memory: str = "14Gi",
                  active_deadline_seconds: int = 1800,
                  ttl_seconds_after_finished: int = 30, dry_run: bool = False,
@@ -197,6 +243,10 @@ class K8sJobLauncher:
                  cpu_max_tets: int | None = None):
         self.namespace = namespace
         self.image = image
+        # Required for a GPU job and never substituted for ``image``: the CPU
+        # image has no CUDA stack. A GPU job with no gpu_image is a refusal,
+        # not a degraded run.
+        self.gpu_image = gpu_image
         self.pull_secret = pull_secret
         self.cpu = cpu
         self.memory = memory
@@ -224,9 +274,18 @@ class K8sJobLauncher:
     def manifest(self, job_id, units: str, n_index: float, n_modes: int,
                  min_feature_m: float | None = None,
                  scale: float = 1.0,
-                 materials: dict | None = None) -> dict:
+                 materials: dict | None = None,
+                 gpu: bool = False) -> dict:
+        if gpu and not self.gpu_image:
+            raise ValueError(
+                "a GPU job needs a CUDA solver image (gpu_image), and there is "
+                "none configured. Refusing rather than launching the CPU image, "
+                "which has no CUDA stack and would die after taking the quota "
+                "slot. Set MSE_SOLVER_GPU_IMAGE in the Deployment."
+            )
         return build_job_manifest(
-            job_id, units, n_index, n_modes, self.image, self.pull_secret,
+            job_id, units, n_index, n_modes,
+            self.gpu_image if gpu else self.image, self.pull_secret,
             self.namespace, cpu=self.cpu, memory=self.memory,
             active_deadline_seconds=self.active_deadline_seconds,
             ttl_seconds_after_finished=self.ttl_seconds_after_finished,
@@ -237,6 +296,7 @@ class K8sJobLauncher:
             # pure: this is the app's own setting, the one ``estimate_tets``
             # priced the upload with.
             graded_meshing=COMMON.graded_meshing_enabled(),
+            gpu=gpu,
         )
 
     # -- cluster state -----------------------------------------------------
@@ -380,7 +440,8 @@ class K8sJobLauncher:
     # -- mutation ----------------------------------------------------------
     def create(self, job_id, units: str, n_index: float, n_modes: int,
                min_feature_m: float | None = None, scale: float = 1.0,
-               materials: dict | None = None, kind: str | None = None) -> str:
+               materials: dict | None = None, kind: str | None = None,
+               gpu: bool = False) -> str:
         """Create the Job and return its name.
 
         ``materials`` is passed for the FLAG only -- it decides whether the
@@ -406,7 +467,7 @@ class K8sJobLauncher:
             )
         manifest = self.manifest(job_id, units, n_index, n_modes,
                                  min_feature_m=min_feature_m, scale=scale,
-                                 materials=materials)
+                                 materials=materials, gpu=gpu)
         if self.dry_run:
             return manifest["metadata"]["name"]
         from kubernetes import client
@@ -588,14 +649,22 @@ def _attr(obj, name, default=None):
 
 #: owner-facing text per known failure reason. Kept deliberately plain: this is
 #: what appears on the job page, and the owner is not a Kubernetes operator.
+#:
+#: ``OOMKilled`` does NOT say "try a simpler object". A container killed for
+#: memory may have run out on a machine smaller than the problem needs, and the
+#: A4000 Job is exactly that case: the card's memory is the binding limit, not
+#: the object's shape. Telling the owner to simplify an object that is already
+#: fine sends them to redo work rather than retry, so the text names the machine
+#: and offers the retry the app can actually act on.
 FAILURE_MESSAGES = {
     "DeadlineExceeded": (
         "The solver took too long and was stopped. Try a simpler object, or "
         "ask for fewer modes."
     ),
     "OOMKilled": (
-        "The solver ran out of memory. Try a simpler object, or ask for fewer "
-        "modes."
+        "The solver ran out of memory on its machine. This is a limit of the "
+        "hardware, not necessarily anything wrong with the object -- retry, or "
+        "ask for fewer modes."
     ),
 }
 
