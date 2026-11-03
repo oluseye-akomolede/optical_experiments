@@ -221,6 +221,22 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       `eps_tet` factor turns all three scored quantities red (slab 5.86e-01, shells
       capacitance 6.02e-01, shells interface 9.97e-01), and a 1% error in one shell's eps
       scores 8.98e-03 against a 2e-3 tolerance. Both are now tests, not one-off runs.
+
+      **Review round (1.6 fixes).** The reviewer found that `SPHERE_N_R` was chosen
+      because it passed, not because it converged, and that the comments were prose
+      rather than measurements. Both correct. `--sweep` now runs the tables, and they
+      are in the commit message: against the meshed reference the capacitance error
+      falls 2.91e-03 (n_r=8) -> 7.05e-05 (48) -> 4.15e-07 (128) at order ~2, so n_r=48
+      is where the radial error drops below the angular floor and is now the scored
+      resolution. `rel_ideal` sits at 7.22e-02 at EVERY n_r and never converges: the
+      conductor shell faces are pinned at `r_in+t_shell` with `t_shell` independent of
+      n_r, so that gap is geometry, not discretisation. It is reported, never scored.
+      `TOL_SHELL` is 5e-4 (7x the floor, 3.3x below the weakest 1% perturbation).
+      `TOL_PHI_SHELL` is 2e-3 and is a SANITY CHECK, not an eps detector -- all four
+      perturbations move phi by only 0.1x-0.2x of it, and a test freezes that so it
+      cannot later be claimed as coverage. `perturbation_table()` scores all four
+      against references rebuilt from UNPERTURBED eps, closing the circularity that
+      made the first bench blind to a wrong eps.
 - [ ] 1.7 Measure the per-node memory of both solve paths from the bench RSS, replace the
       `design.md` §5 estimates with the measured figures, and wire `budget=` refusals.
 - [ ] 1.8 `stark.py`: the 7-point effective-mass operator on a Cartesian box, LOBPCG, the
