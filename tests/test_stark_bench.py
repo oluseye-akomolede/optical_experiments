@@ -101,3 +101,42 @@ def test_the_report_names_the_unconfined_hole():
     bare = box.size[2] ** 2 * (1.0 / 12.0 - 1.0 / (2.0 * np.pi**2))
     assert rows[0]["z2h"] == pytest.approx(bare, rel=5e-3)
     assert rows[1]["z2h"] < 0.5 * bare
+
+
+def test_report_flags_non_perturbative_fields(capsys):
+    """The default sweep's fields push the shift past the level spacing.
+
+    A 4.9 eV shift on a 0.08 eV excitation is not a perturbation, and the
+    quadratic p/beta form does not describe it. Reporting beta from those
+    rows without saying so would be the same class of error as quoting a
+    number nobody measured, so the bench must say it.
+    """
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
+    import stark_bench as SB
+    rows, box = SB.sweep(depths=(0.0, 0.3), fields=(0.0, 0.1, 0.2, 0.4),
+                         height_nm=4.0, transverse_nm=12.0, z_extent_nm=16.0,
+                         n_xy=6, n_z=40)
+    SB.report(rows, (0.0, 0.1, 0.2, 0.4), box, 4.0)
+    out = capsys.readouterr().out
+    assert "outside the regime" in out
+    # and the units a reader needs
+    assert "kV/cm" in out
+
+
+def test_report_uses_the_well_ceiling_not_the_box_ceiling(capsys):
+    """The confinement criterion must be h^2/12, a LENGTH, not a fraction of
+    the box's bare value. With the box-relative rule the zero-depth row -- a
+    free particle sitting exactly at the box ceiling -- reads as confined,
+    which is backwards."""
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
+    import stark_bench as SB
+    rows, box = SB.sweep(depths=(0.0,), fields=(0.0, 0.1),
+                         height_nm=4.0, transverse_nm=12.0, z_extent_nm=16.0,
+                         n_xy=6, n_z=40)
+    SB.report(rows, (0.0, 0.1), box, 4.0)
+    out = capsys.readouterr().out
+    assert "1.333 nm^2" in out
+    # at depth 0 both carriers sit at the bare box ceiling and must be
+    # reported NOT confined
+    assert "HOLE is NOT confined" in out
+    assert "ELECTRON is NOT confined" in out

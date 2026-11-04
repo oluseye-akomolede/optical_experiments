@@ -224,6 +224,17 @@ def exciton_energy_eV(
 
     e_c, diag = _coulomb.coulomb_energy_eV(psi_e, psi_h, box, material.eps_s)
 
+    # ``e_c`` comes back NEGATIVE, and that is correct -- do not "fix" it to
+    # positive. It is tempting: coulomb.py's potential is written
+    # ``V = -e^2 / (4 pi eps0 eps_s |r|)``, which looks repulsive for two
+    # same-sign densities, so a negative binding energy reads as a sign error.
+    # The reason it is right is that ``e_e`` and ``e_h`` are energies measured
+    # from a band edge sitting at ZERO, and the field pulls both carriers up
+    # the ramp, so each can sit BELOW zero. ``e_x`` here is therefore a
+    # SPACING between two such levels, not an absolute energy, and ``e_c`` is
+    # the (attractive) correction to that spacing. Its sign is the sign of the
+    # interaction, relative to the free-carrier reference, and the absolute
+    # datum is arbitrary. Changing the reference shifts all three together.
     e_x = e_e + e_h + e_c
     confinement = e_e + e_h
     ratio = abs(e_c) / abs(confinement) if confinement != 0 else float("inf")

@@ -20,16 +20,35 @@ confined at all. ``<z^2>`` is the honest test: a bare box has
 "dot" whose ``<z^2>`` equals the bare-box value is a free particle wearing the
 word dot.
 
-The output is deliberately not a single beta. Reporting one would require a
-depth nobody has measured.
+The output is deliberately not a single beta. Reporting one would require
+four numbers nobody has measured: the well DEPTH, the well HEIGHT (4 nm is
+assumed; the cited TEM range is 3-7 nm), the alloy masses (linear
+interpolation, ASSUMED) and ``eps_s`` (the InP host's, ASSUMED for an InAsP
+dot). ``beta`` is a property of all four, so a single value needs four
+citations, not one.
 
 Reading the table
 -----------------
-``<z2>e`` / ``<z2>h`` fall as the well deepens; the bare-box value printed above
-the table is the ceiling. If the hole is still near that ceiling at the depth
-you care about, the hole is not confined and the numbers are not a dot's.
-``beta`` is a property of the ASSUMED depth, not of the dot: over the depths
-swept here it changes sign.
+``<z2>e`` / ``<z2>h`` fall as the well deepens. Two very different ceilings
+bracket the reading, and it is worth keeping them apart:
+
+* the BARE-BOX value (printed above the table, ``8.364`` here) is the
+  ceiling for this *box*. A carrier sitting at it is a FREE particle; the
+  only level an unconfined carrier can occupy is that value, so proximity to
+  it means "not a dot", never "confined".
+* the TIGHT-WELL value ``h^2/12`` (``1.333`` nm^2 for a 4 nm well) is the
+  ceiling for a carrier confined to the cited dot height. It depends on the
+  well, not the box, which is why it is the criterion: confinement is a
+  length.
+
+So a carrier counts as confined when its ``<z^2>`` is below ``h^2/12``. Rows
+where the ELECTRON is above that are electron-limited: the light carrier is
+not held by the well, so the exciton's extent is set by the box and those
+rows are not a dot's either, whatever beta does.
+
+``beta`` still changes sign over the swept depths, which is the result. It is
+not decoratable into a percentage: the swing is dominated entirely by the
+deepest row.
 
 Cost and where it runs
 ----------------------
@@ -139,6 +158,13 @@ def report(rows, fields, box, height_nm):
           f"grid {box.n[0]}x{box.n[1]}x{box.n[2]} cells")
     print(f"bare-box <z^2> for this extent, the ceiling: {bare:.3f} nm^2")
     print()
+    # Fields are eV/nm throughout the model; report them in kV/cm too, because
+    # a reader needs to know whether these are laboratory fields and whether
+    # the shift is small enough for the quadratic form to mean anything.
+    # 1 eV/nm = 1e4 kV/cm (EV_PER_NM_TO_KV_PER_CM in exciton.py).
+    print(f"fields (eV/nm -> kV/cm): "
+          + ", ".join(f"{f:g} -> {f * X.EV_PER_NM_TO_KV_PER_CM:,.0f}"
+                      for f in fields))
     head = f"{'depth':>6} {'E_X(0)':>9} {'<z2>e':>7} {'<z2>h':>7} {'beta':>9}"
     head += "".join(f" {'dE(' + f'{f:g}' + ')':>11}" for f in fields[1:])
     print(head)
@@ -148,32 +174,58 @@ def report(rows, fields, box, height_nm):
         line += "".join(f" {s:11.3e}" for s in r["shifts"])
         print(line)
     print()
+    biggest = max(abs(s) for r in rows for s in r["shifts"])
+    tightest = min(r["e_x_0"] for r in rows)
+    if biggest > abs(tightest):
+        print(f"WARNING: the largest swept shift ({biggest:.3g} eV) exceeds the "
+              f"smallest E_X(0) ({tightest:.3g} eV). At those fields both "
+              f"carriers are being driven up the ramp past the well, which is "
+              f"outside the regime the perturbation-theory fit assumes. The "
+              f"quadratic p/beta form is being extrapolated there, not "
+              f"measured. Treat large-field rows as a model probe.")
+        print()
+
+    # Confinement is a LENGTH: the carrier is held by the well when its
+    # <z^2> is below the tight-well ceiling h^2/12 (h = the well height),
+    # not when it is below some fraction of the BOX's bare value. At a
+    # fraction-of-box criterion the depth-0 row -- a free particle sitting
+    # exactly at the box ceiling -- reads as "confined", which is backwards.
+    tight = height_nm**2 / 12.0
+    print(f"tight-well ceiling h^2/12 for a {height_nm:g} nm well: "
+          f"{tight:.3f} nm^2; a carrier is confined when its <z^2> is below it")
 
     finite = [r for r in rows if np.isfinite(r["beta"])]
     if len(finite) >= 2:
         betas = [r["beta"] for r in finite]
         lo, hi = min(betas), max(betas)
-        span = (hi - lo) / abs(lo) * 100.0 if lo else float("inf")
-        print(f"beta moves from {lo:.3f} to {hi:.3f} over the swept depths "
-              f"({span:.0f}% of the smaller magnitude).")
+        print(f"beta moves from {lo:.3f} to {hi:.3f} over the swept depths.")
         if lo < 0.0 < hi:
             print("It changes SIGN, so beta is not even of one sign over the "
                   "range of depths a reader could reasonably choose.")
-    confined = [r for r in rows if r["z2h"] < 0.5 * bare]
-    shallow = [r for r in rows if r["z2h"] >= 0.5 * bare]
-    if shallow:
-        depths = ", ".join(f"{r['depth']:g}" for r in shallow)
-        print(f"The HOLE is not confined (its <z^2> is within a factor 2 of the "
-              f"bare box) at depth(s) {depths} eV. Those rows are a free "
-              f"particle in a box, not a dot.")
-    if confined:
-        depths = ", ".join(f"{r['depth']:g}" for r in confined)
-        print(f"The hole is confined at depth(s) {depths} eV.")
+
+    for label, key in (("HOLE", "z2h"), ("ELECTRON", "z2e")):
+        loose = [r["depth"] for r in rows if r[key] > tight]
+        held = [r["depth"] for r in rows if r[key] <= tight]
+        if loose:
+            print(f"The {label} is NOT confined (its <z^2> is above "
+                  f"{tight:.3f} nm^2) at depth(s) "
+                  f"{', '.join(f'{d:g}' for d in loose)} eV.")
+        if held:
+            print(f"The {label} is confined at depth(s) "
+                  f"{', '.join(f'{d:g}' for d in held)} eV.")
+    electron_limited = [r["depth"] for r in rows
+                        if r["z2e"] > tight and r["z2h"] <= tight]
+    if electron_limited:
+        print(f"At depth(s) {', '.join(f'{d:g}' for d in electron_limited)} eV "
+              f"the hole is held but the ELECTRON is not: those rows are "
+              f"electron-limited, so the exciton extent is set by the box and "
+              f"they are not a dot's either, whatever beta does.")
     print()
     print("What this means for the paper's p/beta form: the fit is well-defined "
-          "at every depth, but its value is a property of a depth NOBODY HAS "
-          "MEASURED. A single beta cannot be quoted until the dot's alloy gap "
-          "is retrieved with a bowing parameter. Until then, report the sweep.")
+          "at every depth, but its value is a property of the ASSUMED depth, "
+          "height, alloy masses and eps_s, none of which is a cited number for "
+          "this dot. A single beta cannot be quoted until all four are. Until "
+          "then, report the sweep.")
 
 
 def main(argv=None):

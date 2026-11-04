@@ -445,20 +445,69 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         well depth, `E_X(0)`, the electron and hole `<z^2>`, `beta`, and the Stark shift
         at each field. Defaults: depths 0/0.1/0.2/0.3/0.5/0.8 eV, fields 0/0.1/0.2/0.4
         eV/nm, well height 4 nm, box 12x12x16 nm at 6x6x40 cells. Measured:
-        `beta` = -10.008, -8.601, -6.989, -5.306, -1.985, +0.882 -- it **changes sign**,
-        a 109% swing. `<z^2>` for the hole falls 8.364 (bare box, exactly the analytic
-        value) -> 1.377 -> 1.086 -> 0.987 -> 0.904 -> 0.853 nm^2, so the heavy hole is
-        confined from 0.1 eV up, while at zero depth it is a free particle.
+        `beta` = -10.008, -8.601, -6.989, -5.306, -1.985, +0.882 -- it **changes sign**.
+        `<z^2>` for the hole falls 8.364 (bare box, exactly the analytic value) -> 1.377
+        -> 1.086 -> 0.987 -> 0.904 -> 0.853 nm^2; the electron 8.364 -> 4.936 -> 3.244
+        -> 2.439 -> 1.759 -> 1.391 nm^2.
+      - **CONFINEMENT CRITERION, corrected 2026-11-04 (reviewer finding 1).** The first
+        version compared `<z^2>` to half the bare-box value, which reads BACKWARDS: at
+        depth 0 a free particle sits exactly at the box ceiling, and that rule called it
+        confined. Confinement is a LENGTH, so the criterion is now the tight-well ceiling
+        `h^2/12` (1.333 nm^2 for the 4 nm well), which depends on the well, not the box.
+        Under the corrected rule the HOLE is unconfined at 0 and 0.1 eV only, but the
+        ELECTRON is unconfined at EVERY swept depth: rows 0.2-0.8 eV are
+        electron-limited, so the exciton extent is set by the box and they are not a
+        dot's either. This STRENGTHENS the negative result below.
+      - **NON-PERTURBATIVE FIELDS, added 2026-11-04 (reviewer finding 5).** The default
+        sweep's largest shift (4.89 eV) exceeds the smallest `E_X(0)` (0.081 eV) by 60x.
+        Both carriers are driven up the ramp past the well, which is outside the regime
+        the quadratic p/beta fit assumes; the bench now prints a warning saying the
+        large-field rows are a model probe. Fields are also reported in kV/cm alongside
+        eV/nm (1 eV/nm = 1e4 kV/cm), so `EV_PER_NM_TO_KV_PER_CM` is no longer an unused
+        export.
       - **What the sweep concludes, stated plainly in the bench output:** the p/beta fit
-        is well-defined at every depth, but `beta` is a property of a depth NOBODY HAS
-        MEASURED. A single beta cannot be quoted until the alloy gap is retrieved with a
-        bowing parameter; until then the sweep is the result. This is a NEGATIVE result
-        about the deliverable's headline number, and it is the honest one.
+        is well-defined at every depth, but `beta` is a property of FOUR assumed numbers,
+        not one: the well DEPTH, the well HEIGHT (4 nm assumed; the cited TEM range is
+        3-7 nm), the alloy masses (linear interpolation, ASSUMED) and `eps_s` (the InP
+        host's, ASSUMED for an InAsP dot). A single beta needs four citations. This is a
+        NEGATIVE result about the deliverable's headline number, and it is the honest one.
       - The bench refuses `--height >= --z-extent` with an error naming the
         infinite-well trap, and refuses a field sweep with no zero point.
-      - `tests/test_stark_bench.py` (7 tests) pins the sweep's discrimination, the
-        bare-box calibration, and the refusals. Mutation: dropping the well from
-        `_potential_grid` fails 3 of them.
+      - `tests/test_stark_bench.py` (9 tests) pins the sweep's discrimination, the
+        bare-box calibration, the refusals, the well-ceiling criterion, and the
+        non-perturbative warning. Mutations caught: dropping the well from
+        `_potential_grid` fails 3; reverting the criterion to `0.5 * bare` fails the
+        ceiling test.
+      - **SILENT LOBPCG FAILURE, fixed 2026-11-04 (reviewer finding 3, made REQUIRED by
+        the lead).** `scipy`'s `lobpcg` reports a missed tolerance only through a
+        `UserWarning` and then returns whatever it has, so `lowest_states` was handing
+        back unconverged eigenvalues with nothing to distinguish them. It happened on
+        this change's own sweep (12 of 159 electron solves). `lowest_states` now measures
+        the true residual `||Hv - Ev||/(|E|||v||)` per pair and raises `StarkError`
+        unless it is below `residual_tol` (default 1e-6), or returns a `converged` array
+        with `return_converged=True`. `residual_tol` is deliberately NOT `tol`: `tol` is
+        LOBPCG's internal estimate, while the measured residual floors near 5e-10 and
+        does not improve with more iterations, so binding the check to `tol` would
+        reject correct solves. Tests force failure with `maxiter=3` (raises) and check a
+        good solve still passes (does not fire); mutations both ways are caught.
+      - **Test counts, corrected 2026-11-04 (reviewer finding 2).** The round's message
+        reported "113 passed" as if it were this change's; that was the WHOLE electrical
+        suite. This change touches these files: `test_stark.py` 21, `test_stark_bench.py`
+        9, `test_exciton.py` 22, `test_paper1_wire_electrode.py` 15 = 67 passing. Both
+        numbers are counted from the run output, not transcribed.
+      - **The E_C sign, documented 2026-11-04 (reviewer finding 4).** `e_c` is negative
+        and correct. `e_e` and `e_h` are energies from a band edge at zero, and the field
+        pulls both carriers up the ramp, so each can sit below zero; `e_x` is a SPACING
+        between levels, not an absolute energy, and `e_c` is the attractive correction to
+        it. Comment added at the call site because the next reader would otherwise read a
+        negative attraction as a sign bug.
+      - **Finite-square-well convergence order, stated precisely 2026-11-04.** Measured
+        1.09 / 1.05 / 1.04 -- FIRST order, and that is correct, not a defect: the
+        potential step is sampled at nodes, so the well width the discrete problem solves
+        is uncertain by up to one cell and `dE/da` is nonzero. Smooth (harmonic 2.04 /
+        2.14) and hard-wall (transverse 1.91-2.00) cases pin the difference. The old
+        assertion `min(orders) > 0.9` would have passed at 0.91; it now asserts
+        `1.0 < min < max < 1.5`, which pins the order the test documents.
 - [ ] 1.10 The paper-1 gate sweep (tier 2): E_X(V) for the wire, recorded with its mesh
       counts and RSS.
 
