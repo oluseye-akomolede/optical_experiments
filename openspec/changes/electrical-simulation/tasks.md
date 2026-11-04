@@ -248,7 +248,7 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       cannot later be claimed as coverage. `perturbation_table()` scores all four
       against references rebuilt from UNPERTURBED eps, closing the circularity that
       made the first bench blind to a wrong eps.
-- [ ] 1.7 Measure the per-node memory of both solve paths from the bench RSS, replace the
+- [x] 1.7 Measure the per-node memory of both solve paths from the bench RSS, replace the
       `design.md` §5 estimates with the measured figures, and wire `budget=` refusals.
       **DONE, measured on the cluster.** The Jetson never answered (DNS resolves
       100.74.195.113; 0/2 pings, ssh dies at the banner exchange), so the lead ran
@@ -260,9 +260,12 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         factorisation — assembly is the first big allocation, so a later check would spend
         the memory it protects. `EstimateError` subclasses `MemoryError` (that is the failure
         it stands in for) and the message names the estimate, the budget, the path and the
-        "coarser mesh" lever. `budget=None` skips the check rather than reading this
-        process: the module runs on the control plane and the solve runs elsewhere, so a
-        figure read here is the wrong device's — the same reason `fdtd.NO_DEVICE` exists.
+        "coarser mesh" lever. `budget=None` reads THIS process's admission ceiling
+        (`admission_budget()`, at call time), and `budget=NO_DEVICE` skips the check — the
+        same three meanings `fdtd.check_limits` uses, re-exported from `fdtd` rather than
+        reinvented, because a module running on the control plane while the solve runs
+        elsewhere must be able to say "I am not on the run's device" explicitly.
+        `web/td_form.py` already passes `NO_DEVICE` for exactly this.
       - *Measured AMG, power law fits:* `bytes = 12812 * n_free^0.91`, worst point 2.0 %
         off over `n_free` 1,859..27,869 (~5 kB/unknown at the top). Above that range the
         law is scaled by `AMG_EXTRAPOLATION_MARGIN` (1.5) and the estimate reports
@@ -288,9 +291,16 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         container) — it fits, but does not fit the 6 GiB Job it was measured in. E3 (the
         uniform mesh today's one-size path would build) is **31.5 GiB and does not fit**,
         which makes the graded sizing field load-bearing rather than an optimisation.
-      - *Known weak point:* `AMG_NODE_CROSSOVER` (5e5) is above the direct table, so it can
-        be checked against a measurement on neither side. It remains a named, untested speed
-        choice; recorded in §5 rather than papered over.
+      - *A bug the measurement exposed, now fixed:* `AMG_NODE_CROSSOVER` (5e5) sits **above**
+        the direct table's top (112,847), so `auto` in that band chose direct and then
+        could not price it — refusing a solve AMG could do, for the product's *normal* mesh
+        size. `_direct_is_viable()` now consults both limits (the speed crossover AND the
+        knowledge ceiling) so they cannot drift, and `auto` takes AMG in the band while
+        `method="direct"` still refuses there. A new test covers the band, proven by
+        mutating the fix away. The old test sampled at `crossover + 1`, past both limits,
+        which is why it passed while the bug lived.
+      - *Known weak point:* the crossover itself is still a speed choice with no measurement
+        on either side. What changed is that it can no longer cause a false refusal.
       - *Corrected:* the old §5 claim that "a direct LU at 5e5 nodes is ~5.8 GiB, so memory
         does not set the crossover" rested on the nested-dissection fill formula, which the
         measurements do not support. Removed. The VM four-point run that found no usable
