@@ -196,7 +196,7 @@ Why these and not more:
 
 | option | 3-D | open | fit for us |
 |---|---|---|---|
-| **DEVSIM** (Sanchez, "DEVSIM: A TCAD Semiconductor Device Simulator", J. Open Source Softw. 7(70), 3898 (2022), doi:10.21105/joss.03898; devsim.org) | yes, tetrahedra | Apache-2.0; wheels for x86_64 **and aarch64** Linux (v2.11.2: `manylinux_2_27_x86_64` and `manylinux_2_26_aarch64.manylinux_2_28_aarch64`, verified on PyPI) | Scharfetter-Gummel, SRH, transient, Python API; **direct documented** (MKL PARDISO / UMFPACK); an iterative path is declared and compiled in but undocumented and unrun by us, plus bundled UMFPACK. On aarch64 there is no MKL, so UMFPACK is the direct solver **and the manual warns that FPE checking is disabled on arm64 during direct solves** — worth watching on any Jetson bench. All open questions settled 2026-11-04 (§2) |
+| **DEVSIM** (Sanchez, "DEVSIM: A TCAD Semiconductor Device Simulator", J. Open Source Softw. 7(70), 3898 (2022), doi:10.21105/joss.03898; devsim.org) | yes, tetrahedra | Apache-2.0; wheels for x86_64 **and aarch64** Linux (v2.11.2: `manylinux_2_27_x86_64` and `manylinux_2_26_aarch64.manylinux_2_28_aarch64`, verified on PyPI) | Scharfetter-Gummel, SRH, transient, Python API; **direct documented** (MKL PARDISO / UMFPACK); an iterative path is declared and compiled in but undocumented and unrun by us, plus bundled UMFPACK. On aarch64 there is no MKL, so UMFPACK is the direct solver; **the changelog's note that FPE checking is disabled for direct solves is scoped to Apple M1 (macOS arm64) and says nothing about Linux aarch64** (§2). All open questions settled 2026-11-04 (§2) |
 | Sesame (NIST; Gaury, Sun, Bermel & Haney, "Sesame: A 2-dimensional solar cell modeling tool", Sol. Energy Mater. Sol. Cells 198, 53–62 (2019)) | no (1-D/2-D only, from the code: `sesame/builder.py` assigns `dimension` 1 or 2 and nothing else, and the arXiv abstract says "1 and 2-dimensional systems" — read 2026-11-04; the README's "multi-dimensional" overstates the tool) | open | no 3-D cross-check |
 | own SG on scikit-fem / FEniCSx | yes | open | we would write and validate the SG stabilisation and Newton ourselves: the most risk |
 | Charon (Sandia, Trilinos) | yes | open | heavy C++/MPI build, more than one Job needs |
@@ -210,6 +210,13 @@ discretisation. **All of its open questions are now answered from the shipped 2.
   The Jetson is therefore likely a real fallback, not a maybe — **but that remains unverified**:
   the wheel needs glibc ≥ 2.26 (the `manylinux_2_26` tag), and the Jetson was unreachable
   throughout task 0.2 (2026-11-04), so its glibc was never read. Check it before relying on it.
+  **FPE behaviour on that wheel is untested, and the changelog does not cover it.** The one
+  FPE statement in `devsim_data/CHANGES.md` sits under the heading `### Apple M1` (line 435):
+  "On this platform, the software does not check for floating point exceptions (FPEs) during
+  usage of the direct solver", with the follow-on "FPE during testing on macOS M1" (line 447).
+  macOS arm64 is a different build from the `manylinux` aarch64 wheel named above, so the note
+  does **not** describe what we would run on the Jetson. What is true for Linux aarch64 is
+  simply unestablished; if a Jetson bench is ever taken up, check it rather than assume either way.
 - **Mesh hand-off:** `create_gmsh_mesh(mesh=..., file=...)` reads a `.msh`, **and can equally
   take `coordinates=`, `elements=`, `physical_names=` as plain Python lists** (element type 3 =
   tetrahedron). So a TetGen mesh can be handed over as arrays with no file on disk; writing a
