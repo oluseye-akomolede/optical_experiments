@@ -379,11 +379,14 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         -1/d. The evidence for fringing rather than a solver defect is that the error falls
         monotonically under refinement at fixed geometry; a bad operator would not improve.
         *Corrected 2026-11-04:* an earlier note claimed "a 1.2 um box is WORSE (21.85%)" and
-        offered that as the decisive signature. It does not reproduce. At a fixed 0.2 um gap
-        a 1.2 um box gives 8.98% and a 4 um box 10.54% -- the narrower box is BETTER -- and
-        the 1.2 um / 0.6 um case the helper would need is refused outright ("body have no
-        tets"). Box size is not monotone because mesh resolution changes with it. The
-        21.85% is withdrawn, not explained.
+        offered that as the decisive signature. It does not reproduce and is withdrawn, not
+        explained. The helper refuses the 1.2 um / 0.6 um configuration the claim would need
+        ("body have no tets"), which refutes it without quoting any refinement level. A
+        replacement pair (1.2 um 8.98% vs 4 um 10.54% at a fixed 0.2 um gap) is measured at
+        n_modes 16 ONLY -- at n_modes 8 they are tied (20.40% vs 20.70%) -- so it is not a
+        "narrower is better" law either. Box size is not monotone because mesh resolution
+        changes with it. Quoting one refinement level as if it settled the question is the
+        same mistake as the 21.85% was.
         The test asserts the convergence direction and a bound, not a single value.
       - *V/m -> eV/nm is `* 1e-9` and nothing else.* A volt across a nanometre is 1 eV/nm
         because the electron charge cancels between the volt and the electron-volt.

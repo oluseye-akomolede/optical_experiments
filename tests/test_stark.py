@@ -208,12 +208,17 @@ def test_field_approaches_the_parallel_plate_value_under_refinement():
     would not improve as the mesh resolves.
 
     Do NOT claim "a narrower box is worse". That was measured here once (21.85%)
-    and it does not reproduce: at a fixed 0.2 um gap a 1.2 um box gives 8.98% and
-    a 4 um box gives 10.54%, i.e. the narrower box is BETTER. Confirmed
-    independently by the reviewer at the committed helper, which refuses
-    extent_m=1.2e-7 with gap 0.6e-7 outright ("part(s) body have no tets"). Box
-    size is not monotone because the mesh resolution also changes with it, so
-    there is no single "narrower is worse" law to cite.
+    and it does not reproduce. The claim is refuted outright by the helper
+    refusing extent_m=1.2e-7 with gap 0.6e-7 ("part(s) body have no tets"), so
+    no refinement level is needed to kill it.
+
+    The replacement pair -- 1.2 um 8.98% vs 4 um 10.54% at a fixed 0.2 um gap --
+    is measured at n_modes 16 ONLY and must not be quoted without that
+    qualifier. At n_modes 8 the two are effectively tied (20.40% vs 20.70%); at
+    30 the ordering holds (7.25% vs 9.08%). Quoting one refinement level as
+    though it settled box size is the same mistake as the 21.85%. Box size is
+    not monotone in the error because the mesh resolution also changes with it,
+    so there is no "narrower is better/worse" law at all.
 
     The test therefore asserts the convergence DIRECTION and a bound, because
     a tolerance on a single value cannot distinguish the two explanations.
