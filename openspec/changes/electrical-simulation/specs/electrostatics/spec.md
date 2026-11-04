@@ -86,12 +86,24 @@ among these, not the only one.
 
 
 ### Requirement: Electrostatics SHALL refuse a mesh over the admission budget before factorising
-`solve` SHALL take `budget=None` (bytes). With `None` it SHALL read the machine's admission
-budget at call time (`admission_budget()`, as the time-domain `check_limits` does), not a fixed
-constant. Before assembly it SHALL estimate peak memory from the free-node count for the solve
-path it will take (direct or iterative, below), using a per-node cost for each path measured on
-the bench and recorded in the module. It SHALL raise `ValueError` naming the path, the estimate
-and the budget when the estimate exceeds the budget.
+`solve` SHALL take `budget=None` (bytes), with the SAME meanings as
+`fdtd.check_limits` (baseline spec, "The memory and cell ceilings SHALL follow the device
+the run lands on"). With `None` it SHALL read this process's admission ceiling at call time
+(`admission_budget()`); with `NO_DEVICE` (re-exported from `fdtd`) it SHALL check nothing,
+because the caller is not on the device the solve will run on; with a number it SHALL check
+against that number. It SHALL NOT read a fixed constant. Before assembly it SHALL estimate
+peak memory from the free-node count for the solve path it will take, using the per-path
+model MEASURED on the bench and recorded in the module: a power law for AMG
+(`12812 * n_free^0.91`, with a stated margin above its measured range) and a log-log
+interpolation of the measured table for direct, which SHALL refuse above the table's
+largest measured size rather than extrapolate. It SHALL raise `EstimateError` (a
+`MemoryError` subclass, because that is the failure it stands in for) naming the path, the
+estimate, its kind (measured, extrapolated, or estimated) and the budget when the estimate
+exceeds the budget.
+
+> Changed from `ValueError` to `EstimateError` during task 1.7: a caller catching
+> `MemoryError` -- the failure a refused solve is standing in for -- must catch this, and
+> `ValueError` would file it under the wrong heading.
 
 #### Scenario: A mesh over a passed budget is refused before work
 - **WHEN** `solve` is called on a small bench mesh with a `budget` below that mesh's estimate
@@ -99,16 +111,34 @@ and the budget when the estimate exceeds the budget.
 
 #### Scenario: The estimate follows the path
 - **WHEN** the same mesh is estimated for the direct path and for the iterative path
-- **THEN** the two estimates differ and each uses its own recorded per-node cost
+- **THEN** the two estimates differ and each uses its own measured model
+
+#### Scenario: A direct solve past the measured table is refused, not extrapolated
+- **WHEN** `estimate_memory` is asked for a direct solve above the largest measured `n_free`
+- **THEN** it raises `EstimateError` naming the measured limit and recommending the AMG path
+
+#### Scenario: An extrapolated AMG estimate says so
+- **WHEN** the AMG estimate is above the power law's measured range
+- **THEN** the margin is applied and the estimate reports `extrapolated: True`, which a
+  refusal renders as extrapolated rather than measured
 
 ### Requirement: Electrostatics SHALL solve large 3-D meshes iteratively, with a checked residual
 `solve` SHALL use the direct path (`mse_backend.factor`) up to `direct_max_nodes` free nodes
-(a module constant set from the bench, design estimate about 5 × 10⁵) and above it an
+(a module constant set from the bench). The measured direct table ends at 112,847 free
+unknowns, so above that size direct is refused outright and AMG is the only path; the
+crossover constant only decides the choice BELOW that, where both were measured.
 AMG-preconditioned conjugate-gradient solve (`pyamg`). The iterative path SHALL stop at a
-relative residual ‖b − Ax‖/‖b‖ ≤ 1e-10. It SHALL recompute that residual from the assembled
-matrix after the solve, not take it from the solver's own report, and SHALL raise
-`RuntimeError` naming the residual when it is above the tolerance or the iteration cap is
-reached. The result SHALL record which path ran and the residual.
+relative residual ‖b − Ax‖/‖b‖ ≤ 1e-12 (`AMG_RTOL`). It SHALL recompute that residual from
+the assembled matrix after the solve, not take it from the solver's own report, and SHALL
+raise `RuntimeError` naming the residual when it is above the tolerance (allowing
+`AMG_RESIDUAL_SLACK`, a factor of 10) or the iteration cap is reached. The result SHALL
+record which path ran and the residual.
+
+> Tightened from 1e-10 to 1e-12 during task 1.4: the direct path is exact to machine
+> precision (~1e-15 measured on the contact chain), so the agreement test compares one
+> path against a near-exact reference and every bit of the difference is AMG's. Measured
+> at rtol=1e-10 the AMG error against the exact answer reached 6.4e-11 -- too close to the
+> tolerance to assert against when the alternative is exact.
 
 #### Scenario: Both paths agree
 - **WHEN** a bench mesh below `direct_max_nodes` is solved on both paths (forced by a keyword)

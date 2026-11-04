@@ -98,6 +98,9 @@ Why these and not more:
   so L3 is 3-D. It runs on a uniform
   Cartesian finite-difference box around the dot, with the L1 field interpolated onto it.
   At 0.5 nm a 60 × 60 × 40 nm box is about 1.2 × 10⁶ unknowns, about 0.35 GiB (estimate; §5).
+  This is the STARK grid arithmetic, which is priced by its own explicit formula in §5's
+  Stark table — it is NOT priced by the measured electrostatics model, which covers the
+  LOBPCG-free direct and AMG paths only.
   Material parameters come from Vurgaftman, Meyer & Ram-Mohan, J. Appl. Phys. 89, 5815 (2001).
 - L5 is the p-i-n half of "full electrical analysis", as in the first electrically driven
   single-photon source (Yuan et al., Science 295, 102 (2002)). Full 3-D L5 does not fit at
@@ -228,7 +231,38 @@ conductor part of the upload, not only a contact; paper 1's gate is one fixture.
 This reading was ours, put to the owner as question 3; the owner answered "b yes" on
 2026-11-02, which puts it in this change.
 
-## 5. What fits in 3-D, and at what resolution (estimates)
+## 5. What fits in 3-D, and at what resolution (MEASURED)
+
+**Status (task 1.7, 2026-11-04): the two solve paths are now MEASURED, on a bounded
+cluster Job** — sigma-worker2 (x86_64), 2 cpu / 6 GiB, image
+`mse-maxwell-solver-gpu:28997f1` with no GPU, code at `b3bbdc1`, running
+`dockerfiles/maxwell_solver/solve_memory_bench.py`. The raw job and output are in
+`memory-bench.md` beside this file. The Jetson this was originally planned for was
+unreachable for the whole row (DNS resolves; 0/2 pings and every SSH path times out
+at the banner exchange), so the figures come from the cluster, which is where solves
+actually run — **these are the right device's numbers.**
+
+The estimate is `mse_electrostatics.estimate_memory`, and `solve()` refuses a run
+over its `budget=` before assembling. Each path is modelled differently because the
+measurements say they behave differently:
+
+- **AMG-CG: a power law, `bytes = 12812 * n_free^0.91`**, worst point 2.0 % off over
+  `n_free` 1,859..27,869 (~5 kB/unknown at the top of that range). Above the measured
+  range the law is applied with a **1.5× margin** (`AMG_EXTRAPOLATION_MARGIN`) and the
+  estimate reports `extrapolated: True`, so a refusal says so.
+- **Direct LU: interpolated from a table, not a law.** Measured peak-RSS growth:
+  1,859 → 10.9 MiB; 6,137 → 32.2 MiB; 14,375 → 122 MiB; 27,869 → 339 MiB; 47,915 → 723 MiB;
+  75,809 → 1,444 MiB; 112,847 → 4,797 MiB (the bench's own column: `VmHWM` is KiB,
+  printed as `grow_kb / 1024`, so these are MiB and the table stores
+  `MiB × 1_048_576`). **No law fits** (a power law is 27 % off its
+  own worst point, linear 277 %), and the per-unknown rate climbs from 6,148 B to
+  44,574 B (5.86 → 42.5 kB in the rounded terms the fit is discussed in), with the
+  largest single jump in that rate (2.2×) between the last two points as the
+  ordering changes strategy. State which growth figure you mean: the rate rises
+  2.2× over the last step while the total grows 3.3× (1,444 → 4,797 MiB) as
+  unknowns grow 1.49×.
+  `estimate_memory` therefore interpolates this table in log-log space and **refuses
+  above 112,847 unknowns** (see below) rather than extrapolate.
 
 Inputs: wire circumradius R = 239.4 nm, hex area (3√3/2)R² = 1.49 × 10⁵ nm², height
 1500 nm, wire volume 2.23 × 10⁸ nm³. Air 500 nm around and above: box side 2(R + 500)
@@ -236,40 +270,90 @@ Inputs: wire circumradius R = 239.4 nm, hex area (3√3/2)R² = 1.49 × 10⁵ nm
 1479² × 12 = 2.62 × 10⁷ nm³. Gold 150 nm, 3.28 × 10⁸ nm³.
 
 Nodes per volume at edge h: a regular tet has volume h³/(6√2), so there are 6√2 ≈ 8.49 tets
-per h³, and a tet mesh has about 5.5 tets per node, giving **1.54 nodes per h³**. Memory (all
-estimates, to be replaced by task 2.6's measured per-node cost):
-- Direct sparse LU in 3-D (nested dissection): fill ≈ 10⁹ entries × (n/10⁶)^{4/3}, where n
-  is the NODE count, at 12 B/entry × 1.3 overhead (15.6 B/entry). For a k-unknown-per-node
-  system, multiply the fill by k² (electrostatics k = 1; drift-diffusion k = 3, so 9 × 10⁹).
-- AMG-preconditioned CG: about 1.5 kB per unknown.
+per h³, and a tet mesh has about 5.5 tets per node, giving **1.54 nodes per h³**. Memory
+(measured per §5 above; the tables below are DERIVED from the measured model, not from
+a per-node constant):
+- Direct sparse LU: interpolate `DIRECT_MEMORY_TABLE`. **It does not extend above
+  112,847 unknowns** — a direct solve of the E1/E2 meshes cannot be priced and is
+  refused, with the reason and a recommendation to use AMG.
+- AMG-preconditioned CG: `12812 * n_free^0.91` bytes, × 1.5 above 27,869 unknowns.
 - The container limit is 16 GiB, and the namespace's 18 GiB includes the web app.
+
+### The model, and why the two paths differ (measured on a cluster Job)
+
+The VM run (task 1.7, before the cluster figures) measured the direct path at four
+sizes and found the per-unknown rate was **not constant** — it rose from 6.2 kB to
+12.9 kB over a fourfold size range. Neither a power law (33.8 % worst point) nor a
+linear fit (116.5 %) described it, and the bench correctly printed `usable model:
+NONE` rather than quoting one. That result was the reason to measure larger: at VM
+sizes SuperLU's fill had not settled into any regular regime.
+
+At cluster scale the answer split in two. **AMG has a law** — the hierarchy grows
+regularly with `n`, so a power law fits to 2.0 % over nearly two decades, and it
+could safely be extrapolated (with a margin) beyond the fitted range. **Direct does
+not** — seven points spanning 60× in unknowns still show a 2.2× jump between the last
+two as the ordering changes strategy, which is a discretely different algorithm, not a
+curve. So direct is interpolated and then refused, and AMG is the path a mesh above
+~10⁵ unknowns must take.
+
+This is why the original plan to measure only on the VM would have produced a wrong
+model: four small points were consistent with several incompatible laws, and only a
+size range wide enough to cross SuperLU's strategy changes could tell them apart.
+
 
 ### Electrostatics (1 unknown/node)
 
-| mesh | edges (nm) | nodes | LU | AMG-CG | verdict |
+Every row is priced by the measured model above (`estimate_memory`), not by the old
+fill formula. **Direct is refused for all four**: each is above 112,847 unknowns,
+where the direct table stops. So AMG is not a fallback here — it is the only path,
+and the verdicts below are AMG verdicts.
+
+| mesh | edges (nm) | nodes | direct | AMG-CG | verdict |
 |---|---|---|---|---|---|
-| E1 graded | wire 20, oxide 6, air/gold 80 | 2.4 × 10⁵ | ≥ 2.2 GiB | 0.34 GiB | **fits** (direct) |
-| E2 graded | wire 10, dot ball (radius 100) 3, oxide 4, air/gold 50 | 1.27 × 10⁶ | ≥ 20 GiB | 1.8 GiB | **fits with AMG-CG only** |
-| E3 uniform (today's one `maxvolume`) | 10 everywhere | 7.3 × 10⁶ | ≥ 205 GiB | 10 GiB | AMG barely, slow; not used |
-| E4 uniform | 4 everywhere (what the oxide asks of one size) | 1.1 × 10⁸ | — | 159 GiB | **does not fit** |
+| E1 graded | wire 20, oxide 6, air/gold 80 | 2.4 × 10⁵ | refused (> table) | 1.41 GiB (extrap) | **fits** |
+| E2 graded | wire 10, dot ball (radius 100) 3, oxide 4, air/gold 50 | 1.27 × 10⁶ | refused (> table) | 6.42 GiB (extrap) | **fits with AMG-CG only** |
+| E3 uniform (today's one `maxvolume`) | 10 everywhere | 7.3 × 10⁶ | refused (> table) | 31.5 GiB (extrap) | **does not fit** the 16 GiB container |
+| E4 uniform | 4 everywhere (what the oxide asks of one size) | 1.1 × 10⁸ | refused (> table) | 372 GiB (extrap) | **does not fit** |
 
 Worked E2: wire (2.23 × 10⁸ − 4.19 × 10⁶)/10³ × 1.54 = 3.4 × 10⁵; dot ball of radius
 100 nm, 4.19 × 10⁶ nm³/27 × 1.54 = 2.4 × 10⁵; oxide 2.62 × 10⁷/64 × 1.54 = 6.3 × 10⁵; air
-4.15 × 10⁹/50³ × 1.54 = 5.1 × 10⁴; gold 4 × 10³; total 1.27 × 10⁶. LU:
-10⁹ × 1.27^{4/3} × 15.6 B = 21 GB ≈ 20 GiB. AMG: 1.27 × 10⁶ × 1.5 kB = 1.8 GiB.
+4.15 × 10⁹/50³ × 1.54 = 5.1 × 10⁴; gold 4 × 10³; total 1.27 × 10⁶. AMG:
+12812 × (1.27 × 10⁶)^0.91 × 1.5 = 6.42 GiB, 40 % of a 16 GiB container.
 
-So **3-D electrostatics fits**, but only with the graded mesh (the `-m` sizing field). It
-needs AMG-CG (`pyamg`) once it is above about 5 × 10⁵ nodes. The gold mirror and the
-electrodes are held nodes, so they cost almost nothing to solve.
+So **3-D electrostatics fits, with the graded mesh and AMG-CG** — but with less
+headroom than the pre-measurement estimate suggested. E1 has about 1.4 GiB against
+16 GiB; E2 about 6.4 GiB, which still fits a 16 GiB container but would NOT fit the
+6 GiB Job this model was measured in. **E3, the uniform mesh the current one-size
+path would build, does not fit at all** — 31.5 GiB — so the graded sizing field is
+now load-bearing for the product, not just an optimisation.
 
-That 5 × 10⁵ becomes a named constant (`AMG_NODE_CROSSOVER`, task 1.4), and it is **not**
-derived from the memory law:
-at 5 × 10⁵ nodes a direct LU is 10⁹ × 0.5^(4/3) × 15.6 B ≈ 5.8 GiB of 16 GiB, about a third
-of the container, so memory does not set it. It is an estimate of where the iterative solver
-stops being the slower choice. It sits between E1 (2.4 × 10⁵, 2.17 GiB direct) and E2
-(1.27 × 10⁶, 20 GiB direct), and task 1.4's direct-vs-AMG agreement test is the only place it
-gets exercised. Revisit it when task 2.6 replaces the per-node cost with a measured one; until
-then it is a named estimate, not a result.
+Note the extrapolation: every row above 27,869 unknowns applies the 1.5× margin, so
+these are margin-padded figures, and they are the honest ones to plan against — an
+under-estimate here is a pod OOM-kill. The gold mirror and the electrodes are held
+nodes, so they cost almost nothing to solve.
+
+That 5 × 10⁵ becomes a named constant (`AMG_NODE_CROSSOVER`, task 1.4). It is still
+**not** derived from the memory model, but the measurement has changed what can be
+said about it:
+- The old justification — "a direct LU at 5 × 10⁵ nodes is ~5.8 GiB, about a third of
+  the container, so memory does not set the crossover" — rested on the
+  nested-dissection fill formula, which the measurements **do not support**. A direct
+  solve at that size has never been measured (the table stops at 112,847) and is now
+  REFUSED by `estimate_memory`, so no measured figure exists on either side of the
+  crossing.
+- What the measurement does establish: at every size measured, AMG fits where direct
+  is already impractical, and every graded mesh the product builds (E1, E2) is above
+  the direct table. So in practice the crossover is **academic for the product's real
+  meshes** — they take AMG regardless.
+- The crossover is therefore still a SPEED choice with a *named, untested* basis. It
+  sits between E1 (2.4 × 10⁵) and E2 (1.27 × 10⁶), and task 1.4's direct-vs-AMG
+  agreement test is the only place it is exercised — and that test runs on tiny
+  meshes far below the crossover, so it does not constrain it either.
+
+**This is a known weak point, recorded rather than papered over:** the model cannot
+price a direct solve above 112,847 unknowns, so the crossover's claim ("direct is
+still feasible here, just slower") is unverified by measurement. Revisit it when
+task 2.6 has measurements in that band; until then it is a named estimate.
 
 ### Stark (3-D effective mass, finite differences, 7-point, about 10 LOBPCG vectors)
 
