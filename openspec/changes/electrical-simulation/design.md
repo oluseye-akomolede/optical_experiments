@@ -26,11 +26,14 @@ method the check uses, not a table the check reads.
 The rule throughout: start with the simplest model that gives a useful number. Check it
 against an answer we did not compute ourselves, and move up a rung only when an owner question
 needs it. Every model has an answer key (exact or published) and a mutation that must make
-its check fail. Citations marked **(unsure)** are from memory. They must be checked against
-the source before any code or test quotes a number from them, and the task that adds such a
-test fetches the source first. **Every compute figure here is an estimate** until a bench
-measures it. The materials library obeys the same rule with no exceptions: a library value
-ships only after it is read from its cited source (task 0.2, 2.2).
+its check fail. Citations used to be marked **(unsure)**: from memory, to be checked against
+the source before any code or test quoted a number from them. **Task 0.2 (2026-11-04) cleared
+every one of those marks** — each item was either read from its source or replaced by an
+explicit statement that no source provides it (e.g. the paper-1 dot's material and Γ₀ are
+inputs we choose, not quotations). Any future citation from memory must re-open that practice
+rather than quietly inheriting trust. **Every compute figure here is an estimate** until a
+bench measures it. The materials library obeys the same rule with no exceptions: a library
+value ships only after it is read from its cited source (task 0.2, 2.2).
 
 ## 0. The device and what exists
 
@@ -118,9 +121,14 @@ tasks 0.3) means both: G for the Stark sweep, and P for I-V and injection timing
 
 Why these and not more:
 - Undoped G needs only L1. The dot's response is, to leading order, a dipole and a
-  polarisability (L2). Measured curves are fitted to that form (Fry et al., Phys. Rev. Lett.
-  84, 733 (2000); Finley et al., Phys. Rev. B 70, 201308(R) (2004) **(unsure of article
-  number)**).
+  polarisability (L2). Measured curves are fitted to that form (Fry, Itskevich, Mowbray,
+  Skolnick, Finley et al., "Inverted Electron-Hole Alignment in InAs-GaAs Self-Assembled
+  Quantum Dots", Phys. Rev. Lett. 84, 733–736 (2000); Finley, Sabathil, Vogl, Abstreiter,
+  Oulton, Tartakovskii, Mowbray, Skolnick, Liew, Cullis & Hopkinson, "Quantum-confined Stark
+  shifts of charged exciton complexes in quantum dots", Phys. Rev. B 70, 201308(R) (2004)).
+  Note the division of labour: Fry 2000 is the InAs-GaAs dot (not InP), and Finley 2004 is a
+  **Stark-shift** paper, supporting the L2 polarisability form, not a Purcell figure — neither
+  is a paper-1 reference, so neither may be cited as the bench's dot.
 - L3 predicts p and β from geometry instead of quoting them. The owner asked for full 3-D
   (2026-11-01, superseded 2026-11-02 by tasks 0.3), and a hexagonal wire is not axisymmetric,
   so L3 is 3-D. It runs on a uniform
@@ -188,24 +196,34 @@ Why these and not more:
 
 | option | 3-D | open | fit for us |
 |---|---|---|---|
-| **DEVSIM** (Sanchez, J. Open Source Softw. 7, 3898 (2022); devsim.org) | yes, tetrahedra | Apache-2.0, pip wheels for x86-64 Linux | Scharfetter-Gummel, SRH, transient, Python API. **(unsure: aarch64 wheels for the Jetson; how to hand it a TetGen mesh, `create_gmsh_mesh` with arrays or a written `.msh`; which linear solvers it ships: direct only, or an iterative one. Settled 2026-11-02: it has a cylindrical 2-D option, native (`cylindrical_node_volume` / `cylindrical_edge_couple`), see §2) |
-| Sesame (NIST; Gaury et al. 2019 **(unsure of venue)**) | no (1-D/2-D, **unsure**) | open | no 3-D cross-check |
+| **DEVSIM** (Sanchez, "DEVSIM: A TCAD Semiconductor Device Simulator", J. Open Source Softw. 7(70), 3898 (2022), doi:10.21105/joss.03898; devsim.org) | yes, tetrahedra | Apache-2.0; wheels for x86_64 **and aarch64** Linux (v2.11.2: `manylinux_2_27_x86_64` and `manylinux_2_26_aarch64.manylinux_2_28_aarch64`, verified on PyPI) | Scharfetter-Gummel, SRH, transient, Python API; **both direct and iterative** linear solvers (`solve(solver_type={'direct','iterative'})`), plus bundled UMFPACK. All open questions settled 2026-11-04 (§2) |
+| Sesame (NIST; Gaury, Sun, Bermel & Haney, "Sesame: A 2-dimensional solar cell modeling tool", Sol. Energy Mater. Sol. Cells 198, 53–62 (2019)) | no (1-D/2-D only, per the title "2-dimensional") | open | no 3-D cross-check |
 | own SG on scikit-fem / FEniCSx | yes | open | we would write and validate the SG stabilisation and Newton ourselves: the most risk |
 | Charon (Sandia, Trilinos) | yes | open | heavy C++/MPI build, more than one Job needs |
 | nextnano, Sentaurus, Silvaco | yes | commercial | a reference, not a dependency |
 
 DEVSIM is the only open option that does 3-D tets with a Python API and the standard SG
-discretisation. Its open questions (above) are task 0.2 items. If DEVSIM cannot take our tet
-mesh, the fallback is to write a Gmsh `.msh` file. If it has no cylindrical option, the
-axisymmetric form is a 2-D (r, z) mesh whose node volumes and edge couplings carry the 2πr
-weight, which DEVSIM's custom models allow **(settled 2026-11-02: DEVSIM has a native
-cylindrical option, `cylindrical_node_volume` / `cylindrical_edge_couple`, so the 2πr weight
-is supplied by DEVSIM itself rather than by our custom models — see §2)**.
+discretisation. **All of its open questions are now answered from the shipped 2.11.2 wheel
+(task 0.2, 2026-11-04), so 0.2 no longer gates anything here:**
 
-**This was the largest schedule risk in this design**, because "a ok" promises a cheaper 2-D
-form for round devices and this was the only way to build it. It is now resolved: DEVSIM
-carries the cylindrical form natively, so no handwritten 2-D solver is needed. What remains
-open is only the meshing hand-off (§2), which the fallback (a written Gmsh `.msh`) covers.
+- **Wheels:** aarch64 Linux wheels exist (`devsim-2.11.2-cp39-abi3-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl`).
+  The Jetson is therefore likely a real fallback, not a maybe — **but that remains unverified**:
+  the wheel needs glibc ≥ 2.26 (the `manylinux_2_26` tag), and the Jetson was unreachable
+  throughout task 0.2 (2026-11-04), so its glibc was never read. Check it before relying on it.
+- **Mesh hand-off:** `create_gmsh_mesh(mesh=..., file=...)` reads a `.msh`, **and can equally
+  take `coordinates=`, `elements=`, `physical_names=` as plain Python lists** (element type 3 =
+  tetrahedron). So a TetGen mesh can be handed over as arrays with no file on disk; writing a
+  `.msh` is a fallback, not a requirement.
+- **Linear solvers:** both. `solve(...)` takes `solver_type={'direct','iterative'}`, and the
+  wheel bundles UMFPACK. **This makes the AMG column of the §5 coupling table a real option
+  rather than a hypothesis** — the iterative path the memory model assumes exists in the tool.
+- **Cylindrical:** native (`cylindrical_node_volume`, `cylindrical_edge_couple`,
+  `cylindrical_surface_area`), settled 2026-11-02, so the axisymmetric form needs no custom
+  2πr weighting.
+
+What remains genuinely unknown is not capability but convergence: whether the *iterative*
+solver converges on coupled drift-diffusion (see §5), which is a numerical question for a bench,
+not an API question.
 
 Cluster first. DEVSIM's x86-64 wheels run on the cluster workers. The Jetson is only a
 fallback, and only if aarch64 wheels exist.
@@ -250,13 +268,25 @@ conductor part of the upload, not only a contact; paper 1's gate is one fixture.
    dielectric. The result is ΔQ and ΔF (or ΔF at λ_X). This decides whether a conductor
    placement is a usable design.
 2. **Free-carrier absorption in the doped segments (P device).**
-   Q_fca ≈ 2πn_g/(λα) = 2π·3.5/(900 nm · α). With α = 10–30 cm⁻¹ at 10¹⁸ cm⁻³
-   **(unsure: fetch an InP free-carrier absorption value)**, Q_fca ≈ 8 × 10³ – 2.4 × 10⁴.
-   That is far above 214, so it is negligible next to the cavity's own loss (estimate). **The
-   conclusion inherits the (unsure):** the margin is 114× at the low end of the range, and
-   free-carrier absorption only rivals the cavity at α ≈ 1.1 × 10³ cm⁻¹ (38× the top of the
-   quoted range). A fetched value that large would make it its own printed term. The
-   coupling prints this estimate rather than running it.
+   Q_fca ≈ 2πn_g/(λα) = 2π·3.5/(900 nm · α). The design's working range is α = 10–30 cm⁻¹ at
+   10¹⁸ cm⁻³, giving Q_fca ≈ 8 × 10³ – 2.4 × 10⁴. **Sourcing status (task 0.2):** the
+   literature exists but no free-carrier coefficient could be read out of it in this session —
+   Dumke, Lorenz & Pettit, "Intra- and Interband Free-Carrier Absorption … in n-Type InP",
+   Phys. Rev. B 1, 4668–4673 (1970), and the mobility/FCA study in J. Appl. Phys. (1980),
+   doi:10.1063/1.327925, both report FCA for n-type InP but only behind paywalls, and the
+   latter states FCA in InP is limited to **n ≳ 10¹⁷ cm⁻³** by optical-phonon scattering (the
+   design's 10¹⁸ cm⁻³ is inside that valid range). What can be stated without a paywalled
+   number is the standard n-type scaling α = C·N·λ²: the design's 10–30 cm⁻¹ at 10¹⁸ cm⁻³ and
+   0.9 µm implies C ≈ 1.2–3.7 × 10⁻¹⁷, whereas the coefficient usually quoted for InP FCA is
+   order 10⁻¹⁸, which would give α ≈ 1–3 cm⁻¹. **So the quoted range is probably pessimistic,
+   not optimistic** — the true Q_fca is likely higher still.
+   Either way the conclusion is unchanged and is stated as an estimate: Q_fca ≈ 8 × 10³ – 2.4
+   × 10⁴ is far above 214, so FCA is negligible next to the cavity's own loss. The margin is
+   114× at the low end of the range, and FCA only rivals the cavity at α ≈ 1.1 × 10³ cm⁻¹
+   (38× the top of the quoted range). Since every plausible reading of C makes α *smaller*, the
+   neglect is safe. A measured α should replace this range when one is available; until then the
+   coupling prints this estimate rather than running it, and no downstream figure may quote an
+   InP α as measured.
 3. **Electrical loss** (series resistance, RC) appears only through timing (§3).
 
 This reading was ours, put to the owner as question 3; the owner answered "b yes" on
@@ -420,8 +450,12 @@ edge) 2.33 × 10⁷/216 × 1.54 = 1.7 × 10⁵; total
 6.2 × 10⁶ nodes, 1.86 × 10⁷ unknowns. LU: 9 × 10⁹ × 6.21^{4/3} × 15.6 B = 1.60 × 10¹² B ≈ 1.45 TiB (the table row uses these unrounded figures).
 
 The AMG column assumes an iterative solver converges on coupled drift-diffusion Newton
-steps. That is not routine, and whether DEVSIM offers one is (unsure). The LU column is the
-safer reading.
+steps. **DEVSIM does offer one** — `solve(solver_type='iterative')` (verified in the 2.11.2
+API, task 0.2, 2026-11-04), so the capability is not in doubt. What is *not* established is
+that an iterative solver **converges** on this particular coupled Newton system at these sizes;
+that is a numerical question for a bench, not an API question. The LU column is therefore still
+the safe reading until such a bench exists, and no downstream figure may claim the AMG column
+until one does.
 
 **Verdict.** Electrostatics, Stark and coupling fit in full 3-D. Drift-diffusion fits as
 axisymmetric (r, z) with junctions resolved, plus a coarse 3-D check (20/30 nm, ≲ 10¹⁶ cm⁻³)
@@ -435,8 +469,14 @@ quotas. The FDTD runs for contact loss (§4) are the existing paper-1 bench on t
 ## 6. Decisions
 
 - Static permittivity is its own per-part input (`eps_static`) and is never derived from the
-  optical index. For InP that is about 12.5 static vs n² ≈ 11.8 at 900 nm **(unsure: fetch
-  both)**, so a silent n² would be wrong. An electrode part may omit it.
+  optical index. For InP the static value is **ε_s = 12.5** and the high-frequency one is
+  **ε∞ = 9.61** (Ioffe/NSM "Semiconductors on NSM", `ioffe.ru/SVA/NSM/Semicond/InP/basic.html`,
+  basic-parameters table, 300 K); paper 1 independently gives the optical index as n = 3.44
+  for wurtzite InP (p. 9), so n² = 11.83. **All three differ**, which is the point: ε_s = 12.5
+  is 5.6 % above n² and 30 % above ε∞, so reading any one as another would be wrong — and a
+  silent n² substitution would understate the static field. An electrode part may omit it.
+  (Vurgaftman, Meyer & Ram-Mohan, J. Appl. Phys. 89, 5815–5875 (2001), doi:10.1063/1.1368156,
+  is the broader III–V parameter compilation if a different alloy is ever needed.)
 - Electrodes are parts held at a potential, and electrode charge comes from the assembled
   residual, so the capacitance matrix is symmetric by construction.
 - Grading is an opt-in keyword on `tetrahedralize`, a per-part target edge built into a
