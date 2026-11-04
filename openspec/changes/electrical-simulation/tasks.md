@@ -235,7 +235,7 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       **Reviewer correction 2026-11-04 (`qitem-20261104052338`):** two figures here were
       MAX tet z-span presented as if typical, and one docstring in the function claimed
       TetGen puts Steiner points on the facets so a tet "never straddles a boundary" --
-      false, and directly contradicting this entry. Both corrected in `a2c6d70`; the
+      false, and directly contradicting this entry. Both corrected in `c1819ea`; the
       correction is recorded rather than silently edited because the false comment was the
       shape of error the 0.2 round kept finding: a true-sounding statement about the wrong
       thing, in the code a maintainer would read when deciding the label is safe.
