@@ -408,6 +408,57 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         answer without an error.
 - [ ] 1.9 First-order Coulomb term, E_X(F), the p/β fit and `scripts/stark_bench.py`. Prove
       its mutations.
+      - **Ruling 2026-11-04 (`qitem-20261104102757`, "2 + 3"): cited endpoints, an
+        ASSUMED interpolation, and a sweep of the well depth. Docstrings first.**
+      - Docstrings fixed: `sawtooth_potential` now states plainly that it adds NO well,
+        so the old "+ well" case was a free particle in the box. (The physics defect:
+        `<z^2>` came back as 95.27 nm^2, the bare-box `L^2(1/12 - 1/(2 pi^2))`, while
+        the docstrings called the carrier a quantum dot.)
+      - `well_depth_eV` / `well_height_nm` threaded through `_potential_grid`,
+        `_ground_state` and `exciton_energy_eV`; `None` keeps today's behaviour.
+      - **Confinement is now measured, not asserted.** `test_a_deep_well_actually_confines_the_state`
+        pins that a bare box reproduces `L^2(1/12 - 1/(2 pi^2))` (52.2762 measured vs
+        52.2764 analytic for L = 40 nm; 4.7049 vs 4.7049 for L = 12 nm) and that a 0.6 eV
+        well narrows `<z^2>` by more than 20x. Mutation: dropping the well makes it fail
+        with `<z^2>` equal to the bare-box value, which is the exact trap.
+      - **Validation on a known answer (finite square well).** The ground state solves
+        `u tan u = sqrt(v0 - u^2)`, `E = u^2 K/(m a^2)`; `test_finite_square_well_recovers_the_bound_state`
+        pins it. Measured errors at 127/255/511 cells: 1.13e-2, 5.30e-3, 2.55e-3.
+      - **Measured convergence order, which is the point of the proof.** O(h^2) on any
+        smooth case -- harmonic 2.04 / 2.14 across 40->80->160->320 cells, reproducing the
+        existing pin; transverse box 1.91 / 1.98 / 1.99 / 2.00. The finite square well is
+        **O(h)**: 1.16 / 1.09 / 1.05 / 1.04. That is correct behaviour, not a defect: a
+        node-sampled step lies between grid points, so the effective well width carries an
+        O(h) error. Recorded here so a later reader does not "fix" it.
+      - *Trap worth keeping:* a barrier mask whose half-width equals the box half-width
+        puts the step on the Dirichlet walls, where the potential value is unused. The
+        solver then silently returns the INFINITE-well energy: measured 0.0734434 against
+        the true 0.0471547, stable at every resolution, so it looks converged. It is not.
+        Any well must be strictly narrower than its box.
+      - *Instrument lesson:* three separate alarms during this proof ("E is 12x too
+        large", "the potential is ignored", "transverse couplings are missing") were all
+        wrong, and each came from comparing numbers produced by DIFFERENT boxes -- a 1-D
+        formula applied to a 3-D box, an analytic transverse term from a different z
+        extent, an elementwise diff on a degenerate pair. Cross-box subtraction is the
+        failure mode here; subtract only within one box family.
+      - **`scripts/stark_bench.py`, the depth sweep (ruling item 3).** Prints, for each
+        well depth, `E_X(0)`, the electron and hole `<z^2>`, `beta`, and the Stark shift
+        at each field. Defaults: depths 0/0.1/0.2/0.3/0.5/0.8 eV, fields 0/0.1/0.2/0.4
+        eV/nm, well height 4 nm, box 12x12x16 nm at 6x6x40 cells. Measured:
+        `beta` = -10.008, -8.601, -6.989, -5.306, -1.985, +0.882 -- it **changes sign**,
+        a 109% swing. `<z^2>` for the hole falls 8.364 (bare box, exactly the analytic
+        value) -> 1.377 -> 1.086 -> 0.987 -> 0.904 -> 0.853 nm^2, so the heavy hole is
+        confined from 0.1 eV up, while at zero depth it is a free particle.
+      - **What the sweep concludes, stated plainly in the bench output:** the p/beta fit
+        is well-defined at every depth, but `beta` is a property of a depth NOBODY HAS
+        MEASURED. A single beta cannot be quoted until the alloy gap is retrieved with a
+        bowing parameter; until then the sweep is the result. This is a NEGATIVE result
+        about the deliverable's headline number, and it is the honest one.
+      - The bench refuses `--height >= --z-extent` with an error naming the
+        infinite-well trap, and refuses a field sweep with no zero point.
+      - `tests/test_stark_bench.py` (7 tests) pins the sweep's discrimination, the
+        bare-box calibration, and the refusals. Mutation: dropping the well from
+        `_potential_grid` fails 3 of them.
 - [ ] 1.10 The paper-1 gate sweep (tier 2): E_X(V) for the wire, recorded with its mesh
       counts and RSS.
 

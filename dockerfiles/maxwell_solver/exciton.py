@@ -110,15 +110,24 @@ class ExcitonResult:
     coulomb_diagnostics: dict
 
 
-def sawtooth_potential(box: _stark.Box, field_eV_per_nm: float) -> np.ndarray:
+def sawtooth_potential(
+    box: _stark.Box,
+    field_eV_per_nm: float,
+    well_depth_eV: float | None = None,
+    well_height_nm: float | None = None,
+) -> np.ndarray:
     """The L1 potential ``-e F z`` on the box's node grid, in eV.
 
     The field is along z. For a POSITIVE field the potential falls along +z, so
-    a carrier of charge -e sees a ramp that pushes it toward +z. The same array
-    is used for both species: the confinement well is symmetric, so the electron
-    and hole spectra are related by ``z -> -z``, and the pair of energies is the
-    same either way. The function returns the potential, and the caller decides
-    which mass goes with it.
+    a carrier of charge -e sees a ramp that pushes it toward +z.
+
+    NO CONFINEMENT WELL IS ADDED. The returned array is ``-F z`` alone, so the
+    "+ well" case is a free particle in the box and its energies and densities
+    describe a delocalised carrier, not a quantum dot. A well depth can be
+    passed separately via ``well_depth_eV``; with the default of None there is
+    none. This is stated here because three docstrings in this module used to
+    describe "the symmetric confinement well" as though this function created
+    one, and it does not.
     """
     if not (isinstance(field_eV_per_nm, (int, float)) and math.isfinite(field_eV_per_nm)):
         raise ExcitonError(f"field must be a finite number, got {field_eV_per_nm!r}")
@@ -127,25 +136,54 @@ def sawtooth_potential(box: _stark.Box, field_eV_per_nm: float) -> np.ndarray:
             f"field must be non-negative; the spectrum is symmetric under "
             f"F -> -F and the fit uses |F|, got {field_eV_per_nm!r}"
         )
-    return _potential_grid(box, field_eV_per_nm)
+    return _potential_grid(box, field_eV_per_nm, well_depth_eV, well_height_nm)
 
 
-def _potential_grid(box: _stark.Box, field_eV_per_nm: float) -> np.ndarray:
-    """``-e F z`` sampled on the box's node grid, shaped like the eigenvectors."""
+def _potential_grid(
+    box: _stark.Box,
+    field_eV_per_nm: float,
+    well_depth_eV: float | None = None,
+    well_height_nm: float | None = None,
+) -> np.ndarray:
+    """``-e F z`` plus an optional symmetric well, on the box's node grid.
+
+    The well is a finite square well of ``well_depth_eV`` filling the box in x
+    and y and extending ``well_height_nm`` along z, centred on the box. Outside
+    it in z the potential is raised by the depth. ``None`` depth means no well:
+    the carrier is free in the box.
+    """
     xs, ys, zs = box.axes()
     # stark's potential is applied as a diagonal in the same flattened order as
     # the eigenvectors, which is meshgrid(..., indexing="ij").ravel().
     X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
-    # A positive field tilts the potential DOWN along +z for the electron and UP
-    # for the hole. Both species get the same V here and the mass carries the
-    # sign-independent part; see exciton_energy_eV for why that is the right
-    # split for a symmetric confinement well.
-    return -field_eV_per_nm * Z
+    V = -field_eV_per_nm * Z
+    if well_depth_eV is not None:
+        if well_height_nm is None:
+            raise ExcitonError(
+                "well_depth_eV needs well_height_nm: the well width is the dot "
+                "height, which is not the box size"
+            )
+        if not (math.isfinite(well_depth_eV) and well_depth_eV > 0):
+            raise ExcitonError(f"well depth must be positive, got {well_depth_eV!r}")
+        if not (math.isfinite(well_height_nm) and well_height_nm > 0):
+            raise ExcitonError(f"well height must be positive, got {well_height_nm!r}")
+        z_mid = 0.5 * (zs[0] + zs[-1])
+        lo = z_mid - 0.5 * well_height_nm
+        hi = z_mid + 0.5 * well_height_nm
+        outside = (Z < lo) | (Z > hi)
+        V = V + np.where(outside, well_depth_eV, 0.0)
+    return V
 
 
-def _ground_state(box: _stark.Box, mass_ratio: float, field_eV_per_nm: float):
+def _ground_state(
+    box: _stark.Box,
+    mass_ratio: float,
+    field_eV_per_nm: float,
+    well_depth_eV: float | None = None,
+    well_height_nm: float | None = None,
+):
     """Ground-state energy and vector of one species in the L1 potential."""
-    V = _potential_grid(box, field_eV_per_nm)
+    V = _potential_grid(box, field_eV_per_nm, well_depth_eV, well_height_nm)
     evals, full = _stark.lowest_states(box, mass_ratio, n_states=1, potential_eV=V)
     return float(evals[0]), full[:, 0], {"n_states": 1, "energy_eV": float(evals[0])}
 
@@ -154,23 +192,35 @@ def exciton_energy_eV(
     material: DotMaterial,
     box: _stark.Box,
     field_eV_per_nm: float,
+    well_depth_eV: float | None = None,
+    well_height_nm: float | None = None,
 ) -> ExcitonResult:
     """``E_X`` at one field: electron + hole ground states + first-order Coulomb.
 
-    The electron and hole see potentials of opposite sign in reality, but the
-    confinement well is symmetric and the two single-particle problems are
-    related by ``z -> -z``. Solving both with the SAME ``V = -eFz`` and the two
-    masses gives the same pair of energies as the physical assignment, because
-    the symmetric well has the same spectrum under reflection. That is stated
-    here because it is a physics assumption, not a coding convenience.
+    The electron and hole see potentials of opposite sign in reality, but when
+    the confinement well is symmetric the two single-particle problems are
+    related by ``z -> -z``. Solving both with the SAME ``V = -eFz + V_well`` and
+    the two masses gives the same pair of energies as the physical assignment,
+    because a symmetric well has the same spectrum under reflection. That is a
+    physics assumption, not a coding convenience, and it holds only while
+    ``well_depth_eV`` describes a well centred on the box.
+
+    With the default ``well_depth_eV=None`` there is NO well: the carrier is
+    free in the box and ``E_X`` is not a quantum-dot energy. Pass a depth to get
+    a confined result, and check ``<z^2>`` against the bare-box value
+    ``L^2 (1/12 - 1/(2 pi^2))`` to see that it actually is confined.
     """
     # Route through the validated helper rather than a bare finite check, so
     # the sign rule cannot be bypassed by this one entry point. Earlier this
     # function checked only finiteness and a negative field silently solved.
-    sawtooth_potential(box, field_eV_per_nm)
+    sawtooth_potential(box, field_eV_per_nm, well_depth_eV, well_height_nm)
 
-    e_e, psi_e, sol_e = _ground_state(box, material.m_e_ratio, field_eV_per_nm)
-    e_h, psi_h, sol_h = _ground_state(box, material.m_h_ratio, field_eV_per_nm)
+    e_e, psi_e, sol_e = _ground_state(
+        box, material.m_e_ratio, field_eV_per_nm, well_depth_eV, well_height_nm
+    )
+    e_h, psi_h, sol_h = _ground_state(
+        box, material.m_h_ratio, field_eV_per_nm, well_depth_eV, well_height_nm
+    )
 
     e_c, diag = _coulomb.coulomb_energy_eV(psi_e, psi_h, box, material.eps_s)
 
@@ -207,12 +257,17 @@ def fit_p_beta(results):
     confining well the potential ``-eFz`` is odd in z, so the spectrum is
     identical at ``+F`` and ``-F`` and the LINEAR Stark term is identically
     zero by symmetry. ``p`` is then not a measured dipole but the small
-    asymmetric residue of the fit, and on the paper-1 dot it comes out as a
-    large number that is pure conditioning artefact: measured here as
-    ``E(+F) - E(-F) = -4.7e-12 eV`` at F = 0.01 eV/nm, i.e. zero to rounding.
+    asymmetric residue of the fit, and it comes out as a large number that is
+    pure conditioning artefact: measured here as ``E(+F) - E(-F) = -4.7e-12 eV``
+    at F = 0.01 eV/nm, i.e. zero to rounding.
     The fit is kept because the paper asks for the p/beta form and a real dot
     is not perfectly symmetric, but a caller reporting ``p`` for a symmetric
     dot is reporting noise. :func:`beta_low_field` is the stable estimator.
+
+    That symmetry figure was measured with NO confining well present, where the
+    box potential is symmetric trivially. It has NOT been re-measured with a
+    well, and passing ``well_depth_eV`` is the correct way to make the premise
+    true rather than assumed.
     """
     seq = list(results)
     zeros = [r for r in seq if r.field_eV_per_nm == 0.0]
