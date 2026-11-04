@@ -196,8 +196,8 @@ Why these and not more:
 
 | option | 3-D | open | fit for us |
 |---|---|---|---|
-| **DEVSIM** (Sanchez, "DEVSIM: A TCAD Semiconductor Device Simulator", J. Open Source Softw. 7(70), 3898 (2022), doi:10.21105/joss.03898; devsim.org) | yes, tetrahedra | Apache-2.0; wheels for x86_64 **and aarch64** Linux (v2.11.2: `manylinux_2_27_x86_64` and `manylinux_2_26_aarch64.manylinux_2_28_aarch64`, verified on PyPI) | Scharfetter-Gummel, SRH, transient, Python API; **direct documented** (MKL PARDISO / UMFPACK); an iterative path is declared and compiled in but undocumented and unrun by us, plus bundled UMFPACK. All open questions settled 2026-11-04 (§2) |
-| Sesame (NIST; Gaury, Sun, Bermel & Haney, "Sesame: A 2-dimensional solar cell modeling tool", Sol. Energy Mater. Sol. Cells 198, 53–62 (2019)) | no (1-D/2-D only, per the title "2-dimensional") | open | no 3-D cross-check |
+| **DEVSIM** (Sanchez, "DEVSIM: A TCAD Semiconductor Device Simulator", J. Open Source Softw. 7(70), 3898 (2022), doi:10.21105/joss.03898; devsim.org) | yes, tetrahedra | Apache-2.0; wheels for x86_64 **and aarch64** Linux (v2.11.2: `manylinux_2_27_x86_64` and `manylinux_2_26_aarch64.manylinux_2_28_aarch64`, verified on PyPI) | Scharfetter-Gummel, SRH, transient, Python API; **direct documented** (MKL PARDISO / UMFPACK); an iterative path is declared and compiled in but undocumented and unrun by us, plus bundled UMFPACK. On aarch64 there is no MKL, so UMFPACK is the direct solver **and the manual warns that FPE checking is disabled on arm64 during direct solves** — worth watching on any Jetson bench. All open questions settled 2026-11-04 (§2) |
+| Sesame (NIST; Gaury, Sun, Bermel & Haney, "Sesame: A 2-dimensional solar cell modeling tool", Sol. Energy Mater. Sol. Cells 198, 53–62 (2019)) | no (1-D/2-D only, from the code: `sesame/builder.py` assigns `dimension` 1 or 2 and nothing else, and the arXiv abstract says "1 and 2-dimensional systems" — read 2026-11-04; the README's "multi-dimensional" overstates the tool) | open | no 3-D cross-check |
 | own SG on scikit-fem / FEniCSx | yes | open | we would write and validate the SG stabilisation and Newton ourselves: the most risk |
 | Charon (Sandia, Trilinos) | yes | open | heavy C++/MPI build, more than one Job needs |
 | nextnano, Sentaurus, Silvaco | yes | commercial | a reference, not a dependency |
@@ -286,8 +286,10 @@ conductor part of the upload, not only a contact; paper 1's gate is one fixture.
    design's 10¹⁸ cm⁻³ is inside that valid range). What can be stated without a paywalled
    number is the standard n-type scaling α = C·N·λ²: the design's 10–30 cm⁻¹ at 10¹⁸ cm⁻³ and
    0.9 µm implies C ≈ 1.2–3.7 × 10⁻¹⁷, whereas the coefficient usually quoted for InP FCA is
-   order 10⁻¹⁸, which would give α ≈ 1–3 cm⁻¹. **So the quoted range is probably pessimistic,
-   not optimistic** — the true Q_fca is likely higher still.
+   order 10⁻¹⁸, which would give α ≈ 1–3 cm⁻¹. **So the quoted loss is probably too pessimistic**:
+   the literature coefficient gives a *smaller* α, hence a *larger* Q_fca and a *wider* margin
+   than the estimate below. The estimate is safe in the direction that matters — Q_fca is not
+   overstated.
    Either way the conclusion is unchanged and is stated as an estimate: Q_fca ≈ 8 × 10³ – 2.4
    × 10⁴ is far above 214, so FCA is negligible next to the cavity's own loss. The margin is
    114× at the low end of the range, and FCA only rivals the cavity at α ≈ 1.1 × 10³ cm⁻¹
