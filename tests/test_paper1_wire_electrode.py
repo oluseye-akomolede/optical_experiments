@@ -124,6 +124,30 @@ def test_mesh_covers_all_four_layers(coarse_mesh):
         assert (region == i).sum() > 0, f"no tets in layer {name!r}"
 
 
+def test_tets_straddle_layer_boundaries(coarse_mesh):
+    # The labelling is per centroid, so it is only exact if no element spans a
+    # boundary. It is NOT exact: this is one solid with no internal facets, so
+    # TetGen spans elements across the layer planes. Pinning straddle > 0 is
+    # what stops a future reader (or a future "the label is exact" comment)
+    # from assuming the label is safe. If this ever fails because the mesher
+    # gained internal facets, that is good news: revisit the UNVALIDATED status
+    # in the module docstring rather than deleting the test.
+    s = F.straddle_counts(coarse_mesh)
+    assert s["n_tets"] > 0
+    assert s["n_straddle"] > 0, (
+        "no tet straddles a layer boundary; if the mesher now constrains to "
+        "internal facets, the fixture may be mesh-convergent -- re-measure "
+        "the spread in test_the_field_is_not_converged_in_the_mesh")
+    # Both oxide faces are crossed, so the effect is on the layer that matters.
+    # Boundaries sit near 120 nm and at 132 nm (mirror 120 + oxide 12). Keys are
+    # float nm out of the dict, so match with a tolerance rather than ==.
+    crossings = s["per_boundary_nm"]
+    near = lambda target: [n for z, n in crossings.items() if abs(z - target) < 0.5]  # noqa: E731
+    assert near(120.0) and near(120.0)[0] > 0, crossings
+    assert near(132.0) and near(132.0)[0] > 0, crossings
+    assert 0.0 < s["fraction"] < 1.0
+
+
 def test_region_ids_are_integers_into_parts(coarse_mesh):
     region = np.asarray(coarse_mesh["region_of_tet"])
     assert region.dtype.kind == "i"

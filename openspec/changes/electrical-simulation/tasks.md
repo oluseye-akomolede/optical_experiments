@@ -213,20 +213,36 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       both ε_s values are still marked unsure, and 0.2 says no test quotes an unsure value.
 - [x] 1.6b The paper-1 wire with a top electrode, as a bench fixture labelled UNVALIDATED
       until compared with paper 1. Built at `scripts/paper1_wire_electrode.py` with
-      `tests/test_paper1_wire_electrode.py` (14 tests). Same placement and shape as its
+      `tests/test_paper1_wire_electrode.py` (15 tests). Same placement and shape as its
       sibling `scripts/paper1_nanowire.py`, which is also a standalone bench script, not
       solver-package code: the "not `scripts/`" note in 1.6 history below is about the
       ELECTROSTATICS fixtures (slab/spheres), which are imported by the solver package and
       run in the container. This one is a bench that stands on its own.
       **The fixture's headline result is a NEGATIVE, and it is measured.** The 12 nm oxide
       inside a 1567 nm stack cannot be resolved by any mesh the current one-part path can
-      build: tet z-span falls only as ~n^(-1/3) (110 nm at n_modes 20, 52 nm at 200 = 153k
-      tets, still 4x the oxide), and |E| at the probe moves **40.1 %** and NOT monotonically
-      across n_modes 20/60/120 (557, 780, 690 kV/m per volt). Tets STRADDLE the layer
-      boundaries, so the per-centroid layer labels are applied to elements whose
+      build: tet z-span falls only as ~n^(-1/3), and the SPREAD is wide -- at n_modes 200
+      (153k tets) the MEDIAN element spans 20.4 nm in z and the WORST spans 51.7 nm (at
+      n_modes 20 the worst is 110.4 nm), so even the median is 1.7x the oxide. |E| at the
+      probe moves **40.1 %** and NOT monotonically across n_modes 20/60/120 (557, 780, 690
+      kV/m per volt). Tets STRADDLE the layer boundaries -- measured at n_modes 20, 1064 of
+      9775 tets (10.9 %), with 555 crossing z=120 nm and 544 crossing z=132 nm -- so the
+      per-centroid layer labels are applied to elements whose
       permittivity is not uniform -- that, not the physics, is what moves. **No field value
       from this fixture is quotable**, and the script and its tests say so (`--convergence`
-      prints the spread; `test_the_field_is_not_converged_in_the_mesh` pins it).
+      prints the spread; `test_the_field_is_not_converged_in_the_mesh` pins it, and
+      `test_tets_straddle_layer_boundaries` pins the straddle count so the claim cannot
+      drift back to "the label is exact").
+      **Reviewer correction 2026-11-04 (`qitem-20261104052338`):** two figures here were
+      MAX tet z-span presented as if typical, and one docstring in the function claimed
+      TetGen puts Steiner points on the facets so a tet "never straddles a boundary" --
+      false, and directly contradicting this entry. Both corrected in `a2c6d70`; the
+      correction is recorded rather than silently edited because the false comment was the
+      shape of error the 0.2 round kept finding: a true-sounding statement about the wrong
+      thing, in the code a maintainer would read when deciding the label is safe.
+      A fifth control (field falls when the top electrode is withdrawn) is **GONE, not
+      merely disabled**: it needed two-part input, which wall (a) does not permit. Do not
+      rebuild it here. It becomes worth filing when `mse_meshing` gains internal facets or a
+      graded electrical upload -- the same condition that unblocks walls (a) and (b).
       Two walls, both measured, neither fixable in this file: (a) `PartSet` refuses touching
       parts and requires one part to enclose all others, so the four layers cannot be four
       parts (a 12 nm oxide cannot enclose a 1375 nm wire); (b) `sizing=` is REFUSED on a

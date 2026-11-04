@@ -57,18 +57,22 @@ mesh**, so it cannot be a gate for anything. Driving the only lever the one-part
 mesher exposes (``n_modes``) from 20 to 120 changes ``|E|`` at the probe by
 **40.1 %** and NOT monotonically (557, 780, 690 kV/m per volt). The cause is a
 12 nm oxide inside a 1567 nm stack: every element must span both a 1375 nm wire
-and a 12 nm layer, and the tet z-span only falls as roughly ``n^-1/3`` --
-measured 110 nm at ``n_modes=20``, 52 nm at 200 (153k tets), still 4x the oxide.
-Resolving the oxide would need on the order of 10^6 tets, past tier 1 and past
-this rig's memory cap.
+and a 12 nm layer, and the tet z-span only falls as roughly ``n^-1/3``. The
+z-span spread is wide, so both ends of it matter: at ``n_modes=200`` (153k tets)
+the MEDIAN element spans 20.4 nm in z while the WORST spans 51.7 nm (at
+``n_modes=20`` the worst is 110.4 nm). Even the median is 1.7x the oxide and the
+worst 4.3x, so resolution alone does not reach 12 nm; doing so would need on the
+order of 10^6 tets, past tier 1 and past this rig's memory cap.
 
 A single closed solid is used because it is the ONLY shape that reaches the
 mesher: :class:`mse_parts.PartSet` refuses touching parts and requires one part
 to enclose all others, and ``sizing=`` is refused on a one-part upload. So the
 graded layered mesh this device needs has no path in the current mesher. Every
 layer is labelled by the z of the tet's centroid, and at these resolutions tets
-STRADDLE the layer boundaries (measured: a tet spanning 175 nm across a 12 nm
-oxide), so the labels are applied to elements whose permittivity is not uniform.
+STRADDLE the layer boundaries (measured: at ``n_modes=20``, 1064 of 9775 tets,
+10.9 %, cross z=120 nm or z=132 nm; a worst-case element has a 175 nm diagonal
+spanning a 12 nm oxide), so the labels are applied to elements whose permittivity
+is not uniform.
 That, and not the physics, is what moves with resolution.
 
 What this fixture therefore establishes, and what it does not:
@@ -216,10 +220,15 @@ def stacked_solid_with_labels():
     field at the pad edge; it does not change which tets are "wire", because
     layers are separated by z, not by outline.
 
-    Each tet is labelled by the layer its centroid falls in. That is exact:
-    every boundary is a plane at a known z, and TetGen puts Steiner points on
-    the facets, so a tet lies in one layer or the other and never straddles a
-    boundary.
+    Each tet is labelled by the layer its centroid falls in. The boundary
+    planes are at known z, but **the mesh is not constrained to them**: this is
+    a single solid with no internal facets, so TetGen is free to span an element
+    across a boundary and the centroid then assigns the whole element to one
+    layer. It does happen, and it is measured, not assumed -- at ``n_modes=20``
+    about 10.9 % of tets straddle (see :func:`straddle_counts` and
+    ``test_tets_straddle_layer_boundaries``). The label is therefore applied to
+    elements whose permittivity is not uniform, which is why the field this
+    fixture reports is not converged.
     """
     radius = circumradius_nm() * NM
     zs = [
@@ -279,6 +288,43 @@ def stacked_solid_with_labels():
         return out
 
     return solid, label_fn, zs, labels
+
+
+def straddle_counts(mesh: dict) -> dict:
+    """Measure how many tets cross a layer boundary, and by how much.
+
+    The labelling in :func:`stacked_solid_with_labels` is per centroid, which
+    is only exact if no element spans a boundary. This is the measurement that
+    shows it does: an element "straddles" when its vertex z-values fall on both
+    sides of a boundary plane.
+
+    Returns the total, the straddling count and fraction, and per-boundary
+    crossings, plus the widest z-span and the widest diagonal span overall.
+    """
+    solid, _label_fn, zs, _labels = stacked_solid_with_labels()
+    pts = np.asarray(mesh["points_m"], dtype=np.float64)
+    tets = np.asarray(mesh["tets"])
+    z = pts[tets][:, :, 2]
+    zlo, zhi = z.min(axis=1), z.max(axis=1)
+    # Interior boundary planes only; the outer faces are not boundaries.
+    inner = np.asarray(zs[1:-1], dtype=np.float64)
+    straddles = (zlo[:, None] < inner[None, :]) & (zhi[:, None] > inner[None, :])
+    n = int(tets.shape[0])
+    n_straddle = int(np.any(straddles, axis=1).sum())
+    span_z = zhi - zlo
+    # Full diagonal extent of each element's bounding box.
+    ext = pts[tets].max(axis=1) - pts[tets].min(axis=1)
+    diag = np.linalg.norm(ext, axis=1)
+    return {
+        "n_tets": n,
+        "n_straddle": n_straddle,
+        "fraction": (n_straddle / n) if n else 0.0,
+        "per_boundary_nm": {float(b / NM): int(straddles[:, i].sum())
+                            for i, b in enumerate(inner)},
+        "span_z_median_nm": float(np.median(span_z) / NM),
+        "span_z_max_nm": float(span_z.max() / NM),
+        "diag_max_nm": float(diag.max() / NM),
+    }
 
 
 def footprint_error():
