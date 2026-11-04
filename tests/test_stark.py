@@ -110,8 +110,19 @@ def test_laplacian_is_positive_semidefinite():
 
     The first version of this module had the DIAGONAL's sign flipped, giving a
     spectrum from -2t to 0: every energy negative, which is impossible for a
-    kinetic operator alone. The analytic tests' tolerances were loose enough to
-    let it through; this check catches it in one line.
+    kinetic operator alone.
+
+    Reproduced 2026-11-04 against THIS commit: setting ``main = -2.0 * t`` in
+    ``laplacian_1d_eV_nm2`` (stark.py:366, the 1-D operator these tests use --
+    NOT the 3-D ``build_laplacian_eV_nm2``) fails 7 of 16, including all four
+    analytic tests. Note the 1-D operator is a separate function from the 3-D
+    builder; mutating the 3-D diagonal does nothing to these tests, which is why
+    the first three attempts at this mutation appeared to change nothing.
+
+    (An earlier version of this docstring said the analytic tests' tolerances
+    were loose enough to let it through. That is false at this commit. What I
+    had seen was a looser intermediate ``harmonic`` on a coarse box, not these
+    tests. Corrected 2026-11-04.)
     """
     L = S.laplacian_1d_eV_nm2(21, 0.5)
     ev = np.linalg.eigvalsh(L.toarray())
@@ -190,9 +201,19 @@ def test_field_approaches_the_parallel_plate_value_under_refinement():
     It does NOT sit on the 1-D value, and the gap is not solver error: a 4 um
     box with a 0.6 um gap is not a parallel-plate capacitor, and the fringing
     field converges inward as the mesh resolves it. Measured error 14.28% ->
-    9.96% -> 8.79% at n_modes 8/16/30, and a NARROWER 1.2 um box is worse
-    (21.85%), which is the signature of fringing rather than of a bad
-    operator: a solver defect would not improve with refinement.
+    9.96% -> 8.79% at n_modes 8/16/30.
+
+    The evidence that this is fringing and not a bad operator is that the error
+    FALLS MONOTONICALLY UNDER REFINEMENT at fixed geometry. A defective operator
+    would not improve as the mesh resolves.
+
+    Do NOT claim "a narrower box is worse". That was measured here once (21.85%)
+    and it does not reproduce: at a fixed 0.2 um gap a 1.2 um box gives 8.98% and
+    a 4 um box gives 10.54%, i.e. the narrower box is BETTER. Confirmed
+    independently by the reviewer at the committed helper, which refuses
+    extent_m=1.2e-7 with gap 0.6e-7 outright ("part(s) body have no tets"). Box
+    size is not monotone because the mesh resolution also changes with it, so
+    there is no single "narrower is worse" law to cite.
 
     The test therefore asserts the convergence DIRECTION and a bound, because
     a tolerance on a single value cannot distinguish the two explanations.

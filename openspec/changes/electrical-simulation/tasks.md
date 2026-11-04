@@ -359,17 +359,31 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         wrong one that happens to be close; the order can. `test_stark.py` is 16 tests.
       - *Sign of the Laplacian was wrong on the first attempt* (diagonal `-2t` instead of
         `+2t`), giving a spectrum from -2t to 0: every energy negative, which a kinetic
-        operator alone cannot produce. The analytic tests passed anyway -- their
-        tolerances were loose enough -- and `test_laplacian_is_positive_semidefinite`
-        caught it in one line. Mutation-tested: flipping the diagonal back fails 7 tests.
+        operator alone cannot produce. Reproduced against this commit: `main = -2.0 * t` in
+        `laplacian_1d_eV_nm2` (the 1-D operator the analytic tests use, NOT the 3-D
+        `build_laplacian_eV_nm2`) fails 7 of 16, all four analytic tests among them.
+        `test_laplacian_is_positive_semidefinite` catches it in one line.
+        *Corrected 2026-11-04:* an earlier version of this note claimed "the analytic
+        tests passed anyway -- their tolerances were loose enough". That is false at
+        this commit and the reviewer showed it by running the mutation. What I had
+        actually observed was a looser intermediate `harmonic` on a coarse box, not the
+        committed tests; I generalised a transient observation into a property of the
+        record. The committed tests are tight enough to catch the sign error.
       - *Particle-in-a-box formula:* the correct value is `K(pi/L)^2`, where `K` is already
         `hbar^2/2m`, NOT `pi^2 K / (2 L^2)`. The wrong formula gives exactly half, a ratio
         of 2.0000 that does not move with the grid -- which is how it was distinguished
         from a discretisation error (that would converge away). Measured ratio 0.99998.
       - *Parallel-plate field is NOT hit exactly, and that is correct physics.* On the axis
-        at 4 um x 4 um x 0.4 um the error is 14.28% / 9.96% / 8.79% at n_modes 8/16/30,
-        converging toward -1/d. A 1.2 um box is WORSE (21.85%), the signature of fringing
-        rather than of a solver defect: a bad operator would not improve with refinement.
+        at 4 um x 4 um x 0.6 um (the gap is 0.6 um; an earlier note said 0.4 um, which was
+        wrong) the error is 14.28% / 9.96% / 8.79% at n_modes 8/16/30, converging toward
+        -1/d. The evidence for fringing rather than a solver defect is that the error falls
+        monotonically under refinement at fixed geometry; a bad operator would not improve.
+        *Corrected 2026-11-04:* an earlier note claimed "a 1.2 um box is WORSE (21.85%)" and
+        offered that as the decisive signature. It does not reproduce. At a fixed 0.2 um gap
+        a 1.2 um box gives 8.98% and a 4 um box 10.54% -- the narrower box is BETTER -- and
+        the 1.2 um / 0.6 um case the helper would need is refused outright ("body have no
+        tets"). Box size is not monotone because mesh resolution changes with it. The
+        21.85% is withdrawn, not explained.
         The test asserts the convergence direction and a bound, not a single value.
       - *V/m -> eV/nm is `* 1e-9` and nothing else.* A volt across a nanometre is 1 eV/nm
         because the electron charge cancels between the volt and the electron-volt.
