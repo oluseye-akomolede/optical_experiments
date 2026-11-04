@@ -351,8 +351,61 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         measurements do not support. Removed. The VM four-point run that found no usable
         model is kept in §5 as the reason a wider range was needed.
 
-- [ ] 1.8 `stark.py`: the 7-point effective-mass operator on a Cartesian box, LOBPCG, the
+- [x] 1.8 `stark.py`: the 7-point effective-mass operator on a Cartesian box, LOBPCG, the
       field interpolated from the tet solve. Harmonic-oscillator and Airy checks.
+      - *Both analytic cases proven by MEASURED CONVERGENCE ORDER, not tolerance:*
+        harmonic 2.00 / 1.99 across 160->320->640 cells, Airy 2.00 / 2.00 across
+        240->480->960. A tolerance cannot tell a correct second-order operator from a
+        wrong one that happens to be close; the order can. `test_stark.py` is 16 tests.
+      - *Sign of the Laplacian was wrong on the first attempt* (diagonal `-2t` instead of
+        `+2t`), giving a spectrum from -2t to 0: every energy negative, which a kinetic
+        operator alone cannot produce. Reproduced against this commit: `main = -2.0 * t` in
+        `laplacian_1d_eV_nm2` (the 1-D operator the analytic tests use, NOT the 3-D
+        `build_laplacian_eV_nm2`) fails 7 of 16, all four analytic tests among them.
+        `test_laplacian_is_positive_semidefinite` catches it in one line.
+        *Corrected 2026-11-04:* an earlier version of this note claimed "the analytic
+        tests passed anyway -- their tolerances were loose enough". That is false at
+        this commit and the reviewer showed it by running the mutation. What I had
+        actually observed was a looser intermediate `harmonic` on a coarse box, not the
+        committed tests; I generalised a transient observation into a property of the
+        record. The committed tests are tight enough to catch the sign error.
+      - *Particle-in-a-box formula:* the correct value is `K(pi/L)^2`, where `K` is already
+        `hbar^2/2m`, NOT `pi^2 K / (2 L^2)`. The wrong formula gives exactly half, a ratio
+        of 2.0000 that does not move with the grid -- which is how it was distinguished
+        from a discretisation error (that would converge away). Measured ratio 0.99998.
+      - *Parallel-plate field is NOT hit exactly, and that is correct physics.* On the axis
+        at 4 um x 4 um x 0.6 um (the gap is 0.6 um; an earlier note said 0.4 um, which was
+        wrong) the error is 14.28% / 9.96% / 8.79% at n_modes 8/16/30, converging toward
+        -1/d. The evidence for fringing rather than a solver defect is that the error falls
+        monotonically under refinement at fixed geometry; a bad operator would not improve.
+        *Corrected 2026-11-04:* an earlier note claimed "a 1.2 um box is WORSE (21.85%)" and
+        offered that as the decisive signature. It does not reproduce and is withdrawn, not
+        explained.
+        *Corrected again 2026-11-04:* the replacement pair (1.2 um 8.98% vs 4 um 10.54%, then
+        labelled "a fixed 0.2 um gap") was also wrong and is deleted rather than replaced. The
+        reviewer found their own helper holds the top and bottom 0.6 um at fixed potential, so
+        the gap is extent - 1.2 um and CHANGES with the box. Measured gaps: 1.2 um box ->
+        1.08 um, 4 um box -> 3.88 um. A cross-box comparison at "fixed gap" is comparing two
+        different geometries.
+        *Corrected a third time, same day:* the note that replaced it stood on a refusal, and
+        the refusal was for the wrong box. The helper refuses extent_m=1.2e-7 (0.12 um) with
+        n_modes 8/16, and that refusal is gone by 0.2 um (solved, gap 80 nm) and at 1.2 um
+        (solved, 112/167 electrode tets). "1.2e-7 m is the 1.2 um box" was a factor-of-ten
+        error of the same kind as the pair it replaced, and the 4 um gap is 3.88 um, not 2.8.
+        Resolved by dropping the refusal sentence entirely, not by re-quoting a boundary.
+        Nothing is now claimed here about box size in either direction: the error falls
+        monotonically under refinement at fixed geometry, and that is all.
+        The test asserts the convergence direction and a bound, not a single value.
+      - *V/m -> eV/nm is `* 1e-9` and nothing else.* A volt across a nanometre is 1 eV/nm
+        because the electron charge cancels between the volt and the electron-volt.
+        Dividing by `e` as well (the obvious-looking mistake) gives a spectrum in the
+        millions of eV. End-to-end measured error 1.3e-4.
+      - *The field sign is asserted, not discarded.* A sign flip in `field_on_grid` was
+        caught by only ONE test while the end-to-end check took `abs()`; it now asserts
+        `E_z < 0` before entering the Airy case, and two tests catch the mutation.
+      - *A `Box` takes CELLS per axis (`n`), so it has `n + 1` nodes;* `lowest_states_1d`
+        takes NODES. Passing one where the other belongs shifts the walls and changes the
+        answer without an error.
 - [ ] 1.9 First-order Coulomb term, E_X(F), the p/β fit and `scripts/stark_bench.py`. Prove
       its mutations.
 - [ ] 1.10 The paper-1 gate sweep (tier 2): E_X(V) for the wire, recorded with its mesh
