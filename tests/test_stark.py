@@ -213,18 +213,20 @@ def test_field_approaches_the_parallel_plate_value_under_refinement():
 
     Note what _slab_solution actually does before comparing across box sizes:
     it holds the top and bottom 0.6 um at fixed potential (see its docstring),
-    so the gap is extent_m - 1.2 um and it CHANGES WITH THE BOX. A 1.2 um box
-    has a 1.08 um gap; a 4 um box has 2.8 um. Any "fixed gap" cross-box
+    so the gap is extent_m - 1.2 um and it CHANGES WITH THE BOX. Measured
+    gaps: 1.2 um box -> 1.08 um, 4 um box -> 3.88 um. Any "fixed gap" cross-box
     comparison is therefore measuring two different geometries, not two box
     sizes. An earlier pair here (1.2 um 8.98% vs 4 um 10.54%) was labelled
     "fixed 0.2 um gap" and was wrong on both counts -- the electrode was 0.6 um
     -- and has been removed rather than replaced with another unverified pair.
 
-    No cross-box-size claim is needed for this test's conclusion. What kills
-    "narrower is worse" without any number is that the helper refuses an
-    overlapping configuration outright: at extent_m=1.2e-7 with a 0.6e-7
-    electrode the body has no tets and solve raises, so the claim is not even
-    well-posed at small boxes.
+    Nothing is claimed here about box size in either direction, and no refusal
+    is quoted to prop that up. An earlier version of this note said the helper
+    refuses an overlapping configuration at extent_m=1.2e-7 and called that "the
+    1.2 um box"; 1.2e-7 m is 0.12 um, and the refusal is gone by 0.20 um. The
+    sentence was mis-sized by a factor of ten in the same way as the pair it
+    replaced. The honest position needs no boundary: box size is simply not
+    measured here.
 
     The test therefore asserts the convergence DIRECTION and a bound, because
     a tolerance on a single value cannot distinguish the two explanations.

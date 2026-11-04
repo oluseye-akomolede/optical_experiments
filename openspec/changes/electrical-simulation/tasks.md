@@ -380,16 +380,21 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         monotonically under refinement at fixed geometry; a bad operator would not improve.
         *Corrected 2026-11-04:* an earlier note claimed "a 1.2 um box is WORSE (21.85%)" and
         offered that as the decisive signature. It does not reproduce and is withdrawn, not
-        explained. The helper refuses the configuration the claim would need ("body have no
-        tets"), which refutes it without quoting any refinement level.
+        explained.
         *Corrected again 2026-11-04:* the replacement pair (1.2 um 8.98% vs 4 um 10.54%, then
         labelled "a fixed 0.2 um gap") was also wrong and is deleted rather than replaced. The
         reviewer found their own helper holds the top and bottom 0.6 um at fixed potential, so
-        the gap is extent - 1.2 um and CHANGES with the box: 1.08 um at 1.2 um extent, 2.8 um
-        at 4 um. A cross-box comparison at "fixed gap" is comparing two different geometries.
-        No cross-box-size claim is made here now. It is not needed: short of a re-measured
-        sweep with its own committed helper, the honest statement is that the error falls
-        monotonically under refinement at fixed geometry, and nothing is claimed about box size.
+        the gap is extent - 1.2 um and CHANGES with the box. Measured gaps: 1.2 um box ->
+        1.08 um, 4 um box -> 3.88 um. A cross-box comparison at "fixed gap" is comparing two
+        different geometries.
+        *Corrected a third time, same day:* the note that replaced it stood on a refusal, and
+        the refusal was for the wrong box. The helper refuses extent_m=1.2e-7 (0.12 um) with
+        n_modes 8/16, and that refusal is gone by 0.2 um (solved, gap 80 nm) and at 1.2 um
+        (solved, 112/167 electrode tets). "1.2e-7 m is the 1.2 um box" was a factor-of-ten
+        error of the same kind as the pair it replaced, and the 4 um gap is 3.88 um, not 2.8.
+        Resolved by dropping the refusal sentence entirely, not by re-quoting a boundary.
+        Nothing is now claimed here about box size in either direction: the error falls
+        monotonically under refinement at fixed geometry, and that is all.
         The test asserts the convergence direction and a bound, not a single value.
       - *V/m -> eV/nm is `* 1e-9` and nothing else.* A volt across a nanometre is 1 eV/nm
         because the electron charge cancels between the volt and the electron-volt.
