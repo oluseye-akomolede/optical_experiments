@@ -250,6 +250,36 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       made the first bench blind to a wrong eps.
 - [ ] 1.7 Measure the per-node memory of both solve paths from the bench RSS, replace the
       `design.md` §5 estimates with the measured figures, and wire `budget=` refusals.
+      **PARTIAL — the refusal half is done and proven; the measurement is blocked.**
+      - *Done:* `estimate_memory()`, `check_budget()` and `solve_memory()`, wired into
+        `solve(..., budget=)`. The check runs BEFORE `assemble_stiffness`, not before the
+        factorisation — assembly is the first big allocation, so a later check would spend
+        the memory it protects. `EstimateError` subclasses `MemoryError` (that is the failure
+        it stands in for) and the message names the estimate, the budget, the path and the
+        "coarser mesh" lever. `budget=None` skips the check rather than reading this
+        process: the module runs on the control plane and the solve runs elsewhere, so a
+        figure read here is the wrong device's — the same reason `fdtd.NO_DEVICE` exists.
+      - *Mutations, three, each caught by a different test:* forcing `budget=None` inside
+        `solve()` (caught by the end-to-end refusal test and by nothing else — recorded,
+        because a check that only one test notices is thin); making `check_budget` never
+        refuse (caught by 2); hardcoding `path="direct"` (caught by the path-choice test).
+      - *Measured on the VM, four sizes, direct path:* 1.9k/6.1k/14.4k/27.9k free unknowns
+        grew 11.1/32.0/122.5/343.8 MiB. **Per-unknown rate is not constant** (6.2 → 12.9 kB);
+        a power law misses its worst point by 33.8 %, linear-through-origin by 116.5 %.
+        Neither fits, so `solve_memory_bench.py` prints `usable model: NONE` and no figure
+        was adopted. Recorded in `design.md` §5 under "The per-node law is open".
+      - *BLOCKED:* the Jetson. DNS resolves `sigma-jetson.taildfdd3b.ts.net` to
+        100.74.195.113; from `controlplane` (up, reachable) 0/2 pings answered and every
+        ssh path (`ProxyJump`, direct) dies at "Connection timed out during banner
+        exchange". So the ≥3 sizes per path at product scale, and the AMG path "big enough
+        to pick naturally", could not be run. `UNMEASURED_BYTES_PER_UNKNOWN` therefore still
+        holds the guesses, and `estimate_memory()` returns `measured: False`, which the
+        refusal message renders as "estimated:". When the Jetson returns, one command
+        produces the table:
+        `ulimit -v 5000000; nice -n 10 timeout 30m python solve_memory_bench.py`.
+      - *Not done, and deliberately:* no numbers in `design.md` §5's tables were replaced.
+        Writing a measured figure that was not measured is the one thing this task exists
+        to prevent.
 - [ ] 1.8 `stark.py`: the 7-point effective-mass operator on a Cartesian box, LOBPCG, the
       field interpolated from the tet solve. Harmonic-oscillator and Airy checks.
 - [ ] 1.9 First-order Coulomb term, E_X(F), the p/β fit and `scripts/stark_bench.py`. Prove

@@ -1045,3 +1045,117 @@ def test_field_at_refuses_a_point_inside_an_electrode():
     # Half a plate thickness in from the bottom face, at the centre of the box.
     with pytest.raises(ValueError, match="electrode"):
         E.field_at(result, [1e-4, 1e-4, 0.5 * z0])
+
+
+# ---------------------------------------------------------------------------
+# Task 1.7: the memory estimate and the budget refusal
+# ---------------------------------------------------------------------------
+
+def test_estimate_picks_the_path_solve_would_take():
+    """The estimate must model the path that will actually run.
+
+    Both branches are checked and they must pick DIFFERENT paths, so a mutation
+    that hardcodes one path fails on the other rather than passing on both.
+    """
+    below = E.estimate_memory(E.AMG_NODE_CROSSOVER - 1)
+    above = E.estimate_memory(E.AMG_NODE_CROSSOVER + 1)
+    assert below["path"] == "direct"
+    assert above["path"] == "amg"
+    # Forcing a path overrides the crossover, as it does in solve().
+    assert E.estimate_memory(10, method="amg")["path"] == "amg"
+    assert E.estimate_memory(E.AMG_NODE_CROSSOVER * 10, method="direct")["path"] == "direct"
+
+
+def test_estimate_scales_with_the_free_node_count():
+    """Doubling the unknowns doubles the estimate, and held nodes cost nothing.
+
+    The second half is the reason the check takes ``n_free`` rather than the node
+    count: a mesh whose electrodes are most of its nodes would otherwise be
+    refused for memory it never allocates.
+    """
+    one = E.estimate_memory(10**5)["bytes"]
+    two = E.estimate_memory(2 * 10**5)["bytes"]
+    assert two == pytest.approx(2 * one, rel=1e-12)
+    assert E.estimate_memory(0)["bytes"] == 0.0
+
+
+def test_unmeasured_rates_are_flagged_as_estimates():
+    """A refusal built on an estimate must say so; only a supplied table is measured.
+
+    This is the flag that keeps this change honest: task 1.7's measurement has
+    not landed, so every figure the product reports today is an estimate, and the
+    message says "estimated" until it is replaced.
+    """
+    assert E.estimate_memory(10**5)["measured"] is False
+    table = {"direct": 1e3, "amg": 1e3}
+    assert E.estimate_memory(10**5, method="direct",
+                             bytes_per_unknown=table)["measured"] is True
+
+
+def test_budget_refusal_names_both_the_estimate_and_the_budget():
+    """The message has to carry the numbers, or a person cannot act on it."""
+    est = E.estimate_memory(10**6, method="direct")
+    budget = est["bytes"] / 2.0
+    with pytest.raises(E.EstimateError) as caught:
+        E.check_budget(est, budget=budget)
+    msg = str(caught.value)
+    # Both figures, in the same units, and the mesh lever that would fix it.
+    assert "GiB" in msg and msg.count("GiB") >= 2
+    assert "coarser mesh" in msg
+    # It is a MemoryError, because that is the failure it is standing in for.
+    assert isinstance(caught.value, MemoryError)
+
+
+def test_budget_under_the_estimate_passes_through_untouched():
+    """No refusal when the run fits, and the estimate comes back unchanged."""
+    est = E.estimate_memory(10**4, method="direct")
+    assert E.check_budget(est, budget=est["bytes"] * 1.5) is est
+    assert E.check_budget(est, budget=est["bytes"]) is est  # exactly at the line
+
+
+def test_no_budget_means_no_check():
+    """``budget=None`` must skip the check rather than default to some figure.
+
+    The device this module runs on is not the device the solve runs on, so a
+    figure read from this process would be the wrong one -- see check_budget.
+    """
+    huge = E.estimate_memory(10**12, method="direct")
+    assert E.check_budget(huge, budget=None) is huge
+
+
+def test_solve_refuses_an_over_budget_mesh_before_assembling():
+    """The end-to-end refusal, through ``solve`` itself.
+
+    THE MUTATION TEST. With the budget check removed from ``solve`` this raises
+    nothing and the solve succeeds: the mesh is tiny and would otherwise solve
+    fine. So a green run here is only possible if the check is present and
+    reached -- it is not a test that passes either way.
+    """
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain()
+    eps_static = {"left": 1.0, "gap": gap_eps, "right": 1.0}
+    electrodes = {"left": 0.0, "right": 1.0}
+
+    # A one-byte budget refuses ANY solve, which is the cleanest proof the check
+    # runs at all -- it does not depend on the estimate's rate being right.
+    with pytest.raises(E.EstimateError, match="coarser mesh"):
+        E.solve(points, tets, parts, region_of_tet, eps_static, electrodes,
+                method="direct", budget=1)
+
+    # And with no budget the same mesh solves, so the refusal above was the
+    # budget's doing and not the mesh's.
+    result = E.solve(points, tets, parts, region_of_tet, eps_static, electrodes,
+                     method="direct")
+    assert result["n_free"] > 0
+    assert "memory_estimate" in result
+
+
+def test_solve_reports_the_estimate_it_ran_against():
+    """A run that was allowed should record what it was checked against."""
+    points, tets, parts, region_of_tet, gap_eps = _contact_chain()
+    result = E.solve(points, tets, parts, region_of_tet,
+                     {"left": 1.0, "gap": gap_eps, "right": 1.0},
+                     {"left": 0.0, "right": 1.0}, method="direct")
+    est = result["memory_estimate"]
+    assert est["n_free"] == result["n_free"]
+    assert est["path"] == "direct"
+    assert est["bytes"] > 0

@@ -60,11 +60,25 @@ SPD_LU = {
 }
 
 #: Node count above which :func:`solve` switches from the direct factorisation
-#: to AMG-preconditioned CG. This is a NAMED ESTIMATE, not a derived limit:
-#: ``design.md`` §5 puts it between the E1 and E2 bench meshes and says the
-#: memory law does not set it (at 5e5 nodes a direct LU is about a third of the
-#: container). Task 1.7 replaces it with a measured per-node cost.
+#: to AMG-preconditioned CG. This is a CROSSOVER, not a memory limit, and it is
+#: still a named estimate: it is where the direct solve inverts slower than the
+#: iterative one, and task 1.4's agreement test is the only place it is
+#: exercised. Memory does NOT set it -- a direct factorisation at this node
+#: count stays far inside a 16 GiB container (see :data:`DIRECT_ESTIMATE`). Do
+#: not derive it from the memory model: that would be a memory limit dressed up
+#: as a speed choice.
 AMG_NODE_CROSSOVER = 5 * 10**5
+
+#: The memory model, UNMEASURED. Task 1.7 measures both paths on the Jetson and
+#: replaces the three numbers below with the fitted ones and the table they came
+#: from. Until that lands, every figure this module reports is an ESTIMATE, and
+#: the refusal message says so -- a run refused on an estimate must be
+#: distinguishable from one refused on a measurement.
+#:
+#: ``"direct"`` is the SuperLU factorisation's fill; ``"amg"`` is the AMG-CG
+#: hierarchy. Both are bytes per unknown, as ``a * n + b``, which is the shape of
+#: the measured fits (fill at these sizes is close to linear in ``n``).
+UNMEASURED_BYTES_PER_UNKNOWN = {"direct": 3.0e3, "amg": 1.5e3}
 
 #: Relative residual AMG-CG must reach before its answer is accepted.
 #:
@@ -381,6 +395,102 @@ def amg_solve(A, b, *, rtol: float = AMG_RTOL, maxiter: int = 500):
     return x, float(residual)
 
 
+class EstimateError(MemoryError):
+    """A run was refused before allocating, because its estimate exceeds the budget.
+
+    A ``MemoryError``, because that is what it is standing in for: the same
+    outcome the kernel would have produced, raised early and with a number
+    attached. It is its own class so a caller can distinguish a refusal it can
+    act on (ask for a coarser mesh) from an allocation that genuinely failed.
+    """
+
+
+def estimate_memory(n_free: int, *, method: str = "auto",
+                    bytes_per_unknown: dict[str, float] | None = None) -> dict:
+    """Estimate the peak memory of a solve, in bytes, before it allocates.
+
+    ``n_free`` is the REDUCED unknown count -- the nodes not held at a fixed
+    potential -- because those are the only ones factorised. Held electrodes
+    cost nothing to solve, which is why a mesh's node count alone is the wrong
+    input here.
+
+    ``method`` follows :func:`solve`: ``"auto"`` estimates whichever path
+    ``n_free`` would actually take, ``"direct"`` and ``"amg"`` force one.
+
+    Returns ``bytes``, the path it estimated (``path``), per-unknown rate, and
+    ``measured`` -- ``False`` while
+    :data:`UNMEASURED_BYTES_PER_UNKNOWN` is what is being used. The caller
+    should say which in any message it shows a person.
+    """
+    if n_free < 0:
+        raise ValueError(f"n_free must not be negative, got {n_free!r}")
+    if method not in METHODS:
+        raise ValueError(
+            f"method={method!r} is not a known solve method; use one of "
+            f"{', '.join(METHODS)}"
+        )
+    rates = bytes_per_unknown or UNMEASURED_BYTES_PER_UNKNOWN
+    path = "amg" if (method == "amg" or (method == "auto"
+                    and n_free >= AMG_NODE_CROSSOVER)) else "direct"
+    if path not in rates:
+        raise ValueError(
+            f"no per-unknown rate for the {path!r} path; expected keys "
+            f"{sorted(rates)}"
+        )
+    rate = float(rates[path])
+    return {
+        "bytes": float(n_free) * rate,
+        "path": path,
+        "bytes_per_unknown": rate,
+        # A caller-supplied table is the only way to get measured=True here, so
+        # a test can prove the flag tracks the TABLE and not the caller's mood.
+        "measured": rates is not UNMEASURED_BYTES_PER_UNKNOWN,
+        "n_free": int(n_free),
+    }
+
+
+def check_budget(estimate: dict, *, budget=None) -> dict:
+    """Refuse an ``estimate`` that exceeds ``budget``, naming both figures.
+
+    ``budget`` is the memory this run may use, in bytes. ``None`` means the
+    caller does not know and the estimate is not checked -- it is NOT read from
+    the process here, because this module does not run inside the container it
+    is estimating for (the web app asks on the control plane and the job runs
+    elsewhere, so a figure read here would be the wrong device's). A caller that
+    knows its own limit passes it, as :func:`fdtd.check_limits` does.
+
+    Raises :class:`EstimateError` with the estimate, the budget and the mesh
+    setting that would bring the run under it -- a refusal a person can act on
+    rather than a number they have to go and compare themselves.
+    """
+    if budget is None:
+        return estimate
+    budget = float(budget)
+    if budget <= 0:
+        raise ValueError(
+            f"budget must be positive, got {budget!r}; pass None to skip the check"
+        )
+    if estimate["bytes"] <= budget:
+        return estimate
+    gb = 2**30
+    kind = "measured" if estimate.get("measured") else "estimated"
+    raise EstimateError(
+        f"this solve needs about {estimate['bytes'] / gb:.2f} GiB "
+        f"({kind}: {estimate['n_free']:,} free unknowns x "
+        f"{estimate['bytes_per_unknown'] / 1e3:.2f} kB, {estimate['path']} path) "
+        f"against a budget of {budget / gb:.2f} GiB. Refusing before allocating. "
+        "Use a coarser mesh, a smaller domain, or a larger budget."
+    )
+
+
+def solve_memory(n_free: int, *, method: str = "auto", budget=None,
+                 bytes_per_unknown: dict[str, float] | None = None) -> dict:
+    """Estimate, then refuse if over ``budget``. What :func:`solve` calls."""
+    estimate = estimate_memory(n_free, method=method,
+                               bytes_per_unknown=bytes_per_unknown)
+    return check_budget(estimate, budget=budget)
+
+
 def solve(
     points_m: np.ndarray,
     tets: np.ndarray,
@@ -391,6 +501,7 @@ def solve(
     *,
     backend: str | None = None,
     method: str = "auto",
+    budget=None,
 ):
     """Solve the electrostatic problem with the electrodes held at fixed volts.
 
@@ -413,6 +524,12 @@ def solve(
     a mesh small enough for tier-1 tests. Without it the agreement test could
     only ever compare AMG against a direct answer on meshes above 5 x 10**5 nodes,
     which no tier-1 test can build.
+
+    ``budget`` is the memory this run may use, in bytes; ``None`` does not check
+    it. The estimate is made from the FREE node count and compared BEFORE any
+    assembly, so a run that cannot fit is refused rather than dying part-way
+    through allocating. It is not read from this process: see
+    :func:`check_budget`.
 
     Returns a dict with ``phi`` (the ``(n_points,)`` nodal potential in volts),
     ``free`` (the boolean mask of solved nodes), ``electrodes`` (the part ->
@@ -464,10 +581,16 @@ def solve(
             )
 
     tet_part = check_tet_regions(region_of_tet, parts)
+    # The memory check comes BEFORE the assembly below, not before the
+    # factorisation. Assembly is the first big allocation, so a check placed
+    # later would spend the memory it is meant to protect.
+    held = electrode_nodes(tets, parts, tet_part, electrodes)
+    n_free = n_points - sum(len(nodes) for nodes in held.values())
+    memory = solve_memory(n_free, method=method, budget=budget)
+
     K, _ = assemble_stiffness(points_m, tets, parts, eps_static, tet_part,
                               n_points=n_points, skip=set(electrodes))
 
-    held = electrode_nodes(tets, parts, tet_part, electrodes)
     phi_e = np.zeros(n_points, dtype=np.float64)
     fixed = np.zeros(n_points, dtype=bool)
     for part, nodes in held.items():
@@ -500,6 +623,9 @@ def solve(
         "n_free": int(free.sum()),
         "method": solved_by,
         "residual": residual,
+        # The estimate this run was checked against, so a caller can record what
+        # a successful run cost rather than only the ones that were refused.
+        "memory_estimate": memory,
         # The mesh and the inputs :func:`field_at` and :func:`_electrode_charge`
         # need. Carried here rather than passed alongside, because a solution
         # read with a DIFFERENT mesh is a silent wrong answer (the potential is

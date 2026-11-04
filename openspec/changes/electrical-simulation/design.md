@@ -230,6 +230,20 @@ This reading was ours, put to the owner as question 3; the owner answered "b yes
 
 ## 5. What fits in 3-D, and at what resolution (estimates)
 
+**Status (task 1.7, 2026-11-04): the per-node figures below are still ESTIMATES,
+not measurements.** The bench that measures them
+(`dockerfiles/maxwell_solver/solve_memory_bench.py`) is written and runs, but the
+Jetson was unreachable for the whole of task 1.7 (DNS resolves, 0/2 pings and
+every SSH path times out at the banner exchange). No row in the tables below has
+been replaced with a measured number, because inventing one would be worse than
+carrying a labelled estimate. What the VM run DID establish is that the model
+shape is not yet known -- see "The per-node law is open" below.
+
+The estimate is the memory law: bytes per unknown on each solve path, multiplied
+by the reduced unknown count. `mse_electrostatics.estimate_memory` implements it,
+`solve()` refuses a run over its `budget=` before assembling, and
+`UNMEASURED_BYTES_PER_UNKNOWN` is the table to replace.
+
 Inputs: wire circumradius R = 239.4 nm, hex area (3√3/2)R² = 1.49 × 10⁵ nm², height
 1500 nm, wire volume 2.23 × 10⁸ nm³. Air 500 nm around and above: box side 2(R + 500)
 = 1479 nm, box height 12 + 1500 + 500 = 2012 nm, so air 4.15 × 10⁹ nm³. Oxide
@@ -237,12 +251,33 @@ Inputs: wire circumradius R = 239.4 nm, hex area (3√3/2)R² = 1.49 × 10⁵ nm
 
 Nodes per volume at edge h: a regular tet has volume h³/(6√2), so there are 6√2 ≈ 8.49 tets
 per h³, and a tet mesh has about 5.5 tets per node, giving **1.54 nodes per h³**. Memory (all
-estimates, to be replaced by task 2.6's measured per-node cost):
+estimates, to be replaced by task 1.7's measured per-node cost):
 - Direct sparse LU in 3-D (nested dissection): fill ≈ 10⁹ entries × (n/10⁶)^{4/3}, where n
   is the NODE count, at 12 B/entry × 1.3 overhead (15.6 B/entry). For a k-unknown-per-node
   system, multiply the fill by k² (electrostatics k = 1; drift-diffusion k = 3, so 9 × 10⁹).
 - AMG-preconditioned CG: about 1.5 kB per unknown.
 - The container limit is 16 GiB, and the namespace's 18 GiB includes the web app.
+
+### The per-node law is open (measured on the VM, not the Jetson)
+
+The direct path was measured at four sizes on the VM (1.9k, 6.1k, 14.4k, 27.9k free
+unknowns; tiers 1, tiny meshes). Peak resident growth was 11.1, 32.0, 122.5 and
+343.8 MiB. The per-unknown rate is **not constant**: it rises monotonically from
+6.2 kB to 12.9 kB over that range, which is the shape of fill growth rather than
+a fixed cost.
+
+Neither model fits: a power law (664 × n^1.28) misses its own worst point by
+**33.8 %**, and a linear-through-origin law (11.55 kB/unknown) by **116.5 %**. The
+bench therefore reports both and prints `usable model: NONE` rather than quoting
+the better-looking one. A law that is right at the largest measured size and
+wrong below it is exactly the failure a single fitted number hides, and the
+product's own mesh sizes are ABOVE every point measured so far -- extrapolating
+from these four would be the worst use of them.
+
+This is why the measurement has to happen on the Jetson at product-scale meshes:
+SuperLU's fill depends on the elimination ordering, which changes discretely with
+size, so the law cannot be learned from meshes small enough to run on the VM.
+
 
 ### Electrostatics (1 unknown/node)
 
