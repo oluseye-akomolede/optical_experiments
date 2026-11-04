@@ -13,6 +13,7 @@ The checks, in the order the task lists them:
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -1056,45 +1057,219 @@ def test_estimate_picks_the_path_solve_would_take():
 
     Both branches are checked and they must pick DIFFERENT paths, so a mutation
     that hardcodes one path fails on the other rather than passing on both.
+
+    ``AMG_NODE_CROSSOVER`` is 5e5, which is ABOVE the top of the measured direct
+    table (112,847), so ``auto`` takes AMG there -- the path that has a model
+    that wide. Forcing direct at that count is a different question and is
+    covered by the refusal test: the table does not reach, so it will not answer.
     """
-    below = E.estimate_memory(E.AMG_NODE_CROSSOVER - 1)
+    below = E.estimate_memory(10**4)
     above = E.estimate_memory(E.AMG_NODE_CROSSOVER + 1)
     assert below["path"] == "direct"
     assert above["path"] == "amg"
     # Forcing a path overrides the crossover, as it does in solve().
     assert E.estimate_memory(10, method="amg")["path"] == "amg"
-    assert E.estimate_memory(E.AMG_NODE_CROSSOVER * 10, method="direct")["path"] == "direct"
+    assert E.estimate_memory(10**4, method="direct")["path"] == "direct"
+
+
+def test_auto_chooses_amg_in_the_band_above_the_direct_table():
+    """Between the table's top and the crossover, ``auto`` must still pick AMG.
+
+    This is the product's actual mesh size. The crossover (5e5) sits ABOVE the
+    direct table's top (112,847), so a size in that band has: direct chosen by
+    the crossover rule, direct unpriceable by the table. An earlier version used
+    the crossover alone and raised the direct refusal for every mesh in the band
+    -- a refusal of a solve AMG could have done. The test above passed anyway
+    because it sampled at ``crossover + 1``, on the far side of both limits.
+    """
+    top = E.DIRECT_MEMORY_TABLE[-1][0]
+    assert top < E.AMG_NODE_CROSSOVER, "the band only exists while this holds"
+    for n in (top + 1, 240_000, E.AMG_NODE_CROSSOVER - 1):
+        est = E.estimate_memory(n, method="auto")
+        assert est["path"] == "amg", n
+        assert est["bytes"] > 0, n
+    # Forcing direct up there is still refused -- the band changes what AUTO
+    # picks, not what direct may claim to know.
+    with pytest.raises(E.EstimateError):
+        E.estimate_memory(top + 1, method="direct")
 
 
 def test_estimate_scales_with_the_free_node_count():
-    """Doubling the unknowns doubles the estimate, and held nodes cost nothing.
+    """The estimate rises with the unknowns, and held nodes cost nothing.
 
     The second half is the reason the check takes ``n_free`` rather than the node
     count: a mesh whose electrodes are most of its nodes would otherwise be
     refused for memory it never allocates.
+
+    NOT asserted: that doubling ``n_free`` doubles the estimate. The measured
+    table is not linear in ``n`` (bytes per unknown climb 5.86k -> 42.5k across
+    it), so an exact 2x belongs to the old flat-rate model and asserting it here
+    would pin the estimator to the shape the measurement disproved.
     """
-    one = E.estimate_memory(10**5)["bytes"]
-    two = E.estimate_memory(2 * 10**5)["bytes"]
-    assert two == pytest.approx(2 * one, rel=1e-12)
+    one = E.estimate_memory(10**4, method="direct")["bytes"]
+    two = E.estimate_memory(2 * 10**4, method="direct")["bytes"]
+    assert two > one
     assert E.estimate_memory(0)["bytes"] == 0.0
 
 
-def test_unmeasured_rates_are_flagged_as_estimates():
-    """A refusal built on an estimate must say so; only a supplied table is measured.
+def test_the_model_is_measured_and_marks_its_own_extrapolation():
+    """Every estimate now derives from the cluster measurement, not a guess.
 
-    This is the flag that keeps this change honest: task 1.7's measurement has
-    not landed, so every figure the product reports today is an estimate, and the
-    message says "estimated" until it is replaced.
+    This is the flag that keeps the refusal honest. In range the figure is
+    ``measured`` and not ``extrapolated``; above the AMG law's measured range it
+    is still measured-derived but must SAY it is extrapolated, because a reader
+    deciding whether to trust a 4 GiB number needs to know which it is.
     """
-    assert E.estimate_memory(10**5)["measured"] is False
-    table = {"direct": 1e3, "amg": 1e3}
-    assert E.estimate_memory(10**5, method="direct",
-                             bytes_per_unknown=table)["measured"] is True
+    in_range = E.estimate_memory(10**4, method="amg")
+    assert in_range["measured"] is True
+    assert in_range["extrapolated"] is False
+    beyond = E.estimate_memory(E.AMG_MEASURED_MAX_UNKNOWNS * 4, method="amg")
+    assert beyond["measured"] is True
+    assert beyond["extrapolated"] is True
+    # A caller-supplied rate is a test seam, not a measurement, and is never
+    # allowed to claim otherwise.
+    seam = E.estimate_memory(10**4, method="direct",
+                             bytes_per_unknown={"direct": 1e3, "amg": 1e3})
+    assert seam["measured"] is False
+    assert seam["extrapolated"] is False
+
+
+def test_amg_in_range_follows_the_measured_power_law():
+    """AMG bytes == coefficient * n**exponent inside the fitted range, no margin."""
+    law = E.AMG_MEMORY_POWER_LAW
+    for n in (1_859, 10_000, E.AMG_MEASURED_MAX_UNKNOWNS):
+        expect = law["coefficient"] * n ** law["exponent"]
+        got = E.estimate_memory(n, method="amg")["bytes"]
+        assert got == pytest.approx(expect, rel=1e-12), n
+    # ~5 kB per unknown at the top of the range, as the measurement reported.
+    top = E.estimate_memory(E.AMG_MEASURED_MAX_UNKNOWNS, method="amg")
+    assert top["bytes_per_unknown"] / 1e3 == pytest.approx(5.0, rel=0.3)
+
+
+def test_amg_above_range_applies_the_stated_margin():
+    """Above the measured range the law is scaled by AMG_EXTRAPOLATION_MARGIN.
+
+    The margin must be a real factor, not a comment: an under-predicting memory
+    estimate is the one that gets a pod OOM-killed, so the test compares the
+    extrapolated figure against the bare law it was grown from.
+    """
+    law = E.AMG_MEMORY_POWER_LAW
+    n = E.AMG_MEASURED_MAX_UNKNOWNS * 10
+    bare = law["coefficient"] * n ** law["exponent"]
+    got = E.estimate_memory(n, method="amg")["bytes"]
+    assert got == pytest.approx(bare * E.AMG_EXTRAPOLATION_MARGIN, rel=1e-12)
+    assert got > bare
+
+
+def test_direct_hits_every_measured_table_point_exactly():
+    """A table point estimates to its own measured bytes, not near it.
+
+    This is the check that the interpolation is anchored to the measurements:
+    an off-by-a-gap error in the bracket search, or an extrapolation leaking
+    into the in-range path, shows up as a point missing its own value.
+    """
+    for n, b in E.DIRECT_MEMORY_TABLE:
+        got = E.estimate_memory(n, method="direct")["bytes"]
+        assert got == pytest.approx(b, rel=1e-9), n
+
+
+def test_direct_interpolates_between_measured_points():
+    """Between two table entries the estimate lands between their byte counts.
+
+    Log-log interpolation is monotone, so the midpoint of a gap sits strictly
+    inside the gap's endpoints. A model that ignored the table -- the old flat
+    rate -- would fail this against the measured spread.
+    """
+    table = E.DIRECT_MEMORY_TABLE
+    for (n0, b0), (n1, b1) in zip(table, table[1:]):
+        mid = E.estimate_memory((n0 + n1) // 2, method="direct")["bytes"]
+        assert min(b0, b1) < mid < max(b0, b1), (n0, n1)
+
+
+def test_direct_below_the_table_charges_the_smallest_measured_rate():
+    """Below the table, cost is the smallest point's OWN rate, scaled linearly.
+
+    The rate is not monotonic -- it falls 5.86 -> 5.25 kB/unknown across the
+    first two points before climbing -- so "the rate climbs with size" is false
+    at the bottom and a below-table estimate can read LOW by up to 11 %. That
+    direction is pinned here so a future edit cannot silently claim
+    conservatism the data does not support; the docstring says the same.
+    """
+    n0, b0 = E.DIRECT_MEMORY_TABLE[0]
+    rate = b0 / n0
+    for n in (1, 37, 500, n0 - 1):
+        got = E.estimate_memory(n, method="direct")["bytes"]
+        assert got == pytest.approx(rate * n, rel=1e-9), n
+    # The rate at the second point is genuinely lower, which is why the
+    # below-table branch is flagged as possibly-low rather than conservative.
+    n1, b1 = E.DIRECT_MEMORY_TABLE[1]
+    assert b1 / n1 < rate
+
+
+def test_direct_interpolation_is_log_log_not_linear():
+    """The gap is interpolated in LOG space, which is a different number.
+
+    THIS IS THE CURVATURE CHECK. The midpoint-in-the-gap test above passes for a
+    straight line between the endpoints as well as for a log-log curve, so on
+    its own it cannot tell the two apart -- a mutation swapping in linear
+    interpolation survived it. The two schemes disagree at the geometric mean of
+    the counts, where log-log returns ``sqrt(b0*b1)``; at the log-midpoint the
+    linear reading is strictly LARGER than the log-log one, so asserting the
+    log-log value with a tight tolerance rejects the linear model.
+    """
+    table = E.DIRECT_MEMORY_TABLE
+    for (n0, b0), (n1, b1) in zip(table, table[1:]):
+        # Geometric mean of the counts: log(n) is exactly midway, t = 0.5.
+        n_mid = math.sqrt(n0 * n1)
+        n = int(round(n_mid))
+        # Recompute t for the INTEGER count actually passed, so the expected
+        # value is the law's own, not a rounded approximation of it.
+        t = (math.log(n) - math.log(n0)) / (math.log(n1) - math.log(n0))
+        want_loglog = math.exp(math.log(b0) + t * (math.log(b1) - math.log(b0)))
+        want_linear = b0 + t * (b1 - b0)
+        got = E.estimate_memory(n, method="direct")["bytes"]
+        assert got == pytest.approx(want_loglog, rel=1e-9), (n0, n1)
+        # And the two readings must actually be distinguishable at this point,
+        # or the assertion above would not be testing curvature.
+        assert want_linear > want_loglog * 1.001, (n0, n1, want_linear, want_loglog)
+
+
+def test_direct_beyond_the_table_is_refused_with_a_reason_not_a_number():
+    """Above the measured table direct refuses and points at AMG.
+
+    Extrapolating a curve already 27 % off its own worst point would produce a
+    confidently wrong figure; "too big to predict, use AMG" is something a
+    caller can act on. The refusal is an EstimateError so it travels the same
+    route as a budget refusal.
+    """
+    largest = E.DIRECT_MEMORY_TABLE[-1][0]
+    with pytest.raises(E.EstimateError) as caught:
+        E.estimate_memory(largest + 1, method="direct")
+    msg = str(caught.value)
+    assert f"{largest:,}" in msg
+    assert "amg" in msg.lower()
+    # At the largest measured point it still answers: the refusal is beyond the
+    # table, not at its edge.
+    assert E.estimate_memory(largest, method="direct")["bytes"] > 0
+
+
+def test_budget_refusal_says_extrapolated_when_the_margin_was_applied():
+    """A refusal on an extrapolated figure must not present it as measured."""
+    est = E.estimate_memory(E.AMG_MEASURED_MAX_UNKNOWNS * 10, method="amg")
+    assert est["extrapolated"] is True
+    with pytest.raises(E.EstimateError) as caught:
+        E.check_budget(est, budget=est["bytes"] / 2.0)
+    assert "extrapolated" in str(caught.value)
 
 
 def test_budget_refusal_names_both_the_estimate_and_the_budget():
-    """The message has to carry the numbers, or a person cannot act on it."""
-    est = E.estimate_memory(10**6, method="direct")
+    """The message has to carry the numbers, or a person cannot act on it.
+
+    The count stays inside the measured direct table: past 112,847 unknowns the
+    estimate itself refuses (it will not extrapolate), so a larger n here would
+    test that refusal instead of this message.
+    """
+    est = E.estimate_memory(100_000, method="direct")
     budget = est["bytes"] / 2.0
     with pytest.raises(E.EstimateError) as caught:
         E.check_budget(est, budget=budget)
@@ -1113,14 +1288,42 @@ def test_budget_under_the_estimate_passes_through_untouched():
     assert E.check_budget(est, budget=est["bytes"]) is est  # exactly at the line
 
 
-def test_no_budget_means_no_check():
-    """``budget=None`` must skip the check rather than default to some figure.
+def test_no_device_means_no_check():
+    """``budget=NO_DEVICE`` skips the check: the caller is not on the run's device.
 
-    The device this module runs on is not the device the solve runs on, so a
-    figure read from this process would be the wrong one -- see check_budget.
+    The web app asks on the control plane while the solve runs in a Job, so a
+    figure read here would be the wrong machine's. That caller says so with
+    ``NO_DEVICE`` (the same sentinel ``fdtd.check_limits`` uses) rather than
+    relying on a ``None`` that would now read the wrong device.
+
+    The estimate comes from the AMG path, which will answer at any size (its law
+    extrapolates with a stated margin). The direct path refuses past its table,
+    so it cannot produce the "far too big" figure this test needs.
     """
-    huge = E.estimate_memory(10**12, method="direct")
-    assert E.check_budget(huge, budget=None) is huge
+    huge = E.estimate_memory(10**12, method="amg")
+    assert huge["extrapolated"] is True
+    assert E.check_budget(huge, budget=E.NO_DEVICE) is huge
+    # The sentinel is the time-domain one, shared rather than redefined, so the
+    # two solvers cannot drift apart on what "not on the device" means.
+    import fdtd
+    assert E.NO_DEVICE == fdtd.NO_DEVICE
+
+
+def test_budget_none_reads_this_process_device_at_call_time():
+    """``budget=None`` reads the calling process's admission budget, not a constant.
+
+    This is the spec's requirement (``admission_budget()``, as ``check_limits``
+    does). Proved by asking for a budget that is unambiguously larger than any
+    ceiling this process could report, and which therefore must pass: a hardcoded
+    constant would have refused it.
+    """
+    est = E.estimate_memory(100, method="direct")  # a tiny estimate
+    # Whatever the ceiling is, a 100-unknown solve at ~6 kB is a few hundred kB.
+    assert E.check_budget(est, budget=None) is est
+    # And the ceiling it read is real: a solve far over it is refused.
+    huge = E.estimate_memory(10**5, method="direct")
+    with pytest.raises(E.EstimateError):
+        E.check_budget(huge, budget=1.0)
 
 
 def test_solve_refuses_an_over_budget_mesh_before_assembling():

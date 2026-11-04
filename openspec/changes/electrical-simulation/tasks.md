@@ -250,7 +250,11 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       made the first bench blind to a wrong eps.
 - [ ] 1.7 Measure the per-node memory of both solve paths from the bench RSS, replace the
       `design.md` §5 estimates with the measured figures, and wire `budget=` refusals.
-      **PARTIAL — the refusal half is done and proven; the measurement is blocked.**
+      **DONE, measured on the cluster.** The Jetson never answered (DNS resolves
+      100.74.195.113; 0/2 pings, ssh dies at the banner exchange), so the lead ran
+      `solve_memory_bench.py` as a bounded Job on `sigma-worker2` (2 cpu / 6 GiB, no GPU,
+      code at `b3bbdc1`) instead — and the cluster is where solves actually run, so these
+      are the right device's numbers. Full provenance in `memory-bench.md`.
       - *Done:* `estimate_memory()`, `check_budget()` and `solve_memory()`, wired into
         `solve(..., budget=)`. The check runs BEFORE `assemble_stiffness`, not before the
         factorisation — assembly is the first big allocation, so a later check would spend
@@ -259,27 +263,39 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         "coarser mesh" lever. `budget=None` skips the check rather than reading this
         process: the module runs on the control plane and the solve runs elsewhere, so a
         figure read here is the wrong device's — the same reason `fdtd.NO_DEVICE` exists.
-      - *Mutations, three, each caught by a different test:* forcing `budget=None` inside
-        `solve()` (caught by the end-to-end refusal test and by nothing else — recorded,
-        because a check that only one test notices is thin); making `check_budget` never
-        refuse (caught by 2); hardcoding `path="direct"` (caught by the path-choice test).
-      - *Measured on the VM, four sizes, direct path:* 1.9k/6.1k/14.4k/27.9k free unknowns
-        grew 11.1/32.0/122.5/343.8 MiB. **Per-unknown rate is not constant** (6.2 → 12.9 kB);
-        a power law misses its worst point by 33.8 %, linear-through-origin by 116.5 %.
-        Neither fits, so `solve_memory_bench.py` prints `usable model: NONE` and no figure
-        was adopted. Recorded in `design.md` §5 under "The per-node law is open".
-      - *BLOCKED:* the Jetson. DNS resolves `sigma-jetson.taildfdd3b.ts.net` to
-        100.74.195.113; from `controlplane` (up, reachable) 0/2 pings answered and every
-        ssh path (`ProxyJump`, direct) dies at "Connection timed out during banner
-        exchange". So the ≥3 sizes per path at product scale, and the AMG path "big enough
-        to pick naturally", could not be run. `UNMEASURED_BYTES_PER_UNKNOWN` therefore still
-        holds the guesses, and `estimate_memory()` returns `measured: False`, which the
-        refusal message renders as "estimated:". When the Jetson returns, one command
-        produces the table:
-        `ulimit -v 5000000; nice -n 10 timeout 30m python solve_memory_bench.py`.
-      - *Not done, and deliberately:* no numbers in `design.md` §5's tables were replaced.
-        Writing a measured figure that was not measured is the one thing this task exists
-        to prevent.
+      - *Measured AMG, power law fits:* `bytes = 12812 * n_free^0.91`, worst point 2.0 %
+        off over `n_free` 1,859..27,869 (~5 kB/unknown at the top). Above that range the
+        law is scaled by `AMG_EXTRAPOLATION_MARGIN` (1.5) and the estimate reports
+        `extrapolated: True`, which the refusal message renders as "extrapolated, with a
+        1.5x margin applied".
+      - *Measured DIRECT, no law fits:* seven points from 1,859 to 112,847 unknowns
+        (10.9 MB → 4,797 MB). Power law 27 % off its own worst point, linear 277 %.
+        Bytes/unknown climb 5.86k → 42.5k with a **2.2× jump** between the last two
+        points — SuperLU switching ordering strategy, an algorithm change rather than a
+        curve.
+        So direct interpolates `DIRECT_MEMORY_TABLE` in log-log space and **refuses above
+        112,847 unknowns** with an `EstimateError` recommending AMG.
+      - *Mutations, three, each caught by a different test:* margin 1.5→1.0 (caught by the
+        margin test); direct refusal pushed beyond reach (caught by the refusal test); and
+        **log-log → linear interpolation, which SURVIVED the first suite** — the
+        midpoint-in-the-gap test passes for a straight line too. A curvature test was added
+        that compares the log-log value against the linear one at the geometric mean of each
+        gap, and now kills it. Recorded because a surviving mutation is the finding, not a
+        footnote.
+      - *Product consequence, and it changed the story:* every graded mesh the product
+        builds (E1 2.4e5, E2 1.27e6) is above the direct table, so **all of them take AMG**;
+        direct is refused for all four §5 meshes. E2 prices at 6.42 GiB (40 % of a 16 GiB
+        container) — it fits, but does not fit the 6 GiB Job it was measured in. E3 (the
+        uniform mesh today's one-size path would build) is **31.5 GiB and does not fit**,
+        which makes the graded sizing field load-bearing rather than an optimisation.
+      - *Known weak point:* `AMG_NODE_CROSSOVER` (5e5) is above the direct table, so it can
+        be checked against a measurement on neither side. It remains a named, untested speed
+        choice; recorded in §5 rather than papered over.
+      - *Corrected:* the old §5 claim that "a direct LU at 5e5 nodes is ~5.8 GiB, so memory
+        does not set the crossover" rested on the nested-dissection fill formula, which the
+        measurements do not support. Removed. The VM four-point run that found no usable
+        model is kept in §5 as the reason a wider range was needed.
+
 - [ ] 1.8 `stark.py`: the 7-point effective-mass operator on a Cartesian box, LOBPCG, the
       field interpolated from the tet solve. Harmonic-oscillator and Airy checks.
 - [ ] 1.9 First-order Coulomb term, E_X(F), the p/β fit and `scripts/stark_bench.py`. Prove

@@ -40,11 +40,21 @@ caller never has to remember it.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from scipy import sparse
 
 import mse_backend as BACKEND
 import mse_fem
+import fdtd
+
+#: Re-exported from the time-domain solver so both paths answer "which device?"
+#: the same way. ``budget=NO_DEVICE`` means the caller is not on the run's device.
+NO_DEVICE = fdtd.NO_DEVICE
+
+#: Re-exported: the admission ceiling of THIS process, read at call time.
+admission_budget = fdtd.admission_budget
 
 #: vacuum permittivity, F/m (CODATA), applied to the relative input
 EPS0 = 8.8541878128e-12
@@ -69,16 +79,47 @@ SPD_LU = {
 #: as a speed choice.
 AMG_NODE_CROSSOVER = 5 * 10**5
 
-#: The memory model, UNMEASURED. Task 1.7 measures both paths on the Jetson and
-#: replaces the three numbers below with the fitted ones and the table they came
-#: from. Until that lands, every figure this module reports is an ESTIMATE, and
-#: the refusal message says so -- a run refused on an estimate must be
-#: distinguishable from one refused on a measurement.
+#: Measured peak-memory growth of the DIRECT (SuperLU) path, in bytes above the
+#: empty-process baseline. Task 1.7 measured these on a bounded cluster Job
+#: (sigma-worker2, x86_64, 2 cpu / 6 GiB, image mse-maxwell-solver-gpu:28997f1
+#: with no GPU, code at b3bbdc1) using ``solve_memory_bench.py``; the job spec and
+#: the raw output are in ``openspec/changes/electrical-simulation/memory-bench.md``.
 #:
-#: ``"direct"`` is the SuperLU factorisation's fill; ``"amg"`` is the AMG-CG
-#: hierarchy. Both are bytes per unknown, as ``a * n + b``, which is the shape of
-#: the measured fits (fill at these sizes is close to linear in ``n``).
-UNMEASURED_BYTES_PER_UNKNOWN = {"direct": 3.0e3, "amg": 1.5e3}
+#: The first column is ``n_free``, the reduced unknown count the solve actually
+#: factorises; the second is the peak RSS growth it took. Fill in a sparse direct
+#: factorisation is NOT linear in ``n`` -- over this table the bytes per unknown
+#: climb from 5.86 kB to 42.5 kB, with a 2.2x jump between the last two points as
+#: the ordering changes strategy. No closed law fits it (a power law is 27 % off
+#: its own worst point, a linear fit 277 %), so the estimate INTERPOLATES this
+#: table in log-log space and refuses beyond it rather than extrapolate a curve
+#: it does not have. See :func:`_direct_bytes`.
+DIRECT_MEMORY_TABLE = (
+    (1_859, 10.9e6),
+    (6_137, 32.2e6),
+    (14_375, 122e6),
+    (27_869, 339e6),
+    (47_915, 723e6),
+    (75_809, 1_444e6),
+    (112_847, 4_797e6),
+)
+
+#: Measured peak-memory growth of the AMG path, which IS well described by a
+#: power law over the range it was measured. ``bytes = coefficient * n ** exponent``,
+#: fitted on the same cluster Job as :data:`DIRECT_MEMORY_TABLE`; the fit's worst
+#: point is 2.0 % off over ``n_free`` 1,859..27,869. That range is the ONLY range
+#: the law is measured for -- above it the estimate is scaled by
+#: :data:`AMG_EXTRAPOLATION_MARGIN` and reported as extrapolated.
+AMG_MEMORY_POWER_LAW = {"coefficient": 12_812.0, "exponent": 0.91}
+
+#: The largest ``n_free`` the AMG power law was fitted to. Above this the law is
+#: an extrapolation and the estimate is inflated to say so.
+AMG_MEASURED_MAX_UNKNOWNS = 27_869
+
+#: Safety factor applied to the AMG power law above its measured range. The law
+#: under-predicts if the hierarchy's cost per level grows at larger sizes, and an
+#: under-predicting memory estimate is the one that gets a pod OOM-killed. 1.5x is
+#: a margin, not a measurement: the reported figure is labelled ``extrapolated``.
+AMG_EXTRAPOLATION_MARGIN = 1.5
 
 #: Relative residual AMG-CG must reach before its answer is accepted.
 #:
@@ -405,6 +446,85 @@ class EstimateError(MemoryError):
     """
 
 
+def _direct_bytes(n_free: int) -> float:
+    """Interpolate :data:`DIRECT_MEMORY_TABLE` in log-log space; refuse beyond it.
+
+    Log-log, because both axes span an order of magnitude and the cost between
+    two measured points grows geometrically, so a straight line in log space is
+    the least-wrong reading available. The estimate is taken on the UPPER-BOUND
+    side (``exp`` of the interpolated log), which is why a point sitting exactly
+    on a table entry reproduces that entry's measured bytes rather than drifting
+    low.
+
+    Below the table's smallest point the cost is the smallest measured rate
+    scaled linearly. That is the ONE place this estimate can read low: the rate
+    is not monotonic in size -- it falls from 5.86 to 5.25 kB/unknown across the
+    first two points before climbing to 42.5 kB at the top -- so a tiny mesh may
+    cost slightly more per unknown than the 5.86 kB charged here. The error is
+    bounded by that 5.86 vs 5.25 ratio (11 %) and applies only to meshes below
+    1859 unknowns, where the absolute figure is a few MB and the budget check is
+    not what decides the outcome. Above the largest point it RAISES:
+    extrapolating a curve that fits at 27 % error would produce a confidently
+    wrong number, and the caller can act on "too big, use AMG" in a way it
+    cannot act on "4.8 GB".
+    """
+    table = DIRECT_MEMORY_TABLE
+    smallest_n, smallest_b = table[0]
+    largest_n, _ = table[-1]
+    if n_free > largest_n:
+        raise EstimateError(
+            f"the direct solve has not been measured above {largest_n:,} free "
+            f"unknowns, and this mesh has {n_free:,}. Direct-solve memory grows "
+            "faster than any law fitted to the measurements (fill is not linear "
+            "in the unknown count), so extrapolating it would be a guess. Use "
+            "the AMG path (method='amg'), which has a measured model over a "
+            "wider range, or a coarser mesh."
+        )
+    if n_free <= smallest_n:
+        return float(n_free) * (smallest_b / smallest_n)
+    # Find the bracketing pair and interpolate log(n) -> log(bytes).
+    for (n0, b0), (n1, b1) in zip(table, table[1:]):
+        if n_free <= n1:
+            t = (math.log(n_free) - math.log(n0)) / (math.log(n1) - math.log(n0))
+            return float(math.exp(math.log(b0) + t * (math.log(b1) - math.log(b0))))
+    # Unreachable: n_free <= largest_n is guaranteed above.
+    raise AssertionError(f"no bracket for n_free={n_free!r}")  # pragma: no cover
+
+
+def _amg_bytes(n_free: int) -> tuple[float, bool]:
+    """The AMG power law, with a stated margin above its measured range.
+
+    Returns ``(bytes, extrapolated)``. ``extrapolated`` is ``True`` above
+    :data:`AMG_MEASURED_MAX_UNKNOWNS`, where the margin has been applied and the
+    caller must not present the figure as measured.
+    """
+    law = AMG_MEMORY_POWER_LAW
+    raw = law["coefficient"] * float(n_free) ** law["exponent"]
+    if n_free > AMG_MEASURED_MAX_UNKNOWNS:
+        return raw * AMG_EXTRAPOLATION_MARGIN, True
+    return raw, False
+
+
+def _direct_is_viable(n_free: int) -> bool:
+    """Whether the direct path is both chosen AND priceable at ``n_free``.
+
+    Two limits govern direct, and they are not the same number:
+
+    * ``AMG_NODE_CROSSOVER`` (5 x 10**5) is a SPEED choice -- above it AMG is
+      expected to win, so ``auto`` switches.
+    * ``DIRECT_MEMORY_TABLE``'s largest point (112,847) is a KNOWLEDGE limit --
+      direct cost was never measured above it, so it cannot be priced.
+
+    The crossover sits ABOVE the table, so between the two there is a band where
+    ``auto`` would pick direct and then be unable to estimate it, refusing a mesh
+    that AMG could have solved. Every product-scale mesh (E1 ~2.4e5, E2 ~2.4e5
+    free unknowns) lands in that band, so the band is the common case, not an
+    edge. ``auto`` must therefore treat "cannot be priced" as a reason to choose
+    AMG, and the two limits are consulted together here so they cannot drift.
+    """
+    return n_free < AMG_NODE_CROSSOVER and n_free <= DIRECT_MEMORY_TABLE[-1][0]
+
+
 def estimate_memory(n_free: int, *, method: str = "auto",
                     bytes_per_unknown: dict[str, float] | None = None) -> dict:
     """Estimate the peak memory of a solve, in bytes, before it allocates.
@@ -417,10 +537,20 @@ def estimate_memory(n_free: int, *, method: str = "auto",
     ``method`` follows :func:`solve`: ``"auto"`` estimates whichever path
     ``n_free`` would actually take, ``"direct"`` and ``"amg"`` force one.
 
-    Returns ``bytes``, the path it estimated (``path``), per-unknown rate, and
-    ``measured`` -- ``False`` while
-    :data:`UNMEASURED_BYTES_PER_UNKNOWN` is what is being used. The caller
-    should say which in any message it shows a person.
+    The model is MEASURED, on a bounded cluster Job, not fitted here: the direct
+    path interpolates :data:`DIRECT_MEMORY_TABLE` (and refuses above it), AMG
+    applies :data:`AMG_MEMORY_POWER_LAW` with a margin above its measured range.
+    See ``openspec/changes/electrical-simulation/memory-bench.md``.
+
+    Returns ``bytes``, the path estimated (``path``), the per-unknown rate, and
+    two flags a caller must not flatten: ``measured`` (the figure derives from a
+    measurement of this path) and ``extrapolated`` (the AMG law was applied
+    beyond its measured range, with :data:`AMG_EXTRAPOLATION_MARGIN` applied).
+    A refusal message should say which it is.
+
+    ``bytes_per_unknown`` is a test and experiment seam that overrides the model
+    with a flat rate, reproducing the pre-1.7 behaviour. It sets
+    ``measured=False``, because a caller-supplied rate is not a measurement.
     """
     if n_free < 0:
         raise ValueError(f"n_free must not be negative, got {n_free!r}")
@@ -429,22 +559,33 @@ def estimate_memory(n_free: int, *, method: str = "auto",
             f"method={method!r} is not a known solve method; use one of "
             f"{', '.join(METHODS)}"
         )
-    rates = bytes_per_unknown or UNMEASURED_BYTES_PER_UNKNOWN
-    path = "amg" if (method == "amg" or (method == "auto"
-                    and n_free >= AMG_NODE_CROSSOVER)) else "direct"
-    if path not in rates:
-        raise ValueError(
-            f"no per-unknown rate for the {path!r} path; expected keys "
-            f"{sorted(rates)}"
-        )
-    rate = float(rates[path])
+    path = "amg" if (method == "amg" or (method == "auto" and not _direct_is_viable(n_free))) else "direct"
+    if bytes_per_unknown is not None:
+        if path not in bytes_per_unknown:
+            raise ValueError(
+                f"no per-unknown rate for the {path!r} path; expected keys "
+                f"{sorted(bytes_per_unknown)}"
+            )
+        rate = float(bytes_per_unknown[path])
+        return {
+            "bytes": float(n_free) * rate,
+            "path": path,
+            "bytes_per_unknown": rate,
+            "measured": False,
+            "extrapolated": False,
+            "n_free": int(n_free),
+        }
+    if path == "amg":
+        total, extrapolated = _amg_bytes(n_free)
+    else:
+        total, extrapolated = _direct_bytes(n_free), False
+    rate = total / n_free if n_free else 0.0
     return {
-        "bytes": float(n_free) * rate,
+        "bytes": float(total),
         "path": path,
         "bytes_per_unknown": rate,
-        # A caller-supplied table is the only way to get measured=True here, so
-        # a test can prove the flag tracks the TABLE and not the caller's mood.
-        "measured": rates is not UNMEASURED_BYTES_PER_UNKNOWN,
+        "measured": True,
+        "extrapolated": extrapolated,
         "n_free": int(n_free),
     }
 
@@ -452,28 +593,46 @@ def estimate_memory(n_free: int, *, method: str = "auto",
 def check_budget(estimate: dict, *, budget=None) -> dict:
     """Refuse an ``estimate`` that exceeds ``budget``, naming both figures.
 
-    ``budget`` is the memory this run may use, in bytes. ``None`` means the
-    caller does not know and the estimate is not checked -- it is NOT read from
-    the process here, because this module does not run inside the container it
-    is estimating for (the web app asks on the control plane and the job runs
-    elsewhere, so a figure read here would be the wrong device's). A caller that
-    knows its own limit passes it, as :func:`fdtd.check_limits` does.
+    ``budget`` is the memory this run may use, in bytes, and follows
+    :func:`fdtd.check_limits` -- the time-domain path solved this same problem
+    first and there is no reason for electrostatics to answer it differently:
+
+    * ``None`` reads :func:`fdtd.admission_budget` of THIS process at call time,
+      so the figure follows the cgroup limit or the device the caller is on.
+    * :data:`NO_DEVICE` says the caller is not on the run's device, so nothing is
+      read and the estimate is not checked. The web app asks on the control
+      plane while the solve runs in a Job, and a figure read from the control
+      plane would be the wrong machine's -- so that caller passes ``NO_DEVICE``
+      rather than relying on a ``None`` that would silently read the wrong one.
+    * A number checks against exactly that.
+
+    A refusal on an unread device is impossible by construction here, which is
+    why ``NO_DEVICE`` is the honest answer for a caller that cannot know: it
+    says so, instead of guessing a ceiling from the wrong host.
 
     Raises :class:`EstimateError` with the estimate, the budget and the mesh
     setting that would bring the run under it -- a refusal a person can act on
     rather than a number they have to go and compare themselves.
     """
-    if budget is None:
+    if budget == NO_DEVICE:
         return estimate
+    if budget is None:
+        budget = admission_budget()["bytes"]
     budget = float(budget)
     if budget <= 0:
         raise ValueError(
-            f"budget must be positive, got {budget!r}; pass None to skip the check"
+            f"budget must be positive, got {budget!r}; pass NO_DEVICE to skip "
+            "the check when the caller is not on the run's device"
         )
     if estimate["bytes"] <= budget:
         return estimate
     gb = 2**30
-    kind = "measured" if estimate.get("measured") else "estimated"
+    if estimate.get("extrapolated"):
+        kind = "extrapolated, with a 1.5x margin applied"
+    elif estimate.get("measured"):
+        kind = "measured"
+    else:
+        kind = "estimated"
     raise EstimateError(
         f"this solve needs about {estimate['bytes'] / gb:.2f} GiB "
         f"({kind}: {estimate['n_free']:,} free unknowns x "
@@ -605,7 +764,7 @@ def solve(
         # K_fe phi_e: the held values' pull on the free rows.
         rhs = -(K[free][:, fixed] @ phi_e[fixed])
         K_ff = K[free][:, free].tocsc()
-        use_amg = method == "amg" or (method == "auto" and K_ff.shape[0] >= AMG_NODE_CROSSOVER)
+        use_amg = method == "amg" or (method == "auto" and not _direct_is_viable(K_ff.shape[0]))
         if use_amg:
             phi[free], residual = amg_solve(K_ff, np.asarray(rhs).ravel())
             solved_by = "amg"
