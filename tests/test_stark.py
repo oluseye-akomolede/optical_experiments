@@ -207,18 +207,24 @@ def test_field_approaches_the_parallel_plate_value_under_refinement():
     FALLS MONOTONICALLY UNDER REFINEMENT at fixed geometry. A defective operator
     would not improve as the mesh resolves.
 
-    Do NOT claim "a narrower box is worse". That was measured here once (21.85%)
-    and it does not reproduce. The claim is refuted outright by the helper
-    refusing extent_m=1.2e-7 with gap 0.6e-7 ("part(s) body have no tets"), so
-    no refinement level is needed to kill it.
+    Do NOT claim "a narrower box is worse" -- and do not claim the reverse.
+    Neither is measured here, and both have been asserted in this docstring at
+    different times.
 
-    The replacement pair -- 1.2 um 8.98% vs 4 um 10.54% at a fixed 0.2 um gap --
-    is measured at n_modes 16 ONLY and must not be quoted without that
-    qualifier. At n_modes 8 the two are effectively tied (20.40% vs 20.70%); at
-    30 the ordering holds (7.25% vs 9.08%). Quoting one refinement level as
-    though it settled box size is the same mistake as the 21.85%. Box size is
-    not monotone in the error because the mesh resolution also changes with it,
-    so there is no "narrower is better/worse" law at all.
+    Note what _slab_solution actually does before comparing across box sizes:
+    it holds the top and bottom 0.6 um at fixed potential (see its docstring),
+    so the gap is extent_m - 1.2 um and it CHANGES WITH THE BOX. A 1.2 um box
+    has a 1.08 um gap; a 4 um box has 2.8 um. Any "fixed gap" cross-box
+    comparison is therefore measuring two different geometries, not two box
+    sizes. An earlier pair here (1.2 um 8.98% vs 4 um 10.54%) was labelled
+    "fixed 0.2 um gap" and was wrong on both counts -- the electrode was 0.6 um
+    -- and has been removed rather than replaced with another unverified pair.
+
+    No cross-box-size claim is needed for this test's conclusion. What kills
+    "narrower is worse" without any number is that the helper refuses an
+    overlapping configuration outright: at extent_m=1.2e-7 with a 0.6e-7
+    electrode the body has no tets and solve raises, so the claim is not even
+    well-posed at small boxes.
 
     The test therefore asserts the convergence DIRECTION and a bound, because
     a tolerance on a single value cannot distinguish the two explanations.

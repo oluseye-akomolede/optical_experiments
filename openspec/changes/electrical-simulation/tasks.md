@@ -380,13 +380,16 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         monotonically under refinement at fixed geometry; a bad operator would not improve.
         *Corrected 2026-11-04:* an earlier note claimed "a 1.2 um box is WORSE (21.85%)" and
         offered that as the decisive signature. It does not reproduce and is withdrawn, not
-        explained. The helper refuses the 1.2 um / 0.6 um configuration the claim would need
-        ("body have no tets"), which refutes it without quoting any refinement level. A
-        replacement pair (1.2 um 8.98% vs 4 um 10.54% at a fixed 0.2 um gap) is measured at
-        n_modes 16 ONLY -- at n_modes 8 they are tied (20.40% vs 20.70%) -- so it is not a
-        "narrower is better" law either. Box size is not monotone because mesh resolution
-        changes with it. Quoting one refinement level as if it settled the question is the
-        same mistake as the 21.85% was.
+        explained. The helper refuses the configuration the claim would need ("body have no
+        tets"), which refutes it without quoting any refinement level.
+        *Corrected again 2026-11-04:* the replacement pair (1.2 um 8.98% vs 4 um 10.54%, then
+        labelled "a fixed 0.2 um gap") was also wrong and is deleted rather than replaced. The
+        reviewer found their own helper holds the top and bottom 0.6 um at fixed potential, so
+        the gap is extent - 1.2 um and CHANGES with the box: 1.08 um at 1.2 um extent, 2.8 um
+        at 4 um. A cross-box comparison at "fixed gap" is comparing two different geometries.
+        No cross-box-size claim is made here now. It is not needed: short of a re-measured
+        sweep with its own committed helper, the honest statement is that the error falls
+        monotonically under refinement at fixed geometry, and nothing is claimed about box size.
         The test asserts the convergence direction and a bound, not a single value.
       - *V/m -> eV/nm is `* 1e-9` and nothing else.* A volt across a nanometre is 1 eV/nm
         because the electron charge cancels between the volt and the electron-volt.
