@@ -207,10 +207,14 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         Fixed by splitting `assemble_capacitance` out and pinning the convention on
         deliberately non-symmetric charge maps. The task's "symmetry test" wording would
         have shipped the bug; a symmetry property cannot test an index convention.
-- [ ] 1.6 Bench fixtures (two-layer slab, concentric spheres, sphere between plates, the
-      paper-1 wire with a top electrode) and `scripts/electrostatics_bench.py`. Prove the
-      ε_s-ignored mutation.
-      **Partially done, deliberately left unticked.** Built and proven: two-layer slab,
+- [x] 1.6 Bench fixtures (two-layer slab, concentric spheres, sphere between plates) and
+      `scripts/electrostatics_bench.py`. Prove the ε_s-ignored mutation.
+      **Lead decision 2026-11-04:** the paper-1 wire fixture moved to 1.6b. Its geometry and
+      both ε_s values are still marked unsure, and 0.2 says no test quotes an unsure value.
+- [ ] 1.6b The paper-1 wire with a top electrode, as a bench fixture labelled UNVALIDATED
+      until compared with paper 1. **Blocked on 0.2** (paper-1 dot geometry, InP and SiO₂
+      static ε from cited sources); no value is invented in the meantime.
+      **1.6 history:** Built and proven: two-layer slab,
       concentric spheres, sphere between plates; the bench and its fixtures live in
       `dockerfiles/maxwell_solver/` beside the solver they exercise (not `scripts/`, so they
       import with the rest of the package and run from a container). Fixtures are in
