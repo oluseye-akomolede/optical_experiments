@@ -196,7 +196,7 @@ Why these and not more:
 
 | option | 3-D | open | fit for us |
 |---|---|---|---|
-| **DEVSIM** (Sanchez, "DEVSIM: A TCAD Semiconductor Device Simulator", J. Open Source Softw. 7(70), 3898 (2022), doi:10.21105/joss.03898; devsim.org) | yes, tetrahedra | Apache-2.0; wheels for x86_64 **and aarch64** Linux (v2.11.2: `manylinux_2_27_x86_64` and `manylinux_2_26_aarch64.manylinux_2_28_aarch64`, verified on PyPI) | Scharfetter-Gummel, SRH, transient, Python API; **both direct and iterative** linear solvers (`solve(solver_type={'direct','iterative'})`), plus bundled UMFPACK. All open questions settled 2026-11-04 (§2) |
+| **DEVSIM** (Sanchez, "DEVSIM: A TCAD Semiconductor Device Simulator", J. Open Source Softw. 7(70), 3898 (2022), doi:10.21105/joss.03898; devsim.org) | yes, tetrahedra | Apache-2.0; wheels for x86_64 **and aarch64** Linux (v2.11.2: `manylinux_2_27_x86_64` and `manylinux_2_26_aarch64.manylinux_2_28_aarch64`, verified on PyPI) | Scharfetter-Gummel, SRH, transient, Python API; **direct documented** (MKL PARDISO / UMFPACK); an iterative path is declared and compiled in but undocumented and unrun by us, plus bundled UMFPACK. All open questions settled 2026-11-04 (§2) |
 | Sesame (NIST; Gaury, Sun, Bermel & Haney, "Sesame: A 2-dimensional solar cell modeling tool", Sol. Energy Mater. Sol. Cells 198, 53–62 (2019)) | no (1-D/2-D only, per the title "2-dimensional") | open | no 3-D cross-check |
 | own SG on scikit-fem / FEniCSx | yes | open | we would write and validate the SG stabilisation and Newton ourselves: the most risk |
 | Charon (Sandia, Trilinos) | yes | open | heavy C++/MPI build, more than one Job needs |
@@ -214,19 +214,27 @@ discretisation. **All of its open questions are now answered from the shipped 2.
   take `coordinates=`, `elements=`, `physical_names=` as plain Python lists** (element type 3 =
   tetrahedron). So a TetGen mesh can be handed over as arrays with no file on disk; writing a
   `.msh` is a fallback, not a requirement.
-- **Linear solvers:** both. `solve(...)` takes `solver_type={'direct','iterative'}`, and the
-  wheel bundles UMFPACK. **This makes the AMG column of the §5 coupling table a real option
-  rather than a hypothesis** — the iterative path the memory model assumes exists in the tool.
+- **Linear solvers:** both, though only the direct one is *documented*. `solve(...)` declares
+  `solver_type : {'direct','iterative'}` and the wheel bundles UMFPACK; the published solver
+  page lists only MKL PARDISO / UMFPACK / SuperLU and never mentions an iterative path. Read
+  against the binary itself, `dsMath::IterativeLinearSolver<double>::SolveImpl` — the DC
+  solve — **is compiled in and instantiated**, alongside GMRES, `BlockPreconditioner` and
+  `MKLPardisoPreconditioner`; the `"... iterative solve not implemented"` messages cover only
+  AC, noise and extended precision, none of which this design uses. So iterative DC exists but
+  is undocumented and unexercised by us — a thing to prove on a bench, not to assume.
+  **So the AMG column of the §5 coupling table is more than a hypothesis** — the memory model
+  assumes an iterative path that is present in the tool, though undocumented and unproven here.
 - **Cylindrical:** native (`cylindrical_node_volume`, `cylindrical_edge_couple`,
   `cylindrical_surface_area`), settled 2026-11-02, so the axisymmetric form needs no custom
   2πr weighting.
 
-What remains genuinely unknown is not capability but convergence: whether the *iterative*
-solver converges on coupled drift-diffusion (see §5), which is a numerical question for a bench,
-not an API question.
+What remains genuinely unknown is mostly convergence — whether the *iterative* solver
+converges on coupled drift-diffusion (see §5), a numerical question for a bench — along with
+whether the undocumented iterative path behaves as its symbols suggest.
 
 Cluster first. DEVSIM's x86-64 wheels run on the cluster workers. The Jetson is only a
-fallback, and only if aarch64 wheels exist.
+fallback: aarch64 wheels do exist (confirmed independently from PyPI), so it turns on the
+host's glibc being ≥ 2.26 — never read, because the host was unreachable throughout 0.2.
 
 ## 3. Coupling into the Purcell runs
 
@@ -450,9 +458,11 @@ edge) 2.33 × 10⁷/216 × 1.54 = 1.7 × 10⁵; total
 6.2 × 10⁶ nodes, 1.86 × 10⁷ unknowns. LU: 9 × 10⁹ × 6.21^{4/3} × 15.6 B = 1.60 × 10¹² B ≈ 1.45 TiB (the table row uses these unrounded figures).
 
 The AMG column assumes an iterative solver converges on coupled drift-diffusion Newton
-steps. **DEVSIM does offer one** — `solve(solver_type='iterative')` (verified in the 2.11.2
-API, task 0.2, 2026-11-04), so the capability is not in doubt. What is *not* established is
-that an iterative solver **converges** on this particular coupled Newton system at these sizes;
+steps. **DEVSIM appears to offer one** — `solver_type='iterative'` is declared in the API and
+`IterativeLinearSolver<double>` is compiled into the 2.11.2 binary for the DC solve, though
+the published docs do not document the path and we have never run it (task 0.2, 2026-11-04).
+So the capability is likely present but unproven, and what is *not* established — by a wider
+margin now — is that it **converges** on this particular coupled Newton system at these sizes;
 that is a numerical question for a bench, not an API question. The LU column is therefore still
 the safe reading until such a bench exists, and no downstream figure may claim the AMG column
 until one does.
