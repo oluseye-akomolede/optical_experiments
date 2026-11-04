@@ -36,11 +36,39 @@ ships only after it is read from its cited source (task 0.2, 2.2).
 
 **Device (paper 1 is the validation bench, not the scope).** The job accepts any device
 (tasks 0.3, "general ok"); the first thing built and checked against is the paper-1 nanowire
-quantum dot (arXiv 2601.04440) made electrically triggerable. The scene follows `scripts/paper1_nanowire.py`:
-a hexagonal InP prism about 1.5 µm tall (the bench scans 1375 to 1525 nm), with a circumradius
-of about 240 nm (420 nm × 1.14 / 2, so about 415 nm across the flats). It stands on a 12 nm
-SiO₂ buffer over a gold mirror. The paper-1 dot's material and size **(unsure: InAsP in InP?
-fetch from the paper, task 0.2)**. Paper 1 has no electrical contact, so one is added:
+quantum dot (Gangopadhyay, Grayli, Kokilathasan & Reimer, "A Broadband Nanowire Quantum Dot
+Cavity Design for the Efficient Extraction of Entangled Photons", arXiv:2601.04440v1
+[quant-ph], 7 Jan 2026 — one version, no journal DOI). The scene follows
+`scripts/paper1_nanowire.py`: a **wurtzite InP** hexagonal prism of **height H = 1375 nm and
+diameter D = 420 nm** ("the optimal cavity dimensions (height of 1375 nm and width of 420 nm)
+that we found", p. 3, Results; Fig. 1 caption gives "height (H) of 1375 nm and diameter (D)
+of 420 nm"). Take H and D from p. 3, **not** the Fig. 5a caption, which swaps them
+("(D=1375 nm and H= 420 nm)", p. 8) and contradicts the rest of the paper. The 1.14 factor is
+the paper's own hex-to-cylinder conversion: "A scaling factor of 1.14 was applied to the
+diameter as the nanowire has a hexagonal cross-section" (p. 10, S2). `scripts/paper1_nanowire.py`
+applies that relation as the paper writes it — `2s = 1.14 D`, s the hexagon's side — giving a
+corner-to-corner width of 1.14 × 420 = 478.8 nm, a **circumradius of 239.4 nm** and a
+flat-to-flat of 414.6 nm. The bench's 1375–1525 nm scan is the height sweep; the wire height
+is the 1375 nm above. It stands on a 12 nm SiO₂ buffer ("a 12 nm thick oxide layer optimizes
+the Purcell enhancement and extraction efficiency", p. 4) over a gold mirror.
+
+**The dot is a point dipole in this paper — its material, size and Γ₀ are not quotable from
+it.** The paper never names the dot's composition for its own model: "A dipole source was used
+to model the QD emitter" (p. 9, S1), and it gives no dot dimensions; the only positional fact
+is "a QD emitter placed on-axis at 30 nm below the top" (Fig. 2 caption, p. 5) at "the second
+antinode from the top" (p. 3). "InAsP" appears only as cited literature ("In AsP/InP NW
+quantum dot sources with a spontaneous emission lifetime of typically ∼1 ns", p. 2) and via a
+2012 reference on InAsP/InP dots, never as this paper's system. There is **no Γ₀, decay rate or
+dipole moment** anywhere in it; the Purcell factor is read off the simulator ("directly
+accessed from the results tab of the dipole", p. 9). So the zero-field dipole or Γ₀ that §3
+needs **must be an input we choose, not a quotation** — the ∼1 ns figure above is a literature
+value for InAsP/InP NW dots and is the only lifetime the paper offers.
+
+**Permittivities: the paper states refractive indices only, never ε.** InP is modelled at
+"an index of refraction n=3.44 ... to simulate the nanowire material (Wurtzite InP)" (p. 9,
+S1) — about 11.8 when squared, but that is n², **not** a static ε_s. Gold uses "Palik's
+experimental permittivity data" (p. 9) with no number given, and **no SiO₂ index or ε is stated
+anywhere**. The paper is therefore no source for any `eps_static` in this design.
 
 - **gate (G):** the gold mirror is the back electrode (it is already a conductor under the
   buffer), plus a top electrode. The wire is undoped. The field at the dot is set by V_G.
@@ -170,14 +198,14 @@ DEVSIM is the only open option that does 3-D tets with a Python API and the stan
 discretisation. Its open questions (above) are task 0.2 items. If DEVSIM cannot take our tet
 mesh, the fallback is to write a Gmsh `.msh` file. If it has no cylindrical option, the
 axisymmetric form is a 2-D (r, z) mesh whose node volumes and edge couplings carry the 2πr
-weight, which DEVSIM's custom models allow **(unsure)**.
+weight, which DEVSIM's custom models allow **(settled 2026-11-02: DEVSIM has a native
+cylindrical option, `cylindrical_node_volume` / `cylindrical_edge_couple`, so the 2πr weight
+is supplied by DEVSIM itself rather than by our custom models — see §2)**.
 
-**That (unsure) is the largest schedule risk in this design**, because "a ok" promises a
-cheaper 2-D form for round devices and this is the only way we have to build it. Task 0.2
-therefore resolves it before any other fetch, and says what happens if the answer is no: a
-junction-resolving 3-D only (about 100 GiB, §5 — beyond our quota) or a handwritten 2-D
-solver, which this change does not carry. Nothing downstream may quote the (unsure) as
-established until 0.2 lands.
+**This was the largest schedule risk in this design**, because "a ok" promises a cheaper 2-D
+form for round devices and this was the only way to build it. It is now resolved: DEVSIM
+carries the cylindrical form natively, so no handwritten 2-D solver is needed. What remains
+open is only the meshing hand-off (§2), which the fallback (a written Gmsh `.msh`) covers.
 
 Cluster first. DEVSIM's x86-64 wheels run on the cluster workers. The Jetson is only a
 fallback, and only if aarch64 wheels exist.
@@ -192,8 +220,11 @@ fallback, and only if aarch64 wheels exist.
   run with the same dipole orientation, and the file records it.
 - **Strength:** Γ₀ = n·ω³·|d|²/(3πε₀ħc³) for a dipole d in a homogeneous medium of index n.
   In the field, the oscillator strength scales by |⟨ψ_e|ψ_h⟩|²(V)/|⟨ψ_e|ψ_h⟩|²(0) (from L3).
-  Then Γ(V) = F(λ_X(V))·Γ₀·(overlap ratio). The zero-field d is an input (from the paper or
-  a measurement) **(unsure: does paper 1 state a lifetime or Γ₀? fetch)**.
+  Then Γ(V) = F(λ_X(V))·Γ₀·(overlap ratio). **The zero-field d is an input we choose, not a
+  quotation** — paper 1 states no Γ₀, decay rate or dipole moment (task 0.2, read in full;
+  see the device note above). The only lifetime it offers is a literature figure for a
+  different system, InAsP/InP NW dots at "typically ∼1 ns" (p. 2), which is the natural
+  starting value but must be labelled as such, never cited as this bench's dot.
 - **Timing:** L5 gives the carrier arrival profile g(t) at the dot after a voltage step or
   pulse. The photon-emission density is (g ⊛ Γe^{−Γt})(t). The electrical RC of the contacts
   (from L1 capacitances and a series resistance from L5's I-V) sets g's rise for the G
