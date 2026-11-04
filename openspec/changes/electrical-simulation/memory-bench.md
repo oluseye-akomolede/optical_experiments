@@ -50,19 +50,27 @@ estimate reports `extrapolated: True`.
 
 | n_free | peak RSS growth |
 |---:|---:|
-| 1,859 | 10.9 MB |
-| 6,137 | 32.2 MB |
-| 14,375 | 122 MB |
-| 27,869 | 339 MB |
-| 47,915 | 723 MB |
-| 75,809 | 1,444 MB |
-| 112,847 | 4,797 MB |
+| 1,859 | 10.9 MiB |
+| 6,137 | 32.2 MiB |
+| 14,375 | 122 MiB |
+| 27,869 | 339 MiB |
+| 47,915 | 723 MiB |
+| 75,809 | 1,444 MiB |
+| 112,847 | 4,797 MiB |
+
+These are **MiB**, the bench's own column (`VmHWM` is KiB, printed as
+`grow_kb / 1024`). `DIRECT_MEMORY_TABLE` stores them as `MiB × 1_048_576` bytes.
+Reading them as MB would make every direct estimate 4.63 % **low** — the unsafe
+direction for an OOM guard.
 
 **No law fits this path.** A power law misses its own worst point by 27 %, linear
-by 277 %. Bytes per unknown climb from 5.86 kB to 42.5 kB across the table, with a
-**2.2× jump** in the per-unknown rate between the last two points — SuperLU's fill
-depends on the elimination ordering, which changes strategy discretely with size.
-That is an algorithm switching, not a curve.
+by 277 %. Bytes per unknown climb from 6,148 B to 44,574 B across the table
+(5.86 → 42.5 kB), with a **2.2× jump** in the per-unknown rate between the last two
+points. Over that same last step the *total* grows **3.3×** (1,444 → 4,797 MiB)
+while the unknowns grow 1.49× — both statements are true of different quantities,
+so say which one is meant. SuperLU's fill depends on the elimination ordering,
+which changes strategy discretely with size. That is an algorithm switching, not a
+curve.
 
 So the direct path is **interpolated in log-log space between measured points**,
 and **refused above 112,847 unknowns** (`EstimateError`, recommending AMG) rather

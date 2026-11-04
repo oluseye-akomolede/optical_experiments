@@ -251,11 +251,16 @@ measurements say they behave differently:
   range the law is applied with a **1.5× margin** (`AMG_EXTRAPOLATION_MARGIN`) and the
   estimate reports `extrapolated: True`, so a refusal says so.
 - **Direct LU: interpolated from a table, not a law.** Measured peak-RSS growth:
-  1,859 → 10.9 MB; 6,137 → 32.2 MB; 14,375 → 122 MB; 27,869 → 339 MB; 47,915 → 723 MB;
-  75,809 → 1,444 MB; 112,847 → 4,797 MB. **No law fits** (a power law is 27 % off its
-  own worst point, linear 277 %), and the per-unknown rate climbs from 5.86 kB to
-  42.5 kB, with the largest single jump (2.2×) between the last two points as the
-  ordering changes strategy.
+  1,859 → 10.9 MiB; 6,137 → 32.2 MiB; 14,375 → 122 MiB; 27,869 → 339 MiB; 47,915 → 723 MiB;
+  75,809 → 1,444 MiB; 112,847 → 4,797 MiB (the bench's own column: `VmHWM` is KiB,
+  printed as `grow_kb / 1024`, so these are MiB and the table stores
+  `MiB × 1_048_576`). **No law fits** (a power law is 27 % off its
+  own worst point, linear 277 %), and the per-unknown rate climbs from 6,148 B to
+  44,574 B (5.86 → 42.5 kB in the rounded terms the fit is discussed in), with the
+  largest single jump in that rate (2.2×) between the last two points as the
+  ordering changes strategy. State which growth figure you mean: the rate rises
+  2.2× over the last step while the total grows 3.3× (1,444 → 4,797 MiB) as
+  unknowns grow 1.49×.
   `estimate_memory` therefore interpolates this table in log-log space and **refuses
   above 112,847 unknowns** (see below) rather than extrapolate.
 

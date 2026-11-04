@@ -1173,6 +1173,29 @@ def test_direct_hits_every_measured_table_point_exactly():
         assert got == pytest.approx(b, rel=1e-9), n
 
 
+def test_direct_table_is_stored_in_bytes_not_mebibytes():
+    """The table holds BYTES, pinned absolutely so a units slip cannot hide.
+
+    Every other table test reads ``DIRECT_MEMORY_TABLE`` and so passes whatever
+    unit it is stored in. The bench prints growth in MiB (``grow_kb / 1024``,
+    since ``VmHWM`` is KiB); storing those figures as ``e6`` made every direct
+    estimate 4.63 % LOW, which is the unsafe direction for an OOM guard. These
+    literals are from the cluster run and must not be re-derived from the table.
+    """
+    top_n, top_b = E.DIRECT_MEMORY_TABLE[-1]
+    assert top_n == 112_847
+    # The printed figure was 4,797 MiB; in bytes that is 5.030e9, not 4.797e9.
+    assert top_b == pytest.approx(5.030e9, rel=1e-3)
+    assert top_b / top_n == pytest.approx(44_570, rel=2e-3)
+
+    first_n, first_b = E.DIRECT_MEMORY_TABLE[0]
+    assert first_n == 1_859
+    assert first_b == pytest.approx(10.9 * 1_048_576, rel=1e-3)
+
+    # A MiB-as-MB slip is 4.63 % low; assert the table is NOT that reading.
+    assert top_b > 4_797e6 * 1.04
+
+
 def test_direct_interpolates_between_measured_points():
     """Between two table entries the estimate lands between their byte counts.
 

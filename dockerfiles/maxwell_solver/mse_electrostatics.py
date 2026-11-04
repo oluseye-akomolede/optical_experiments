@@ -86,21 +86,25 @@ AMG_NODE_CROSSOVER = 5 * 10**5
 #: the raw output are in ``openspec/changes/electrical-simulation/memory-bench.md``.
 #:
 #: The first column is ``n_free``, the reduced unknown count the solve actually
-#: factorises; the second is the peak RSS growth it took. Fill in a sparse direct
-#: factorisation is NOT linear in ``n`` -- over this table the bytes per unknown
-#: climb from 5.86 kB to 42.5 kB, with a 2.2x jump between the last two points as
-#: the ordering changes strategy. No closed law fits it (a power law is 27 % off
-#: its own worst point, a linear fit 277 %), so the estimate INTERPOLATES this
-#: table in log-log space and refuses beyond it rather than extrapolate a curve
-#: it does not have. See :func:`_direct_bytes`.
+#: factorises; the second is the peak RSS growth it took, IN BYTES. Fill in a
+#: sparse direct factorisation is NOT linear in ``n`` -- over this table the bytes
+#: per unknown climb from 6,148 B to 44,574 B, with a 2.2x jump between the last
+#: two points as the ordering changes strategy. No closed law fits it (a power law
+#: is 27 % off its own worst point, a linear fit 277 %), so the estimate
+#: INTERPOLATES this table in log-log space and refuses beyond it rather than
+#: extrapolate a curve it does not have. See :func:`_direct_bytes`.
+#: The bench (``solve_memory_bench.py``) reports growth in MiB (``grow_kb / 1024``);
+#: ``VmHWM`` is in KiB.  ``MIB`` converts those MiB figures to bytes.
+MIB = 1_048_576
+
 DIRECT_MEMORY_TABLE = (
-    (1_859, 10.9e6),
-    (6_137, 32.2e6),
-    (14_375, 122e6),
-    (27_869, 339e6),
-    (47_915, 723e6),
-    (75_809, 1_444e6),
-    (112_847, 4_797e6),
+    (1_859, 10.9 * MIB),
+    (6_137, 32.2 * MIB),
+    (14_375, 122 * MIB),
+    (27_869, 339 * MIB),
+    (47_915, 723 * MIB),
+    (75_809, 1_444 * MIB),
+    (112_847, 4_797 * MIB),
 )
 
 #: Measured peak-memory growth of the AMG path, which IS well described by a
@@ -458,15 +462,15 @@ def _direct_bytes(n_free: int) -> float:
 
     Below the table's smallest point the cost is the smallest measured rate
     scaled linearly. That is the ONE place this estimate can read low: the rate
-    is not monotonic in size -- it falls from 5.86 to 5.25 kB/unknown across the
-    first two points before climbing to 42.5 kB at the top -- so a tiny mesh may
-    cost slightly more per unknown than the 5.86 kB charged here. The error is
-    bounded by that 5.86 vs 5.25 ratio (11 %) and applies only to meshes below
-    1859 unknowns, where the absolute figure is a few MB and the budget check is
+    is not monotonic in size -- it falls from 6,148 to 5,502 B/unknown across the
+    first two points before climbing to 44,574 B at the top -- so a tiny mesh may
+    cost slightly more per unknown than the 6,148 B charged here. The error is
+    bounded by that 6,148 vs 5,502 ratio (11 %) and applies only to meshes below
+    1859 unknowns, where the absolute figure is tens of MB and the budget check is
     not what decides the outcome. Above the largest point it RAISES:
     extrapolating a curve that fits at 27 % error would produce a confidently
     wrong number, and the caller can act on "too big, use AMG" in a way it
-    cannot act on "4.8 GB".
+    cannot act on "4.8 GiB".
     """
     table = DIRECT_MEMORY_TABLE
     smallest_n, smallest_b = table[0]
