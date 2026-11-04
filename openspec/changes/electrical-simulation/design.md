@@ -137,7 +137,10 @@ Why these and not more:
   This is the STARK grid arithmetic, which is priced by its own explicit formula in §5's
   Stark table — it is NOT priced by the measured electrostatics model, which covers the
   LOBPCG-free direct and AMG paths only.
-  Material parameters come from Vurgaftman, Meyer & Ram-Mohan, J. Appl. Phys. 89, 5815 (2001).
+  Material parameters come from Ioffe/NSM basic-parameter tables at 300 K (see the ε_s rows
+  below); Vurgaftman, Meyer & Ram-Mohan, J. Appl. Phys. 89, 5815 (2001) covers the band
+  parameters — gaps, effective masses, Luttinger parameters, deformation potentials — and is not
+  a source for ε_s (no permittivity was found in it when task 0.2 checked its tables).
 - L5 is the p-i-n half of "full electrical analysis", as in the first electrically driven
   single-photon source (Yuan et al., Science 295, 102 (2002)). Full 3-D L5 does not fit at
   junction-resolving resolution (§5), so L5 has two forms. The **axisymmetric** (r, z) form
@@ -495,7 +498,13 @@ quotas. The FDTD runs for contact loss (§4) are the existing paper-1 bench on t
   is 5.6 % above n² and 30 % above ε∞, so reading any one as another would be wrong — and a
   silent n² substitution would understate the static field. An electrode part may omit it.
   (Vurgaftman, Meyer & Ram-Mohan, J. Appl. Phys. 89, 5815–5875 (2001), doi:10.1063/1.1368156,
-  is the broader III–V parameter compilation if a different alloy is ever needed.)
+  is the broader III–V **band**-parameter compilation if a different alloy is ever needed. It is
+  **not** a permittivity source: its tables carry gaps, masses, Luttinger parameters and
+  deformation potentials, and no ε_s or refractive index was found in it when it was checked for
+  task 0.2. (That check was a read of the paper's parameter tables; the "no ε_s anywhere in the
+  text" form of it is the one claim here we have NOT verified word by word, so treat it as
+  "not found", not "proven absent".) An ε_s taken from it, to any number of figures, would be
+  unsourced — the 12.5/9.61 above are Ioffe's.)
 - Electrodes are parts held at a potential, and electrode charge comes from the assembled
   residual, so the capacitance matrix is symmetric by construction.
 - Grading is an opt-in keyword on `tetrahedralize`, a per-part target edge built into a
