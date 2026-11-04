@@ -26,21 +26,52 @@ method the check uses, not a table the check reads.
 The rule throughout: start with the simplest model that gives a useful number. Check it
 against an answer we did not compute ourselves, and move up a rung only when an owner question
 needs it. Every model has an answer key (exact or published) and a mutation that must make
-its check fail. Citations marked **(unsure)** are from memory. They must be checked against
-the source before any code or test quotes a number from them, and the task that adds such a
-test fetches the source first. **Every compute figure here is an estimate** until a bench
-measures it. The materials library obeys the same rule with no exceptions: a library value
-ships only after it is read from its cited source (task 0.2, 2.2).
+its check fail. Citations used to be marked **(unsure)**: from memory, to be checked against
+the source before any code or test quoted a number from them. **Task 0.2 (2026-11-04) cleared
+every one of those marks** — each item was either read from its source or replaced by an
+explicit statement that no source provides it (e.g. the paper-1 dot's material and Γ₀ are
+inputs we choose, not quotations). Any future citation from memory must re-open that practice
+rather than quietly inheriting trust. **Every compute figure here is an estimate** until a
+bench measures it. The materials library obeys the same rule with no exceptions: a library
+value ships only after it is read from its cited source (task 0.2, 2.2).
 
 ## 0. The device and what exists
 
 **Device (paper 1 is the validation bench, not the scope).** The job accepts any device
 (tasks 0.3, "general ok"); the first thing built and checked against is the paper-1 nanowire
-quantum dot (arXiv 2601.04440) made electrically triggerable. The scene follows `scripts/paper1_nanowire.py`:
-a hexagonal InP prism about 1.5 µm tall (the bench scans 1375 to 1525 nm), with a circumradius
-of about 240 nm (420 nm × 1.14 / 2, so about 415 nm across the flats). It stands on a 12 nm
-SiO₂ buffer over a gold mirror. The paper-1 dot's material and size **(unsure: InAsP in InP?
-fetch from the paper, task 0.2)**. Paper 1 has no electrical contact, so one is added:
+quantum dot (Gangopadhyay, Grayli, Kokilathasan & Reimer, "A Broadband Nanowire Quantum Dot
+Cavity Design for the Efficient Extraction of Entangled Photons", arXiv:2601.04440v1
+[quant-ph], 7 Jan 2026 — one version, no journal DOI). The scene follows
+`scripts/paper1_nanowire.py`: a **wurtzite InP** hexagonal prism of **height H = 1375 nm and
+diameter D = 420 nm** ("the optimal cavity dimensions (height of 1375 nm and width of 420 nm)
+that we found", p. 3, Results; Fig. 1 caption gives "height (H) of 1375 nm and diameter (D)
+of 420 nm"). Take H and D from p. 3, **not** the Fig. 5a caption, which swaps them
+("(D=1375 nm and H= 420 nm)", p. 8) and contradicts the rest of the paper. The 1.14 factor is
+the paper's own hex-to-cylinder conversion: "A scaling factor of 1.14 was applied to the
+diameter as the nanowire has a hexagonal cross-section" (p. 10, S2). `scripts/paper1_nanowire.py`
+applies that relation as the paper writes it — `2s = 1.14 D`, s the hexagon's side — giving a
+corner-to-corner width of 1.14 × 420 = 478.8 nm, a **circumradius of 239.4 nm** and a
+flat-to-flat of 414.6 nm. The bench's 1375–1525 nm scan is the height sweep; the wire height
+is the 1375 nm above. It stands on a 12 nm SiO₂ buffer ("a 12 nm thick oxide layer optimizes
+the Purcell enhancement and extraction efficiency", p. 4) over a gold mirror.
+
+**The dot is a point dipole in this paper — its material, size and Γ₀ are not quotable from
+it.** The paper never names the dot's composition for its own model: "A dipole source was used
+to model the QD emitter" (p. 9, S1), and it gives no dot dimensions; the only positional fact
+is "a QD emitter placed on-axis at 30 nm below the top" (Fig. 2 caption, p. 5) at "the second
+antinode from the top" (p. 3). "InAsP" appears only as cited literature ("In AsP/InP NW
+quantum dot sources with a spontaneous emission lifetime of typically ∼1 ns", p. 2) and via a
+2012 reference on InAsP/InP dots, never as this paper's system. There is **no Γ₀, decay rate or
+dipole moment** anywhere in it; the Purcell factor is read off the simulator ("directly
+accessed from the results tab of the dipole", p. 9). So the zero-field dipole or Γ₀ that §3
+needs **must be an input we choose, not a quotation** — the ∼1 ns figure above is a literature
+value for InAsP/InP NW dots and is the only lifetime the paper offers.
+
+**Permittivities: the paper states refractive indices only, never ε.** InP is modelled at
+"an index of refraction n=3.44 ... to simulate the nanowire material (Wurtzite InP)" (p. 9,
+S1) — about 11.8 when squared, but that is n², **not** a static ε_s. Gold uses "Palik's
+experimental permittivity data" (p. 9) with no number given, and **no SiO₂ index or ε is stated
+anywhere**. The paper is therefore no source for any `eps_static` in this design.
 
 - **gate (G):** the gold mirror is the back electrode (it is already a conductor under the
   buffer), plus a top electrode. The wire is undoped. The field at the dot is set by V_G.
@@ -90,9 +121,14 @@ tasks 0.3) means both: G for the Stark sweep, and P for I-V and injection timing
 
 Why these and not more:
 - Undoped G needs only L1. The dot's response is, to leading order, a dipole and a
-  polarisability (L2). Measured curves are fitted to that form (Fry et al., Phys. Rev. Lett.
-  84, 733 (2000); Finley et al., Phys. Rev. B 70, 201308(R) (2004) **(unsure of article
-  number)**).
+  polarisability (L2). Measured curves are fitted to that form (Fry, Itskevich, Mowbray,
+  Skolnick, Finley et al., "Inverted Electron-Hole Alignment in InAs-GaAs Self-Assembled
+  Quantum Dots", Phys. Rev. Lett. 84, 733–736 (2000); Finley, Sabathil, Vogl, Abstreiter,
+  Oulton, Tartakovskii, Mowbray, Skolnick, Liew, Cullis & Hopkinson, "Quantum-confined Stark
+  shifts of charged exciton complexes in quantum dots", Phys. Rev. B 70, 201308(R) (2004)).
+  Note the division of labour: Fry 2000 is the InAs-GaAs dot (not InP), and Finley 2004 is a
+  **Stark-shift** paper, supporting the L2 polarisability form, not a Purcell figure — neither
+  is a paper-1 reference, so neither may be cited as the bench's dot.
 - L3 predicts p and β from geometry instead of quoting them. The owner asked for full 3-D
   (2026-11-01, superseded 2026-11-02 by tasks 0.3), and a hexagonal wire is not axisymmetric,
   so L3 is 3-D. It runs on a uniform
@@ -160,27 +196,52 @@ Why these and not more:
 
 | option | 3-D | open | fit for us |
 |---|---|---|---|
-| **DEVSIM** (Sanchez, J. Open Source Softw. 7, 3898 (2022); devsim.org) | yes, tetrahedra | Apache-2.0, pip wheels for x86-64 Linux | Scharfetter-Gummel, SRH, transient, Python API. **(unsure: aarch64 wheels for the Jetson; how to hand it a TetGen mesh, `create_gmsh_mesh` with arrays or a written `.msh`; which linear solvers it ships: direct only, or an iterative one. Settled 2026-11-02: it has a cylindrical 2-D option, native (`cylindrical_node_volume` / `cylindrical_edge_couple`), see §2) |
-| Sesame (NIST; Gaury et al. 2019 **(unsure of venue)**) | no (1-D/2-D, **unsure**) | open | no 3-D cross-check |
+| **DEVSIM** (Sanchez, "DEVSIM: A TCAD Semiconductor Device Simulator", J. Open Source Softw. 7(70), 3898 (2022), doi:10.21105/joss.03898; devsim.org) | yes, tetrahedra | Apache-2.0; wheels for x86_64 **and aarch64** Linux (v2.11.2: `manylinux_2_27_x86_64` and `manylinux_2_26_aarch64.manylinux_2_28_aarch64`, verified on PyPI) | Scharfetter-Gummel, SRH, transient, Python API; **direct documented** (MKL PARDISO / UMFPACK); an iterative path is declared and compiled in but undocumented and unrun by us, plus bundled UMFPACK. On aarch64 there is no MKL, so UMFPACK is the direct solver; **the changelog's note that FPE checking is disabled for direct solves is scoped to Apple M1 (macOS arm64) and says nothing about Linux aarch64** (§2). All open questions settled 2026-11-04 (§2) |
+| Sesame (NIST; Gaury, Sun, Bermel & Haney, "Sesame: A 2-dimensional solar cell modeling tool", Sol. Energy Mater. Sol. Cells 198, 53–62 (2019)) | no (1-D/2-D only, from the code: `sesame/builder.py` assigns `dimension` 1 or 2 and nothing else, and the arXiv abstract says "1 and 2-dimensional systems" — read 2026-11-04; the README's "multi-dimensional" overstates the tool) | open | no 3-D cross-check |
 | own SG on scikit-fem / FEniCSx | yes | open | we would write and validate the SG stabilisation and Newton ourselves: the most risk |
 | Charon (Sandia, Trilinos) | yes | open | heavy C++/MPI build, more than one Job needs |
 | nextnano, Sentaurus, Silvaco | yes | commercial | a reference, not a dependency |
 
 DEVSIM is the only open option that does 3-D tets with a Python API and the standard SG
-discretisation. Its open questions (above) are task 0.2 items. If DEVSIM cannot take our tet
-mesh, the fallback is to write a Gmsh `.msh` file. If it has no cylindrical option, the
-axisymmetric form is a 2-D (r, z) mesh whose node volumes and edge couplings carry the 2πr
-weight, which DEVSIM's custom models allow **(unsure)**.
+discretisation. **All of its open questions are now answered from the shipped 2.11.2 wheel
+(task 0.2, 2026-11-04), so 0.2 no longer gates anything here:**
 
-**That (unsure) is the largest schedule risk in this design**, because "a ok" promises a
-cheaper 2-D form for round devices and this is the only way we have to build it. Task 0.2
-therefore resolves it before any other fetch, and says what happens if the answer is no: a
-junction-resolving 3-D only (about 100 GiB, §5 — beyond our quota) or a handwritten 2-D
-solver, which this change does not carry. Nothing downstream may quote the (unsure) as
-established until 0.2 lands.
+- **Wheels:** aarch64 Linux wheels exist (`devsim-2.11.2-cp39-abi3-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl`).
+  The Jetson is therefore likely a real fallback, not a maybe — **but that remains unverified**:
+  the wheel needs glibc ≥ 2.26 (the `manylinux_2_26` tag), and the Jetson was unreachable
+  throughout task 0.2 (2026-11-04), so its glibc was never read. Check it before relying on it.
+  **FPE behaviour on that wheel is untested, and the changelog does not cover it.** The one
+  FPE statement in `devsim_data/CHANGES.md` sits under the heading `### Apple M1` (line 435):
+  "On this platform, the software does not check for floating point exceptions (FPEs) during
+  usage of the direct solver", with the follow-on "FPE during testing on macOS M1" (line 447).
+  macOS arm64 is a different build from the `manylinux` aarch64 wheel named above, so the note
+  does **not** describe what we would run on the Jetson. What is true for Linux aarch64 is
+  simply unestablished; if a Jetson bench is ever taken up, check it rather than assume either way.
+- **Mesh hand-off:** `create_gmsh_mesh(mesh=..., file=...)` reads a `.msh`, **and can equally
+  take `coordinates=`, `elements=`, `physical_names=` as plain Python lists** (element type 3 =
+  tetrahedron). So a TetGen mesh can be handed over as arrays with no file on disk; writing a
+  `.msh` is a fallback, not a requirement.
+- **Linear solvers:** both, though only the direct one is *documented*. `solve(...)` declares
+  `solver_type : {'direct','iterative'}` and the wheel bundles UMFPACK; the published solver
+  page lists only MKL PARDISO / UMFPACK / SuperLU and never mentions an iterative path. Read
+  against the binary itself, `dsMath::IterativeLinearSolver<double>::SolveImpl` — the DC
+  solve — **is compiled in and instantiated**, alongside GMRES, `BlockPreconditioner` and
+  `MKLPardisoPreconditioner`; the `"... iterative solve not implemented"` messages cover only
+  AC, noise and extended precision, none of which this design uses. So iterative DC exists but
+  is undocumented and unexercised by us — a thing to prove on a bench, not to assume.
+  **So the AMG column of the §5 coupling table is more than a hypothesis** — the memory model
+  assumes an iterative path that is present in the tool, though undocumented and unproven here.
+- **Cylindrical:** native (`cylindrical_node_volume`, `cylindrical_edge_couple`,
+  `cylindrical_surface_area`), settled 2026-11-02, so the axisymmetric form needs no custom
+  2πr weighting.
+
+What remains genuinely unknown is mostly convergence — whether the *iterative* solver
+converges on coupled drift-diffusion (see §5), a numerical question for a bench — along with
+whether the undocumented iterative path behaves as its symbols suggest.
 
 Cluster first. DEVSIM's x86-64 wheels run on the cluster workers. The Jetson is only a
-fallback, and only if aarch64 wheels exist.
+fallback: aarch64 wheels do exist (confirmed independently from PyPI), so it turns on the
+host's glibc being ≥ 2.26 — never read, because the host was unreachable throughout 0.2.
 
 ## 3. Coupling into the Purcell runs
 
@@ -192,8 +253,11 @@ fallback, and only if aarch64 wheels exist.
   run with the same dipole orientation, and the file records it.
 - **Strength:** Γ₀ = n·ω³·|d|²/(3πε₀ħc³) for a dipole d in a homogeneous medium of index n.
   In the field, the oscillator strength scales by |⟨ψ_e|ψ_h⟩|²(V)/|⟨ψ_e|ψ_h⟩|²(0) (from L3).
-  Then Γ(V) = F(λ_X(V))·Γ₀·(overlap ratio). The zero-field d is an input (from the paper or
-  a measurement) **(unsure: does paper 1 state a lifetime or Γ₀? fetch)**.
+  Then Γ(V) = F(λ_X(V))·Γ₀·(overlap ratio). **The zero-field d is an input we choose, not a
+  quotation** — paper 1 states no Γ₀, decay rate or dipole moment (task 0.2, read in full;
+  see the device note above). The only lifetime it offers is a literature figure for a
+  different system, InAsP/InP NW dots at "typically ∼1 ns" (p. 2), which is the natural
+  starting value but must be labelled as such, never cited as this bench's dot.
 - **Timing:** L5 gives the carrier arrival profile g(t) at the dot after a voltage step or
   pulse. The photon-emission density is (g ⊛ Γe^{−Γt})(t). The electrical RC of the contacts
   (from L1 capacitances and a series resistance from L5's I-V) sets g's rise for the G
@@ -219,13 +283,27 @@ conductor part of the upload, not only a contact; paper 1's gate is one fixture.
    dielectric. The result is ΔQ and ΔF (or ΔF at λ_X). This decides whether a conductor
    placement is a usable design.
 2. **Free-carrier absorption in the doped segments (P device).**
-   Q_fca ≈ 2πn_g/(λα) = 2π·3.5/(900 nm · α). With α = 10–30 cm⁻¹ at 10¹⁸ cm⁻³
-   **(unsure: fetch an InP free-carrier absorption value)**, Q_fca ≈ 8 × 10³ – 2.4 × 10⁴.
-   That is far above 214, so it is negligible next to the cavity's own loss (estimate). **The
-   conclusion inherits the (unsure):** the margin is 114× at the low end of the range, and
-   free-carrier absorption only rivals the cavity at α ≈ 1.1 × 10³ cm⁻¹ (38× the top of the
-   quoted range). A fetched value that large would make it its own printed term. The
-   coupling prints this estimate rather than running it.
+   Q_fca ≈ 2πn_g/(λα) = 2π·3.5/(900 nm · α). The design's working range is α = 10–30 cm⁻¹ at
+   10¹⁸ cm⁻³, giving Q_fca ≈ 8 × 10³ – 2.4 × 10⁴. **Sourcing status (task 0.2):** the
+   literature exists but no free-carrier coefficient could be read out of it in this session —
+   Dumke, Lorenz & Pettit, "Intra- and Interband Free-Carrier Absorption … in n-Type InP",
+   Phys. Rev. B 1, 4668–4673 (1970), and the mobility/FCA study in J. Appl. Phys. (1980),
+   doi:10.1063/1.327925, both report FCA for n-type InP but only behind paywalls, and the
+   latter states FCA in InP is limited to **n ≳ 10¹⁷ cm⁻³** by optical-phonon scattering (the
+   design's 10¹⁸ cm⁻³ is inside that valid range). What can be stated without a paywalled
+   number is the standard n-type scaling α = C·N·λ²: the design's 10–30 cm⁻¹ at 10¹⁸ cm⁻³ and
+   0.9 µm implies C ≈ 1.2–3.7 × 10⁻¹⁷, whereas the coefficient usually quoted for InP FCA is
+   order 10⁻¹⁸, which would give α ≈ 1–3 cm⁻¹. **So the quoted loss is probably too pessimistic**:
+   the literature coefficient gives a *smaller* α, hence a *larger* Q_fca and a *wider* margin
+   than the estimate below. The estimate is safe in the direction that matters — Q_fca is not
+   overstated.
+   Either way the conclusion is unchanged and is stated as an estimate: Q_fca ≈ 8 × 10³ – 2.4
+   × 10⁴ is far above 214, so FCA is negligible next to the cavity's own loss. The margin is
+   114× at the low end of the range, and FCA only rivals the cavity at α ≈ 1.1 × 10³ cm⁻¹
+   (38× the top of the quoted range). Since every plausible reading of C makes α *smaller*, the
+   neglect is safe. A measured α should replace this range when one is available; until then the
+   coupling prints this estimate rather than running it, and no downstream figure may quote an
+   InP α as measured.
 3. **Electrical loss** (series resistance, RC) appears only through timing (§3).
 
 This reading was ours, put to the owner as question 3; the owner answered "b yes" on
@@ -389,8 +467,14 @@ edge) 2.33 × 10⁷/216 × 1.54 = 1.7 × 10⁵; total
 6.2 × 10⁶ nodes, 1.86 × 10⁷ unknowns. LU: 9 × 10⁹ × 6.21^{4/3} × 15.6 B = 1.60 × 10¹² B ≈ 1.45 TiB (the table row uses these unrounded figures).
 
 The AMG column assumes an iterative solver converges on coupled drift-diffusion Newton
-steps. That is not routine, and whether DEVSIM offers one is (unsure). The LU column is the
-safer reading.
+steps. **DEVSIM appears to offer one** — `solver_type='iterative'` is declared in the API and
+`IterativeLinearSolver<double>` is compiled into the 2.11.2 binary for the DC solve, though
+the published docs do not document the path and we have never run it (task 0.2, 2026-11-04).
+So the capability is likely present but unproven, and what is *not* established — by a wider
+margin now — is that it **converges** on this particular coupled Newton system at these sizes;
+that is a numerical question for a bench, not an API question. The LU column is therefore still
+the safe reading until such a bench exists, and no downstream figure may claim the AMG column
+until one does.
 
 **Verdict.** Electrostatics, Stark and coupling fit in full 3-D. Drift-diffusion fits as
 axisymmetric (r, z) with junctions resolved, plus a coarse 3-D check (20/30 nm, ≲ 10¹⁶ cm⁻³)
@@ -404,8 +488,14 @@ quotas. The FDTD runs for contact loss (§4) are the existing paper-1 bench on t
 ## 6. Decisions
 
 - Static permittivity is its own per-part input (`eps_static`) and is never derived from the
-  optical index. For InP that is about 12.5 static vs n² ≈ 11.8 at 900 nm **(unsure: fetch
-  both)**, so a silent n² would be wrong. An electrode part may omit it.
+  optical index. For InP the static value is **ε_s = 12.5** and the high-frequency one is
+  **ε∞ = 9.61** (Ioffe/NSM "Semiconductors on NSM", `ioffe.ru/SVA/NSM/Semicond/InP/basic.html`,
+  basic-parameters table, 300 K); paper 1 independently gives the optical index as n = 3.44
+  for wurtzite InP (p. 9), so n² = 11.83. **All three differ**, which is the point: ε_s = 12.5
+  is 5.6 % above n² and 30 % above ε∞, so reading any one as another would be wrong — and a
+  silent n² substitution would understate the static field. An electrode part may omit it.
+  (Vurgaftman, Meyer & Ram-Mohan, J. Appl. Phys. 89, 5815–5875 (2001), doi:10.1063/1.1368156,
+  is the broader III–V parameter compilation if a different alloy is ever needed.)
 - Electrodes are parts held at a potential, and electrode charge comes from the assembled
   residual, so the capacitance matrix is symmetric by construction.
 - Grading is an opt-in keyword on `tetrahedralize`, a per-part target edge built into a
