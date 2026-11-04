@@ -211,9 +211,38 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       `scripts/electrostatics_bench.py`. Prove the ε_s-ignored mutation.
       **Lead decision 2026-11-04:** the paper-1 wire fixture moved to 1.6b. Its geometry and
       both ε_s values are still marked unsure, and 0.2 says no test quotes an unsure value.
-- [ ] 1.6b The paper-1 wire with a top electrode, as a bench fixture labelled UNVALIDATED
-      until compared with paper 1. **Blocked on 0.2** (paper-1 dot geometry, InP and SiO₂
-      static ε from cited sources); no value is invented in the meantime.
+- [x] 1.6b The paper-1 wire with a top electrode, as a bench fixture labelled UNVALIDATED
+      until compared with paper 1. Built at `scripts/paper1_wire_electrode.py` with
+      `tests/test_paper1_wire_electrode.py` (14 tests). Same placement and shape as its
+      sibling `scripts/paper1_nanowire.py`, which is also a standalone bench script, not
+      solver-package code: the "not `scripts/`" note in 1.6 history below is about the
+      ELECTROSTATICS fixtures (slab/spheres), which are imported by the solver package and
+      run in the container. This one is a bench that stands on its own.
+      **The fixture's headline result is a NEGATIVE, and it is measured.** The 12 nm oxide
+      inside a 1567 nm stack cannot be resolved by any mesh the current one-part path can
+      build: tet z-span falls only as ~n^(-1/3) (110 nm at n_modes 20, 52 nm at 200 = 153k
+      tets, still 4x the oxide), and |E| at the probe moves **40.1 %** and NOT monotonically
+      across n_modes 20/60/120 (557, 780, 690 kV/m per volt). Tets STRADDLE the layer
+      boundaries, so the per-centroid layer labels are applied to elements whose
+      permittivity is not uniform -- that, not the physics, is what moves. **No field value
+      from this fixture is quotable**, and the script and its tests say so (`--convergence`
+      prints the spread; `test_the_field_is_not_converged_in_the_mesh` pins it).
+      Two walls, both measured, neither fixable in this file: (a) `PartSet` refuses touching
+      parts and requires one part to enclose all others, so the four layers cannot be four
+      parts (a 12 nm oxide cannot enclose a 1375 nm wire); (b) `sizing=` is REFUSED on a
+      one-part upload, so there is no graded path for an electrical mesh. A gate needs a
+      change to `mse_meshing` (internal facets at the layer planes, or a graded
+      electrical upload), not to the fixture.
+      **What IS established:** the solver runs end to end on the paper's geometry; the prism
+      volume matches the closed form exactly (rel < 1e-9); the solid is watertight, Euler 2;
+      the result is exactly linear in the applied volts (max |dE| = 0 at 2V/2 vs 1V and at
+      -1V vs 1V); and direct and AMG agree to 1e-5 on this fixture.
+      **Geometry departure, reported not hidden:** every layer carries the wire's hexagonal
+      outline, so the electrode is a hexagon of the wire's size rather than the square pad
+      plus `ELECTRODE_PAD_NM`; `footprint_error()` returns the 2.408x area ratio that says so.
+      `--no-top` and `--heights-run` (the two controls in the earlier draft) were REMOVED when
+      the geometry became one solid: a single prism has no withdrawable electrode, and
+      leaving flags that do nothing would have been a control that is not a control.
       **1.6 history:** Built and proven: two-layer slab,
       concentric spheres, sphere between plates; the bench and its fixtures live in
       `dockerfiles/maxwell_solver/` beside the solver they exercise (not `scripts/`, so they
