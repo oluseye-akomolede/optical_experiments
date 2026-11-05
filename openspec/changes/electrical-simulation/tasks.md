@@ -408,6 +408,117 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         answer without an error.
 - [ ] 1.9 First-order Coulomb term, E_X(F), the p/β fit and `scripts/stark_bench.py`. Prove
       its mutations.
+      - **Ruling 2026-11-04 (`qitem-20261104102757`, "2 + 3"): cited endpoints, an
+        ASSUMED interpolation, and a sweep of the well depth. Docstrings first.**
+      - Docstrings fixed: `sawtooth_potential` now states plainly that it adds NO well,
+        so the old "+ well" case was a free particle in the box. (The physics defect:
+        `<z^2>` came back as 95.27 nm^2, the bare-box `L^2(1/12 - 1/(2 pi^2))`, while
+        the docstrings called the carrier a quantum dot.)
+      - `well_depth_eV` / `well_height_nm` threaded through `_potential_grid`,
+        `_ground_state` and `exciton_energy_eV`; `None` keeps today's behaviour.
+      - **Confinement is now measured, not asserted.** `test_a_deep_well_actually_confines_the_state`
+        pins that a bare box reproduces `L^2(1/12 - 1/(2 pi^2))` (52.2762 measured vs
+        52.2764 analytic for L = 40 nm; 4.7049 vs 4.7049 for L = 12 nm) and that a 0.6 eV
+        well narrows `<z^2>` by more than 20x. Mutation: dropping the well makes it fail
+        with `<z^2>` equal to the bare-box value, which is the exact trap.
+      - **Validation on a known answer (finite square well).** The ground state solves
+        `u tan u = sqrt(v0 - u^2)`, `E = u^2 K/(m a^2)`; `test_finite_square_well_recovers_the_bound_state`
+        pins it. Measured errors at 127/255/511 cells: 1.13e-2, 5.30e-3, 2.55e-3.
+      - **Measured convergence order, which is the point of the proof.** O(h^2) on any
+        smooth case -- harmonic 2.04 / 2.14 across 40->80->160->320 cells, reproducing the
+        existing pin; transverse box 1.91 / 1.98 / 1.99 / 2.00. The finite square well is
+        **O(h)**: 1.16 / 1.09 / 1.05 / 1.04. That is correct behaviour, not a defect: a
+        node-sampled step lies between grid points, so the effective well width carries an
+        O(h) error. Recorded here so a later reader does not "fix" it.
+      - *Trap worth keeping:* a barrier mask whose half-width equals the box half-width
+        puts the step on the Dirichlet walls, where the potential value is unused. The
+        solver then silently returns the INFINITE-well energy: measured 0.0734434 against
+        the true 0.0471547, stable at every resolution, so it looks converged. It is not.
+        Any well must be strictly narrower than its box.
+      - *Instrument lesson:* three separate alarms during this proof ("E is 12x too
+        large", "the potential is ignored", "transverse couplings are missing") were all
+        wrong, and each came from comparing numbers produced by DIFFERENT boxes -- a 1-D
+        formula applied to a 3-D box, an analytic transverse term from a different z
+        extent, an elementwise diff on a degenerate pair. Cross-box subtraction is the
+        failure mode here; subtract only within one box family.
+      - **`scripts/stark_bench.py`, the depth sweep (ruling item 3).** Prints, for each
+        well depth, `E_X(0)`, the electron and hole `<z^2>`, `beta`, and the Stark shift
+        at each field. Defaults: depths 0/0.1/0.2/0.3/0.5/0.8 eV, fields 0/0.1/0.2/0.4
+        eV/nm, well height 4 nm, box 12x12x16 nm at 6x6x40 cells. Measured:
+        `beta` = -10.008, -8.601, -6.989, -5.306, -1.985, +0.882 -- it **changes sign**.
+        `<z^2>` for the hole falls 8.364 (bare box, exactly the analytic value) -> 1.377
+        -> 1.086 -> 0.987 -> 0.904 -> 0.853 nm^2; the electron 8.364 -> 4.936 -> 3.244
+        -> 2.439 -> 1.759 -> 1.391 nm^2.
+      - **CONFINEMENT CRITERION, corrected 2026-11-04 (reviewer finding 1).** The first
+        version compared `<z^2>` to half the bare-box value, which reads BACKWARDS: at
+        depth 0 a free particle sits exactly at the box ceiling, and that rule called it
+        confined. Confinement is a LENGTH, so the criterion is now the tight-well ceiling
+        `h^2/12` (1.333 nm^2 for the 4 nm well), which depends on the well, not the box.
+        Under the corrected rule the HOLE is unconfined at 0 and 0.1 eV only, but the
+        ELECTRON is unconfined at EVERY swept depth: rows 0.2-0.8 eV are
+        electron-limited, so the exciton extent is set by the box and they are not a
+        dot's either. This STRENGTHENS the negative result below.
+      - **NON-PERTURBATIVE FIELDS, added 2026-11-04 (reviewer finding 5).** The default
+        sweep's largest shift (4.89 eV) exceeds the smallest `E_X(0)` (0.081 eV) by 60x.
+        Both carriers are driven up the ramp past the well, which is outside the regime
+        the quadratic p/beta fit assumes; the bench now prints a warning saying the
+        large-field rows are a model probe. Fields are also reported in kV/cm alongside
+        eV/nm (1 eV/nm = 1e4 kV/cm), so `EV_PER_NM_TO_KV_PER_CM` is no longer an unused
+        export.
+      - **What the sweep concludes, stated plainly in the bench output:** the p/beta fit
+        is well-defined at every depth, but `beta` is a property of FOUR assumed numbers,
+        not one: the well DEPTH, the well HEIGHT (4 nm assumed; the cited TEM range is
+        3-7 nm), the alloy masses (linear interpolation, ASSUMED) and `eps_s` (the InP
+        host's, ASSUMED for an InAsP dot). A single beta needs four citations. This is a
+        NEGATIVE result about the deliverable's headline number, and it is the honest one.
+      - The bench refuses `--height >= --z-extent` with an error naming the
+        infinite-well trap, and refuses a field sweep with no zero point.
+      - `tests/test_stark_bench.py` (11 tests) pins the sweep's discrimination, the
+        bare-box calibration, the refusals, the well-ceiling criterion, the
+        non-perturbative warning, and the beta-cell marker. Mutations caught: dropping
+        the well from `_potential_grid` fails 3; reverting the criterion to
+        `0.5 * bare` fails the ceiling test; never flagging an electron-limited row
+        fails the bare-number test; flagging every row fails the held-electron test.
+      - **THE BETA COLUMN CARRIES ITS OWN CAVEAT, 2026-11-05 (reviewer CHANGES-NEEDED
+        @8c531ad, on the lead's stricter bar).** The emitted table printed `beta` as a
+        bare number on every row, including the four where `<z2>e` was above the
+        tight-well ceiling the same script computes. The prose saying those rows are
+        "not a dot's either" sat sixteen lines BELOW the table -- and the table is what
+        gets screenshotted and the number lifted from. Electron-limited rows now print
+        `blank*` with a one-line key directly under the table naming the depths. In the
+        default sweep every row is electron-limited, so the honest output is that beta
+        is blank on all six; the test pins depth 0.2 specifically so a later edit cannot
+        restore a bare number there.
+      - **SILENT LOBPCG FAILURE, fixed 2026-11-04 (reviewer finding 3, made REQUIRED by
+        the lead).** `scipy`'s `lobpcg` reports a missed tolerance only through a
+        `UserWarning` and then returns whatever it has, so `lowest_states` was handing
+        back unconverged eigenvalues with nothing to distinguish them. It happened on
+        this change's own sweep (12 of 159 electron solves). `lowest_states` now measures
+        the true residual `||Hv - Ev||/(|E|||v||)` per pair and raises `StarkError`
+        unless it is below `residual_tol` (default 1e-6), or returns a `converged` array
+        with `return_converged=True`. `residual_tol` is deliberately NOT `tol`: `tol` is
+        LOBPCG's internal estimate, while the measured residual floors near 5e-10 and
+        does not improve with more iterations, so binding the check to `tol` would
+        reject correct solves. Tests force failure with `maxiter=3` (raises) and check a
+        good solve still passes (does not fire); mutations both ways are caught.
+      - **Test counts, corrected 2026-11-04 (reviewer finding 2).** The round's message
+        reported "113 passed" as if it were this change's; that was the WHOLE electrical
+        suite. This change touches these files: `test_stark.py` 21, `test_stark_bench.py`
+        9, `test_exciton.py` 22, `test_paper1_wire_electrode.py` 15 = 67 passing. Both
+        numbers are counted from the run output, not transcribed.
+      - **The E_C sign, documented 2026-11-04 (reviewer finding 4).** `e_c` is negative
+        and correct. `e_e` and `e_h` are energies from a band edge at zero, and the field
+        pulls both carriers up the ramp, so each can sit below zero; `e_x` is a SPACING
+        between levels, not an absolute energy, and `e_c` is the attractive correction to
+        it. Comment added at the call site because the next reader would otherwise read a
+        negative attraction as a sign bug.
+      - **Finite-square-well convergence order, stated precisely 2026-11-04.** Measured
+        1.09 / 1.05 / 1.04 -- FIRST order, and that is correct, not a defect: the
+        potential step is sampled at nodes, so the well width the discrete problem solves
+        is uncertain by up to one cell and `dE/da` is nonzero. Smooth (harmonic 2.04 /
+        2.14) and hard-wall (transverse 1.91-2.00) cases pin the difference. The old
+        assertion `min(orders) > 0.9` would have passed at 0.91; it now asserts
+        `1.0 < min < max < 1.5`, which pins the order the test documents.
 - [ ] 1.10 The paper-1 gate sweep (tier 2): E_X(V) for the wire, recorded with its mesh
       counts and RSS.
 

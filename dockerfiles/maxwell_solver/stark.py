@@ -61,6 +61,7 @@ What this module does NOT do
 from __future__ import annotations
 
 import math
+import warnings
 from typing import NamedTuple
 
 import numpy as np
@@ -292,7 +293,9 @@ def build_hamiltonian(box: Box, mass_ratio, potential_eV=None):
 
 
 def lowest_states(box: Box, mass_ratio, *, n_states: int = 4,
-                  potential_eV=None, tol: float = 1e-10, seed: int = 0):
+                  potential_eV=None, tol: float = 1e-10, seed: int = 0,
+                  return_converged: bool = False, maxiter: int = 2000,
+                  residual_tol: float = 1e-6):
     """The lowest ``n_states`` eigenpairs of the confined-carrier Hamiltonian.
 
     Uses LOBPCG with a fixed seed, so a re-run reproduces the same eigenvalues
@@ -308,6 +311,35 @@ def lowest_states(box: Box, mass_ratio, *, n_states: int = 4,
     Returns ``(energies_eV, vectors)`` with ``vectors`` of shape
     ``(n_nodes, n_states)``, zero on the walls; that is the full-box shape,
     which is what a caller plotting a state wants.
+
+    CONVERGENCE IS CHECKED, NOT ASSUMED. ``scipy.sparse.linalg.lobpcg`` does
+    not report whether it met its tolerance in its return value: on failure it
+    only emits a ``UserWarning`` and hands back whatever it has. A caller that
+    ignores warnings therefore gets an unconverged eigenvalue with nothing to
+    distinguish it from a converged one. Worse, LOBPCG's own stopping rule is
+    an estimate, so "no warning" is not proof either. This function instead
+    measures the true residual ``||H v - E v|| / (|E| ||v||)`` for every pair
+    and compares it against ``residual_tol``.
+
+    ``tol`` and ``residual_tol`` are different quantities and are not
+    interchangeable: ``tol`` is LOBPCG's internal stopping estimate, whereas
+    ``residual_tol`` bounds the residual that is actually reported here. The
+    measured residual on these matrices floors around ``5e-10`` and does not
+    improve with more iterations, so binding the check to ``tol`` would reject
+    correct solves. ``residual_tol`` defaults to ``1e-6``: far tighter than
+    any physics question here needs, and far looser than an unconverged solve
+    (which lands orders of magnitude above it).
+
+    A pair that fails that check raises :class:`StarkError` by default. Pass
+    ``return_converged=True`` to receive ``(energies_eV, vectors, converged)``
+    instead, where ``converged`` is a boolean array; that form is for callers
+    that want to report the failure rather than die on it. The check is the
+    authority in both cases: an unconverged pair is never returned as if it
+    were fine.
+
+    Pass a larger ``maxiter`` (via ``lowest_states(..., maxiter=...)``) when a
+    residual failure is reported; the failure is a statement about the solve,
+    not about the physics.
     """
     H, interior_idx, flat = build_hamiltonian(box, mass_ratio, potential_eV)
     m = interior_idx.size
@@ -323,11 +355,49 @@ def lowest_states(box: Box, mass_ratio, *, n_states: int = 4,
     rng = np.random.default_rng(seed)
     X = rng.standard_normal((m, k))
 
-    evals, evecs = spla.lobpcg(H, X, largest=False, tol=tol, maxiter=2000)
+    with warnings.catch_warnings(record=True) as caught:
+        # lobpcg reports a missed tolerance only through a UserWarning, and
+        # it has several differently-worded forms ("Exited at iteration",
+        # "Exited postprocessing", ...). Recording rather than filtering is
+        # deliberate: scipy manipulates the filter state itself, so an
+        # `ignore` filter is not reliably honoured. The warnings are dropped
+        # on purpose; the measured residual below is the authority, and it is
+        # what is reported to the caller.
+        warnings.simplefilter("always")
+        evals, evecs = spla.lobpcg(H, X, largest=False, tol=tol,
+                                   maxiter=maxiter)
+    del caught
 
     order = np.argsort(evals)
     evals = evals[order]
     evecs = evecs[:, order]
+
+    # True residual per pair. LOBPCG's stopping estimate is not trustworthy on
+    # its own (it can report "converged" to an estimate that is wrong), so
+    # this measured quantity decides.
+    converged = np.zeros(k, dtype=bool)
+    for i in range(k):
+        v = evecs[:, i]
+        nrm = float(np.linalg.norm(v))
+        if nrm == 0.0:
+            continue
+        r = H @ v - evals[i] * v
+        scale = abs(float(evals[i])) * nrm
+        # A near-zero eigenvalue makes the relative test meaningless; fall
+        # back to the absolute residual against ||H|| ~ the row scale.
+        if scale <= 0.0:
+            scale = nrm * float(abs(H).sum(axis=1).max())
+        converged[i] = (float(np.linalg.norm(r)) / scale) <= residual_tol
+    if not converged.all() and not return_converged:
+        bad = ", ".join(f"{evals[i]:.8g}" for i in np.flatnonzero(~converged))
+        raise StarkError(
+            f"lowest_states did not converge for {int((~converged).sum())} of "
+            f"{k} eigenpairs (energies {bad}): the measured residual exceeds "
+            f"{residual_tol:g} within maxiter={maxiter}; the returned values "
+            f"would be unconverged. "
+            f"Refusing to hand them back silently. Retry with a larger "
+            f"maxiter, or pass return_converged=True to inspect them."
+        )
 
     # Normalise: LOBPCG returns mass-orthonormal vectors for the identity
     # metric only up to its tolerance, so fix the sign and the norm explicitly.
@@ -342,6 +412,8 @@ def lowest_states(box: Box, mass_ratio, *, n_states: int = 4,
         if v[np.argmax(np.abs(v))] < 0:
             nrm = -nrm
         full[:, i] = v / nrm
+    if return_converged:
+        return evals, full, converged
     return evals, full
 
 

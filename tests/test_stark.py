@@ -78,6 +78,70 @@ def test_harmonic_converges_at_second_order():
     assert min(orders) > 1.8, orders
 
 
+def test_finite_square_well_recovers_the_bound_state():
+    """A finite square well's ground state matches the transcendental root.
+
+    This is the "case with a known answer" the confinement validation stands
+    on. The bound-state energy solves, in dimensionless ``u = k a`` with
+    ``v0 = V0 a^2 / (K/m)``,
+
+        u tan u = sqrt(v0 - u^2)        (even / ground state)
+
+    and ``E = u^2 K / (m a^2)``. The well is narrower than the box so that the
+    outer barrier is a real wall, not the Dirichlet boundary (with ``a`` equal
+    to the box half-width the mask covers the whole grid, the barrier lands on
+    the walls where its value is unused, and the solver silently reports the
+    INFINITE-well energy -- measured 0.0734434 against the true 0.0471547 --
+    which is how that mistake was caught).
+
+    The convergence is O(h), not O(h^2), and that is correct for this problem:
+    a node-sampled step sits between grid points, so the effective well width
+    carries an O(h) uncertainty. Measured orders for THIS geometry (a = 2 nm,
+    V0 = 0.5 eV; the bench uses a different well and measures 1.16/1.09/1.05/
+    1.04): 1.092 / 1.054.
+
+    The ``Exited postprocessing`` UserWarning from ``lobpcg`` here is expected
+    and is deliberately not silenced: at these coarse grids the eigensolver's
+    postprocessing pass does not hit its accuracy target, which is exactly the
+    O(h) behaviour being measured. The assertion is on convergence to the
+    analytic root, which the numbers above establish.
+    """
+    import math
+    from scipy.optimize import brentq
+
+    K = S.HBAR2_OVER_2ME_EV_NM2
+    mass_ratio, a, V0 = 0.08, 2.0, 0.5
+    v0 = V0 / (K / mass_ratio) * a**2
+    u = brentq(lambda u: u * math.tan(u) - math.sqrt(max(v0 - u * u, 0.0)),
+               1e-9, math.pi / 2 - 1e-9)
+    exact = u * u * K / mass_ratio / a**2
+
+    def solve(n_cells):
+        h = 16.0 / n_cells
+        zs = np.linspace(-8.0, 8.0, n_cells + 1)
+        V = np.where(np.abs(zs) < a, 0.0, V0)
+        e, _ = S.lowest_states_1d(n_cells + 1, h, mass_ratio=mass_ratio,
+                                  potential_eV=V, n_states=1)
+        return float(e[0])
+
+    errs = [abs(solve(n) - exact) for n in (127, 255, 511)]
+    assert errs[-1] < 2e-3, errs
+    orders = [np.log2(errs[i] / errs[i + 1]) for i in range(len(errs) - 1)]
+
+    # FIRST order, not second, and that is the correct answer here, not a
+    # defect. The potential step is sampled AT THE NODES: whether the node at
+    # |z| = a falls on the near or the far side of the step flips with h, so
+    # the well the discrete problem actually solves has a width uncertain by
+    # up to one cell, and dE/da is nonzero. That costs one order. The smooth
+    # (harmonic) and hard-wall cases in this file converge at 2 and pin the
+    # difference; see test_laplacian... and the infinite-well test.
+    #
+    # Measured here: 1.092, 1.054. The bound is set to catch drift
+    # (towards O(1), or a sudden jump), NOT to pass on a technicality -- the
+    # previous bound of 0.9 would have passed 0.91, which pins nothing.
+    assert 1.0 < min(orders) and max(orders) < 1.5, (orders, errs)
+
+
 # ----------------------------------------------------------- analytic: Airy
 
 def test_airy_ground_state_matches_the_airy_zero():
@@ -145,6 +209,43 @@ def test_zero_potential_recovers_the_particle_in_a_box():
     got, _ = S.lowest_states_1d(n, h, potential_eV=np.zeros(n), n_states=1)
     want = S.HBAR2_OVER_2ME_EV_NM2 * (np.pi / extent) ** 2
     assert got[0] == pytest.approx(want, rel=2e-3), (got[0], want)
+
+
+def test_a_deep_well_actually_confines_the_state():
+    """A deep well must localise the state; a bare box must not.
+
+    The trap this pins: ``exciton.sawtooth_potential`` used to return ``-F z``
+    only, so the "--well" case was a free particle in the box and its
+    ``<z^2>`` was the bare-box ``L^2 (1/12 - 1/(2 pi^2))`` to five digits
+    (95.27 nm^2 for L = 40 nm) while the docstrings called it a quantum dot.
+    An energy comparison alone does not catch that: the bare box has a
+    perfectly finite ground state. Only the WIDTH does.
+
+    So this test asserts the confined state is much narrower than the bare
+    box, and that the bare box reproduces the analytic width. If the well is
+    silently dropped, the first assertion fails with <z^2> == 95.27, which is
+    the exact value the second assertion pins.
+    """
+    n_cells = 40
+    extent = 40.0
+    box = S.Box((0.0, 0.0, -extent / 2), (12.0, 12.0, extent),
+                (8, 8, n_cells))
+    xs, ys, zs = box.axes()
+    _x, _y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+
+    def z_squared(potential):
+        _e, vec = S.lowest_states(box, 0.08, n_states=1, potential_eV=potential)
+        dens = vec[:, 0] ** 2
+        dens = dens / dens.sum()
+        return float(np.dot(Z.reshape(-1) ** 2, dens))
+
+    bare = z_squared(None)
+    widest = extent**2 * (1.0 / 12.0 - 1.0 / (2.0 * np.pi**2))
+    assert bare == pytest.approx(widest, rel=5e-3), (bare, widest)
+
+    well = np.where(np.abs(Z) > 2.0, 0.6, 0.0)
+    confined = z_squared(well)
+    assert confined < 0.05 * bare, (confined, bare)
 
 
 def test_walls_are_dirichlet():
@@ -289,3 +390,62 @@ def test_field_from_a_tet_solve_feeds_airy_levels_end_to_end():
                             extent_nm=120.0, n_cells=960)
     got, _ = S.lowest_states_1d(n, h, potential_eV=V, n_states=1)
     assert got[0] == pytest.approx(exact[0], rel=2e-3), (got[0], exact[0])
+
+
+# ------------------------------------------------ silent-failure guardrails
+
+
+def test_unconverged_lobpcg_raises_instead_of_returning():
+    """A solve that hits the iteration cap must NOT hand back a number.
+
+    scipy's lobpcg reports a missed tolerance only through a UserWarning and
+    then returns whatever it has; a caller that does not read warnings cannot
+    tell that result from a converged one. That happened on this change's own
+    sweep (12 of 159 electron solves), which is why lowest_states now measures
+    the residual itself.
+
+    ``maxiter=3`` cannot converge a matrix of this size, so this is a forced
+    failure, not a lucky one.
+    """
+    box = S.Box((0.0, 0.0, -8.0), (12.0, 12.0, 16.0), (6, 6, 40))
+    xs, ys, zs = box.axes()
+    Z = np.meshgrid(xs, ys, zs, indexing="ij")[2]
+    V = np.where(np.abs(Z) < 2.0, 0.0, 0.2)
+
+    with pytest.raises(S.StarkError, match="did not converge"):
+        S.lowest_states(box, 0.0684, n_states=1, potential_eV=V, maxiter=3)
+
+    # The reporting form returns the same verdict instead of raising, so a
+    # caller can record it rather than abort.
+    _e, _v, converged = S.lowest_states(box, 0.0684, n_states=1,
+                                        potential_eV=V, maxiter=3,
+                                        return_converged=True)
+    assert converged.tolist() == [False]
+
+
+def test_converged_lobpcg_is_reported_converged():
+    """The guard must not fire on a good solve -- otherwise it is just a bug
+    that rejects correct answers, which is the worse failure mode."""
+    box = S.Box((0.0, 0.0, -8.0), (12.0, 12.0, 16.0), (6, 6, 40))
+    xs, ys, zs = box.axes()
+    Z = np.meshgrid(xs, ys, zs, indexing="ij")[2]
+    V = np.where(np.abs(Z) < 2.0, 0.0, 0.2)
+    _e, _v, converged = S.lowest_states(box, 0.0684, n_states=1,
+                                        potential_eV=V, return_converged=True)
+    assert converged.tolist() == [True]
+
+
+def test_lowest_states_emits_no_lobpcg_warning_to_callers():
+    """The residual check replaces the warning; it must not leak the raw one
+    to a caller that would reasonably mistake it for the check."""
+    import warnings as _w
+    box = S.Box((0.0, 0.0, -8.0), (12.0, 12.0, 16.0), (6, 6, 40))
+    xs, ys, zs = box.axes()
+    Z = np.meshgrid(xs, ys, zs, indexing="ij")[2]
+    V = np.where(np.abs(Z) < 2.0, 0.0, 0.2)
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        S.lowest_states(box, 0.0684, n_states=1, potential_eV=V, maxiter=3,
+                        return_converged=True)
+    msgs = [str(c.message) for c in caught]
+    assert not any("tolerance" in m for m in msgs), msgs
