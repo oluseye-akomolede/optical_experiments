@@ -558,6 +558,80 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         2.14) and hard-wall (transverse 1.91-2.00) cases pin the difference. The old
         assertion `min(orders) > 0.9` would have passed at 0.91; it now asserts
         `1.0 < min < max < 1.5`, which pins the order the test documents.
+- [ ] 1.9a Lateral confinement of the dot (follow-on to 1.9; reviewer: "the electron is not
+      held at any swept depth -- is the missing lateral size the cause?"). Spec: `stark-shift`,
+      "The dot SHALL have a lateral extent, proven on exact answers".
+      - **Answer: no. Lateral size is not the cause, and it slightly LOOSENS the electron along
+        z.** The 1.9 well already had lateral walls: the hard 12 nm box, tighter than the 18 nm
+        dot. A finite lateral barrier lets part of the state sit beside the dot, where there is
+        no z-well, so the effective z-depth falls. Measured at 0.8 eV, same cell mask and grid,
+        32 nm box: `<z^2>e` 1.2460 filling the box -> 1.2507 with the 15.95 nm dot
+        (`test_lateral_confinement_does_not_tighten_the_electron_along_z`).
+      - **What did move the 1.9 verdict is the step's sampling, not the physics.** The 1.9
+        `node` mask counts both face nodes as inside, so the 4 nm well is 4.4 nm at h_z = 0.4.
+        Exact 1-D answer (`stark.finite_well_in_box`, 4 nm, 0.8 eV, m_e 0.0686, 16 nm box):
+        `<z^2>` = 1.2574 nm^2, BELOW the 1.333 ceiling. The node mask reads 1.391 / 1.322 /
+        1.289 / 1.273 at n_z 40/80/160/320: first order, converging to the exact value from
+        above, and already under the ceiling at n_z = 80. So 1.9's "electron not held at 0.8
+        eV" was a grid artefact of the mask; the exact 1-D crossing depth is 0.714 eV. The
+        `node` mask stays the default, so every 1.9 number is unchanged (pinned
+        bit-for-bit by `test_node_mask_without_lateral_is_exactly_the_1_9_potential`).
+      - **Model.** A square box dot, `exciton.dot_fill_fraction`, host barrier around it at the
+        same depth (in a nanowire InP is above, below and around the dot). A box, not a
+        cylinder: `stark.py` is a uniform Cartesian 7-point grid (design §1 fixes L3 on it), so
+        a box's faces lie on grid planes and a cylinder's would be a staircase. Bench default
+        side: the equal-AREA square of `DOT_DIAMETER_NM` (D sqrt(pi)/2 = 15.952 nm), the same
+        equal-area rule design §1 uses for hexagon -> cylinder. Masses, eps_s and height are
+        the 1.9 inputs, unchanged; nothing was tuned.
+      - **The `cell` mask** weights each node by the fraction of its dual cell inside the dot,
+        so the well width is exact on any grid. Proven by measured order, faces on nodes,
+        8 nm cube at 8/16/32 cells (`tests/test_lateral_dot.py`): hard-wall limit (V0 = 1e6 eV)
+        1.981 / 1.994; separable finite box well vs three exact 1-D roots 1.857 / 1.962;
+        lateral-fill limit (the 1.9 model) vs exact 1-D + hard box 1.847 / 1.960. The
+        non-separable dot has no closed form: it self-converges at 1.95 on 16/32/64 (1.82 on
+        8/16/32, where h = 1 nm is pre-asymptotic) and is bracketed exactly,
+        E_sep(V0/3) < E_dot < E_sep(V0): 0.25376 < 0.29770 (Richardson) < 0.29914 eV.
+        Faces OFF nodes converge but not at a clean order (the sub-cell offset changes with h);
+        measured in a scratch run, not pinned.
+      - *Bound I set before measuring, corrected:* the order tests first asserted
+        `min > 1.85`, a number I had not measured; the lateral-fill limit measured 1.847 and
+        failed. The bound is now `1.8 < min, max < 2.2`, the bar 1.8's harmonic/Airy tests
+        already use. Recorded so it does not read as a bound tuned to pass.
+      - **The sweep, rerun with the lateral dot.**
+        `python -I scripts/stark_bench.py --lateral --transverse 32 --n-xy 16` (75 s, peak RSS
+        603 MiB under `ulimit -v 4194304`). Electron, zero field, depths 0.1/0.2/0.3/0.5/0.8 eV:
+        E_e 0.0875 / 0.1225 / 0.1462 / 0.1774 / 0.2058 eV, all below V0, so the electron is in
+        a BOUND state of the dot at every depth; P_in 0.566 / 0.718 / 0.799 / 0.878 / 0.926;
+        `<z^2>e` 5.313 / 3.368 / 2.426 / 1.653 / 1.251. On the 1.9 length criterion the
+        electron is held at 0.8 eV only; the extra depths (`--depths 0.6 0.7 0.75`) put the
+        crossing between 0.70 (1.344, not held) and 0.75 (1.294, held). Laterally
+        (`<x^2>e <= s^2/12` = 21.2) it is held at every depth. Grid check at n_z = 80: 0.7 ->
+        1.351, 0.8 -> 1.259, same verdicts. Side check with the circumscribing 18 nm square
+        (`--lateral 18 --transverse 34 --n-xy 17`): 0.7 -> 1.342 not held, 0.75 -> 1.292 held.
+        Without the lateral dot, cell mask (`--mask cell`): 0.8 -> 1.246 held, 0.5 -> 1.636 not.
+      - **beta.** With the lateral dot the 0.8 eV row is no longer electron-limited and prints
+        beta = 0.816, but that fit spans fields up to 0.4 eV/nm, which the bench already flags
+        as non-perturbative (shift 4.88 eV against E_X(0) = 0.0227 eV). It is not a quotable
+        beta, and the four-assumptions caveat from 1.9 stands unchanged.
+      - The bench's binding table reports three tests side by side and does not merge them:
+        below the continuum edge (V0 with a lateral dot; without one, V0 + the box column's
+        lateral energy, 0.0761 eV for the 12 nm box, because there the walls are part of the
+        model), P_in, and the length criteria. The verdict lines still use the 1.9 criterion.
+      - `stark.finite_well_in_box` first scanned uniformly in E and returned an EXCITED state for
+        a thin well (several roots in one interval), and its tan/cot form lost the 1e7 eV root
+        beside the pole. Now pole-free and scanned in k at pi/(4L); both cases are tests.
+      - `coulomb._screened_pair_energy` block 4096 -> 1024: memory only (the 32 nm box has ~12k
+        nodes, a 4096-row block is a 1.2 GB displacement array). Same sum.
+      - Mutations (each reverted): dropping the lateral faces from `dot_fill_fraction` fails 2
+        (hard-wall limit, lateral-vs-z; the bracket does NOT catch it, 0.27992 eV lies inside,
+        and its docstring says so); node sampling inside the cell mask fails 7; the 1.8
+        half-factor in `hard_box_ground_eV` fails 3; coth -> tanh in `finite_well_in_box` fails
+        3; the potential ignoring `well_lateral_nm` fails 2.
+      - Tests: `test_lateral_dot.py` 11, `test_stark_bench.py` 11 -> 15; with `test_stark.py`
+        21 and `test_exciton.py` 22, 69 passing.
+      - *Not proven:* the BenDaniel-Duke mass step (the dot mass is still used in the barrier,
+        as in 1.9); a cylinder (not built, by the choice above); the openspec CLI is not
+        installed here, so the delta is not machine-validated.
 - [ ] 1.10 The paper-1 gate sweep (tier 2): E_X(V) for the wire, recorded with its mesh
       counts and RSS.
 

@@ -196,3 +196,58 @@ def test_beta_cell_is_a_number_when_the_electron_is_held(capsys):
     cell = _beta_cell(out, 3.0)
     assert "*" not in cell
     float(cell)  # must parse as a number
+
+
+# ---------------------------------------------- lateral confinement (1.9 follow-on)
+
+def test_lateral_default_is_the_equal_area_square_of_the_cited_diameter():
+    """The side is derived from dot_material, never typed into the bench."""
+    import math
+    assert B.EQUAL_AREA_SIDE_NM == pytest.approx(
+        DM.DOT_DIAMETER_NM.value * math.sqrt(math.pi) / 2.0, rel=1e-15)
+    assert B.EQUAL_AREA_SIDE_NM ** 2 == pytest.approx(
+        math.pi * (DM.DOT_DIAMETER_NM.value / 2.0) ** 2, rel=1e-12)
+
+
+def test_bench_refuses_a_lateral_dot_as_wide_as_its_box():
+    """The default 12 nm box is narrower than the 15.95 nm dot: refused, not
+    silently turned into the hard box wall."""
+    with pytest.raises(SystemExit):
+        B.main(["--lateral"])
+    with pytest.raises(SystemExit):
+        B.main(["--lateral", "20", "--transverse", "20"])
+
+
+def _lateral_electron(depth):
+    material = B._material()
+    box = S.Box((0.0, 0.0, -8.0), (32.0, 32.0, 16.0), (16, 16, 40))
+    return B._confinement(box, material.m_e_ratio, depth, 4.0,
+                          B.EQUAL_AREA_SIDE_NM, "cell")
+
+
+def test_with_lateral_confinement_the_electron_is_held_from_0_75_eV_not_0_7():
+    """The follow-on's answer, at the bench's lateral grid (2 nm x 0.4 nm).
+
+    On the 1.9 length criterion (<z^2>e <= h^2/12 = 1.333 nm^2): NOT held at
+    0.7 eV (1.344), held at 0.75 (1.294) and 0.8 (1.251). Below the barrier
+    (E_e < V0, a bound state) already at 0.1 eV (0.0875 eV). Pinned both ways
+    so neither verdict can drift silently.
+    """
+    tight = 16.0 / 12.0
+    at = {d: _lateral_electron(d) for d in (0.1, 0.7, 0.75, 0.8)}
+    assert at[0.7]["z2"] > tight, at[0.7]
+    assert at[0.75]["z2"] < tight and at[0.8]["z2"] < tight, (at[0.75], at[0.8])
+    assert at[0.1]["energy"] < 0.1, at[0.1]
+    assert 0.5 < at[0.1]["p_in"] < at[0.8]["p_in"] < 1.0
+
+
+def test_lateral_report_prints_the_binding_table_against_V0(capsys):
+    """With a lateral dot the continuum edge is V0 itself, and the table says so."""
+    rows, box = B.sweep((0.8,), (0.0, 0.1), 4.0, 20.0, 16.0, 10, 40,
+                        lateral_nm=B.EQUAL_AREA_SIDE_NM, mask="cell")
+    B.report(rows, (0.0, 0.1), box, 4.0, B.EQUAL_AREA_SIDE_NM, "cell")
+    out = capsys.readouterr().out
+    assert "electron binding" in out
+    assert "continuum edge = V0," in out
+    assert "box dot 15.952 x 15.952 nm" in out
+    assert rows[0]["bound_e"]

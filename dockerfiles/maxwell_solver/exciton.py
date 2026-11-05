@@ -42,6 +42,9 @@ __all__ = [
     "ExcitonError",
     "DotMaterial",
     "ExcitonResult",
+    "WELL_MASKS",
+    "axis_inside_fraction",
+    "dot_fill_fraction",
     "sawtooth_potential",
     "exciton_energy_eV",
     "fit_p_beta",
@@ -115,6 +118,8 @@ def sawtooth_potential(
     field_eV_per_nm: float,
     well_depth_eV: float | None = None,
     well_height_nm: float | None = None,
+    well_lateral_nm=None,
+    well_mask: str = "node",
 ) -> np.ndarray:
     """The L1 potential ``-e F z`` on the box's node grid, in eV.
 
@@ -136,7 +141,106 @@ def sawtooth_potential(
             f"field must be non-negative; the spectrum is symmetric under "
             f"F -> -F and the fit uses |F|, got {field_eV_per_nm!r}"
         )
-    return _potential_grid(box, field_eV_per_nm, well_depth_eV, well_height_nm)
+    return _potential_grid(box, field_eV_per_nm, well_depth_eV, well_height_nm,
+                           well_lateral_nm, well_mask)
+
+
+#: The two ways a dot's potential step is put on the node grid.
+#:
+#: ``"node"`` -- the 1.9 rule: a node is inside when it lies in the closed dot
+#: region, and takes the full depth otherwise. A face that lands on a node
+#: counts that node as inside, so the discrete well is up to one cell WIDER
+#: than asked (half a cell each side) and every result carries an O(h) error.
+#: Measured for the 1.9 bench well (4 nm, 0.8 eV, electron, h_z = 0.4 nm):
+#: ``<z^2>`` = 1.391 nm^2 against the exact 1.2574, converging at first order
+#: (1.322 / 1.289 / 1.273 at h_z = 0.2 / 0.1 / 0.05).
+#:
+#: ``"cell"`` -- each node takes ``depth * (1 - f)``, ``f`` the fraction of its
+#: dual cell (``x +- h/2`` per axis) lying inside the dot. That preserves the
+#: integral of the potential exactly on any grid, which is what removes the
+#: O(h) width error: measured O(h^2) against exact answers when the faces lie
+#: on nodes (see ``tests/test_lateral_dot.py``).
+WELL_MASKS = ("node", "cell")
+
+
+def axis_inside_fraction(nodes_nm, h_nm: float, lo_nm: float, hi_nm: float) -> np.ndarray:
+    """Fraction of each node's dual cell ``[x - h/2, x + h/2]`` inside ``[lo, hi]``.
+
+    1 deep inside, 0 far outside, 1/2 for a node sitting exactly on a face. The
+    fractions times ``h`` sum to the overlap length of ``[lo, hi]`` with the
+    covered span, so the cell-averaged step carries the right well WIDTH on any
+    grid, which node sampling does not.
+    """
+    x = np.asarray(nodes_nm, dtype=np.float64)
+    a = np.maximum(x - 0.5 * h_nm, lo_nm)
+    b = np.minimum(x + 0.5 * h_nm, hi_nm)
+    # Clipped to [0, 1]: b - a can exceed h by a rounding ulp.
+    return np.clip((b - a) / h_nm, 0.0, 1.0)
+
+
+def _check_well(box, well_height_nm, well_lateral_nm, well_mask):
+    if well_mask not in WELL_MASKS:
+        raise ExcitonError(f"well_mask must be one of {WELL_MASKS}, got {well_mask!r}")
+    if not (math.isfinite(well_height_nm) and well_height_nm > 0):
+        raise ExcitonError(f"well height must be positive, got {well_height_nm!r}")
+    if well_lateral_nm is None:
+        return None
+    try:
+        lat = tuple(float(v) for v in well_lateral_nm)
+    except TypeError:
+        lat = (float(well_lateral_nm),) * 2
+    if len(lat) != 2:
+        raise ExcitonError(f"well_lateral_nm is one side or (x, y), got {well_lateral_nm!r}")
+    for side, extent, axis in zip(lat, box.size[:2], "xy"):
+        if not (math.isfinite(side) and side > 0):
+            raise ExcitonError(f"lateral dot side must be positive, got {side!r}")
+        if side >= extent:
+            # The same trap as a well as tall as its box: the barrier would sit
+            # on (or past) the Dirichlet walls, where its value is unused, and
+            # the lateral confinement silently becomes the hard box wall. Pass
+            # None for "the well fills the box laterally" -- the 1.9 model.
+            raise ExcitonError(
+                f"lateral dot side {side} nm along {axis} must be strictly less "
+                f"than the box extent {extent} nm; pass None for a well that "
+                f"fills the box laterally")
+    return lat
+
+
+def dot_fill_fraction(box: _stark.Box, well_height_nm: float,
+                      well_lateral_nm=None, well_mask: str = "cell") -> np.ndarray:
+    """Per-node fraction of the dot occupying the node, on the box's node grid.
+
+    The dot is a rectangular box centred on the grid box: ``well_height_nm``
+    along z (the field axis) and ``well_lateral_nm`` along x and y (a single
+    side, or an ``(x, y)`` pair). ``None`` laterally means the dot fills the box
+    in x and y, which is the 1.9 model.
+
+    ``well_mask`` picks how the faces are put on the grid (see
+    :data:`WELL_MASKS`): ``"node"`` gives 0/1 by the closed-region test (1.9's
+    rule), ``"cell"`` the dual-cell fraction, as a product of per-axis
+    fractions because the dot is a product of three intervals.
+
+    Returned in the ``meshgrid(..., indexing="ij")`` shape, which is the order
+    :func:`stark.build_hamiltonian` flattens.
+    """
+    lat = _check_well(box, well_height_nm, well_lateral_nm, well_mask)
+    axes = box.axes()
+    hs = box.h()
+    extents = [None, None, float(well_height_nm)]
+    if lat is not None:
+        extents[0], extents[1] = lat
+    per_axis = []
+    for nodes, h, ext in zip(axes, hs, extents):
+        if ext is None:
+            per_axis.append(np.ones(nodes.size))
+            continue
+        mid = 0.5 * (nodes[0] + nodes[-1])
+        lo, hi = mid - 0.5 * ext, mid + 0.5 * ext
+        if well_mask == "node":
+            per_axis.append(((nodes >= lo) & (nodes <= hi)).astype(np.float64))
+        else:
+            per_axis.append(axis_inside_fraction(nodes, h, lo, hi))
+    return np.einsum("i,j,k->ijk", *per_axis)
 
 
 def _potential_grid(
@@ -144,13 +248,24 @@ def _potential_grid(
     field_eV_per_nm: float,
     well_depth_eV: float | None = None,
     well_height_nm: float | None = None,
+    well_lateral_nm=None,
+    well_mask: str = "node",
 ) -> np.ndarray:
     """``-e F z`` plus an optional symmetric well, on the box's node grid.
 
-    The well is a finite square well of ``well_depth_eV`` filling the box in x
-    and y and extending ``well_height_nm`` along z, centred on the box. Outside
-    it in z the potential is raised by the depth. ``None`` depth means no well:
-    the carrier is free in the box.
+    The well is a finite box well of ``well_depth_eV``, ``well_height_nm`` along
+    z and ``well_lateral_nm`` along x and y, centred on the box. Outside it the
+    potential is raised by the depth: the dot's material is the well and the
+    host (InP, both above/below AND around the dot in a nanowire) is the
+    barrier, so the lateral barrier has the same depth as the axial one.
+
+    ``well_lateral_nm=None`` (the default) fills the box in x and y: the 1.9
+    model, where the only lateral confinement is the hard box wall.
+    ``None`` depth means no well: the carrier is free in the box.
+
+    ``well_mask="node"`` (the default) is the 1.9 sampling and reproduces its
+    numbers exactly; ``"cell"`` is the cell-averaged step, which converges at
+    second order. See :data:`WELL_MASKS` for why they differ.
     """
     xs, ys, zs = box.axes()
     # stark's potential is applied as a diagonal in the same flattened order as
@@ -165,13 +280,10 @@ def _potential_grid(
             )
         if not (math.isfinite(well_depth_eV) and well_depth_eV > 0):
             raise ExcitonError(f"well depth must be positive, got {well_depth_eV!r}")
-        if not (math.isfinite(well_height_nm) and well_height_nm > 0):
-            raise ExcitonError(f"well height must be positive, got {well_height_nm!r}")
-        z_mid = 0.5 * (zs[0] + zs[-1])
-        lo = z_mid - 0.5 * well_height_nm
-        hi = z_mid + 0.5 * well_height_nm
-        outside = (Z < lo) | (Z > hi)
-        V = V + np.where(outside, well_depth_eV, 0.0)
+        fill = dot_fill_fraction(box, well_height_nm, well_lateral_nm, well_mask)
+        V = V + well_depth_eV * (1.0 - fill)
+    elif well_lateral_nm is not None:
+        raise ExcitonError("well_lateral_nm needs a well depth: no depth means no dot")
     return V
 
 
@@ -181,9 +293,12 @@ def _ground_state(
     field_eV_per_nm: float,
     well_depth_eV: float | None = None,
     well_height_nm: float | None = None,
+    well_lateral_nm=None,
+    well_mask: str = "node",
 ):
     """Ground-state energy and vector of one species in the L1 potential."""
-    V = _potential_grid(box, field_eV_per_nm, well_depth_eV, well_height_nm)
+    V = _potential_grid(box, field_eV_per_nm, well_depth_eV, well_height_nm,
+                        well_lateral_nm, well_mask)
     evals, full = _stark.lowest_states(box, mass_ratio, n_states=1, potential_eV=V)
     return float(evals[0]), full[:, 0], {"n_states": 1, "energy_eV": float(evals[0])}
 
@@ -194,6 +309,8 @@ def exciton_energy_eV(
     field_eV_per_nm: float,
     well_depth_eV: float | None = None,
     well_height_nm: float | None = None,
+    well_lateral_nm=None,
+    well_mask: str = "node",
 ) -> ExcitonResult:
     """``E_X`` at one field: electron + hole ground states + first-order Coulomb.
 
@@ -209,18 +326,22 @@ def exciton_energy_eV(
     free in the box and ``E_X`` is not a quantum-dot energy. Pass a depth to get
     a confined result, and check ``<z^2>`` against the bare-box value
     ``L^2 (1/12 - 1/(2 pi^2))`` to see that it actually is confined.
+
+    ``well_lateral_nm`` gives the dot its lateral size (a box dot, x and y),
+    with the host as the barrier around it; ``None`` keeps the 1.9 well that
+    fills the box laterally. The z-reflection argument above still holds,
+    because the box dot is symmetric in z. ``well_mask`` is passed through to
+    :func:`_potential_grid`.
     """
     # Route through the validated helper rather than a bare finite check, so
     # the sign rule cannot be bypassed by this one entry point. Earlier this
     # function checked only finiteness and a negative field silently solved.
-    sawtooth_potential(box, field_eV_per_nm, well_depth_eV, well_height_nm)
+    sawtooth_potential(box, field_eV_per_nm, well_depth_eV, well_height_nm,
+                       well_lateral_nm, well_mask)
 
-    e_e, psi_e, sol_e = _ground_state(
-        box, material.m_e_ratio, field_eV_per_nm, well_depth_eV, well_height_nm
-    )
-    e_h, psi_h, sol_h = _ground_state(
-        box, material.m_h_ratio, field_eV_per_nm, well_depth_eV, well_height_nm
-    )
+    well = (well_depth_eV, well_height_nm, well_lateral_nm, well_mask)
+    e_e, psi_e, sol_e = _ground_state(box, material.m_e_ratio, field_eV_per_nm, *well)
+    e_h, psi_h, sol_h = _ground_state(box, material.m_h_ratio, field_eV_per_nm, *well)
 
     e_c, diag = _coulomb.coulomb_energy_eV(psi_e, psi_h, box, material.eps_s)
 

@@ -526,6 +526,121 @@ def harmonic(n_states: int = 4, *, half_width_nm: float = 10.0,
     return n_nodes, h_nm, V, exact
 
 
+def hard_box_ground_eV(sizes_nm, mass_ratio: float = 1.0) -> float:
+    """Ground energy of a particle in a hard-walled box, the exact reference.
+
+    ``E = (hbar^2 / 2 m*) * pi^2 * sum(1 / L_i^2)`` over the given side
+    lengths. ``K = hbar^2/2m`` already carries the 1/2, so this is
+    ``K pi^2 / L^2`` per axis, NOT ``pi^2 K / (2 L^2)`` (the 1.8 trap, a ratio of
+    exactly 2 that no refinement moves).
+    """
+    if mass_ratio <= 0:
+        raise StarkError("mass_ratio must be positive")
+    sizes = [float(s) for s in sizes_nm]
+    if not sizes or any(not (math.isfinite(s) and s > 0) for s in sizes):
+        raise StarkError(f"box sides must be positive and finite, got {sizes_nm!r}")
+    return (HBAR2_OVER_2ME_EV_NM2 / mass_ratio) * math.pi ** 2 * sum(
+        1.0 / (s * s) for s in sizes)
+
+
+def finite_well_in_box(depth_eV: float, width_nm: float, extent_nm: float,
+                       mass_ratio: float = 1.0):
+    """Exact even ground state of a 1-D finite square well INSIDE a hard box.
+
+    The well ``|z| < a`` (``a = width/2``) has ``V = 0``; the barrier
+    ``a < |z| < L/2`` has ``V = depth``; ``z = +-L/2`` are hard walls. Unlike
+    the infinite-barrier root used in 1.9's test, this one carries the box, so
+    it has no tail-truncation floor and a convergence order measured against it
+    is the discretisation's alone.
+
+    Matching the log-derivative at ``z = a`` with ``k = sqrt(m E / K)``::
+
+        k tan(k a) = kappa coth(kappa d)        E < depth, kappa = sqrt(m (V0 - E) / K)
+        k tan(k a) = q cot(q d)                 E > depth, q = sqrt(m (E - V0) / K)
+
+    where ``d = L/2 - a`` is the barrier thickness. The root lies between the
+    bare-box ground ``K pi^2 / (m L^2)`` and the hard-wall well ground
+    ``K pi^2 / (m w^2)``, because ``0 <= V <= (hard well)`` pointwise.
+
+    Returns ``(E_eV, z2_nm2)``: the energy and the exact ``<z^2>`` of the
+    normalised state (integrated on a 4e5-point grid of the closed form, which
+    is far below any discretisation error measured against it).
+    """
+    from scipy.optimize import brentq
+
+    V0, w, L, m = float(depth_eV), float(width_nm), float(extent_nm), float(mass_ratio)
+    if not (math.isfinite(V0) and V0 > 0):
+        raise StarkError(f"depth must be positive, got {depth_eV!r}")
+    if not (0 < w < L):
+        raise StarkError(
+            f"well width {w} nm must be strictly inside the box {L} nm; at equal "
+            f"widths the barrier has no thickness and this is the infinite well")
+    if m <= 0:
+        raise StarkError("mass_ratio must be positive")
+    K = HBAR2_OVER_2ME_EV_NM2
+    a, d = 0.5 * w, 0.5 * (L - w)
+
+    def mismatch(E):
+        # The matching condition multiplied through so it has NO poles: tan
+        # and cot both blow up inside the bracket, and a root next to a pole
+        # (a very deep well sits right under ka = pi/2) is lost to any pole
+        # filter. E < V0 is divided by kappa cosh(kappa d) > 0, E > V0 by q, so
+        # the sign is kept and both branches meet at k d sin(ka) - cos(ka).
+        k = math.sqrt(m * E / K)
+        s, c = math.sin(k * a), math.cos(k * a)
+        if E < V0:
+            kap = math.sqrt(m * (V0 - E) / K)
+            t = math.tanh(kap * d) / kap if kap * d > 1e-12 else d
+            return k * s * t - c
+        q = math.sqrt(m * (E - V0) / K)
+        sq = math.sin(q * d) / q if q * d > 1e-12 else d
+        return k * s * sq - c * math.cos(q * d)
+
+    # Scan upward in k = sqrt(m E / K) from the bare-box ground, in steps of a
+    # quarter of the box's level spacing pi/(4L), and stop at the FIRST sign
+    # change. Even states of the whole box are pi/L apart in k, so a step of
+    # pi/(4L) cannot straddle two roots; a scan uniform in E (the first
+    # version) put the ground and several excited roots in one interval when
+    # the well was thin, and returned an excited state.
+    def E_of(k):
+        return K * k * k / m
+
+    k_lo = math.pi / L * (1.0 + 1e-12)
+    k_hi = math.pi / w * (1.0 + 1e-9)
+    step = math.pi / (4.0 * L)
+    E = None
+    k0, g0 = k_lo, mismatch(E_of(k_lo))
+    while k0 < k_hi:
+        k1 = min(k0 + step, k_hi)
+        g1 = mismatch(E_of(k1))
+        if g0 == 0.0:
+            E = E_of(k0)
+            break
+        if np.sign(g0) != np.sign(g1):
+            E = brentq(mismatch, E_of(k0), E_of(k1), xtol=1e-15, rtol=1e-14)
+            break
+        k0, g0 = k1, g1
+    if E is None:
+        raise StarkError("no ground-state root found between the two bounds")
+
+    k = math.sqrt(m * E / K)
+    z = np.linspace(0.0, 0.5 * L, 400_001)
+    if E < V0:
+        kap = math.sqrt(m * (V0 - E) / K)
+        # sinh(kap (L/2 - z)) / sinh(kap d), written with decaying exponentials
+        # only: a deep well has kap d in the thousands and sinh overflows.
+        zz = np.clip(z, a, None)
+        outside = (math.cos(k * a) * np.exp(-kap * (zz - a))
+                   * -np.expm1(-2.0 * kap * (0.5 * L - zz)) / -math.expm1(-2.0 * kap * d))
+    else:
+        q = math.sqrt(m * (E - V0) / K)
+        outside = math.cos(k * a) * np.sin(q * (0.5 * L - z)) / math.sin(q * d)
+    psi = np.where(z <= a, np.cos(k * z), outside)
+    p = psi * psi
+    z2 = float(np.trapezoid(z * z * p, z) / np.trapezoid(p, z))
+    return float(E), z2
+
+
 def interpolate_potential(solution: dict, points_nm, *, chunk: int = 200_000):
     """The electrostatic potential ``phi`` (V) at arbitrary points, in nm.
 
