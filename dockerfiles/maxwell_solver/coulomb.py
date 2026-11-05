@@ -217,13 +217,17 @@ def _trapz_weights(box, p):
     return w.reshape(-1)
 
 
-def _screened_pair_energy(de, dh, pos, eps_s, *, block: int = 4096):
+def _screened_pair_energy(de, dh, pos, eps_s, *, block: int = 1024):
     """``-C/eps_s * sum_ij de_i dh_j / |r_i - r_j|``, blocked to bound memory.
 
     The ``i == j`` term is excluded (``np.inf`` on the diagonal). Blocking over
     the first index keeps the working set to ``block * N`` doubles: the full
     ``(N, N, 3)`` displacement array needs 3.3 GiB at N = 12k, which is over the
     tier-1 cap. The block size is a memory choice, not a physics one.
+
+    Lowered from 4096 to 1024 for the lateral-dot box (1.9 follow-on): a 32 nm
+    transverse box at 2 nm spacing has ~12k nodes, where a 4096-row block is a
+    1.2 GB displacement array; 1024 rows is 0.3 GB. The sum is the same.
     """
     n = de.size
     total = 0.0

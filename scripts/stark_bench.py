@@ -50,6 +50,35 @@ rows are not a dot's either, whatever beta does.
 not decoratable into a percentage: the swing is dominated entirely by the
 deepest row.
 
+Lateral confinement (the 1.9 follow-on)
+---------------------------------------
+By default the well fills the box in x and y, as in 1.9: the only lateral
+confinement is the hard box wall. ``--lateral`` gives the dot its own lateral
+size, a square box dot with the InP host as the barrier around it as well as
+above and below. With no value it takes the equal-AREA square of the cited
+18 nm diameter (``dot_material.DOT_DIAMETER_NM``), side ``D sqrt(pi) / 2`` =
+15.95 nm, the same equal-area rule ``design.md`` uses for hexagon -> cylinder.
+``--transverse`` must then exceed it, with room for the barrier tails.
+
+A square, not a cylinder, because the solver is ``stark.py``'s uniform
+Cartesian 7-point grid: a box dot's faces lie on grid planes, so its
+cell-averaged step converges at second order against exact answers, while a
+cylinder there would be a staircase. ``design.md`` section 1 fixes L3 as that
+Cartesian 3-D grid (the hexagonal wire is not axisymmetric).
+
+``--mask`` picks how the step is put on the grid (``exciton.WELL_MASKS``).
+``node`` is 1.9's rule and its default; it makes the well up to one cell
+wider than asked, an O(h) error. ``cell`` is the cell-averaged step, and is
+the default when ``--lateral`` is given.
+
+The second table, "electron binding", reports three tests side by side and
+does not merge them: ``bound`` (``E_e`` below the continuum edge -- ``V0``
+with a lateral dot, since hard outer walls only raise ``E``; ``V0`` plus the
+box column's lateral energy without one), ``P_in`` (probability inside the dot), and the 1.9 length
+criterion ``<z^2>e < h^2/12`` together with its lateral analogue
+``<x^2>e < s^2/12``. The verdict lines that follow use the 1.9 criterion,
+unchanged.
+
 Cost and where it runs
 ----------------------
 Tiny grids only (the default is a few thousand unknowns), so this is a tier-1
@@ -61,11 +90,13 @@ Usage
     python scripts/stark_bench.py                 # the default sweep
     python scripts/stark_bench.py --depths 0.1 0.2 0.3
     python scripts/stark_bench.py --height 7.0    # the top of the TEM range
+    python scripts/stark_bench.py --lateral --transverse 32 --n-xy 16
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import pathlib
 import sys
 
@@ -84,6 +115,10 @@ DEFAULT_DEPTHS = (0.0, 0.10, 0.20, 0.30, 0.50, 0.80)
 DEFAULT_FIELDS = (0.0, 0.1, 0.2, 0.4)
 DEFAULT_HEIGHT_NM = 4.0
 
+#: The equal-area square of the cited dot diameter: ``D sqrt(pi) / 2``. Derived
+#: from ``dot_material``, never typed: the diameter is that module's number.
+EQUAL_AREA_SIDE_NM = DM.DOT_DIAMETER_NM.value * math.sqrt(math.pi) / 2.0
+
 
 def _material() -> X.DotMaterial:
     """The paper-1 dot's masses at x = 0.20, with the ASSUMED interpolation noted."""
@@ -99,21 +134,48 @@ def _material() -> X.DotMaterial:
     )
 
 
-def _z_squared(box, mass_ratio, depth, height_nm):
-    """<z^2> of the ground state at zero field, in nm^2."""
+def _confinement(box, mass_ratio, depth, height_nm, lateral_nm=None, mask="node"):
+    """Zero-field ground state of one carrier: energy, <z^2>, <x^2>, P_in.
+
+    ``<x^2>`` is about the box's lateral centre; ``P_in`` weights each node by
+    the dot fraction it carries (``exciton.dot_fill_fraction``, same mask as
+    the potential), so it is the probability inside the dot. At depth 0 there
+    is no dot and ``P_in`` is NaN.
+    """
     xs, ys, zs = box.axes()
-    Z = np.meshgrid(xs, ys, zs, indexing="ij")[2]
-    potential = X._potential_grid(box, 0.0, depth if depth > 0 else None,
-                                  height_nm)
-    _evals, vec = S.lowest_states(box, mass_ratio, n_states=1,
-                                  potential_eV=potential)
+    Xg, _Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+    well = depth if depth > 0 else None
+    potential = X._potential_grid(box, 0.0, well, height_nm,
+                                  lateral_nm if well else None, mask)
+    evals, vec = S.lowest_states(box, mass_ratio, n_states=1,
+                                 potential_eV=potential)
     w = vec[:, 0] ** 2
     w = w / w.sum()
-    return float(np.dot(Z.reshape(-1) ** 2, w))
+    x_mid = 0.5 * (xs[0] + xs[-1])
+    p_in = float("nan")
+    if well:
+        fill = X.dot_fill_fraction(box, height_nm, lateral_nm, mask)
+        p_in = float(np.dot(fill.reshape(-1), w))
+    return {
+        "energy": float(evals[0]),
+        "z2": float(np.dot(Z.reshape(-1) ** 2, w)),
+        "x2": float(np.dot((Xg.reshape(-1) - x_mid) ** 2, w)),
+        "p_in": p_in,
+    }
 
 
-def sweep(depths, fields, height_nm, transverse_nm, z_extent_nm, n_xy, n_z):
-    """Run the depth sweep and return rows of (depth, E_X(0), beta, z2e, z2h, shifts)."""
+def _z_squared(box, mass_ratio, depth, height_nm, lateral_nm=None, mask="node"):
+    """<z^2> of the ground state at zero field, in nm^2."""
+    return _confinement(box, mass_ratio, depth, height_nm, lateral_nm, mask)["z2"]
+
+
+def sweep(depths, fields, height_nm, transverse_nm, z_extent_nm, n_xy, n_z,
+          lateral_nm=None, mask="node"):
+    """Run the depth sweep and return rows of (depth, E_X(0), beta, z2e, z2h, shifts).
+
+    ``lateral_nm`` (None = the well fills the box laterally, as in 1.9) and
+    ``mask`` are passed to :func:`exciton.exciton_energy_eV` unchanged.
+    """
     material = _material()
     box = S.Box((0.0, 0.0, -z_extent_nm / 2.0),
                 (transverse_nm, transverse_nm, z_extent_nm),
@@ -123,7 +185,9 @@ def sweep(depths, fields, height_nm, transverse_nm, z_extent_nm, n_xy, n_z):
         well = depth if depth > 0 else None
         results = [
             X.exciton_energy_eV(material, box, f, well_depth_eV=well,
-                                well_height_nm=height_nm)
+                                well_height_nm=height_nm,
+                                well_lateral_nm=lateral_nm if well else None,
+                                well_mask=mask)
             for f in fields
         ]
         e0 = results[0].e_x_eV
@@ -131,8 +195,9 @@ def sweep(depths, fields, height_nm, transverse_nm, z_extent_nm, n_xy, n_z):
             _p, beta, resid, _design = X.fit_p_beta(results)
         except X.ExcitonError:
             beta, resid = float("nan"), float("nan")
-        z2e = _z_squared(box, material.m_e_ratio, depth, height_nm)
-        z2h = _z_squared(box, material.m_h_ratio, depth, height_nm)
+        ce = _confinement(box, material.m_e_ratio, depth, height_nm, lateral_nm, mask)
+        ch = _confinement(box, material.m_h_ratio, depth, height_nm, lateral_nm, mask)
+        z2e, z2h = ce["z2"], ch["z2"]
         rows.append({
             "depth": depth,
             "e_x_0": e0,
@@ -141,11 +206,14 @@ def sweep(depths, fields, height_nm, transverse_nm, z_extent_nm, n_xy, n_z):
             "z2e": z2e,
             "z2h": z2h,
             "shifts": [r.e_x_eV - e0 for r in results[1:]],
+            "e_e0": ce["energy"],
+            "x2e": ce["x2"],
+            "p_in_e": ce["p_in"],
         })
     return rows, box
 
 
-def report(rows, fields, box, height_nm):
+def report(rows, fields, box, height_nm, lateral_nm=None, mask="node"):
     """Print the table, then state plainly what it says about beta."""
     extent = box.size[2]
     bare = extent**2 * (1.0 / 12.0 - 1.0 / (2.0 * np.pi**2))
@@ -157,6 +225,15 @@ def report(rows, fields, box, height_nm):
     print(f"box: {box.size[0]:g} x {box.size[1]:g} x {extent:g} nm, "
           f"grid {box.n[0]}x{box.n[1]}x{box.n[2]} cells")
     print(f"bare-box <z^2> for this extent, the ceiling: {bare:.3f} nm^2")
+    if lateral_nm is None:
+        print("lateral: NONE -- the well fills the box in x and y (the 1.9 "
+              "model); the only lateral confinement is the hard box wall")
+    else:
+        print(f"lateral: box dot {lateral_nm:.3f} x {lateral_nm:.3f} nm, InP "
+              f"barrier around it at the same depth (cited diameter "
+              f"{DM.DOT_DIAMETER_NM.value:g} nm; equal-area square side "
+              f"{EQUAL_AREA_SIDE_NM:.3f} nm)")
+    print(f"step on the grid: '{mask}' mask (exciton.WELL_MASKS)")
     print()
     # Fields are eV/nm throughout the model; report them in kV/cm too, because
     # a reader needs to know whether these are laboratory fields and whether
@@ -171,6 +248,8 @@ def report(rows, fields, box, height_nm):
     # table is what gets screenshotted and the number lifted from; prose below
     # the table travels without it.
     tight = height_nm**2 / 12.0
+    side = lateral_nm if lateral_nm is not None else box.size[0]
+    lat_tight = side**2 / 12.0
     head = f"{'depth':>6} {'E_X(0)':>9} {'<z2>e':>7} {'<z2>h':>7} {'beta':>9}"
     head += "".join(f" {'dE(' + f'{f:g}' + ')':>11}" for f in fields[1:])
     print(head)
@@ -203,6 +282,39 @@ def report(rows, fields, box, height_nm):
               f"quadratic p/beta form is being extrapolated there, not "
               f"measured. Treat large-field rows as a model probe.")
         print()
+
+    # The binding table. Three different tests, printed apart on purpose:
+    # merging them into one "bound" word is how a criterion gets shopped for.
+    # The continuum edge the electron must sit below to be a bound state.
+    # With a lateral dot it is V0: outside the dot the potential is V0 in an
+    # unbounded host, and the hard outer box only RAISES E, so E < V0 in the
+    # box proves a bound state exists. Without one (1.9) the box walls are part
+    # of the model -- an infinite column of the box's cross-section -- so the
+    # edge is V0 plus that column's lateral kinetic energy.
+    edge_extra = 0.0
+    if lateral_nm is None:
+        edge_extra = S.hard_box_ground_eV(box.size[:2], _material().m_e_ratio)
+    print("electron binding (zero field):")
+    print(f"{'depth':>6} {'E_e':>8} {'edge':>8} {'bound':>5} {'P_in':>6} "
+          f"{'<z2>e':>7} {'z:held':>6} {'<x2>e':>7} {'x:held':>6}")
+    for r in rows:
+        if r["depth"] <= 0:
+            continue
+        edge = r["depth"] + edge_extra
+        r["bound_e"] = r["e_e0"] < edge
+        print(f"{r['depth']:6.2f} {r['e_e0']:8.4f} {edge:8.4f} "
+              f"{'yes' if r['bound_e'] else 'NO':>5} "
+              f"{r['p_in_e']:6.3f} {r['z2e']:7.3f} "
+              f"{'yes' if r['z2e'] <= tight else 'NO':>6} {r['x2e']:7.3f} "
+              f"{'yes' if r['x2e'] <= lat_tight else 'NO':>6}")
+    edge_txt = ("V0" if lateral_nm is not None else
+                f"V0 + {edge_extra:.4f} eV (the box column's lateral energy)")
+    print(f"  bound: E_e below the continuum edge = {edge_txt}, so the "
+          f"electron is in a bound state of the dot. z:held: "
+          f"<z2>e <= h^2/12 = {tight:.3f} nm^2 (the 1.9 criterion). x:held: "
+          f"<x2>e <= s^2/12 = {lat_tight:.3f} nm^2 for lateral side "
+          f"{side:.3f} nm" + (" (the BOX, no lateral dot)" if lateral_nm is None else ""))
+    print()
 
     # Confinement is a LENGTH: the carrier is held by the well when its
     # <z^2> is below the tight-well ceiling h^2/12 (h = the well height),
@@ -263,7 +375,19 @@ def main(argv=None):
                         help="box extent along z in nm; must exceed --height")
     parser.add_argument("--n-xy", type=int, default=6, help="transverse cells")
     parser.add_argument("--n-z", type=int, default=40, help="cells along z")
+    parser.add_argument("--lateral", type=float, nargs="?", const=EQUAL_AREA_SIDE_NM,
+                        default=None,
+                        help="lateral side of a square box dot in nm; with no "
+                             "value, the equal-area square of the cited "
+                             f"{DM.DOT_DIAMETER_NM.value:g} nm diameter "
+                             f"({EQUAL_AREA_SIDE_NM:.3f} nm). Omit for the 1.9 "
+                             "well that fills the box laterally")
+    parser.add_argument("--mask", choices=X.WELL_MASKS, default=None,
+                        help="how the step sits on the grid: 'node' (1.9) or "
+                             "'cell' (cell-averaged, O(h^2)); default 'node' "
+                             "without --lateral and 'cell' with it")
     args = parser.parse_args(argv)
+    mask = args.mask or ("node" if args.lateral is None else "cell")
 
     if 0.0 not in args.fields:
         parser.error("--fields must include 0.0 to anchor the Stark shift")
@@ -275,9 +399,16 @@ def main(argv=None):
             f"and the solve silently becomes the INFINITE-well problem"
         )
 
+    if args.lateral is not None and args.lateral >= args.transverse:
+        parser.error(
+            f"lateral dot side {args.lateral:g} nm must be strictly less than "
+            f"the transverse box {args.transverse:g} nm, with room for the "
+            f"barrier tails (e.g. --transverse 32 --n-xy 16); at or past the "
+            f"box the lateral barrier lands on the Dirichlet walls")
+
     rows, box = sweep(args.depths, args.fields, args.height, args.transverse,
-                      args.z_extent, args.n_xy, args.n_z)
-    report(rows, args.fields, box, args.height)
+                      args.z_extent, args.n_xy, args.n_z, args.lateral, mask)
+    report(rows, args.fields, box, args.height, args.lateral, mask)
     return 0
 
 
