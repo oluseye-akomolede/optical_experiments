@@ -96,7 +96,15 @@ def test_finite_square_well_recovers_the_bound_state():
 
     The convergence is O(h), not O(h^2), and that is correct for this problem:
     a node-sampled step sits between grid points, so the effective well width
-    carries an O(h) uncertainty. Measured orders 1.16/1.09/1.05/1.04.
+    carries an O(h) uncertainty. Measured orders for THIS geometry (a = 2 nm,
+    V0 = 0.5 eV; the bench uses a different well and measures 1.16/1.09/1.05/
+    1.04): 1.092 / 1.054.
+
+    The ``Exited postprocessing`` UserWarning from ``lobpcg`` here is expected
+    and is deliberately not silenced: at these coarse grids the eigensolver's
+    postprocessing pass does not hit its accuracy target, which is exactly the
+    O(h) behaviour being measured. The assertion is on convergence to the
+    analytic root, which the numbers above establish.
     """
     import math
     from scipy.optimize import brentq
@@ -128,7 +136,7 @@ def test_finite_square_well_recovers_the_bound_state():
     # (harmonic) and hard-wall cases in this file converge at 2 and pin the
     # difference; see test_laplacian... and the infinite-well test.
     #
-    # Measured here: 1.09, 1.05, 1.04. The bound is set to catch drift
+    # Measured here: 1.092, 1.054. The bound is set to catch drift
     # (towards O(1), or a sudden jump), NOT to pass on a technicality -- the
     # previous bound of 0.9 would have passed 0.91, which pins nothing.
     assert 1.0 < min(orders) and max(orders) < 1.5, (orders, errs)

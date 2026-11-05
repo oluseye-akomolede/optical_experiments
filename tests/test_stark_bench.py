@@ -140,3 +140,59 @@ def test_report_uses_the_well_ceiling_not_the_box_ceiling(capsys):
     # reported NOT confined
     assert "HOLE is NOT confined" in out
     assert "ELECTRON is NOT confined" in out
+
+
+def _beta_cell(out: str, depth: float) -> str:
+    """Return the beta cell of the emitted table row for ``depth``.
+
+    The table is what a reader screenshots, so the test parses the printed
+    row rather than the row dict -- the defect being pinned lives in the
+    emission, not the computation.
+    """
+    for line in out.splitlines():
+        toks = line.split()
+        if len(toks) >= 5 and toks[0] == f"{depth:.2f}":
+            return toks[4]
+    raise AssertionError(f"no emitted table row for depth {depth}")
+
+
+def test_beta_cell_is_not_a_bare_number_on_an_electron_limited_row(capsys):
+    """A beta from a row whose electron is loose describes the box, not the dot.
+
+    At depth 0.2 the hole is held (<z2>h = 1.086 nm^2) but the electron is not
+    (<z2>e = 3.244 nm^2 against the 1.333 nm^2 ceiling), so the exciton extent
+    is set by the box. The caveat must sit IN the cell: a number with its
+    warning sixteen lines below is a number that gets lifted bare.
+    """
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
+    import stark_bench as SB
+    rows, box = SB.sweep(depths=(0.2,), fields=(0.0, 0.1),
+                         height_nm=4.0, transverse_nm=12.0, z_extent_nm=16.0,
+                         n_xy=6, n_z=40)
+    SB.report(rows, (0.0, 0.1), box, 4.0)
+    out = capsys.readouterr().out
+    cell = _beta_cell(out, 0.2)
+    # a plain float is exactly the failure mode
+    assert not cell.removeprefix("-").replace(".", "").isdigit(), cell
+    assert "*" in cell
+    assert "electron-limited" in out
+
+
+def test_beta_cell_is_a_number_when_the_electron_is_held(capsys):
+    """The marker must be earned, not painted on every row.
+
+    If the flag were unconditional, blanking beta everywhere would pass the
+    test above while destroying the table's information. Use a depth deep
+    enough to hold the electron and check the cell is a real number with no
+    asterisk.
+    """
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
+    import stark_bench as SB
+    rows, box = SB.sweep(depths=(3.0,), fields=(0.0, 0.1),
+                         height_nm=4.0, transverse_nm=12.0, z_extent_nm=16.0,
+                         n_xy=6, n_z=40)
+    SB.report(rows, (0.0, 0.1), box, 4.0)
+    out = capsys.readouterr().out
+    cell = _beta_cell(out, 3.0)
+    assert "*" not in cell
+    float(cell)  # must parse as a number

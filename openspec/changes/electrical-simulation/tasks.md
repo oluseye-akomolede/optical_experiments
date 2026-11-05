@@ -473,11 +473,22 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         NEGATIVE result about the deliverable's headline number, and it is the honest one.
       - The bench refuses `--height >= --z-extent` with an error naming the
         infinite-well trap, and refuses a field sweep with no zero point.
-      - `tests/test_stark_bench.py` (9 tests) pins the sweep's discrimination, the
-        bare-box calibration, the refusals, the well-ceiling criterion, and the
-        non-perturbative warning. Mutations caught: dropping the well from
-        `_potential_grid` fails 3; reverting the criterion to `0.5 * bare` fails the
-        ceiling test.
+      - `tests/test_stark_bench.py` (11 tests) pins the sweep's discrimination, the
+        bare-box calibration, the refusals, the well-ceiling criterion, the
+        non-perturbative warning, and the beta-cell marker. Mutations caught: dropping
+        the well from `_potential_grid` fails 3; reverting the criterion to
+        `0.5 * bare` fails the ceiling test; never flagging an electron-limited row
+        fails the bare-number test; flagging every row fails the held-electron test.
+      - **THE BETA COLUMN CARRIES ITS OWN CAVEAT, 2026-11-05 (reviewer CHANGES-NEEDED
+        @8c531ad, on the lead's stricter bar).** The emitted table printed `beta` as a
+        bare number on every row, including the four where `<z2>e` was above the
+        tight-well ceiling the same script computes. The prose saying those rows are
+        "not a dot's either" sat sixteen lines BELOW the table -- and the table is what
+        gets screenshotted and the number lifted from. Electron-limited rows now print
+        `blank*` with a one-line key directly under the table naming the depths. In the
+        default sweep every row is electron-limited, so the honest output is that beta
+        is blank on all six; the test pins depth 0.2 specifically so a later edit cannot
+        restore a bare number there.
       - **SILENT LOBPCG FAILURE, fixed 2026-11-04 (reviewer finding 3, made REQUIRED by
         the lead).** `scipy`'s `lobpcg` reports a missed tolerance only through a
         `UserWarning` and then returns whatever it has, so `lowest_states` was handing

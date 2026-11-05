@@ -165,15 +165,34 @@ def report(rows, fields, box, height_nm):
     print(f"fields (eV/nm -> kV/cm): "
           + ", ".join(f"{f:g} -> {f * X.EV_PER_NM_TO_KV_PER_CM:,.0f}"
                       for f in fields))
+    # A beta from a row where the ELECTRON is still loose is not a dot's beta:
+    # the well does not hold the carrier that sets the exciton extent, so the
+    # number describes the box. The caveat has to sit IN THE CELL, because the
+    # table is what gets screenshotted and the number lifted from; prose below
+    # the table travels without it.
+    tight = height_nm**2 / 12.0
     head = f"{'depth':>6} {'E_X(0)':>9} {'<z2>e':>7} {'<z2>h':>7} {'beta':>9}"
     head += "".join(f" {'dE(' + f'{f:g}' + ')':>11}" for f in fields[1:])
     print(head)
+    flagged = []
     for r in rows:
+        loose = r["z2e"] > tight
+        cell = "  blank" if loose else f"{r['beta']:9.3f}"
+        if loose:
+            cell = f"{cell:>8}*"
+            flagged.append(r["depth"])
         line = (f"{r['depth']:6.2f} {r['e_x_0']:9.5f} {r['z2e']:7.3f} "
-                f"{r['z2h']:7.3f} {r['beta']:9.3f}")
+                f"{r['z2h']:7.3f} {cell}")
         line += "".join(f" {s:11.3e}" for s in r["shifts"])
         print(line)
     print()
+    if flagged:
+        print(f"  * electron-limited: <z2>e is above the tight-well ceiling "
+              f"{tight:.3f} nm^2, so the well does not hold the carrier that "
+              f"sets the exciton extent. NO beta is reported for depth(s) "
+              f"{', '.join(f'{d:g}' for d in flagged)}: any value there is the "
+              f"box's, not the dot's.")
+        print()
     biggest = max(abs(s) for r in rows for s in r["shifts"])
     tightest = min(r["e_x_0"] for r in rows)
     if biggest > abs(tightest):
@@ -190,7 +209,7 @@ def report(rows, fields, box, height_nm):
     # not when it is below some fraction of the BOX's bare value. At a
     # fraction-of-box criterion the depth-0 row -- a free particle sitting
     # exactly at the box ceiling -- reads as "confined", which is backwards.
-    tight = height_nm**2 / 12.0
+    # (``tight`` was computed above for the table's asterisk key; reuse it.)
     print(f"tight-well ceiling h^2/12 for a {height_nm:g} nm well: "
           f"{tight:.3f} nm^2; a carrier is confined when its <z^2> is below it")
 
@@ -198,7 +217,9 @@ def report(rows, fields, box, height_nm):
     if len(finite) >= 2:
         betas = [r["beta"] for r in finite]
         lo, hi = min(betas), max(betas)
-        print(f"beta moves from {lo:.3f} to {hi:.3f} over the swept depths.")
+        print(f"beta moves from {lo:.3f} to {hi:.3f} over the swept depths "
+              f"(computed at every depth; only the unflagged rows above are "
+              f"quotable, because the flagged ones have no confined electron).")
         if lo < 0.0 < hi:
             print("It changes SIGN, so beta is not even of one sign over the "
                   "range of depths a reader could reasonably choose.")
