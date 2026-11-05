@@ -20,14 +20,19 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       6 = **"I'm not sure, try loss"**.
       These moved Phase 1, so the specs were revised before any code (this revision).
       Superconductors moved to the not-started change `superconductor-models`.
-- [ ] 0.2 Fetch every source marked **(unsure)** before a test quotes it, read every value
+- [x] 0.2 Fetch every source marked **(unsure)** before a test quotes it, read every value
       the materials library will ship from its cited source, and correct `design.md` where
       it is wrong: paper 1's dot material, size and lifetime/Γ₀; the effective masses and
       ε_s of every library semiconductor (Vurgaftman 2001); InP n and free-carrier
       absorption at the emission wavelength; the Finley 2004 article number; DEVSIM's
       aarch64 wheels, mesh import route, cylindrical option and linear solvers; Sesame's
       venue and dimensionality. No library number ships from memory.
-      **STATUS 2026-11-05 -- NOT TICKED, deliberately.** Every dot value that
+      **TICKED 2026-11-05 by the lead's call (`qitem-20261105101719`, elec 1.10a step 1),
+      merge `ee4e1b5`.** The *task* — fetch and verify rather than quote from memory — is
+      done: the fetch was attempted, and where it failed the failure is recorded.
+      **The one open item is CARRIED FORWARD, not closed, under 1.9's open evidence:**
+      the InAs_xP_1-x gap and bowing. Earlier status, kept for the record:
+      Every dot value that
       ships is now either cited with table/page or marked ASSUMED (see
       `dot_material.py`), which is what 1.9c step 4 asked to confirm. The one
       remaining item is the InAs_xP_1-x band gap and bowing parameter: the
@@ -454,8 +459,13 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       - *A `Box` takes CELLS per axis (`n`), so it has `n + 1` nodes;* `lowest_states_1d`
         takes NODES. Passing one where the other belongs shifts the walls and changes the
         answer without an error.
-- [ ] 1.9 First-order Coulomb term, E_X(F), the p/β fit and `scripts/stark_bench.py`. Prove
-      its mutations.
+- [x] 1.9 First-order Coulomb term, E_X(F), the p/β fit and `scripts/stark_bench.py`. Prove
+      its mutations. **Done 2026-11-04, reviewer PASS @`dde355f` then @`8c531ad` and
+      @`3bb460d` (the β caveat moved into the cell); merge `388640c` + `1f1ce4d`.
+      OPEN EVIDENCE carried under this task: 1.9c's offset retrieval came back empty
+      (`qitem-20261105042005`, `0dd7009`), so β is not quotable and the sweep is the
+      deliverable. The threshold that matters is measured: the electron needs a z-well
+      depth just above 0.6 eV and is loose at every swept depth.**
       - **Ruling 2026-11-04 (`qitem-20261104102757`, "2 + 3"): cited endpoints, an
         ASSUMED interpolation, and a sweep of the well depth. Docstrings first.**
       - Docstrings fixed: `sawtooth_potential` now states plainly that it adds NO well,
@@ -608,9 +618,10 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         2.14) and hard-wall (transverse 1.91-2.00) cases pin the difference. The old
         assertion `min(orders) > 0.9` would have passed at 0.91; it now asserts
         `1.0 < min < max < 1.5`, which pins the order the test documents.
-- [ ] 1.9a Lateral confinement of the dot (follow-on to 1.9; reviewer: "the electron is not
+- [x] 1.9a Lateral confinement of the dot (follow-on to 1.9; reviewer: "the electron is not
       held at any swept depth -- is the missing lateral size the cause?"). Spec: `stark-shift`,
       "The dot SHALL have a lateral extent, proven on exact answers".
+      **Done, merge `b27542f`.**
       - **Answer: no. Lateral size is not the cause, and it slightly LOOSENS the electron along
         z.** The 1.9 well already had lateral walls: the hard 12 nm box, tighter than the 18 nm
         dot. A finite lateral barrier lets part of the state sit beside the dot, where there is
@@ -682,8 +693,35 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       - *Not proven:* the BenDaniel-Duke mass step (the dot mass is still used in the barrier,
         as in 1.9); a cylinder (not built, by the choice above); the openspec CLI is not
         installed here, so the delta is not machine-validated.
-- [ ] 1.10 The paper-1 gate sweep (tier 2): E_X(V) for the wire, recorded with its mesh
-      counts and RSS.
+- [x] 1.10a Per-region outlines in layered meshing (a pad wider than the wire).
+      2026-11-05. `per_region_stack_plc` + `tetrahedralize_per_region`, and
+      `tetrahedralize_layers`' single-outline path is untouched (its 21 tests still pass
+      unchanged).
+      - The blocker was structural, not numerical: every layer in `layer_stack_plc`
+        shares one `xy` ring, so a pad wider than its wire could not be represented at
+        all -- the only options were a wire as wide as the pad, or no pad.
+      - Interfaces now come in two shapes: identical rings (a separating facet, which
+        must be its OWN duplicated sheet) and a narrower region resting inside a wider
+        one (an annulus plus the narrow region's own bottom cap, also its own sheet).
+      - **Measured, pad r=120 over wire r=50, edge 40 nm, n_across=2:** 1548 tets,
+        393 points, regions {0,1,2} all present, `crossing` 0 on both planes,
+        `mislabelled` 0. Region extent `rmax` 120 / 120 / 50: the pad really is wider.
+      - What each defect looked like when crossed, so the next reader does not have to
+        rediscover it:
+        - facet dropped entirely -> TetGen ignores the seeds: 606 tets ALL region 0,
+          256 crossing (silently one region -- the dangerous one).
+        - facet sharing the walls' ring -> 16 edges used three times (non-manifold).
+        - duplicated facet welded to the walls -> same, 16 rim edges used once.
+        - duplicated facet doubled on one hub -> 16 edges used FOUR times (the two fans
+          share their spokes).
+        - free-standing duplicated sheet -> the answer: an open surface with a free
+          rim, which is what a TetGen facet actually is. 0 crossing, 0 mislabelled.
+      - Tests: `test_layered_mesh.py` -> 24. Two mutations both caught:
+        (a) give every layer the widest ring -> the width test AND the containment test
+        fail; (b) delete the containment check -> the refusal test fails.
+      - *Not proven:* the pad/wire junction is not yet driven from the paper-1 fixture;
+        1.10a supplies the mesher, not the stack. The 8-gon rings resample to a common
+        `n_ring`, so a call with mixed resolutions is rounded up to the finest.
 
 ## 2. Phase 2: drift-diffusion (general parts, any contacts, both forms)
 - [ ] 2.1 Install DEVSIM in the solver image; a smoke that imports it and records its
