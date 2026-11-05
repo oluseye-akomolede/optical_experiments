@@ -703,8 +703,8 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       - Interfaces now come in two shapes: identical rings (a separating facet, which
         must be its OWN duplicated sheet) and a narrower region resting inside a wider
         one (an annulus plus the narrow region's own bottom cap, also its own sheet).
-      - **Measured, pad r=120 over wire r=50, edge 40 nm, n_across=2:** 1548 tets,
-        393 points, regions {0,1,2} all present, `crossing` 0 on both planes,
+      - **Measured, pad r=120 over wire r=50, edge 40 nm, n_across=2:** 1970 tets,
+        516 points, regions {0,1,2} all present, `crossing` 0 on both planes,
         `mislabelled` 0. Region extent `rmax` 120 / 120 / 50: the pad really is wider.
       - What each defect looked like when crossed, so the next reader does not have to
         rediscover it:
@@ -716,12 +716,25 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
           share their spokes).
         - free-standing duplicated sheet -> the answer: an open surface with a free
           rim, which is what a TetGen facet actually is. 0 crossing, 0 mislabelled.
-      - Tests: `test_layered_mesh.py` -> 24. Two mutations both caught:
+      - Tests: `test_layered_mesh.py` -> 25. Three mutations all caught:
         (a) give every layer the widest ring -> the width test AND the containment test
-        fail; (b) delete the containment check -> the refusal test fails.
+        fail; (b) delete the pairwise containment check -> the refusal test and
+        `test_outlines_must_narrow_monotonically_upward` fail.
+      - *Correction (2026-11-05, reviewer-caught):* two record defects fixed.
+        (i) The "widest ring" guard compared a ring against itself
+        (`_ring_contains(rings[i], r)` with `r is rings[i]`), so it could never fire;
+        deleted rather than repaired, since the pairwise check is the one statement
+        of the invariant. (ii) The count was quoted as "1548 tets, 393 points" -- an
+        earlier construction's number, never re-measured. The test's own call gives
+        **1970 tets / 516 points**. This is the third prose count this change got
+        wrong by quoting instead of re-running; counts here are now measured at the
+        call the test makes.
       - *Not proven:* the pad/wire junction is not yet driven from the paper-1 fixture;
         1.10a supplies the mesher, not the stack. The 8-gon rings resample to a common
         `n_ring`, so a call with mixed resolutions is rounded up to the finest.
+        The outlines must also narrow monotonically UPWARD (a pad on top, or a
+        wide-narrow-wide sandwich, is refused) -- which suits the paper-1 stack, where
+        the pad is at the bottom.
 
 ## 2. Phase 2: drift-diffusion (general parts, any contacts, both forms)
 - [ ] 2.1 Install DEVSIM in the solver image; a smoke that imports it and records its

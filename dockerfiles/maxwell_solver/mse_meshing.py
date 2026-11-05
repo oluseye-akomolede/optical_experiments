@@ -2005,14 +2005,18 @@ def tetrahedralize_per_region(outlines_xy_m, layers, edge_m: float, *,
     -- so a wide pad over a narrow wire is represented exactly, not approximated
     by making the wire as wide as the pad.
 
-    Returns ``(points_m, tets, region_of_tet)`` with the same guarantees: the
-    layer planes are facets no element crosses, and every tet carries its
-    layer's index.
+    Returns ``(points, tets, region_of_tet)``, unit-agnostic: whatever unit
+    the outlines, thicknesses and ``edge_m`` are given in is the unit the
+    points come back in. This path has no ``units=`` parameter, so it does not
+    rescale; the numerical tests use nanometres. The layer planes are facets no
+    element crosses, and every tet carries its layer's index.
     """
     import tetgen
 
     if not (np.isfinite(edge_m) and edge_m > 0):
-        raise MeshingError(f"edge_m must be a positive length in metres, got {edge_m!r}")
+        raise MeshingError(
+            f"edge_m must be a positive length in the outlines' own unit, "
+            f"got {edge_m!r}")
     vertices, faces, seeds, planes = per_region_stack_plc(
         outlines_xy_m, layers, edge_m, n_across=n_across, z0_m=z0_m)
     offset, scale = _canonical_frame(vertices)
@@ -2245,14 +2249,14 @@ def per_region_stack_plc(outlines_xy_m, layers, edge_m: float, *,
                 f"layer {layers[i + 1][0]!r}'s outline is not contained in layer "
                 f"{layers[i][0]!r}'s below it: each layer must sit within the "
                 "outline of the layer under it")
-    # And every ring must nest inside the WIDEST ring, which is the only way
-    # the annuli stay disjoint when a pad overhangs a wire.
-    widest = max(range(len(rings)), key=lambda i: _ring_area(rings[i]))
-    for i, r in enumerate(rings):
-        if i != widest and not _ring_contains(rings[i], r):
-            raise MeshingError(
-                f"layer {layers[i][0]!r}'s outline does not contain layer "
-                f"{layers[widest][0]!r}'s, so the two regions cross laterally")
+    # The pairwise check above is what keeps the annuli disjoint when a pad
+    # overhangs a wire: it forces the outlines to narrow monotonically upward,
+    # so every ring nests transitively under the widest one. (An earlier
+    # version also compared each ring against the widest ring directly, but
+    # wrote `_ring_contains(rings[i], r)` with `r is rings[i]` -- a ring tested
+    # against itself, always true. It was dead code, and redundant with the
+    # check above; it is deleted rather than repaired so there is one statement
+    # of the invariant, not two that can drift apart.)
 
     planes = layer_planes(layers, z0_m)
     splits = layer_subdivisions(layers, edge_m, n_across)

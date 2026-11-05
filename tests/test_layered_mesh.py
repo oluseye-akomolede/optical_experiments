@@ -307,3 +307,25 @@ def test_a_region_whose_outline_is_not_contained_is_refused():
     with pytest.raises(MESH.MeshingError, match="contained|contain"):
         MESH.per_region_stack_plc(
             [_ring(WIRE_R), _ring(WIRE_R), _ring(PAD_R)], PAD_WIDER, 40.0)
+
+
+def test_outlines_must_narrow_monotonically_upward():
+    """The pairwise check is the only statement of this invariant.
+
+    An earlier version also compared each ring against the widest ring, but
+    wrote it as ``_ring_contains(rings[i], r)`` with ``r is rings[i]`` -- a
+    ring against itself, always true, so it could never fire. It is deleted
+    rather than repaired: pairwise containment already forces every outline to
+    nest under the one below it, so the widest is always ring 0 and every other
+    ring nests under it transitively. This test pins the consequence, so if the
+    pairwise check ever weakens, a middle-widest or wide-narrow-wide stack is
+    caught here rather than silently meshing crossed regions.
+    """
+    # Middle ring widest: 40 / 120 / 40. Ring 1 is not contained in ring 0.
+    with pytest.raises(MESH.MeshingError, match="contained|contain"):
+        MESH.per_region_stack_plc(
+            [_ring(40.0), _ring(120.0), _ring(40.0)], PAD_WIDER, 40.0)
+    # Wide-narrow-wide: 120 / 40 / 120. Ring 2 is not contained in ring 1.
+    with pytest.raises(MESH.MeshingError, match="contained|contain"):
+        MESH.per_region_stack_plc(
+            [_ring(120.0), _ring(40.0), _ring(120.0)], PAD_WIDER, 40.0)
