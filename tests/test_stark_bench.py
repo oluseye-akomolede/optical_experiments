@@ -95,6 +95,36 @@ def test_the_sweep_shows_beta_is_not_a_property_of_the_dot():
     assert spread > 0.25, (betas, spread)
 
 
+def test_the_electron_needs_an_unrealistically_deep_well_to_bind():
+    """The z-only electron is unbound wherever a real offset would put it.
+
+    The reviewer measured the electron above the tight-well ceiling at EVERY
+    swept depth. This pins the threshold, because "unbound at our depths"
+    invites the reply "sweep deeper". The electron first satisfies h^2/12 at a
+    z-well depth just above 0.6 eV, and the 4 nm infinite-well electron level
+    is already 0.294 eV at m_e = 0.08 -- so a realistic conduction offset sits
+    well short of the depth needed.
+
+    This is the honest negative, not a tuning target: the assertion is that
+    the threshold is HIGH, so shrinking it to make the dot bind would fail.
+    """
+    n = 161
+    zs = np.linspace(-8.0, 8.0, n)
+    h = 16.0 / (n - 1)
+    ceiling = 4.0**2 / 12.0
+
+    def confined(depth):
+        V = np.where(np.abs(zs) < 2.0, 0.0, depth)
+        e, full = S.lowest_states_1d(n, h, mass_ratio=0.08,
+                                     potential_eV=V, n_states=1)
+        v = full[:, 0] / np.linalg.norm(full[:, 0])
+        return float(np.sum(v**2 * zs**2)) <= ceiling
+
+    assert not confined(0.30), "electron must still be loose at 0.30 eV"
+    assert not confined(0.50), "electron must still be loose at 0.50 eV"
+    assert confined(0.80), "electron must bind by 0.80 eV"
+
+
 def test_the_report_names_the_unconfined_hole():
     """At zero depth the hole is NOT a dot, and the report must say so."""
     rows, box = B.sweep((0.0, 0.5), (0.0, 0.2), 4.0, 12.0, 16.0, 6, 40)
