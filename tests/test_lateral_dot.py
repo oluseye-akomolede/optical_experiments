@@ -211,8 +211,12 @@ def test_the_dot_is_bracketed_by_its_two_separable_wells(dot_levels):
     fractions, and ``max`` lies between the mean and the sum. Ordering of
     diagonal potentials orders the ground states (min-max), so the bracket is
     exact on the same grid AND its two ends are exactly known in the
-    continuum. Checked both ways, so a dot mask that dropped its lateral faces
-    (V_dot = V0 oz) falls below the lower end.
+    continuum.
+
+    What it does NOT catch: a dot that dropped its lateral faces (V0 oz
+    alone) gives 0.27992 eV at 32 cells, INSIDE the bracket, so this test
+    passes that mutation. The hard-wall limit and the lateral-vs-z test below
+    are the ones that catch it (measured by mutation).
 
     The continuum check uses the Richardson value of the dot (32/64 cells,
     order 2), not a raw grid value: the dot sits only 1.4 meV under the upper
