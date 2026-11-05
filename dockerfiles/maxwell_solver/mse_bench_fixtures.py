@@ -393,3 +393,97 @@ def sphere_between_plates(plate_gap=200e-6, plate_side=400e-6, radius=40e-6,
         "n_side": n_side, "n_z": n_z, "plate_gap": plate_gap, "radius": radius,
     }
     return problem
+
+
+# ---------------------------------------------------------------------------
+# 4. Thin dielectric between thick ones, meshed by TetGen (task 1.6c)
+# ---------------------------------------------------------------------------
+
+#: The thin-layer capacitor's stack, bottom to top: (name, thickness_m, eps).
+#: Plates are conductor layers (an electrode is a whole part, see fixture 1).
+#: The thin layer has the LOW permittivity, so it carries a large share of the
+#: voltage (about 40 % here) and a mesh that mis-assigns it cannot hide. The
+#: values are bench contrasts, not materials.
+THIN_CAP_STACK = (
+    ("bottom", 20e-9, 1.0),
+    ("thick_a", 200e-9, 10.0),
+    ("thin", 10e-9, 2.0),
+    ("thick_b", 200e-9, 10.0),
+    ("top", 20e-9, 1.0),
+)
+#: Side of the square plates, metres. Small, so the thin layer's sub-slab
+#: facets (elements about as wide as 10 nm / 3) stay a tier-1 mesh.
+THIN_CAP_SIDE = 60e-9
+
+
+def thin_layer_capacitor(edge_m: float, *, conforming: bool = True,
+                         n_across: int | None = None):
+    """A thin dielectric between two thick ones, meshed by TetGen, with its answer.
+
+    The exact answer is the 1-D series capacitor, ``C = eps0 A / sum(d_i/eps_i)``
+    over the dielectric layers, with ``E_i = V / (eps_i sum(d_j/eps_j))``. The
+    sides are natural (zero normal field) and the plates cover the whole
+    cross-section, which is exactly the assumption that makes the 1-D form exact.
+
+    ``conforming=True`` meshes it with :func:`mse_meshing.tetrahedralize_layers`.
+    ``conforming=False`` is the CONTROL: the SAME PLC with every internal facet
+    removed (one closed solid, the 1.6b shape), meshed with the same switches,
+    each tet labelled by the layer its centroid falls in. It exists so the
+    conforming result is measured against what it replaces, not in a vacuum.
+    """
+    import mse_meshing as MESH
+
+    if n_across is None:
+        n_across = MESH.LAYER_ELEMENTS_ACROSS
+    layers = [(name, th) for name, th, _eps in THIN_CAP_STACK]
+    eps = {name: e for name, _th, e in THIN_CAP_STACK}
+    side = THIN_CAP_SIDE
+    outline = [(0.0, 0.0), (side, 0.0), (side, side), (0.0, side)]
+    planes = MESH.layer_planes(layers)
+    if conforming:
+        points, tets, region = MESH.tetrahedralize_layers(
+            outline, layers, edge_m, n_across=n_across)
+    else:
+        points, tets, region = _one_solid_centroid_labelled(
+            MESH, outline, layers, edge_m, planes)
+
+    dielectric = [(n, th) for n, th, _e in THIN_CAP_STACK if n not in ("bottom", "top")]
+    s = sum(th / eps[n] for n, th in dielectric)
+    area = side * side
+    expected = {
+        "C": EPS0 * area / s,
+        "E": {n: 1.0 / (eps[n] * s) for n, _th in dielectric},
+    }
+    problem = {
+        "points_m": points, "tets": tets, "parts": [n for n, _t in layers],
+        "region_of_tet": np.asarray(region, dtype=np.int64),
+        "eps_static": eps,
+        "electrodes": {"bottom": 0.0, "top": 1.0},
+        "planes_m": planes, "layers": layers, "side": side, "edge_m": edge_m,
+    }
+    return problem, expected
+
+
+def _one_solid_centroid_labelled(MESH, outline, layers, edge_m, planes):
+    """The 1.6b shape: the layer PLC without its internal facets, labelled by centroid."""
+    import tetgen
+
+    vertices, faces, _seeds = MESH.layer_stack_plc(outline, layers, edge_m, n_across=1)
+    z = vertices[faces][:, :, 2]
+    flat = np.all(np.abs(z - z[:, :1]) < 1e-12 * planes[-1], axis=1)
+    interior = flat & (z[:, 0] > planes[0]) & (z[:, 0] < planes[-1])
+    faces = faces[~interior]
+    used = np.unique(faces)
+    remap = np.full(vertices.shape[0], -1, dtype=np.int64)
+    remap[used] = np.arange(used.size)
+    vertices, faces = vertices[used], remap[faces].astype(np.int32)
+    offset, scale = MESH._canonical_frame(vertices)
+    tet = tetgen.TetGen((vertices - offset) * scale, faces)
+    tet.tetrahedralize(order=1, mindihedral=20, minratio=2.0,
+                       maxvolume=MESH.target_maxvolume(None, edge_m * scale),
+                       fixedvolume=True)
+    points = np.asarray(tet.node, dtype=float)[:, :3] / scale + offset
+    tets = np.asarray(tet.elem, dtype=np.int64)
+    cz = points[tets][:, :, 2].mean(axis=1)
+    region = np.clip(np.searchsorted(planes, cz, side="right") - 1, 0, len(layers) - 1)
+    return points, tets, region

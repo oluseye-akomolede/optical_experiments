@@ -28,11 +28,13 @@ Usage
     python electrostatics_bench.py                 # score, exit 1 on failure
     python electrostatics_bench.py --report-only    # print, never fail
     python electrostatics_bench.py --method amg     # exercise the AMG path
+    python electrostatics_bench.py --layered        # thin-layer capacitor, TetGen
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 
 import numpy as np
@@ -40,7 +42,9 @@ import numpy as np
 import mse_electrostatics as E
 from mse_bench_fixtures import (
     concentric_spheres,
+    THIN_CAP_STACK,
     sphere_between_plates,
+    thin_layer_capacitor,
     two_layer_slab,
 )
 
@@ -412,6 +416,80 @@ def perturbation_table() -> str:
     return "\n".join(lines)
 
 
+#: The thin-layer capacitor's refinement ladder: (bulk edge m, thin-layer
+#: sub-slabs). Both levers refine together; tets roughly 3k -> 9k -> 31k.
+LAYERED_LADDER = ((40e-9, 3), (20e-9, 4), (10e-9, 6))
+
+#: The conforming layered mesh's tolerance against the exact 1-D capacitance.
+#: The 1-D potential is piecewise linear in z and every interface is a mesh
+#: facet, so it lies in the P1 space and the error is round-off: measured
+#: (``--layered``, 2026-11-05) C 0..9.5e-15 and thin-layer E 1.7e-15..1.1e-14
+#: over the ladder. 1e-10 is far above that and far below the centroid-labelled
+#: control (C 5.6e-02, thin-layer E 2.1e-01 at its finest).
+TOL_LAYERED = 1e-10
+
+
+def layered_rows():
+    """One row per (mesh path, ladder step): tets, straddles, C error, thin-layer E error."""
+    import mse_meshing as MESH
+
+    rows = []
+    for conforming in (True, False):
+        for edge_m, n_across in LAYERED_LADDER:
+            problem, expected = thin_layer_capacitor(
+                edge_m, conforming=conforming, n_across=n_across)
+            C = _capacitance_matrix_only(problem)
+            cap = float(abs(C[0, 0]))
+            sol = _solution(problem)
+            planes = problem["planes_m"]
+            names = problem["parts"]
+            i = names.index("thin")
+            side = problem["side"]
+            probe = np.array([side * 0.37, side * 0.41,
+                              0.5 * (planes[i] + planes[i + 1])])
+            e_thin = float(np.linalg.norm(E.field_at(sol, probe)))
+            st = MESH.layer_straddles(problem["points_m"], problem["tets"],
+                                      problem["region_of_tet"], planes)
+            rows.append({
+                "conforming": conforming, "edge_m": edge_m, "n_across": n_across,
+                "n_tets": int(problem["tets"].shape[0]),
+                "straddling": st["crossing"],
+                "c_err": abs(cap - expected["C"]) / expected["C"],
+                "e_thin_err": abs(e_thin - expected["E"]["thin"]) / expected["E"]["thin"],
+            })
+    return rows
+
+
+def layered_table() -> str:
+    """The thin-layer capacitor against the exact 1-D answer, with observed orders.
+
+    Order is ``log(e_prev / e) / log(h_prev / h)`` on the bulk edge. It is only
+    printed for errors above 1e-12: below that the error is round-off and has
+    no order, and printing one would be a number about the arithmetic.
+    """
+    lines = ["thin-layer capacitor vs exact 1-D series C "
+             f"(layers {', '.join(n for n, _t, _e in THIN_CAP_STACK)})",
+             f"{'mesh':<22}{'edge nm':>8}{'x thin':>7}{'tets':>8}{'straddle':>9}"
+             f"{'C rel err':>12}{'order':>7}{'E_thin err':>12}"]
+    prev = None
+    for r in layered_rows():
+        mesh = "conforming layers" if r["conforming"] else "one solid, centroid"
+        if prev is not None and prev["conforming"] != r["conforming"]:
+            prev = None
+        order = ""
+        if prev is not None and r["c_err"] > 1e-12 and prev["c_err"] > 1e-12:
+            order = f"{math.log(prev['c_err'] / r['c_err']) / math.log(prev['edge_m'] / r['edge_m']):.2f}"
+        elif prev is not None:
+            order = "n/a"
+        lines.append(f"{mesh:<22}{r['edge_m'] * 1e9:>8.0f}{r['n_across']:>7d}"
+                     f"{r['n_tets']:>8d}{r['straddling']:>9d}{r['c_err']:>12.3e}"
+                     f"{order:>7}{r['e_thin_err']:>12.3e}")
+        prev = r
+    lines.append("order n/a: the error is at round-off, so there is no asymptotic "
+                 "rate to observe")
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     global _METHOD
     ap = argparse.ArgumentParser(description=__doc__,
@@ -426,8 +504,15 @@ def main(argv=None) -> int:
     ap.add_argument("--perturb", action="store_true",
                     help="print what a 1%% eps error in each shell scores, then "
                          "exit; this is the sensitivity half of the tolerances")
+    ap.add_argument("--layered", action="store_true",
+                    help="print the thin-layer capacitor table (TetGen layered "
+                         "mesh vs the one-solid control), then exit")
     args = ap.parse_args(argv)
     _METHOD = args.method
+
+    if args.layered:
+        print(layered_table())
+        return 0
 
     if args.sweep:
         print(convergence_table())

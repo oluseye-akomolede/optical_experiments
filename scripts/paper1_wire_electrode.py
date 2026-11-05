@@ -47,8 +47,8 @@ it is used for NEITHER material here.
 - Gold is a conductor and is treated as an equipotential (it is an electrode,
   not a dielectric region).
 
-Status: UNVALIDATED, and NOT USABLE AS A GATE -- the mesh does not resolve the oxide
-------------------------------------------------------------------------------------
+Status: UNVALIDATED; the ONE-PART mesh does not resolve the oxide (the layered one does, 1.6c)
+---------------------------------------------------------------------------------------------
 There is no measurement of the field in this structure to compare against. The
 paper reports a Purcell factor from an FDTD run, not a potential or a field.
 
@@ -82,14 +82,27 @@ What this fixture therefore establishes, and what it does not:
   at -1V vs 1V), and the prism's volume matches the closed form exactly.
 - NOT ESTABLISHED: any field value. None may be quoted downstream.
 
-Before this can be a gate, the mesher needs a graded multi-part path for
-electrical uploads, or a way to give a one-part mesh internal facets at the
-layer planes. That is a change to ``mse_meshing``, not to this file.
+**Task 1.6c (2026-11-05): the layered path.** :func:`mesh_fixture_layered`
+meshes the stack with :func:`mse_meshing.tetrahedralize_layers`, which puts an
+internal facet at every layer plane (and sub-slab facets in the oxide), so no
+tet straddles an interface. On that mesh the field at the probe is the same to
+8e-15 across 9.7k, 38k and 107k tets and equals the exact 1-D value
+(:func:`field_per_volt_1d`, 707.483 kV/m per V) -- run ``--layered-convergence``.
+That agreement is exact, not approximate, because this fixture IS a 1-D stack:
+every layer has the wire's outline and both electrodes cover it, so the
+potential is piecewise linear in z and lies in the P1 space. The 40 % spread
+above was therefore entirely the centroid labels. The fixture is still
+UNVALIDATED against the paper's device: the paper's pad is wider than the wire
+(:func:`footprint_error`), and that 3-D fringing field is not modelled here.
+:func:`mesh_fixture` (the one-part path) is kept, with its negative test, as
+the record of what the one-part mesher does.
 
 Usage
 -----
-    python scripts/paper1_wire_electrode.py            # default mesh, prints E/V
+    python scripts/paper1_wire_electrode.py            # layered mesh, prints E/V
     python scripts/paper1_wire_electrode.py --coarse   # a mesh small enough for tests
+    python scripts/paper1_wire_electrode.py --layered-convergence   # task 1.6c check
+    python scripts/paper1_wire_electrode.py --one-part --convergence  # the 1.6b negative
 
 The script is also importable: :func:`mesh_fixture` and
 :func:`wire_field_per_volt` are what ``tests/test_paper1_wire_electrode.py``
@@ -112,6 +125,7 @@ sys.path.insert(0, os.path.join(_HERE, "..", "dockerfiles", "maxwell_solver"))
 
 import paper1_nanowire as P1  # noqa: E402
 
+import dot_material as DOT  # noqa: E402
 import mse_electrostatics as E  # noqa: E402
 import mse_meshing as MESH  # noqa: E402
 import mse_parts as PARTS  # noqa: E402
@@ -134,8 +148,9 @@ OXIDE_NM = 12.0
 PROBE_BELOW_TOP_NM = 30.0
 
 #: Static permittivity of InP at 300 K, from Ioffe's basic-parameters table
-#: (task 0.2). NOT n^2 = 11.83, which is the optical-band value.
-EPS_INP = 12.5
+#: (task 0.2). NOT n^2 = 11.83, which is the optical-band value. Read from
+#: :mod:`dot_material`, which owns the cited value, rather than re-typed here.
+EPS_INP = DOT.INP_EPS_S.value
 
 #: Static permittivity of SiO2. **Paper 1 states no SiO2 value** ("no SiO2 index
 #: or eps is stated anywhere", design.md §1), so this is a standard-reference
@@ -342,6 +357,65 @@ def footprint_error():
     hexagon = 3 * math.sqrt(3) / 2 * radius ** 2
     square = (2 * pad) ** 2
     return hexagon, square, square / hexagon
+
+def layers() -> list[tuple[str, float]]:
+    """The stack as ``(name, thickness_m)`` bottom to top, for the layered mesher."""
+    _solid, _label, zs, labels = stacked_solid_with_labels()
+    return [(name, hi - lo) for name, lo, hi in zip(labels, zs[:-1], zs[1:])]
+
+
+def hex_outline_m() -> list[tuple[float, float]]:
+    """The wire's hexagon in metres, the same corners :func:`stacked_solid_with_labels` uses."""
+    radius = circumradius_nm() * NM
+    return [(radius * math.cos(math.pi / 6.0 + k * math.pi / 3.0),
+             radius * math.sin(math.pi / 6.0 + k * math.pi / 3.0)) for k in range(6)]
+
+
+def field_per_volt_1d() -> float:
+    """The exact |E| in the wire per applied volt, for THIS fixture's geometry.
+
+    Every layer has the same outline and both electrodes cover it, with natural
+    (zero normal field) side walls, so the fixture is a 1-D series stack: the
+    same displacement crosses oxide and wire and ``E_wire = V / (eps_wire *
+    (t_ox/eps_ox + H/eps_wire))``. That is a property of the fixture's
+    simplification (see :func:`footprint_error`), not of the paper's device,
+    which has a pad wider than the wire and a 3-D fringing field.
+    """
+    s = OXIDE_NM * NM / EPS_SIO2 + HEIGHT_NM * NM / EPS_INP
+    return 1.0 / (EPS_INP * s)
+
+
+def mesh_fixture_layered(*, edge_nm: float = 200.0, n_across: int | None = None,
+                         max_tets: int = 400_000, verbose: bool = False):
+    """The stack meshed as CONFORMING layers (task 1.6c), same dict as :func:`mesh_fixture`.
+
+    Every layer plane is an internal facet, so no tet straddles an interface
+    and ``region_of_tet`` is TetGen's own region attribute, not a centroid
+    guess; the oxide is split into ``n_across`` sub-slabs so it has at least
+    that many elements across its 12 nm.
+    """
+    kw = {} if n_across is None else {"n_across": n_across}
+    stack = layers()
+    points_m, tets, region_of_tet = MESH.tetrahedralize_layers(
+        hex_outline_m(), stack, edge_nm * NM, max_tets=max_tets,
+        verbose=verbose, **kw)
+    return {
+        "points_m": points_m,
+        "tets": tets,
+        "parts": [name for name, _t in stack],
+        "region_of_tet": region_of_tet,
+        "eps_static": materials(),
+        "probe": probe_point(),
+        "planes_m": MESH.layer_planes(stack),
+        "layers": stack,
+    }
+
+
+#: The layered convergence ladder: (bulk edge nm, oxide sub-slabs), coarse to
+#: fine. Both levers refine together, the wire's edge and the oxide's.
+LAYERED_LADDER = ((400.0, 1), (200.0, 2), (100.0, 3))
+
+
 def mesh_fixture(*, max_tets: int = 60_000, n_modes: int = 4, verbose: bool = False):
     """Tetrahedralise the stack and return the solver's own arguments.
 
@@ -441,6 +515,10 @@ def main(argv=None) -> int:
     ap.add_argument("--convergence", action="store_true",
                     help="run at n_modes 20/60/120 and report the spread (the "
                          "number that says whether any value here is usable)")
+    ap.add_argument("--one-part", action="store_true",
+                    help="mesh with the old one-part, centroid-labelled path (1.6b)")
+    ap.add_argument("--layered-convergence", action="store_true",
+                    help="the same check on the conforming layered mesh (task 1.6c)")
     ap.add_argument("--budget", type=float, default=None,
                     help="memory budget in GiB; refused before assembly if over")
     args = ap.parse_args(argv)
@@ -454,6 +532,27 @@ def main(argv=None) -> int:
     print(f"  oxide   {OXIDE_NM:.0f} nm SiO2, eps_s = {EPS_SIO2}")
     print(f"  wire    eps_s = {EPS_INP} (Ioffe, 300 K) -- NOT n^2 = 11.83")
     print(f"  probe   on axis, {PROBE_BELOW_TOP_NM:.0f} nm below the top (Fig. 2 caption)")
+
+    if args.layered_convergence:
+        # Task 1.6c: the same check on the CONFORMING layered mesh.
+        print()
+        print("  convergence on the LAYERED mesh (internal facets at every plane):")
+        exact = field_per_volt_1d()
+        values = []
+        for edge_nm, k in LAYERED_LADDER:
+            m = mesh_fixture_layered(edge_nm=edge_nm, n_across=k)
+            st = MESH.layer_straddles(m["points_m"], m["tets"], m["region_of_tet"],
+                                      m["planes_m"])
+            r = wire_field_per_volt(m, method=args.method, budget=budget)
+            values.append(r["magnitude_per_volt"])
+            print(f"    edge {edge_nm:5.0f} nm, oxide x{k}: {len(m['tets']):7d} tets, "
+                  f"straddling {st['crossing']}  |E| = "
+                  f"{r['magnitude_per_volt']:.9g} V/m per V  "
+                  f"(rel to 1-D {r['magnitude_per_volt'] / exact - 1:+.2e})")
+        lo, hi = min(values), max(values)
+        print(f"    spread {(hi - lo) / lo:.3e}; exact 1-D value for this fixture's "
+              f"geometry {exact:.9g} V/m per V")
+        return 0
 
     if args.convergence:
         # The measured headline of this fixture: the answer moves with the mesh,
@@ -474,7 +573,10 @@ def main(argv=None) -> int:
               f"value above is quotable")
         return 0
 
-    mesh = mesh_fixture(max_tets=max_tets)
+    if args.one_part:
+        mesh = mesh_fixture(max_tets=max_tets)
+    else:
+        mesh = mesh_fixture_layered(edge_nm=400.0 if args.coarse else 200.0)
     n_tets = int(np.asarray(mesh["tets"]).shape[0])
     print(f"  mesh    {int(np.asarray(mesh['points_m']).shape[0])} nodes, {n_tets} tets")
 
@@ -487,9 +589,14 @@ def main(argv=None) -> int:
     print(f"  linearity: 2V/2 vs 1V max|dE| = {lin['two_v_over_two_vs_one_v']:.3g}; "
           f"-1V vs 1V = {lin['minus_one_v_vs_one_v']:.3g}")
     print()
-    print("  NOT CONVERGED: this mesh cannot resolve the 12 nm oxide, and the value")
-    print("  above moves ~40% across mesh sizes (run --convergence). Do not quote it.")
-    print("  The linearity numbers check the solver; the field does not check the device.")
+    if args.one_part:
+        print("  NOT CONVERGED: this one-part mesh cannot resolve the 12 nm oxide, and the")
+        print("  value above moves ~40% across mesh sizes (run --convergence). Do not quote it.")
+    else:
+        print(f"  layered mesh: converged (run --layered-convergence); exact 1-D value "
+              f"{field_per_volt_1d():.9g} V/m per V")
+        print("  UNVALIDATED against the paper's device: every layer has the wire's")
+        print("  outline (footprint_error), so this is a 1-D stack, not the 3-D pad.")
     return 0
 
 
