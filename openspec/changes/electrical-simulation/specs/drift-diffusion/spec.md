@@ -53,6 +53,31 @@ the uploaded geometry. A non-round device SHALL be refused for the axisymmetric 
 - **WHEN** a request asks for the axisymmetric form on a circular cross-section
 - **THEN** the request is accepted and the (r, z) mesh is built
 
+#### Scenario: Roundness is measured per loop about the detected axis (task 2.6)
+- **GIVEN** the uploaded surface (every part, through the solver's own split)
+- **WHEN** it is sliced across each candidate axis (the eigenvectors of its area-weighted
+  normal tensor and of its surface second moment, through its area-weighted centroid)
+- **THEN** each closed loop of each slice gives a circumradius (its farthest point from the
+  axis) and an inradius (the nearest point of its segments), the device's figure is the
+  worst loop's ratio, and the axis is the candidate with the smallest such figure
+- **AND** the limit is `mse_geometry.ROUNDNESS_TOLERANCE` (0.02), read by both the upload
+  refusal and the solver, and a ratio above 1 + 0.02 is refused
+
+#### Scenario: A faceted, tilted or offset cylinder is accepted
+- **WHEN** the cylinder is a 24-sided prism (ratio 1/cos(π/24) = 1.0086), or is tilted and
+  moved off the coordinate origin
+- **THEN** it is accepted, measured about its own axis, not the coordinate z axis
+
+#### Scenario: An elliptic cylinder straddles the limit
+- **WHEN** the cross-section is an ellipse with a/b = 1.03
+- **THEN** it is refused; at a/b = 1.015 it is accepted
+
+#### Scenario: Every part is judged, loop by loop
+- **WHEN** a round core sits inside a round tube
+- **THEN** it is accepted (each loop is round on its own)
+- **AND WHEN** a hexagonal part sits on the same axis beside a round wire
+- **THEN** the upload is refused
+
 ### Requirement: The 3-D form SHALL be size-checked against the Job limit before it runs
 Before building the 3-D mesh, the worker SHALL estimate the run's memory from the mesh it
 would build — the node and edge counts of the actual geometry, at the requested edge lengths,

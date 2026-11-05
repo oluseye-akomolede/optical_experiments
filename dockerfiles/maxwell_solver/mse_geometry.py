@@ -401,3 +401,207 @@ def formation_error(message: str, part_name: str) -> MeshingError:
     the answer it produced is unusable.
     """
     return MeshingError(f"{message} (part {part_name!r})")
+
+
+# --------------------------------------------------------------------------
+# Roundness: may this device use the axisymmetric (r, z) form? (task 2.6)
+# --------------------------------------------------------------------------
+#
+# The axisymmetric form solves a 2-D (r, z) mesh weighted by 2*pi*r, which is
+# only the same device if every cross-section is a circle about one axis. This
+# measures that from the uploaded surface, on numpy alone (the web image runs it
+# at upload, and has no rtree / shapely / networkx).
+#
+# HOW. Find candidate axes, slice the surface with planes across each one, and
+# for every closed loop in every slice take
+#
+#   circumradius = the farthest loop point from the axis,
+#   inradius     = the nearest point of the loop's SEGMENTS to the axis,
+#
+# so a faceted circle of N sides measures 1/cos(pi/N), not 1. The device's
+# figure is the worst loop of the worst slice; the axis is the candidate about
+# which that worst figure is smallest.
+#
+# THE CANDIDATES. Any symmetric tensor of a body of revolution has the symmetry
+# axis as an eigenvector, so the eigenvectors of two such tensors -- the
+# area-weighted normal tensor and the surface second moment -- are tried. Two,
+# because each has one aspect ratio at which its eigenvalues coincide and its
+# eigenvectors stop meaning anything (a cylinder with L = 2R for the normal
+# tensor), and the two coincide at different aspect ratios. The line passes
+# through the area-weighted surface centroid, which lies on the axis of any
+# body of revolution.
+#
+# PER LOOP, NOT PER DEVICE. A tapered pillar or a core inside a tube has round
+# loops of different radii; comparing the biggest loop with the smallest would
+# refuse them. Each loop is judged on its own.
+
+#: The axisymmetric form's limit on circumradius/inradius - 1 (design.md, "Two
+#: forms": "round to within 2 % (circumradius vs inradius)"). One definition:
+#: the solver and the upload refusal both read it from here.
+ROUNDNESS_TOLERANCE = 0.02
+
+#: Planes per candidate axis. Odd, so a symmetric device is sliced at its middle.
+ROUNDNESS_SLICES = 9
+
+
+class NotRoundError(ValueError):
+    """The device's cross-sections are not round enough for the (r, z) form."""
+
+
+def _weld(vertices: np.ndarray, faces: np.ndarray):
+    """Merge coincident vertices so slice segments can be chained by edge."""
+    span = float(np.ptp(vertices, axis=0).max()) or 1.0
+    key = np.round(vertices / (span * 1e-9)).astype(np.int64)
+    _, first, inverse = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    return vertices[first], inverse.reshape(-1)[faces]
+
+
+def _candidate_axes(vertices: np.ndarray, faces: np.ndarray):
+    """The surface centroid and the candidate axis directions (unit vectors)."""
+    tri = vertices[faces]
+    cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    area = 0.5 * np.linalg.norm(cross, axis=1)
+    total = area.sum()
+    if total <= 0.0:
+        raise NotRoundError("The surface has no area, so its roundness cannot be measured.")
+    centroid = (area[:, None] * tri.mean(axis=1)).sum(axis=0) / total
+    normals = cross / np.where(area > 0, 2.0 * area, 1.0)[:, None]
+    normal_tensor = np.einsum("i,ij,ik->jk", area, normals, normals)
+    # Exact second moment of each triangle about the centroid:
+    # A/12 * (sum v v^T + (sum v)(sum v)^T).
+    rel = tri - centroid
+    s = rel.sum(axis=1)
+    moment = (np.einsum("i,ikj,ikl->jl", area, rel, rel)
+              + np.einsum("i,ij,ik->jk", area, s, s)) / 12.0
+    axes = []
+    for tensor in (normal_tensor, moment):
+        for vec in np.linalg.eigh(tensor)[1].T:
+            if all(abs(float(vec @ a)) < 0.999 for a in axes):
+                axes.append(vec / np.linalg.norm(vec))
+    return centroid, axes
+
+
+def _slice_heights(t: np.ndarray, n: int) -> np.ndarray:
+    """``n`` heights across ``t``'s range, none on a vertex (so no degenerate cut)."""
+    lo, hi = float(t.min()), float(t.max())
+    levels = np.unique(t)
+    eps = 1e-7 * (hi - lo)
+    heights = lo + (np.arange(n) + 0.5) / n * (hi - lo)
+    for k, h in enumerate(heights):
+        if np.abs(levels - h).min() < eps:
+            above = levels[levels > h + eps]
+            below = levels[levels < h - eps]
+            nxt = above[0] if above.size else hi
+            prv = below[-1] if below.size else lo
+            heights[k] = 0.5 * (h + nxt) if nxt - h >= h - prv else 0.5 * (h + prv)
+    return heights
+
+
+def _loops_at(vertices, faces, t, height):
+    """The closed loops of the cut at ``t == height``, as arrays of 3-D points."""
+    s = t[faces] - height
+    pos = s > 0
+    crossing = pos.any(axis=1) & ~pos.all(axis=1)
+    point_of = {}
+    neighbours: dict = {}
+    for f, sf in zip(faces[crossing], s[crossing]):
+        ends = []
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            if (sf[a] > 0) != (sf[b] > 0):
+                i, j = int(f[a]), int(f[b])
+                key = (min(i, j), max(i, j))
+                if key not in point_of:
+                    w = sf[a] / (sf[a] - sf[b])
+                    point_of[key] = vertices[i] + w * (vertices[j] - vertices[i])
+                ends.append(key)
+        p, q = ends
+        neighbours.setdefault(p, []).append(q)
+        neighbours.setdefault(q, []).append(p)
+    if any(len(v) != 2 for v in neighbours.values()):
+        raise NotRoundError(
+            "The surface is not a closed manifold where it was cut, so its "
+            "roundness cannot be measured.")
+    loops, seen = [], set()
+    for start in neighbours:
+        if start in seen:
+            continue
+        loop, prev, cur = [], None, start
+        while cur not in seen:
+            seen.add(cur)
+            loop.append(point_of[cur])
+            a, b = neighbours[cur]
+            prev, cur = cur, (b if a == prev else a)
+        loops.append(np.array(loop))
+    return loops
+
+
+def _loop_radii(points: np.ndarray, point_on_axis, direction):
+    """(circumradius, inradius) of one closed loop about the axis line."""
+    rel = points - point_on_axis
+    radial = rel - np.outer(rel @ direction, direction)
+    a = radial
+    b = np.roll(radial, -1, axis=0)
+    ab = b - a
+    denom = np.einsum("ij,ij->i", ab, ab)
+    w = np.clip(-np.einsum("ij,ij->i", a, ab) / np.where(denom > 0, denom, 1.0), 0.0, 1.0)
+    nearest = a + w[:, None] * ab
+    return (float(np.linalg.norm(radial, axis=1).max()),
+            float(np.linalg.norm(nearest, axis=1).min()))
+
+
+def roundness_about(vertices, faces, point_on_axis, direction,
+                    n_slices: int = ROUNDNESS_SLICES) -> dict:
+    """The worst loop's circumradius, inradius and ratio about one given axis."""
+    vertices, faces = _weld(np.asarray(vertices, float), np.asarray(faces, np.int64))
+    direction = np.asarray(direction, float) / np.linalg.norm(direction)
+    point_on_axis = np.asarray(point_on_axis, float)
+    t = (vertices - point_on_axis) @ direction
+    worst = None
+    for height in _slice_heights(t, n_slices):
+        for loop in _loops_at(vertices, faces, t, height):
+            big, small = _loop_radii(loop, point_on_axis, direction)
+            ratio = big / small if small > 0 else float("inf")
+            if worst is None or ratio > worst["ratio"]:
+                worst = {"circumradius": big, "inradius": small, "ratio": ratio}
+    worst.update(axis_point=point_on_axis, axis_direction=direction)
+    return worst
+
+
+def measure_roundness(vertices, faces, n_slices: int = ROUNDNESS_SLICES) -> dict:
+    """Roundness of a closed surface about its detected axis.
+
+    Returns ``circumradius``, ``inradius`` (both in the surface's own units),
+    ``ratio`` (circumradius / inradius of the worst loop of the worst slice),
+    ``axis_point`` and ``axis_direction``.
+    """
+    vertices, faces = _weld(np.asarray(vertices, float), np.asarray(faces, np.int64))
+    centroid, axes = _candidate_axes(vertices, faces)
+    results = [roundness_about(vertices, faces, centroid, a, n_slices) for a in axes]
+    return min(results, key=lambda r: r["ratio"])
+
+
+def roundness_refusal(measured: dict, units: str,
+                      tolerance: float = ROUNDNESS_TOLERANCE) -> str | None:
+    """The plain-English refusal for ``measured``, or ``None`` when it is round."""
+    ratio = measured["ratio"]
+    if ratio <= 1.0 + tolerance:
+        return None
+    return (
+        "This device is not round enough for the axisymmetric (r, z) form. "
+        f"Measured about its axis, its cross-sections have a circumradius of "
+        f"{measured['circumradius']:.4g} {units} and an inradius of "
+        f"{measured['inradius']:.4g} {units}: the circumradius is "
+        f"{100.0 * (ratio - 1.0):.2f}% larger than the inradius, and the "
+        f"axisymmetric form allows at most {100.0 * tolerance:g}%. "
+        "Use the 3-D form for this device instead."
+    )
+
+
+def require_round(vertices, faces, units: str,
+                  tolerance: float = ROUNDNESS_TOLERANCE) -> dict:
+    """``measure_roundness``, raising :class:`NotRoundError` past ``tolerance``."""
+    measured = measure_roundness(vertices, faces)
+    message = roundness_refusal(measured, units, tolerance)
+    if message:
+        raise NotRoundError(message)
+    return measured
