@@ -50,6 +50,15 @@ Dot geometry (measured, from TEM):
 What is NOT sourced, and therefore marked ASSUMED:
     * Any InAs_xP_1-x band-gap bowing. Consequence: this module does not
       report a dot band gap at all, and nothing downstream may quote one.
+      A bounded retrieval on 2026-11-05 for the usual compilation
+      (Vurgaftman, Meyer & Ram-Mohan, J. Appl. Phys. 89, 5815 (2001)) came
+      back EMPTY: the publisher landing page returns HTTP 403 to automated
+      retrieval, and searches for the InP/InAs gap table and the InAsP bowing
+      parameter returned no usable hits. Nothing here was filled in from
+      memory. To close this, someone needs table-level access to that paper
+      (or an equivalent compilation) and must cite section and table for
+      each of: the InP gap, the InAs gap, the InP/InAs band-offset split, and
+      the InAsP bowing parameter.
     * Any InAs_xP_1-x effective mass. The values below are a linear
       interpolation in x between the InP and InAs endpoints. No source states
       this rule.

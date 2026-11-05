@@ -27,6 +27,15 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       absorption at the emission wavelength; the Finley 2004 article number; DEVSIM's
       aarch64 wheels, mesh import route, cylindrical option and linear solvers; Sesame's
       venue and dimensionality. No library number ships from memory.
+      **STATUS 2026-11-05 -- NOT TICKED, deliberately.** Every dot value that
+      ships is now either cited with table/page or marked ASSUMED (see
+      `dot_material.py`), which is what 1.9c step 4 asked to confirm. The one
+      remaining item is the InAs_xP_1-x band gap and bowing parameter: the
+      bounded retrieval came back EMPTY (AIP returns 403; four searches found
+      nothing), so that number is recorded as NOT SOURCED rather than filled in.
+      Ticking 0.2 would assert a fetch that did not happen. It stays open until
+      someone with table-level access to a III-V compilation supplies the gap,
+      the offset split and the bowing parameter with section and table.
       **Resolve this FIRST — it decides whether "a ok" has a cheap path at all:** can
       DEVSIM's custom models carry the 2πr weight on node volumes and edge couplings in a
       cylindrical (r, z) mesh (`design.md` §2)? If yes, record the call with a pointer to
@@ -489,6 +498,47 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         default sweep every row is electron-limited, so the honest output is that beta
         is blank on all six; the test pins depth 0.2 specifically so a later edit cannot
         restore a bare number there.
+      - **1.9c, 2026-11-05: THE OFFSET CITATION CAME BACK EMPTY. Recorded, not
+        filled in.** A bounded one-pass retrieval (as the lead specified) for the
+        standard III-V compilation -- Vurgaftman, Meyer & Ram-Mohan, J. Appl. Phys.
+        89, 5815 (2001) -- returned nothing usable: the AIP landing page answers
+        HTTP 403 to automated retrieval, and four searches (the paper by title and
+        author; the InP/InAs gap table; the InAsP bowing parameter; a narrowed
+        value-based query) returned no hits. **Nothing was written from memory.**
+        A control query ("indium phosphide band gap") did return a result, quoting
+        ~1.34 eV with no source -- which is exactly the kind of unsourced number
+        this change refuses to use, so it was discarded. What is needed to close
+        this: table-level access to that paper (or an equivalent compilation), and
+        a citation of section and table for each of the InP gap, the InAs gap, the
+        InP/InAs offset split, and the InAsP bowing parameter. The sweep remains
+        the answer until then, as the lead's step 3 provides.
+      - **1.9c: HOW FAR SHORT THE ELECTRON FALLS, measured (the part that does not
+        need the missing citations).** The lead's rough figure checks: the 4 nm
+        infinite-well electron level at m_e = 0.08 is **0.2938 eV**. Sweeping a
+        z-only square well, the electron first satisfies the h^2/12 = 1.333 nm^2
+        criterion at a depth just above **0.6 eV** (0.30 and 0.50 eV: loose, 2.139
+        and 1.464 nm^2; 0.60 and 0.80 eV: confined, 1.316 and 1.137 nm^2). So a
+        realistic conduction offset sits well short of what this model needs, and
+        the reviewer's "unbound at every swept depth" is not merely a range
+        artifact -- sweeping deeper would not rescue it until ~0.6 eV. Pinned by
+        `test_the_electron_needs_an_unrealistically_deep_well_to_bind`, which
+        fails if the threshold is shrunk to make the dot bind.
+      - **1.9c: NAMING THE LIKELY CAUSE -- measured zero-points, hypothesis
+        flagged as hypothesis.** The lead asked that if the electron does not
+        bind, the plausible cause be named: the 1-D z model leaves out the 18 nm
+        lateral confinement. Measuring the two zero-points at m_e = 0.08 gives
+        **0.2938 eV (z, 4 nm) against 0.0145 eV (lateral, 18 nm)** -- the lateral
+        term is twenty times smaller. That is a measurement, and it does NOT by
+        itself prove the 1-D model overstates the needed depth. **The mechanism
+        is a hypothesis, not established here:** it would be that the 1-D model
+        assigns the electron's entire zero-point to the z axis and ignores the
+        lateral degree of freedom, so z well depth is being asked to supply an
+        energy that a real 3-D state partly supplies laterally. What would test
+        it: a 3-D solve on this box including the lateral level in the energy
+        reference, then comparing the z-depth at which the electron binds.
+        Building that model is deliberately OUT OF SCOPE for this row (the lead's
+        instruction), and neither the offset nor the mass was tuned to make the
+        dot bind.
       - **SILENT LOBPCG FAILURE, fixed 2026-11-04 (reviewer finding 3, made REQUIRED by
         the lead).** `scipy`'s `lobpcg` reports a missed tolerance only through a
         `UserWarning` and then returns whatever it has, so `lowest_states` was handing
