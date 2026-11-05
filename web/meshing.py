@@ -404,3 +404,35 @@ def load_parts(data: bytes, units: str):
         raise
     except Exception as exc:  # noqa: BLE001 - every failure is the same here
         raise UploadError(str(exc)) from exc
+
+
+# --------------------------------------------------------------------------
+# The roundness refusal for the axisymmetric (r, z) form (task 2.6)
+# --------------------------------------------------------------------------
+
+def refuse_unless_round(data: bytes, units: str) -> dict:
+    """Raise :class:`UploadError` unless ``data`` is round enough for (r, z).
+
+    Every part is measured together, through the solver's own split
+    (``mse_parts.split_obj_parts``), so a core-and-shell device is judged as the
+    device it is, and a box-shaped part beside a round wire is a refusal rather
+    than an ignored part. The split is used rather than :func:`load_parts`
+    because ``load_parts`` also applies the optical cavity's rules (a first
+    part that encloses every other part as the PEC wall), which an electrical
+    device does not have. The measurement and the 2 % limit are
+    ``mse_geometry.measure_roundness`` and ``mse_geometry.ROUNDNESS_TOLERANCE``;
+    this only turns the solver's ``NotRoundError`` into the upload's error.
+
+    Call it after :func:`validate_upload`, only when the request asks for the
+    axisymmetric form. Returns the measurement (axis, radii, ratio) on success.
+    """
+    _common_module()  # puts the solver directory on sys.path for the next import
+    import mse_geometry as GEO  # noqa: PLC0415 - deliberately late
+    import mse_parts as PARTS  # noqa: PLC0415
+
+    try:
+        _, parts = PARTS.split_obj_parts(data)
+        surface = PARTS.merged_surface(parts)
+        return GEO.require_round(surface.vertices, surface.faces, units)
+    except Exception as exc:  # noqa: BLE001 - NotRoundError and the split's own
+        raise UploadError(str(exc)) from exc

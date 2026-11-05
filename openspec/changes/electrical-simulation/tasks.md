@@ -537,8 +537,39 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       terminally against the Job's 16 GiB, naming the estimate, the limit and the
       axisymmetric form when the device is round. Two-geometry test proves the estimate is
       the device's own. A native solve is never attempted to find out.
-- [ ] 2.6 The roundness check: circumradius/inradius within 2 % for the axisymmetric form,
+- [x] 2.6 The roundness check: circumradius/inradius within 2 % for the axisymmetric form,
       measured from the uploaded geometry, refused at upload naming both figures.
+      **Done (measurement + upload refusal; the route call is 4.3's).**
+      `mse_geometry.measure_roundness` / `require_round` (numpy only, so the web image runs
+      it; `NotRoundError` is a `ValueError`, as the spec asks) and the limit
+      `mse_geometry.ROUNDNESS_TOLERANCE = 0.02`. `web/meshing.refuse_unless_round(data,
+      units)` turns it into the app's `UploadError`. It splits with
+      `mse_parts.split_obj_parts`, not `load_parts`, because `load_parts` adds the optical
+      cavity's PEC-wall rule (first part encloses the rest) and refused a two-part
+      electrical fixture for that reason on the first run. Method: the spec's
+      "measured per loop" scenario.
+      - **Where it is wired.** No electrical upload arm exists yet (4.1–4.2), so no route
+        calls it. The call belongs in the `elec` upload arm in `web/app.py`, right after
+        `validate_upload` and only when the form asks for `axisymmetric`, in the same
+        `except UploadError` -> flash pattern the cavity (`validate_upload`, ~l.1044) and td
+        (~l.1261) arms use. That is task 4.3's "roundness refusal surfaced at upload".
+      - **Measured** (`python scripts/roundness_check.py`):
+        256-gon R = 2: ratio 1.000075 pass; 24-gon 1.008629 pass; 16-gon 1.019591 pass;
+        12-gon 1.035276 refused; hexagon R = 239.4 nm: r = 207.326 nm, 1.154701 refused;
+        ellipse a/b = 1.03: 1.030073 refused; a/b = 1.015: 1.015074 pass; tilted + offset
+        cylinder 1.000075 pass (about the coordinate z axis instead: 16.03); squat L = 2R
+        (normal tensor isotropic) 1.000075 pass.
+      - **Tests** `tests/test_roundness.py`, 10 tests, `python -m pytest
+        tests/test_roundness.py -q` -> 10 passed.
+      - **Mutation** (`ROUNDNESS_TOLERANCE` edited, `__pycache__` cleared, pytest exit
+        code read directly): 0.04 -> exit 1 (3 failures, incl. the 3 % ellipse now
+        accepted); 0.01 -> exit 1 (4 failures, incl. the 1.5 % ellipse now refused);
+        restored 0.02 -> exit 0.
+      - **Not covered.** Taper: a cone's loops are each round, so it passes, but the (r, z)
+        builder is an equal-area cylinder (design 0.3) and would not represent it; 2.3's
+        builder should refuse or mesh a varying radius. A device whose roundest axis is not
+        an eigenvector of either tensor cannot exist for a body of revolution, but a
+        near-round non-symmetric body is measured only about those six candidates.
 - [ ] 2.7 Coarse 3-D form on the tet mesh, admitted only when 2.5's estimate fits; the
       axisymmetric-vs-3-D agreement at ≤ 10¹⁶ cm⁻³ (tier 2 or 3, measure RSS).
 - [ ] 2.8 Transient: charge balance and junction capacitance; g(t) at the dot.
