@@ -766,18 +766,7 @@ def tetrahedralize(
     # the surface-edge measurements and every reported length stay in the
     # scaled surface's units, because those are what ``est_tets`` in the app
     # reproduces and what the owner's numbers are in.
-    bbox_lo = vertices.min(axis=0)
-    bbox_hi = vertices.max(axis=0)
-    longest = float(np.max(bbox_hi - bbox_lo))
-    if not np.isfinite(longest) or longest <= 0:
-        # A degenerate (flat or single-point) surface. TetGen will reject it on
-        # its own terms, and inventing a frame for it would only replace a clear
-        # failure with a confusing one, so mesh it as it is.
-        canonical_offset = np.zeros(3)
-        canonical_scale = 1.0
-    else:
-        canonical_offset = (bbox_lo + bbox_hi) / 2.0
-        canonical_scale = 1.0 / longest
+    canonical_offset, canonical_scale = _canonical_frame(vertices)
     vertices = (vertices - canonical_offset) * canonical_scale
     maxvolume *= canonical_scale ** 3
 
@@ -1114,6 +1103,23 @@ def tetrahedralize(
         if region_plan is not None else None
     )
     return points_m, tets, region_of_tet
+
+
+def _canonical_frame(vertices: np.ndarray) -> tuple[np.ndarray, float]:
+    """``(offset, scale)`` mapping a PLC into TetGen's canonical frame.
+
+    Centre on the bounding box and divide by the longest side, so the mesh is a
+    function of the shape and not of the unit it was written in (see the
+    measurement in :func:`tetrahedralize`). A degenerate (flat or single-point)
+    surface gets the identity: TetGen rejects it on its own terms, and inventing
+    a frame would only replace a clear failure with a confusing one.
+    """
+    bbox_lo = vertices.min(axis=0)
+    bbox_hi = vertices.max(axis=0)
+    longest = float(np.max(bbox_hi - bbox_lo))
+    if not np.isfinite(longest) or longest <= 0:
+        return np.zeros(3), 1.0
+    return (bbox_lo + bbox_hi) / 2.0, 1.0 / longest
 
 
 def _region_plan(parts, materials, edge_units: float, units: str,
@@ -1782,3 +1788,267 @@ def achieved_edge_length(points_m: np.ndarray, tets: np.ndarray,
         xyz[:, local[:, 0], :] - xyz[:, local[:, 1], :], axis=2
     )
     return float(np.median(lengths))
+
+
+# ===========================================================================
+# LAYERED STACKS: conforming regions with shared faces (electrostatics, 1.6c)
+# ===========================================================================
+#
+# WHY A SEPARATE ENTRY POINT. A stack of layers that share faces cannot reach
+# :func:`tetrahedralize` at all: ``mse_parts.load_parts`` refuses touching parts
+# and requires one part to enclose the rest (the optical PEC wall), and a 12 nm
+# oxide cannot enclose a 1375 nm wire. The workaround task 1.6b used -- one
+# closed solid labelled by tet centroid -- was measured to put 10.9 % of tets
+# ACROSS a layer plane, and the field at the paper-1 dot moved 40.1 % between
+# mesh sizes because of it. This path builds ONE PLC whose layer planes are
+# INTERNAL FACETS. TetGen must conform to every facet of a PLC, so no element
+# can cross a layer plane and every tet is wholly inside one layer: the region
+# attribute TetGen returns is then the exact material of the whole element.
+#
+# THE GRADING, AND WHY IT IS FACETS AND NOT THE SIZING FIELD. A layer thinner
+# than ``n_across`` bulk edges is split into ``n_across`` equal sub-slabs by
+# further internal facets that carry the SAME region on both sides. Each tet of
+# the layer then sits inside one sub-slab, so any line crossing the layer
+# crosses at least ``n_across`` elements -- a guarantee from the geometry, not a
+# hint. TetGen's own quality bound (``minratio``/``mindihedral``) forces the
+# elements on those facets to be about as wide as the sub-slab is thick and
+# grades them out to the bulk edge with distance, which is the grading near the
+# thin layer. The ``-m`` sizing field the optical path uses was tried first and
+# measured on the paper-1 stack (mindihedral 20, z-graded background): asked for
+# 3 nm in the oxide it built 605,240 tets and still left a 12.0 nm-tall element
+# in the 12 nm layer -- the field is a target, not a bound. Three sub-slabs give
+# 108,378 tets (400 nm bulk edge) and a 4.00 nm worst span, by construction.
+
+#: Elements a thin layer is guaranteed across its thickness ("a few"). A layer
+#: is thin when it is thinner than this many bulk edges; it is then split into
+#: this many sub-slabs. Thick layers are not split: the bulk edge already puts
+#: this many elements across them, and :func:`layer_mesh_report` measures it.
+LAYER_ELEMENTS_ACROSS = 3
+
+#: TetGen's minimum dihedral angle on the layered path, in degrees. NOT the
+#: optical path's 20, and the difference is measured: on the thin-layer
+#: capacitor (``mse_bench_fixtures.thin_layer_capacitor``) swept over edges
+#: 20..80 nm in 5 nm steps, 20 degrees built 4,878..75,443 tets with no order
+#: in the edge (a refinement cascade: 2 nm elements in a 200 nm layer at a 40 nm
+#: target), while 18 built 3,113..3,994 at every step. TetGen guarantees
+#: termination for the radius-edge bound, not the dihedral one, and the sub-slab
+#: facets are what trip it.
+LAYER_MIN_DIHEDRAL = 18
+
+
+def _convex_outline(outline_xy) -> np.ndarray:
+    """The stack's cross-section as a counter-clockwise convex polygon, or refuse.
+
+    The interface facets are fan-triangulated from the outline's own vertices,
+    which is a valid triangulation of a CONVEX polygon only. A non-convex outline
+    would give overlapping facet triangles -- a self-intersecting PLC -- so it is
+    refused by name rather than meshed into something TetGen may silently fix.
+    """
+    xy = np.asarray(outline_xy, dtype=float)
+    if xy.ndim != 2 or xy.shape[1] != 2 or xy.shape[0] < 3:
+        raise MeshingError("a layer stack's outline needs at least 3 (x, y) vertices")
+    nxt = np.roll(xy, -1, axis=0)
+    area2 = float(np.sum(xy[:, 0] * nxt[:, 1] - nxt[:, 0] * xy[:, 1]))
+    if not np.isfinite(area2) or area2 == 0.0:
+        raise MeshingError("a layer stack's outline has zero area")
+    if area2 < 0:
+        xy = xy[::-1]
+        nxt = np.roll(xy, -1, axis=0)
+    e1 = nxt - xy
+    e2 = np.roll(xy, -2, axis=0) - nxt
+    turn = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+    scale = float(np.max(np.abs(xy)))
+    if np.any(turn <= 1e-12 * scale * scale):
+        raise MeshingError(
+            "a layer stack's outline must be strictly convex: its interface "
+            "facets are fanned from the outline's vertices, which is only a "
+            "valid triangulation of a convex polygon"
+        )
+    return xy
+
+
+def layer_planes(layers, z0_m: float = 0.0) -> np.ndarray:
+    """The z of every layer boundary, bottom to top, in metres (n_layers + 1)."""
+    t = np.asarray([float(th) for _name, th in layers], dtype=float)
+    return z0_m + np.concatenate([[0.0], np.cumsum(t)])
+
+
+def layer_subdivisions(layers, edge_m: float,
+                       n_across: int = LAYER_ELEMENTS_ACROSS) -> list[int]:
+    """Sub-slabs per layer: ``n_across`` for a thin layer, 1 for a thick one."""
+    return [n_across if float(th) < n_across * edge_m else 1 for _n, th in layers]
+
+
+def layer_stack_plc(outline_xy_m, layers, edge_m: float, *,
+                    n_across: int = LAYER_ELEMENTS_ACROSS, z0_m: float = 0.0):
+    """The PLC of a layer stack: ``(vertices, faces, seeds)``, in metres.
+
+    ``layers`` is ``[(name, thickness_m), ...]`` bottom to top; every layer has
+    the outline's cross-section. Every layer plane, and every sub-slab plane of
+    a thin layer, is a facet sharing the outline's ring of vertices with the side
+    walls, so the facets meet the walls edge to edge and the PLC conforms.
+    ``seeds`` is ``[(region_id, (x, y, z)), ...]`` with one seed per sub-slab and
+    the LAYER's index as its id, so a split layer is still one region.
+    """
+    xy = _convex_outline(outline_xy_m)
+    names = [name for name, _t in layers]
+    if len(set(names)) != len(names):
+        raise MeshingError(f"layer names must be unique, got {names}")
+    for name, th in layers:
+        if not (np.isfinite(float(th)) and float(th) > 0):
+            raise MeshingError(f"layer {name!r} has thickness {th!r}; it must be > 0")
+    if n_across < 1:
+        raise MeshingError(f"n_across must be at least 1, got {n_across}")
+    planes = layer_planes(layers, z0_m)
+    splits = layer_subdivisions(layers, edge_m, n_across)
+
+    zs, seeds = [float(planes[0])], []
+    centre = xy.mean(axis=0)
+    for i, k in enumerate(splits):
+        lo, hi = float(planes[i]), float(planes[i + 1])
+        for j in range(k):
+            a = lo + (hi - lo) * j / k
+            b = lo + (hi - lo) * (j + 1) / k if j < k - 1 else hi
+            seeds.append((i, (float(centre[0]), float(centre[1]), 0.5 * (a + b))))
+            zs.append(b)
+
+    m = xy.shape[0]
+    vertices = np.array([(x, y, z) for z in zs for (x, y) in xy], dtype=float)
+    faces = []
+    for r in range(len(zs)):
+        base = r * m
+        for q in range(1, m - 1):
+            faces.append((base, base + q, base + q + 1))
+    for r in range(len(zs) - 1):
+        lo, up = r * m, (r + 1) * m
+        for q in range(m):
+            a, b = lo + q, lo + (q + 1) % m
+            c, d = up + (q + 1) % m, up + q
+            faces.append((a, b, c))
+            faces.append((a, c, d))
+    return vertices, np.asarray(faces, dtype=np.int32), seeds
+
+
+def tetrahedralize_layers(outline_xy_m, layers, edge_m: float, *,
+                          n_across: int = LAYER_ELEMENTS_ACROSS,
+                          z0_m: float = 0.0, max_tets: int = DEFAULT_MAX_TETS,
+                          verbose: bool = False):
+    """Mesh a layer stack as conforming regions: ``(points_m, tets, region_of_tet)``.
+
+    ``region_of_tet[i]`` is the index into ``layers`` of the layer tet ``i`` is
+    in -- TetGen's own region attribute, and exact, because the layer planes are
+    facets no element can cross (:func:`layer_straddles` checks it). ``edge_m``
+    is the bulk target edge in metres; it sets one global ``maxvolume`` through
+    :func:`mse_common.target_maxvolume`, the same edge-to-volume rule the
+    optical path uses. Thin layers are graded by sub-slab facets (see the
+    section comment above). The electrical solver has no refractive index, so
+    no Weyl/n_modes rule enters; the caller's edge IS the requirement.
+
+    Refuses with :class:`MeshingError` when the mesh is over ``max_tets``
+    (there is no retry: the thin layers' facets, not ``maxvolume``, set most of
+    the count, so coarsening the bulk cannot be relied on to fit) or when any
+    tet comes back without a layer.
+    """
+    import tetgen
+
+    if not (np.isfinite(edge_m) and edge_m > 0):
+        raise MeshingError(f"edge_m must be a positive length in metres, got {edge_m!r}")
+    vertices, faces, seeds = layer_stack_plc(
+        outline_xy_m, layers, edge_m, n_across=n_across, z0_m=z0_m)
+    offset, scale = _canonical_frame(vertices)
+    tet = tetgen.TetGen((vertices - offset) * scale, faces)
+    for region_id, seed in seeds:
+        tet.add_region(int(region_id), tuple((np.asarray(seed) - offset) * scale))
+    tet.tetrahedralize(
+        order=1, mindihedral=LAYER_MIN_DIHEDRAL, minratio=2.0,
+        maxvolume=target_maxvolume(None, edge_m * scale), fixedvolume=True,
+        regionattrib=True,
+    )
+    tets = np.asarray(tet.elem, dtype=np.int64)
+    if tets.shape[0] == 0:
+        raise MeshingError("tetrahedralization produced no elements")
+    attrib = np.asarray(tet.attributes, dtype=np.int64).reshape(-1)
+    if attrib.shape[0] != tets.shape[0]:
+        raise MeshingError(
+            f"internal error: TetGen returned {attrib.shape[0]} region "
+            f"attributes for {tets.shape[0]} tetrahedra")
+    if attrib.min() < 0 or attrib.max() >= len(layers):
+        raise MeshingError(
+            "internal error: a tetrahedron came back outside every layer "
+            f"(attributes {sorted(set(attrib.tolist()))[:8]} for "
+            f"{len(layers)} layers): a sub-slab has no seed")
+    if tets.shape[0] > max_tets:
+        raise MeshingError(
+            f"this layer stack needs {tets.shape[0]:,} elements, above the "
+            f"{max_tets:,} limit. Thin layers set most of the count (their "
+            "elements are as wide as a sub-slab is thick), so use a smaller "
+            "cross-section or a lower n_across.")
+    points_m = np.asarray(tet.node, dtype=float)[:, :3] / scale + offset
+    if verbose:
+        print(f"[mse] layered mesh: {tets.shape[0]:,} tets, "
+              f"{points_m.shape[0]:,} points, {len(layers)} layers, "
+              f"sub-slabs {layer_subdivisions(layers, edge_m, n_across)}",
+              flush=True)
+    return points_m, tets, attrib
+
+
+def layer_straddles(points_m, tets, region_of_tet, planes_m) -> dict:
+    """Count the tets that cross a material interface. Zero is the contract.
+
+    Two independent counts, because either alone can pass a broken mesh:
+
+    * ``crossing`` -- tets with vertices strictly on BOTH sides of any interior
+      plane. It reads geometry only, so it cannot be fooled by a label.
+    * ``mislabelled`` -- tets with a vertex outside the z-range of the layer
+      their region id names. It checks the label against the geometry, so a
+      conforming mesh with every tet tagged one layer off still fails.
+
+    "Strictly" is ``1e-9`` of the stack height: a vertex ON a plane is shared by
+    the layers either side and is not a crossing.
+    """
+    pts = np.asarray(points_m, dtype=float)
+    z = pts[np.asarray(tets)][:, :, 2]
+    planes = np.asarray(planes_m, dtype=float)
+    tol = 1e-9 * float(planes[-1] - planes[0])
+    inner = planes[1:-1]
+    zlo, zhi = z.min(axis=1), z.max(axis=1)
+    cross = (zlo[:, None] < inner[None, :] - tol) & (zhi[:, None] > inner[None, :] + tol)
+    region = np.asarray(region_of_tet, dtype=np.int64)
+    lo, hi = planes[:-1][region], planes[1:][region]
+    outside = (z < lo[:, None] - tol) | (z > hi[:, None] + tol)
+    return {
+        "n_tets": int(z.shape[0]),
+        "crossing": int(np.any(cross, axis=1).sum()),
+        "crossing_per_plane": [int(c) for c in cross.sum(axis=0)],
+        "mislabelled": int(np.any(outside, axis=1).sum()),
+    }
+
+
+def layer_mesh_report(points_m, tets, region_of_tet, layers,
+                      z0_m: float = 0.0) -> list[dict]:
+    """Per layer: tets, median edge, worst z-span, and elements across it.
+
+    ``elements_across`` is ``thickness / worst z-span`` over the layer's tets: a
+    line through the layer covers at most the worst span per element, so it
+    crosses at least this many. It is a LOWER BOUND measured on the mesh, the
+    number the "a few elements across each thin layer" requirement is held to.
+    """
+    pts = np.asarray(points_m, dtype=float)
+    tets = np.asarray(tets)
+    region = np.asarray(region_of_tet, dtype=np.int64)
+    out = []
+    for i, (name, th) in enumerate(layers):
+        mask = region == i
+        if not mask.any():
+            out.append({"layer": name, "thickness_m": float(th), "n_tets": 0,
+                        "median_edge_m": float("nan"),
+                        "max_zspan_m": float("nan"), "elements_across": 0.0})
+            continue
+        z = pts[tets[mask]][:, :, 2]
+        span = float((z.max(axis=1) - z.min(axis=1)).max())
+        out.append({
+            "layer": name, "thickness_m": float(th), "n_tets": int(mask.sum()),
+            "median_edge_m": achieved_edge_length(pts, tets, mask),
+            "max_zspan_m": span, "elements_across": float(th) / span,
+        })
+    return out

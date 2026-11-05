@@ -168,6 +168,48 @@ floor.
 - **WHEN** `tetrahedralize` is called without `part_edge_m`
 - **THEN** it returns the same arrays as before this change for the existing test meshes
 
+### Requirement: A layer stack SHALL mesh as conforming regions with at least a few elements across each thin layer
+`mse_meshing.tetrahedralize_layers(outline_xy_m, layers, edge_m, n_across=3)` SHALL mesh a
+stack of layers (`[(name, thickness_m), ...]`, bottom to top, each with the same strictly
+convex cross-section) as ONE TetGen PLC whose every layer plane is an internal facet, so that
+no tetrahedron crosses a layer plane. It SHALL return `(points_m, tets, region_of_tet)` with
+`region_of_tet` the index into `layers`, taken from TetGen's region attribute (one seed per
+sub-slab carrying its layer's index), never from a tet centroid. A layer thinner than
+`n_across` bulk edges SHALL be split into `n_across` equal sub-slabs by further internal
+facets of the same region, so every line through it crosses at least `n_across` elements;
+the elements then grade from the sub-slab thickness out to `edge_m` under TetGen's quality
+bound. It SHALL refuse with `MeshingError` a non-convex outline, a non-positive thickness,
+duplicate layer names, a mesh over `max_tets`, and a tet TetGen returns outside every layer.
+It does not go through `mse_parts.PartSet` (which refuses touching parts), and the existing
+`tetrahedralize` paths are unchanged.
+
+`mse_meshing.layer_straddles` SHALL report two counts: tets with vertices strictly on both
+sides of an interior plane (`crossing`, geometry only) and tets with a vertex outside the
+layer their id names (`mislabelled`). `mse_meshing.layer_mesh_report` SHALL report per
+layer the elements across it as `thickness / worst tet z-span`, a lower bound.
+
+#### Scenario: No tet straddles an interface
+- **WHEN** the thin-layer capacitor (`mse_bench_fixtures.thin_layer_capacitor`) or the
+  paper-1 stack is meshed with `tetrahedralize_layers`
+- **THEN** `crossing` and `mislabelled` are both 0
+- **AND** the same PLC without its internal facets, labelled by centroid, gives both > 0
+
+#### Scenario: A thin layer has at least n_across elements across it
+- **WHEN** the paper-1 stack is meshed with `n_across=3`
+- **THEN** the 12 nm oxide's elements-across bound is ≥ 3 and its worst tet z-span ≤ 4 nm
+- **AND** the median longest edge 600–1100 nm above the oxide is > 10× the oxide's
+
+#### Scenario: The thin-layer capacitor matches the exact series capacitor
+- **WHEN** the capacitor is meshed at each step of `electrostatics_bench.LAYERED_LADDER`
+- **THEN** C and the thin layer's field match ε₀A/Σ(dᵢ/εᵢ) and V/(ε_thin Σ dᵢ/εᵢ) within
+  `TOL_LAYERED` (1e-10) at every step, because the 1-D potential lies in the P1 space
+- **AND** the centroid-labelled control misses C by more than 1 % at every step
+
+#### Scenario: The paper-1 field at the dot converges on the layered mesh
+- **WHEN** the paper-1 fixture is meshed at two steps of its `LAYERED_LADDER`
+- **THEN** the field at the dot changes by less than 20 % (the 1.6b bar, unchanged) and
+  matches the fixture's exact 1-D value within 1e-9 relative
+
 ### Requirement: The paper-1 wire geometry SHALL solve in 3-D and respect its symmetry
 The electrostatics bench SHALL include a reduced paper-1 scene: a hexagonal wire of ε_s = 12.5
 on a 12 nm oxide (ε_s = 3.9) over a grounded mirror electrode, with a top electrode, in an air

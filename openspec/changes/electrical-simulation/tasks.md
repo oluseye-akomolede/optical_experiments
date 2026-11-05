@@ -293,6 +293,45 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       cannot later be claimed as coverage. `perturbation_table()` scores all four
       against references rebuilt from UNPERTURBED eps, closing the circularity that
       made the first bench blind to a wrong eps.
+- [x] 1.6c Layered stacks as conforming regions, graded at thin layers (unblocks 1.10).
+      `mse_meshing.tetrahedralize_layers` builds ONE PLC with an internal facet at every
+      layer plane, so TetGen cannot put an element across one; region ids are TetGen's
+      attributes from per-sub-slab seeds. A layer thinner than `LAYER_ELEMENTS_ACROSS` (3)
+      bulk edges is split into 3 sub-slabs of the same region, which GUARANTEES 3 elements
+      across it; TetGen's quality bound grades out from there. Spec: `electrostatics`,
+      "A layer stack SHALL mesh as conforming regions". Tests: `tests/test_layered_mesh.py`.
+      - *Sizing field tried first and rejected, measured (scratch prototype, not kept):* a
+        z-graded `-m` background asking for 3 nm in the paper-1 oxide built 605,240 tets
+        and still left a 12.0 nm-tall element (a target, not a bound; that run used
+        mindihedral 20). Sub-slab facets: 108,378 tets, worst oxide span 4.00 nm.
+      - *`mindihedral` is 18 here, not 20, measured:* at 20 the thin-layer capacitor built
+        4,878..75,443 tets over edges 20..80 nm with no order in the edge (a refinement
+        cascade); at 18 it built 3,113..3,994 at every 5 nm step. `LAYER_MIN_DIHEDRAL`.
+      - *Straddles:* 0 crossing / 0 mislabelled on the capacitor and the paper-1 stack. The
+        control (same PLC, internal facets removed, centroid labels) straddles 109..799 tets.
+      - *Thin-layer capacitor vs exact 1-D series C* (`python electrostatics_bench.py
+        --layered`): conforming C rel err 0 / 9.5e-15 / 7.5e-15 at 3,113 / 8,128 / 31,281
+        tets. This is round-off and has NO observed order: the 1-D potential is piecewise
+        linear with kinks only on mesh facets, so it is in the P1 space and Galerkin
+        reproduces it on any conforming mesh. The centroid control: 1.14e-01 / 8.53e-02 /
+        5.56e-02, observed order 0.42 then 0.62, thin-layer field off 68 % / 69 % / 21 %.
+      - *1.6b rerun on the layered mesh* (`python scripts/paper1_wire_electrode.py
+        --layered-convergence`): |E| at the dot 707482.993 V/m per V at 9,710 / 37,924 /
+        107,437 tets, spread 7.9e-15, equal to the fixture's exact 1-D value. **It
+        converges.** The 40.1 % spread was the centroid labels, all of it. Caveat that
+        keeps the fixture UNVALIDATED: every layer has the wire's outline (footprint_error,
+        2.408x), so this fixture is a 1-D stack; the paper's wider pad and its fringing
+        field are not modelled, and the layered path only takes one common convex outline.
+      - *1.6b's own tests unchanged:* `test_the_field_is_not_converged_in_the_mesh` still
+        runs on the ONE-PART mesh with its 20 % bar and still passes (40.1 %); the new
+        layered test holds the same 20 % bar from the other side plus a 1e-9 check against
+        the 1-D value. `EPS_INP` now reads `dot_material.INP_EPS_S` instead of retyping 12.5.
+      - *Mutations (`__pycache__` cleared):* interface facets dropped -> 9 red (straddle
+        assertion fails on 318 crossing tets, not an exception); seed id by sub-slab instead
+        of layer -> 9 red; thin-layer split disabled -> 3 red.
+      - *Not done:* the withdrawn-electrode control 1.6b removed is now buildable (the stack
+        has separate regions) but was not rebuilt; non-convex or per-layer outlines (the
+        paper's square pad) need a polygon-with-holes facet triangulation.
 - [x] 1.7 Measure the per-node memory of both solve paths from the bench RSS, replace the
       `design.md` §5 estimates with the measured figures, and wire `budget=` refusals.
       **DONE, measured on the cluster.** The Jetson never answered (DNS resolves
