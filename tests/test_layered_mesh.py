@@ -303,29 +303,41 @@ def test_the_pad_is_actually_wider_than_the_wire_in_the_mesh():
     assert r[wire].max() < 0.6 * PAD_R
 
 
-def test_a_region_whose_outline_is_not_contained_is_refused():
-    with pytest.raises(MESH.MeshingError, match="contained|contain"):
-        MESH.per_region_stack_plc(
-            [_ring(WIRE_R), _ring(WIRE_R), _ring(PAD_R)], PAD_WIDER, 40.0)
+def test_a_region_whose_outline_is_not_nested_is_refused():
+    """Adjacent outlines must nest, but in EITHER order (1.10c).
 
-
-def test_outlines_must_narrow_monotonically_upward():
-    """The pairwise check is the only statement of this invariant.
-
-    An earlier version also compared each ring against the widest ring, but
-    wrote it as ``_ring_contains(rings[i], r)`` with ``r is rings[i]`` -- a
-    ring against itself, always true, so it could never fire. It is deleted
-    rather than repaired: pairwise containment already forces every outline to
-    nest under the one below it, so the widest is always ring 0 and every other
-    ring nests under it transitively. This test pins the consequence, so if the
-    pairwise check ever weakens, a middle-widest or wide-narrow-wide stack is
-    caught here rather than silently meshing crossed regions.
+    1.10a required monotonic narrowing upward. 1.10c relaxed it, because paper
+    1's device is wide-narrow-wide: both electrodes are wider than the wire
+    they feed. What must still be refused is a pair where neither contains the
+    other -- side walls there would cross, and no tetrahedralization repairs it.
     """
-    # Middle ring widest: 40 / 120 / 40. Ring 1 is not contained in ring 0.
-    with pytest.raises(MESH.MeshingError, match="contained|contain"):
+    # Two equal hexagons offset sideways: neither contains the other.
+    import numpy as _np
+    def offset_ring(r, dx, n=8):
+        return [(r * _np.cos(2 * _np.pi * k / n) + dx,
+                 r * _np.sin(2 * _np.pi * k / n)) for k in range(n)]
+    with pytest.raises(MESH.MeshingError, match="without either containing"):
         MESH.per_region_stack_plc(
-            [_ring(40.0), _ring(120.0), _ring(40.0)], PAD_WIDER, 40.0)
-    # Wide-narrow-wide: 120 / 40 / 120. Ring 2 is not contained in ring 1.
-    with pytest.raises(MESH.MeshingError, match="contained|contain"):
-        MESH.per_region_stack_plc(
-            [_ring(120.0), _ring(40.0), _ring(120.0)], PAD_WIDER, 40.0)
+            [offset_ring(WIRE_R, 0.0), offset_ring(WIRE_R, 1.5 * WIRE_R)],
+            [("a", 50.0), ("b", 50.0)], 30.0)
+
+
+def test_outlines_may_widen_upward_as_well_as_narrow():
+    """1.10c: wide-narrow-wide meshes, which 1.10a refused by construction.
+
+    Paper 1's device is gold mirror, wire, top electrode -- both electrodes
+    wider than the wire. Before 1.10c that stack was refused outright, so the
+    paper's own geometry could not be meshed at all.
+    """
+    layers = [("mirror", 60.0), ("wire", 100.0), ("top", 60.0)]
+    m = MESH.tetrahedralize_per_region(
+        [_ring(PAD_R), _ring(WIRE_R), _ring(PAD_R)], layers, 40.0)
+    s = MESH.layer_straddles(*m, MESH.layer_planes(layers))
+    assert s["crossing"] == 0, s
+    assert s["mislabelled"] == 0, s
+    # The middle region really is the narrow one, not the pad's width.
+    import numpy as _np
+    pts, tets, attrib = m
+    r = _np.hypot(pts[tets][:, :, 0], pts[tets][:, :, 1])
+    assert r[attrib == 0].max() > 1.5 * r[attrib == 1].max(), (r[attrib == 0].max(), r[attrib == 1].max())
+    assert r[attrib == 2].max() > 1.5 * r[attrib == 1].max()

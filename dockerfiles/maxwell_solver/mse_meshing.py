@@ -2244,19 +2244,21 @@ def per_region_stack_plc(outlines_xy_m, layers, edge_m: float, *,
     n_ring = max(r.shape[0] for r in rings)
     rings = [_ring_resample(r, n_ring) for r in rings]
     for i in range(len(rings) - 1):
-        if not _ring_contains(rings[i], rings[i + 1]):
+        if not (_ring_contains(rings[i], rings[i + 1])
+                or _ring_contains(rings[i + 1], rings[i])):
             raise MeshingError(
-                f"layer {layers[i + 1][0]!r}'s outline is not contained in layer "
-                f"{layers[i][0]!r}'s below it: each layer must sit within the "
-                "outline of the layer under it")
-    # The pairwise check above is what keeps the annuli disjoint when a pad
-    # overhangs a wire: it forces the outlines to narrow monotonically upward,
-    # so every ring nests transitively under the widest one. (An earlier
-    # version also compared each ring against the widest ring directly, but
-    # wrote `_ring_contains(rings[i], r)` with `r is rings[i]` -- a ring tested
-    # against itself, always true. It was dead code, and redundant with the
-    # check above; it is deleted rather than repaired so there is one statement
-    # of the invariant, not two that can drift apart.)
+                f"layer {layers[i + 1][0]!r}'s outline overlaps layer "
+                f"{layers[i][0]!r}'s below it without either containing the "
+                "other: adjacent layers must nest, so their interface is a "
+                "full polygon or an annulus")
+    # Adjacent outlines must NEST, in either order -- a narrow region on a wide
+    # one, or the reverse. 1.10a required monotonic narrowing upward, which
+    # refused paper 1's actual device (both electrodes wider than the wire they
+    # feed). 1.10c relaxed it to "one contains the other" and generalised the
+    # interface code to put the annulus on whichever order occurs. The
+    # transitive nesting the old check gave us is not needed: the interface
+    # facets are built pairwise, so each level only ever needs its own two
+    # outlines to nest.
 
     planes = layer_planes(layers, z0_m)
     splits = layer_subdivisions(layers, edge_m, n_across)
@@ -2359,19 +2361,20 @@ def per_region_stack_plc(outlines_xy_m, layers, edge_m: float, *,
             # non-manifold edge (measured: 16 edges used three times).
             cap(lvl, up, separate=True)
         else:
-            # The upper region rests INSIDE the lower one, so the interface is
-            # the open annulus (wide ring, narrow hole) and the upper region
-            # needs its own bottom cap.
+            # The two regions have different cross-sections, so the interface is
+            # the open annulus (wide ring, narrow hole) and the NARROW region
+            # needs its own cap on the side away from the wide one. Which side
+            # that is depends on which is lower: 1.10c generalised this from
+            # "narrow always rests on wide" to either order, because paper 1's
+            # device is wide-narrow-wide (both electrodes are wider than the
+            # wire). Measured on wide-narrow-wide: without the narrow region's
+            # own facet TetGen ignores the seeds entirely (580 tets, all region
+            # 0, 40 crossing).
             wide_i, narrow_i = (dn, up) if _ring_area(rings[dn]) > _ring_area(rings[up]) else (up, dn)
             wb = ring_base(lvl, wide_i)
             nb = ring_base(lvl, narrow_i)
             faces.extend(_annulus_faces(wb, nb, n_ring))
-            # ...and the narrow region needs its own bottom, or the hole in the
-            # annulus is a tunnel: tets run from inside the wide layer straight
-            # through into the upper one (measured: 22 tets spanning 100 -> 220
-            # over a 120 plane). Its own SHEET, not the annulus's rim, because
-            # the rim already carries the wall above and the annulus below.
-            cap(lvl, up, separate=True)
+            cap(lvl, narrow_i, separate=True)
 
     for lvl in range(len(zs) - 1):
         # The layer that spans this gap is the one BELOW the upper level, which
