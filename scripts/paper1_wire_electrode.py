@@ -454,8 +454,18 @@ def mesh_fixture_padded(*, edge_nm: float = 200.0, n_across: int | None = None,
     """The stack meshed with the paper's REAL footprint (task 1.10c).
 
     Same contract as :func:`mesh_fixture_layered`, but each layer carries its
-    own outline, so the electrodes are wider than the wire. The field is then a
-    3-D fringing field, not :func:`field_per_volt_1d`'s series value.
+    own outline, so the electrodes are wider than the wire.
+
+    The geometry is now the paper's real footprint, but the solve is NOT yet a
+    3-D fringing field, and this docstring claimed it was. Measured (task
+    1.10c, 2026-11-06): the free nodes stop at the wire's own rim, r = 239.4 nm,
+    because no ambient medium is meshed -- the pad overhang is empty space with
+    nothing to carry a field. The solved potential therefore varies by ~1e-16
+    across x within a z-level and the padded solve reproduces
+    :func:`field_per_volt_1d`'s series value. Pinned by
+    ``test_the_padded_solve_is_still_one_dimensional``, which fails the moment
+    the ambient is meshed. Until then this fixture buys the correct GEOMETRY,
+    not a fringing field.
     """
     kw = {} if n_across is None else {"n_across": n_across}
     stack = layers()
