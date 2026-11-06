@@ -316,7 +316,12 @@ def straddle_counts(mesh: dict) -> dict:
     Returns the total, the straddling count and fraction, and per-boundary
     crossings, plus the widest z-span and the widest diagonal span overall.
     """
-    solid, _label_fn, zs, _labels = stacked_solid_with_labels()
+    if "planes_m" in mesh:
+        zs = np.asarray(mesh["planes_m"], dtype=np.float64)
+    else:
+        # :func:`mesh_fixture` (the 1.6b lumpy fixture) predates planes_m and
+        # carries only one outline, so its planes are the flat stack's.
+        _s, _lf, zs, _l = stacked_solid_with_labels()
     pts = np.asarray(mesh["points_m"], dtype=np.float64)
     tets = np.asarray(mesh["tets"])
     z = pts[tets][:, :, 2]
@@ -414,6 +419,71 @@ def mesh_fixture_layered(*, edge_nm: float = 200.0, n_across: int | None = None,
 #: The layered convergence ladder: (bulk edge nm, oxide sub-slabs), coarse to
 #: fine. Both levers refine together, the wire's edge and the oxide's.
 LAYERED_LADDER = ((400.0, 1), (200.0, 2), (100.0, 3))
+
+
+def pad_outline_m() -> list[tuple[float, float]]:
+    """The ELECTRODE outline in metres: the wire's hexagon grown by the pad margin.
+
+    Same 6-fold shape as :func:`hex_outline_m`, so the two rings nest exactly
+    (same angles, larger radius) and the interface between them is an annulus.
+    """
+    radius = (circumradius_nm() + ELECTRODE_PAD_NM) * NM
+    return [(radius * math.cos(math.pi / 6.0 + k * math.pi / 3.0),
+             radius * math.sin(math.pi / 6.0 + k * math.pi / 3.0)) for k in range(6)]
+
+
+def pad_outlines_m() -> list[list[tuple[float, float]]]:
+    """One outline per layer for the pad-WIDENED stack (task 1.10c).
+
+    Paper 1's device is a sandwich: gold mirror below, wire, top electrode
+    above, with BOTH electrodes wider than the wire. That is a
+    wide-narrow-wide stack, which 1.10a's monotonic-narrowing rule refused
+    outright -- so the paper's own geometry could not be meshed at all until
+    1.10c generalised the interface code.
+
+    The electrodes get :func:`pad_outline_m`; the oxide and the wire keep the
+    wire's own hexagon, because the oxide is grown ON the wire.
+    """
+    wire = hex_outline_m()
+    pad = pad_outline_m()
+    return {"mirror": pad, "oxide": wire, "wire": wire, "top": pad}
+
+
+def mesh_fixture_padded(*, edge_nm: float = 200.0, n_across: int | None = None,
+                        max_tets: int = 400_000, verbose: bool = False):
+    """The stack meshed with the paper's REAL footprint (task 1.10c).
+
+    Same contract as :func:`mesh_fixture_layered`, but each layer carries its
+    own outline, so the electrodes are wider than the wire.
+
+    The geometry is now the paper's real footprint, but the solve is NOT yet a
+    3-D fringing field, and this docstring claimed it was. Measured (task
+    1.10c, 2026-11-06): the free nodes stop at the wire's own rim, r = 239.4 nm,
+    because no ambient medium is meshed -- the pad overhang is empty space with
+    nothing to carry a field. The solved potential therefore varies by ~1e-16
+    across x within a z-level and the padded solve reproduces
+    :func:`field_per_volt_1d`'s series value. Pinned by
+    ``test_the_padded_solve_is_still_one_dimensional``, which fails the moment
+    the ambient is meshed. Until then this fixture buys the correct GEOMETRY,
+    not a fringing field.
+    """
+    kw = {} if n_across is None else {"n_across": n_across}
+    stack = layers()
+    by_name = pad_outlines_m()
+    outlines = [by_name[name] for name, _t in stack]
+    points_m, tets, region_of_tet = MESH.tetrahedralize_per_region(
+        outlines, stack, edge_nm * NM, max_tets=max_tets, verbose=verbose, **kw)
+    return {
+        "points_m": points_m,
+        "tets": tets,
+        "parts": [name for name, _t in stack],
+        "region_of_tet": region_of_tet,
+        "eps_static": materials(),
+        "probe": probe_point(),
+        "planes_m": MESH.layer_planes(stack),
+        "layers": stack,
+        "outlines": outlines,
+    }
 
 
 def mesh_fixture(*, max_tets: int = 60_000, n_modes: int = 4, verbose: bool = False):

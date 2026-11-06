@@ -211,3 +211,119 @@ def test_the_field_is_not_converged_in_the_mesh():
         f"can now resolve the 12 nm oxide, revisit the fixture's UNVALIDATED "
         f"status rather than deleting this test"
     )
+
+
+# --------------------------------------------------------------------------
+# 1.10c: the pad-WIDENED fixture -- the paper's real footprint
+# --------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def padded_mesh():
+    return F.mesh_fixture_padded(edge_nm=200.0, max_tets=200_000)
+
+
+def test_the_pad_radius_is_the_wire_plus_the_margin(padded_mesh):
+    # WHY (task 1.10c review, 2026-11-06): I wrote "pad r = 839.4 nm" into the
+    # tasks.md record and a test comment. It does not reproduce: the pad is
+    # circumradius + ELECTRODE_PAD_NM = 239.4 + 60 = 299.4 nm. The 839.4 came
+    # from an unrelated 600 nm perturbation run and was carried across by hand.
+    # Deriving the expected value from the constants, and checking it against
+    # the mesh, means the prose and the mesh cannot drift apart again.
+    # LITERAL values, not circumradius_nm() + ELECTRODE_PAD_NM: deriving the
+    # expectation from the same constants the mesh uses made the first version
+    # of this test CIRCULAR -- mutating ELECTRODE_PAD_NM to 660 moved both
+    # sides and the test still passed. Measured, the pad is 299.4 nm and the
+    # wire 239.4 nm; those are the numbers the record quotes.
+    assert abs(F.circumradius_nm() - 239.4) < 0.1, F.circumradius_nm()
+    assert abs(F.ELECTRODE_PAD_NM - 60.0) < 0.1, F.ELECTRODE_PAD_NM
+    for name in ("mirror", "top"):
+        got = _region_rmax_nm(padded_mesh, name)
+        assert abs(got - 299.4) < 1.0, (name, got)
+    wire = _region_rmax_nm(padded_mesh, "wire")
+    assert abs(wire - 239.4) < 1.0, wire
+
+
+def _region_rmax_nm(mesh, name):
+    """Largest radius of any vertex of a layer's tets, in nm."""
+    pts = np.asarray(mesh["points_m"])
+    tets = np.asarray(mesh["tets"])
+    region = np.asarray(mesh["region_of_tet"])
+    idx = mesh["parts"].index(name)
+    verts = np.unique(tets[region == idx].ravel())
+    return float(np.hypot(pts[verts, 0], pts[verts, 1]).max() / F.NM)
+
+
+def test_the_electrodes_are_actually_wider_than_the_wire(padded_mesh):
+    # The whole point of 1.10c. 1.10a's monotonic-narrowing rule could not
+    # represent this stack at all, and the flat fixture folds the pad margin
+    # into the wire's own outline, so every layer came out wire-wide. If this
+    # test fails because both are equal, the mesher has silently collapsed the
+    # pad back onto the wire -- the failure mode that makes the pad invisible.
+    pad = F.circumradius_nm() + F.ELECTRODE_PAD_NM
+    wire = F.circumradius_nm()
+    assert _region_rmax_nm(padded_mesh, "mirror") == pytest.approx(pad, rel=1e-6)
+    assert _region_rmax_nm(padded_mesh, "top") == pytest.approx(pad, rel=1e-6)
+    assert _region_rmax_nm(padded_mesh, "oxide") == pytest.approx(wire, rel=1e-6)
+    assert _region_rmax_nm(padded_mesh, "wire") == pytest.approx(wire, rel=1e-6)
+    assert pad > wire + 1.0
+
+
+def test_the_padded_stack_keeps_every_layer_and_its_region(padded_mesh):
+    region = np.asarray(padded_mesh["region_of_tet"])
+    for i in range(len(padded_mesh["parts"])):
+        assert (region == i).sum() > 0, f"layer {padded_mesh['parts'][i]} got no tets"
+
+
+def test_no_tet_crosses_a_padded_layer_boundary(padded_mesh):
+    # Measured, not assumed: the pad ring is a separate outline, so an element
+    # that spans a plane would be labelled by its centroid and the layers would
+    # mix. This pins the number rather than a claim of zero -- 1.10c reduces
+    # them relative to the flat fixture but does not reach zero, because the
+    # oxide/wire interface shares one ring and TetGen still spans it.
+    s = F.straddle_counts(padded_mesh)
+    assert s["n_tets"] > 0
+    crossings = {round(k, 1): v for k, v in s["per_boundary_nm"].items()}
+    assert crossings.get(120.0, 0) == 0, crossings
+    assert crossings.get(1507.0, 0) == 0, crossings
+    assert 0.0 <= s["fraction"] < 0.5, s
+
+
+def test_the_padded_solve_is_still_one_dimensional(padded_mesh):
+    # WHY THIS IS THE ASSERTION AND NOT A FIELD NUMBER (task 1.10c, 2026-11-06).
+    #
+    # The padded mesh carries the paper's real footprint: the top pad spans
+    # r = 299.4 nm over a wire of r = 239.4 nm, and both electrodes cover the
+    # wire, so a fringing field is what the fixture is FOR. Measured, it does
+    # not happen: the solved potential varies by ~1e-15 across x within a
+    # z-level, and, decisively, the free (solved) nodes stop at r = 239.4 --
+    # there is no material in the pad overhang at all.
+    #
+    # So the pad is in the mesh but the overhang is empty space: the wide
+    # annulus sits over nothing, and the only Dirichlet contact the wire sees
+    # is its own rim. The solve is therefore the 1-D series stack, and the
+    # padded and flat fixtures agree to ~1e-7 -- but that agreement is a
+    # property of the MISSING AMBIENT, not of the device, and must not be
+    # reported as "the pad does not perturb the field".
+    #
+    # This test pins the defect so that it fails the moment the ambient is
+    # meshed and the solve becomes genuinely 3-D; at that point delete it and
+    # assert the fringing field instead.
+    sol = F.solve_wire(padded_mesh, 1.0)
+    free = sol["free"]
+    r_free = np.hypot(sol["points_m"][free, 0], sol["points_m"][free, 1])
+    assert r_free.max() < 250.0e-9, (
+        "free nodes now extend into the pad overhang -- the ambient has been "
+        "meshed; this pin is obsolete and a fringing field should be asserted"
+    )
+    # Group by EXACT z. Rounding the coordinate first once measured 8e-4 here
+    # purely because it merged neighbouring z-levels, i.e. the instrument
+    # invented lateral spread; exact grouping measures 8e-16.
+    z = sol["points_m"][:, 2]
+    phi = sol["phi"]
+    x = sol["points_m"][:, 0]
+    widest = 0.0
+    for zv in np.unique(z):
+        sel = z == zv
+        if sel.sum() >= 3 and (x[sel].max() - x[sel].min()) > 20e-9:
+            widest = max(widest, float(phi[sel].max() - phi[sel].min()))
+    assert widest < 1e-9, f"lateral phi spread {widest:.3e} -- no longer 1-D"

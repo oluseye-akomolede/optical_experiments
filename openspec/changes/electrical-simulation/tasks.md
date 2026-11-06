@@ -735,6 +735,59 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         The outlines must also narrow monotonically UPWARD (a pad on top, or a
         wide-narrow-wide sandwich, is refused) -- which suits the paper-1 stack, where
         the pad is at the bottom.
+- [x] 1.10c Wide-narrow-wide meshing from the paper-1 fixture, and the pad field.
+      2026-11-06.
+      - The mesher now accepts a wide-narrow-wide sandwich. The invariant is no longer
+        "outlines narrow monotonically upward" but "adjacent outlines must NEST" (one
+        contains the other), which is what a usable device needs. Rings of equal radius
+        nest, so 40/40/120 is legal; a genuinely crossing pair is still refused.
+      - `mesh_fixture_padded` drives the paper's real footprint from the fixture:
+        mirror r=299.4 nm, oxide and wire r=239.4 nm, top r=299.4 nm. The 60 nm pad
+        overhang is real in the mesh, not just in the call.
+      - **The field measurement is a NEGATIVE, and it is a defect, not physics.**
+        The padded and flat fixtures give the same field to ~1e-7, and that looked
+        like "the pad does not perturb the field". It is not: the solved potential
+        varies by **8e-16 across x within a z-level** -- the solve is exactly 1-D.
+        Cause, measured: the free (solved) nodes stop at **r = 239.4 nm**, so there
+        are **zero free nodes in the pad overhang**. The wide annulus sits over empty
+        space, because the fixture meshes no ambient medium outside the wire. The only
+        Dirichlet contact the wire sees is its own rim, and the stack is therefore the
+        1-D series problem the flat fixture already solves exactly.
+      - So the "pad changes nothing" number must NOT be reported as a result. It is
+        pinned by `test_the_padded_solve_is_still_one_dimensional`, which fails the
+        moment the ambient is meshed (mutation: widen the oxide to the pad outline ->
+        free nodes reach the overhang -> the pin fails, as it should).
+      - *Not done, and why:* measuring a real fringing field needs the surrounding
+        medium as a meshed region (with its own permittivity). That is a device-model
+        decision -- what is the ambient, and what is its eps -- not an implementation
+        detail, so it is escalated rather than guessed.
+      - Two instrument errors made on the way, recorded so they are not repeated:
+        (i) probes at x=230 nm were reported "outside the mesh" -- correct, because the
+        hexagon's INRADIUS is 207.3 nm while its circumradius is 239.4; the probe was
+        outside the wire. (ii) grading `phi` spread by `np.round(z, 9)` merged adjacent
+        z-levels and manufactured an 8e-4 lateral spread out of nothing; exact-z
+        grouping gives 8e-16.
+      - `straddle_counts` fixed to use the MESH's own planes (`planes_m`) instead of
+        always reading the flat stack's, and to fall back when a fixture carries none.
+      - Review round (2026-11-06). First submission quoted the pad as **839.4 nm** in
+        four places; it is **299.4** = circumradius 239.4 + `ELECTRODE_PAD_NM` 60, and
+        839.4 came from an unrelated 600 nm perturbation run carried across by hand.
+        Fifth carried-forward number in this change after 83/81, 113/67, 1548/1970 and
+        109. Corrected and pinned by `test_the_pad_radius_is_the_wire_plus_the_margin`
+        against LITERAL values. The first version of that pin derived the expectation
+        from the same two constants the mesh uses, so mutating `ELECTRODE_PAD_NM` to 660
+        moved both sides and the test still PASSED -- circular, the same defect as 1.6b's
+        oxide test, reproduced while writing a test meant to stop numbers drifting. With
+        literals the same mutation FAILS it.
+      - Second review round: `mesh_fixture_padded`'s docstring still promised "a 3-D
+        fringing field, not field_per_volt_1d's series value" -- the opposite of what the
+        pin above measures, and the more quotable of the two because it is a docstring in
+        `scripts/`. Replaced with the measured statement (free nodes stop at r=239.4,
+        ~1e-16 lateral spread, reproduces `field_per_volt_1d`) plus a pointer to the test
+        that fails once the ambient is meshed. The other 3-D/1-D mentions in the file
+        describe the FLAT fixture and are accurate.
+      - **PASS @37cc34f**, "docstring claims reproduce (239.4 nm, ~1e-16)". Still
+        unruled and still the lead's: the ambient medium.
 
 ## 2. Phase 2: drift-diffusion (general parts, any contacts, both forms)
 - [ ] 2.1 Install DEVSIM in the solver image; a smoke that imports it and records its
