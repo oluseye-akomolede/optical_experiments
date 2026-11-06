@@ -769,6 +769,25 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         grouping gives 8e-16.
       - `straddle_counts` fixed to use the MESH's own planes (`planes_m`) instead of
         always reading the flat stack's, and to fall back when a fixture carries none.
+      - Review round (2026-11-06). First submission quoted the pad as **839.4 nm** in
+        four places; it is **299.4** = circumradius 239.4 + `ELECTRODE_PAD_NM` 60, and
+        839.4 came from an unrelated 600 nm perturbation run carried across by hand.
+        Fifth carried-forward number in this change after 83/81, 113/67, 1548/1970 and
+        109. Corrected and pinned by `test_the_pad_radius_is_the_wire_plus_the_margin`
+        against LITERAL values. The first version of that pin derived the expectation
+        from the same two constants the mesh uses, so mutating `ELECTRODE_PAD_NM` to 660
+        moved both sides and the test still PASSED -- circular, the same defect as 1.6b's
+        oxide test, reproduced while writing a test meant to stop numbers drifting. With
+        literals the same mutation FAILS it.
+      - Second review round: `mesh_fixture_padded`'s docstring still promised "a 3-D
+        fringing field, not field_per_volt_1d's series value" -- the opposite of what the
+        pin above measures, and the more quotable of the two because it is a docstring in
+        `scripts/`. Replaced with the measured statement (free nodes stop at r=239.4,
+        ~1e-16 lateral spread, reproduces `field_per_volt_1d`) plus a pointer to the test
+        that fails once the ambient is meshed. The other 3-D/1-D mentions in the file
+        describe the FLAT fixture and are accurate.
+      - **PASS @37cc34f**, "docstring claims reproduce (239.4 nm, ~1e-16)". Still
+        unruled and still the lead's: the ambient medium.
 
 ## 2. Phase 2: drift-diffusion (general parts, any contacts, both forms)
 - [ ] 2.1 Install DEVSIM in the solver image; a smoke that imports it and records its
