@@ -742,7 +742,7 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         contains the other), which is what a usable device needs. Rings of equal radius
         nest, so 40/40/120 is legal; a genuinely crossing pair is still refused.
       - `mesh_fixture_padded` drives the paper's real footprint from the fixture:
-        mirror r=839.4 nm, oxide and wire r=239.4 nm, top r=839.4 nm. The 60 nm pad
+        mirror r=299.4 nm, oxide and wire r=239.4 nm, top r=299.4 nm. The 60 nm pad
         overhang is real in the mesh, not just in the call.
       - **The field measurement is a NEGATIVE, and it is a defect, not physics.**
         The padded and flat fixtures give the same field to ~1e-7, and that looked

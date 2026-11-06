@@ -222,6 +222,27 @@ def padded_mesh():
     return F.mesh_fixture_padded(edge_nm=200.0, max_tets=200_000)
 
 
+def test_the_pad_radius_is_the_wire_plus_the_margin(padded_mesh):
+    # WHY (task 1.10c review, 2026-11-06): I wrote "pad r = 839.4 nm" into the
+    # tasks.md record and a test comment. It does not reproduce: the pad is
+    # circumradius + ELECTRODE_PAD_NM = 239.4 + 60 = 299.4 nm. The 839.4 came
+    # from an unrelated 600 nm perturbation run and was carried across by hand.
+    # Deriving the expected value from the constants, and checking it against
+    # the mesh, means the prose and the mesh cannot drift apart again.
+    # LITERAL values, not circumradius_nm() + ELECTRODE_PAD_NM: deriving the
+    # expectation from the same constants the mesh uses made the first version
+    # of this test CIRCULAR -- mutating ELECTRODE_PAD_NM to 660 moved both
+    # sides and the test still passed. Measured, the pad is 299.4 nm and the
+    # wire 239.4 nm; those are the numbers the record quotes.
+    assert abs(F.circumradius_nm() - 239.4) < 0.1, F.circumradius_nm()
+    assert abs(F.ELECTRODE_PAD_NM - 60.0) < 0.1, F.ELECTRODE_PAD_NM
+    for name in ("mirror", "top"):
+        got = _region_rmax_nm(padded_mesh, name)
+        assert abs(got - 299.4) < 1.0, (name, got)
+    wire = _region_rmax_nm(padded_mesh, "wire")
+    assert abs(wire - 239.4) < 1.0, wire
+
+
 def _region_rmax_nm(mesh, name):
     """Largest radius of any vertex of a layer's tets, in nm."""
     pts = np.asarray(mesh["points_m"])
@@ -271,7 +292,7 @@ def test_the_padded_solve_is_still_one_dimensional(padded_mesh):
     # WHY THIS IS THE ASSERTION AND NOT A FIELD NUMBER (task 1.10c, 2026-11-06).
     #
     # The padded mesh carries the paper's real footprint: the top pad spans
-    # r = 839.4 nm over a wire of r = 239.4 nm, and both electrodes cover the
+    # r = 299.4 nm over a wire of r = 239.4 nm, and both electrodes cover the
     # wire, so a fringing field is what the fixture is FOR. Measured, it does
     # not happen: the solved potential varies by ~1e-15 across x within a
     # z-level, and, decisively, the free (solved) nodes stop at r = 239.4 --
