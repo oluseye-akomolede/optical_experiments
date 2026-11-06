@@ -265,3 +265,67 @@ def test_a_clockwise_outline_meshes_the_same_as_counter_clockwise():
     for mesh in (ccw, cw):
         s = MESH.layer_straddles(*mesh, MESH.layer_planes(layers))
         assert s["crossing"] == 0 and s["mislabelled"] == 0
+
+
+# ---------------------------------------------------------------- 1.10a: per-region outlines
+
+def _ring(r, n=8):
+    import numpy as _np
+    return [(r * _np.cos(2 * _np.pi * k / n), r * _np.sin(2 * _np.pi * k / n))
+            for k in range(n)]
+
+
+PAD_WIDER = [("pad", 100.0), ("ox", 20.0), ("wire", 200.0)]
+PAD_R, WIRE_R = 120.0, 50.0
+
+
+def test_a_pad_wider_than_the_wire_meshes_with_no_crossing_tets():
+    """The case 1.10a exists for: one outline per layer, pad over wire."""
+    m = MESH.tetrahedralize_per_region(
+        [_ring(PAD_R), _ring(PAD_R), _ring(WIRE_R)], PAD_WIDER, 40.0)
+    s = MESH.layer_straddles(*m, MESH.layer_planes(PAD_WIDER))
+    assert s["crossing"] == 0, s
+    assert s["mislabelled"] == 0, s
+
+
+def test_the_pad_is_actually_wider_than_the_wire_in_the_mesh():
+    """Not just 'no straddles': the PAD must reach r=120 and the wire stop at 50.
+
+    A single-outline mesh would give both regions the same radius, and the
+    straddle count alone would not notice -- there would be nothing to cross.
+    """
+    import numpy as _np
+    pts, tets, attrib = MESH.tetrahedralize_per_region(
+        [_ring(PAD_R), _ring(PAD_R), _ring(WIRE_R)], PAD_WIDER, 40.0)
+    r = _np.hypot(pts[tets][:, :, 0], pts[tets][:, :, 1])
+    pad, wire = attrib == 0, attrib == 2
+    assert r[pad].max() > 1.5 * r[wire].max(), (r[pad].max(), r[wire].max())
+    assert r[wire].max() < 0.6 * PAD_R
+
+
+def test_a_region_whose_outline_is_not_contained_is_refused():
+    with pytest.raises(MESH.MeshingError, match="contained|contain"):
+        MESH.per_region_stack_plc(
+            [_ring(WIRE_R), _ring(WIRE_R), _ring(PAD_R)], PAD_WIDER, 40.0)
+
+
+def test_outlines_must_narrow_monotonically_upward():
+    """The pairwise check is the only statement of this invariant.
+
+    An earlier version also compared each ring against the widest ring, but
+    wrote it as ``_ring_contains(rings[i], r)`` with ``r is rings[i]`` -- a
+    ring against itself, always true, so it could never fire. It is deleted
+    rather than repaired: pairwise containment already forces every outline to
+    nest under the one below it, so the widest is always ring 0 and every other
+    ring nests under it transitively. This test pins the consequence, so if the
+    pairwise check ever weakens, a middle-widest or wide-narrow-wide stack is
+    caught here rather than silently meshing crossed regions.
+    """
+    # Middle ring widest: 40 / 120 / 40. Ring 1 is not contained in ring 0.
+    with pytest.raises(MESH.MeshingError, match="contained|contain"):
+        MESH.per_region_stack_plc(
+            [_ring(40.0), _ring(120.0), _ring(40.0)], PAD_WIDER, 40.0)
+    # Wide-narrow-wide: 120 / 40 / 120. Ring 2 is not contained in ring 1.
+    with pytest.raises(MESH.MeshingError, match="contained|contain"):
+        MESH.per_region_stack_plc(
+            [_ring(120.0), _ring(40.0), _ring(120.0)], PAD_WIDER, 40.0)

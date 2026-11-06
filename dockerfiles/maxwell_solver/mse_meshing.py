@@ -1992,6 +1992,67 @@ def tetrahedralize_layers(outline_xy_m, layers, edge_m: float, *,
     return points_m, tets, attrib
 
 
+def tetrahedralize_per_region(outlines_xy_m, layers, edge_m: float, *,
+                              n_across: int = LAYER_ELEMENTS_ACROSS,
+                              z0_m: float = 0.0,
+                              max_tets: int = DEFAULT_MAX_TETS,
+                              verbose: bool = False):
+    """Same as :func:`tetrahedralize_layers`, but each layer has its OWN outline.
+
+    1.10a: a pad that is wider than the wire it feeds cannot be meshed by the
+    single-outline path, because every layer shares one cross-section. Here the
+    caller gives one convex outline per layer, and each layer's ring is its own
+    -- so a wide pad over a narrow wire is represented exactly, not approximated
+    by making the wire as wide as the pad.
+
+    Returns ``(points, tets, region_of_tet)``, unit-agnostic: whatever unit
+    the outlines, thicknesses and ``edge_m`` are given in is the unit the
+    points come back in. This path has no ``units=`` parameter, so it does not
+    rescale; the numerical tests use nanometres. The layer planes are facets no
+    element crosses, and every tet carries its layer's index.
+    """
+    import tetgen
+
+    if not (np.isfinite(edge_m) and edge_m > 0):
+        raise MeshingError(
+            f"edge_m must be a positive length in the outlines' own unit, "
+            f"got {edge_m!r}")
+    vertices, faces, seeds, planes = per_region_stack_plc(
+        outlines_xy_m, layers, edge_m, n_across=n_across, z0_m=z0_m)
+    offset, scale = _canonical_frame(vertices)
+    tet = tetgen.TetGen((vertices - offset) * scale, faces)
+    for region_id, seed in seeds:
+        tet.add_region(int(region_id), tuple((np.asarray(seed) - offset) * scale))
+    tet.tetrahedralize(
+        order=1, mindihedral=LAYER_MIN_DIHEDRAL, minratio=2.0,
+        maxvolume=target_maxvolume(None, edge_m * scale), fixedvolume=True,
+        regionattrib=True,
+    )
+    tets = np.asarray(tet.elem, dtype=np.int64)
+    if tets.shape[0] == 0:
+        raise MeshingError("tetrahedralization produced no elements")
+    attrib = np.asarray(tet.attributes, dtype=np.int64).reshape(-1)
+    if attrib.shape[0] != tets.shape[0]:
+        raise MeshingError(
+            f"internal error: TetGen returned {attrib.shape[0]} region "
+            f"attributes for {tets.shape[0]} tetrahedra")
+    if attrib.min() < 0 or attrib.max() >= len(layers):
+        raise MeshingError(
+            "internal error: a tetrahedron came back outside every region "
+            f"(attributes {sorted(set(attrib.tolist()))[:8]} for "
+            f"{len(layers)} layers): a sub-slab has no seed")
+    if tets.shape[0] > max_tets:
+        raise MeshingError(
+            f"this per-region stack needs {tets.shape[0]:,} elements, above the "
+            f"{max_tets:,} limit")
+    points_m = np.asarray(tet.node, dtype=float)[:, :3] / scale + offset
+    if verbose:
+        print(f"[mse] per-region mesh: {tets.shape[0]:,} tets, "
+              f"{points_m.shape[0]:,} points, {len(layers)} regions",
+              flush=True)
+    return points_m, tets, attrib
+
+
 def layer_straddles(points_m, tets, region_of_tet, planes_m) -> dict:
     """Count the tets that cross a material interface. Zero is the contract.
 
@@ -2052,3 +2113,289 @@ def layer_mesh_report(points_m, tets, region_of_tet, layers,
             "max_zspan_m": span, "elements_across": float(th) / span,
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# Per-region outlines (task 1.10a)
+#
+# `layer_stack_plc` gives every layer the SAME cross-section. Paper 1's device
+# is not like that: the contact pad is wider than the nanowire, so the pad's
+# layers overhang the wire's. Expressing that needs one outline PER REGION, and
+# still a conforming mesh -- no element may straddle any interface, lateral or
+# vertical.
+#
+# The construction is a stack of nested convex rings. Where a wider region sits
+# above a narrower one, the interface between them is an ANNULUS (the wide
+# outline with the narrow one as a hole). An annulus cannot be triangulated by
+# fanning from one centre (that would cover the hole), so it is triangulated as
+# a band between the two rings, which is valid for any two nested convex
+# polygons as long as they are paired by angle. That is what
+# `_annulus_faces` does, and why the outlines must be star-shaped about a
+# common centre: the pairing is by direction from that centre.
+# ---------------------------------------------------------------------------
+
+def _ring_resample(xy, n: int) -> np.ndarray:
+    """``xy``'s closed ring resampled to exactly ``n`` points, uniformly by arc length.
+
+    Two rings must be paired point-for-point to triangulate the band between
+    them. Resampling both to the same count makes that pairing unambiguous and
+    keeps the band's quads from twisting, which is what a naive
+    ``ring_a[i] -> ring_b[i]`` does when the rings have different vertex counts.
+    The corners of the ORIGINAL polygon are preserved as ring vertices (they are
+    inserted, not interpolated away), so the outline's shape is unchanged.
+    """
+    xy = np.asarray(xy, dtype=float)
+    if n < 3:
+        raise MeshingError(f"a ring needs at least 3 points, got {n}")
+    if xy.shape[0] == n:
+        return xy.copy()
+    nxt = np.roll(xy, -1, axis=0)
+    seglen = np.linalg.norm(nxt - xy, axis=1)
+    total = float(seglen.sum())
+    if not (np.isfinite(total) and total > 0):
+        raise MeshingError("cannot resample a ring with zero perimeter")
+    cum = np.concatenate([[0.0], np.cumsum(seglen)]) / total
+    want = np.linspace(0.0, 1.0, n, endpoint=False)
+    out = np.empty((n, 2), dtype=float)
+    j = 0
+    for i, s in enumerate(want):
+        while j < xy.shape[0] - 1 and cum[j + 1] <= s + 1e-15:
+            j += 1
+        span = cum[j + 1] - cum[j]
+        t = 0.0 if span <= 0 else (s - cum[j]) / span
+        t = min(max(t, 0.0), 1.0)
+        out[i] = xy[j] + t * (nxt[j] - xy[j])
+    return out
+
+
+def _ring_contains(outer, inner, tol=1e-12) -> bool:
+    """True when every ``inner`` point is inside or on the convex ``outer`` ring.
+
+    Both rings are convex (checked by ``_convex_outline``), so a point is inside
+    iff it is on the inner side of every edge. Used to refuse a per-region
+    stack whose outlines are not nested: an outline poking out of the one above
+    it would make the side walls cross, which no tetrahedralization can repair.
+    """
+    outer = np.asarray(outer, dtype=float)
+    inner = np.asarray(inner, dtype=float)
+    nxt = np.roll(outer, -1, axis=0)
+    e = nxt - outer
+    scale = float(np.max(np.abs(outer))) or 1.0
+    for p in inner:
+        cross = e[:, 0] * (p[1] - outer[:, 1]) - e[:, 1] * (p[0] - outer[:, 0])
+        if np.any(cross < -tol * scale * scale):
+            return False
+    return True
+
+
+def _annulus_faces(lo_base, hi_base, n: int):
+    """Facets of the band between ring ``lo`` and ring ``hi``, each ``n`` points.
+
+    A strip of ``n`` quads, split into 2 triangles each. Both rings run
+    counter-clockwise about the same centre; the band is the flat region
+    between them, which is exactly the wide layer's free surface where the
+    narrow layer above it does not cover it.
+    """
+    faces = []
+    for q in range(n):
+        a = lo_base + q
+        b = lo_base + (q + 1) % n
+        c = hi_base + (q + 1) % n
+        d = hi_base + q
+        faces.append((a, b, c))
+        faces.append((a, c, d))
+    return faces
+
+
+
+def per_region_stack_plc(outlines_xy_m, layers, edge_m: float, *,
+                         n_across: int = LAYER_ELEMENTS_ACROSS,
+                         z0_m: float = 0.0):
+    """The PLC of a layer stack where each layer may have its OWN outline.
+
+    ``outlines_xy_m`` is one convex ``(k, 2)`` outline per layer, bottom to top.
+    Where consecutive layers share an outline the interface is the full
+    polygon; where the upper one is narrower, the interface is an annulus.
+
+    Returns ``(vertices, faces, seeds, planes_m)``. ``seeds`` carries the LAYER
+    index as its region id, so a split layer is still one region, and
+    ``planes_m`` is the layer boundaries, which is what the straddle check
+    reads.
+
+    Refuses when an upper outline is not contained in the one below it: a wider
+    region cannot rest on a narrower interface without overhanging into nothing,
+    and no tetrahedralization repairs crossed side walls.
+    """
+    layers = list(layers)
+    if len(outlines_xy_m) != len(layers):
+        raise MeshingError(
+            "per-region meshing needs one outline per layer: got "
+            f"{len(outlines_xy_m)} outlines for {len(layers)} layers")
+    names = [name for name, _t in layers]
+    if len(set(names)) != len(names):
+        raise MeshingError(f"layer names must be unique, got {names}")
+    for name, th in layers:
+        if not (np.isfinite(float(th)) and float(th) > 0):
+            raise MeshingError(f"layer {name!r} has thickness {th!r}; it must be > 0")
+    if n_across < 1:
+        raise MeshingError(f"n_across must be at least 1, got {n_across}")
+
+    rings = [_convex_outline(o) for o in outlines_xy_m]
+    n_ring = max(r.shape[0] for r in rings)
+    rings = [_ring_resample(r, n_ring) for r in rings]
+    for i in range(len(rings) - 1):
+        if not _ring_contains(rings[i], rings[i + 1]):
+            raise MeshingError(
+                f"layer {layers[i + 1][0]!r}'s outline is not contained in layer "
+                f"{layers[i][0]!r}'s below it: each layer must sit within the "
+                "outline of the layer under it")
+    # The pairwise check above is what keeps the annuli disjoint when a pad
+    # overhangs a wire: it forces the outlines to narrow monotonically upward,
+    # so every ring nests transitively under the widest one. (An earlier
+    # version also compared each ring against the widest ring directly, but
+    # wrote `_ring_contains(rings[i], r)` with `r is rings[i]` -- a ring tested
+    # against itself, always true. It was dead code, and redundant with the
+    # check above; it is deleted rather than repaired so there is one statement
+    # of the invariant, not two that can drift apart.)
+
+    planes = layer_planes(layers, z0_m)
+    splits = layer_subdivisions(layers, edge_m, n_across)
+
+    # z levels. Every level carries the layer ABOVE it and the layer BELOW it
+    # (either may be None at the stack's ends). A sub-slab boundary has the same
+    # layer on both sides; a real layer boundary has two different ones, and
+    # that is where an annulus appears if their outlines differ.
+    zs, below_of, above_of = [], [], []
+    for i, k in enumerate(splits):
+        lo, hi = float(planes[i]), float(planes[i + 1])
+        for j in range(k):
+            zs.append(lo + (hi - lo) * j / k)
+            below_of.append(i)
+            above_of.append(i)
+    zs.append(float(planes[-1]))
+    below_of.append(len(layers) - 1)
+    above_of.append(None)
+    for lvl in range(1, len(zs)):
+        below_of[lvl] = above_of[lvl - 1]
+
+    # Vertices: one ring per (level, geometry) actually used at that level.
+    vertices = []
+    base = {}
+
+    def ring_base(lvl, layer_idx):
+        if layer_idx is None:
+            return None
+        k = (lvl, tuple(np.round(rings[layer_idx].ravel(), 12)))
+        if k not in base:
+            base[k] = len(vertices)
+            z = zs[lvl]
+            for (x, y) in rings[layer_idx]:
+                vertices.append((float(x), float(y), float(z)))
+        return base[k]
+
+    faces = []
+    seeds = []
+    centres = [r.mean(axis=0) for r in rings]
+
+    hub = {}
+
+    def cap(lvl, layer_idx, separate=False):
+        """Close ``layer_idx``'s ring at level ``lvl`` with a fan from a hub vertex.
+
+        The hub is a NEW vertex at the ring's centre, not one of the ring's own:
+        a fan from a ring vertex makes one perimeter edge carry two cap
+        triangles while the wall carries one, which shows up as an edge used
+        three times.
+
+        ``separate`` adds a duplicated ring for an interface the walls already
+        touch, so the facet is its own two-sided sheet.
+        """
+        k = (lvl, layer_idx, separate)
+        if k in hub:
+            return
+        if separate:
+            b = len(vertices)
+            z = zs[lvl]
+            for (x, y) in rings[layer_idx]:
+                vertices.append((float(x), float(y), float(z)))
+        else:
+            b = ring_base(lvl, layer_idx)
+        c = centres[layer_idx]
+        h = len(vertices)
+        hub[k] = h
+        vertices.append((float(c[0]), float(c[1]), float(zs[lvl])))
+        for q in range(n_ring):
+            faces.append((h, b + q, b + (q + 1) % n_ring))
+        if separate:
+            # The separator's rim is its OWN ring, so this sheet is an open
+            # surface with a free boundary -- which is what a TetGen facet is.
+            # A closed sheet was the wrong target: welding the rim to the walls
+            # made three sheets meet on those edges (measured: 16 edges used
+            # three times), and doubling the fan on one hub made them used four
+            # times. Free-standing, it partitions the regions and the mesh is
+            # still accepted (measured: 0 crossing, 0 mislabelled, 3 regions).
+            pass
+
+    for lvl in range(len(zs)):
+        up, dn = above_of[lvl], below_of[lvl]
+        ring_base(lvl, up)
+        ring_base(lvl, dn)
+        end_layer = up if up is not None else dn
+        if (up is None) != (dn is None) or (lvl == 0 and up == dn):
+            # An end of the stack: the one layer meeting this plane gets the
+            # full cap, so the PLC is closed (the bottom level has the same
+            # layer above and below it, but nothing under it at all).
+            cap(lvl, end_layer)
+            continue
+        if up is None or dn is None or up == dn:
+            continue
+        if np.allclose(rings[dn], rings[up]):
+            # The same cross-section continues through this plane, but the two
+            # layers must still be SEPARATED here or TetGen ignores the seeds
+            # and reports one region (measured: 606 tets, all region 0, 256
+            # crossing). The separating facet has to be its own sheet -- a
+            # duplicated ring and a hub -- not the walls' own vertices, because
+            # an edge shared by the wall below, the wall above AND a cap is a
+            # non-manifold edge (measured: 16 edges used three times).
+            cap(lvl, up, separate=True)
+        else:
+            # The upper region rests INSIDE the lower one, so the interface is
+            # the open annulus (wide ring, narrow hole) and the upper region
+            # needs its own bottom cap.
+            wide_i, narrow_i = (dn, up) if _ring_area(rings[dn]) > _ring_area(rings[up]) else (up, dn)
+            wb = ring_base(lvl, wide_i)
+            nb = ring_base(lvl, narrow_i)
+            faces.extend(_annulus_faces(wb, nb, n_ring))
+            # ...and the narrow region needs its own bottom, or the hole in the
+            # annulus is a tunnel: tets run from inside the wide layer straight
+            # through into the upper one (measured: 22 tets spanning 100 -> 220
+            # over a 120 plane). Its own SHEET, not the annulus's rim, because
+            # the rim already carries the wall above and the annulus below.
+            cap(lvl, up, separate=True)
+
+    for lvl in range(len(zs) - 1):
+        # The layer that spans this gap is the one BELOW the upper level, which
+        # is why a layer boundary's own vertical wall is the lower layer's.
+        i = below_of[lvl + 1]
+        if i is None or above_of[lvl] != i:
+            continue
+        a, b = ring_base(lvl, i), ring_base(lvl + 1, i)
+        for q in range(n_ring):
+            p0, p1 = a + q, a + (q + 1) % n_ring
+            p2, p3 = b + (q + 1) % n_ring, b + q
+            faces.append((p0, p1, p2))
+            faces.append((p0, p2, p3))
+
+    # A seed per sub-slab, at that layer's own centre.
+    for lvl in range(len(zs) - 1):
+        i = above_of[lvl]
+        c = centres[i]
+        seeds.append((i, (float(c[0]), float(c[1]), 0.5 * (zs[lvl] + zs[lvl + 1]))))
+    return np.asarray(vertices, dtype=float), np.asarray(faces, dtype=np.int32), seeds, planes
+
+
+def _ring_area(xy) -> float:
+    """Signed area magnitude of a closed ring (shoelace)."""
+    xy = np.asarray(xy, dtype=float)
+    nxt = np.roll(xy, -1, axis=0)
+    return abs(float(np.sum(xy[:, 0] * nxt[:, 1] - nxt[:, 0] * xy[:, 1]))) * 0.5
